@@ -514,6 +514,7 @@ impl GpuMccfr {
 
             for _ in 0..num_iterations {
                 self.iteration += 1;
+                let weight = self.iteration as f32;
 
                 use rand::Rng;
                 let mut rng = rand::thread_rng();
@@ -543,11 +544,11 @@ impl GpuMccfr {
                         .arg(&self.d_sign_table)
                         .arg(&np)
                         .arg(&batch_size)
-                        .arg(&1.0f32)
+                        .arg(&weight)
                         .arg(&self.regret_floor)
                         .arg(&d_seeds);
                     builder.launch(cfg)?;
-                }
+            }
 
             self.stream.synchronize()?;
         }
@@ -690,6 +691,7 @@ impl GpuNplayerExtSamp {
 
         for _ in 0..num_iterations {
             self.iteration += 1;
+            let weight = self.iteration as f32;
 
             let mut rng = rand::thread_rng();
             seeds.clear();
@@ -736,9 +738,10 @@ impl GpuNplayerExtSamp {
                     .arg(&batch_size)
                     .arg(&nh)
                     .arg(&nr)
-                    .arg(&1.0f32)
+                    .arg(&weight)
                     .arg(&self.regret_floor)
-                    .arg(&d_seeds);
+                    .arg(&d_seeds)
+                    .arg(&1u32);
                 builder.launch(cfg)?;
             }
 
@@ -775,7 +778,8 @@ impl GpuNplayerExtSamp {
                     .arg(&self.d_chance_ranks).arg(&self.d_remaining_deck)
                     .arg(&self.d_chance_sorted_strength).arg(&self.d_chance_sorted_indices)
                     .arg(&d_frame_data).arg(&np).arg(&batch_size).arg(&nh).arg(&nr)
-                    .arg(&1.0f32).arg(&self.regret_floor).arg(&d_seeds);
+                    .arg(&1.0f32).arg(&self.regret_floor).arg(&d_seeds)
+                    .arg(&0u32);
                 builder.launch(cfg)?;
             }
             self.stream.synchronize()?;
@@ -888,7 +892,8 @@ impl GpuNplayerExtSampCompact {
                     .arg(&self.regret_floor)
                     .arg(&d_seeds)
                     .arg(&d_peak)
-                    .arg(&stride);
+                    .arg(&stride)
+                    .arg(&1u32);
                 builder.launch(cfg)?;
             }
 
@@ -928,7 +933,8 @@ impl GpuNplayerExtSampCompact {
                     .arg(&self.d_chance_ranks).arg(&self.d_remaining_deck)
                     .arg(&self.d_chance_sorted_strength).arg(&self.d_chance_sorted_indices)
                     .arg(&d_frame_data).arg(&np).arg(&batch_size).arg(&nh).arg(&nr)
-                    .arg(&1.0f32).arg(&self.regret_floor).arg(&d_seeds).arg(&d_peak).arg(&stride);
+                    .arg(&1.0f32).arg(&self.regret_floor).arg(&d_seeds).arg(&d_peak).arg(&stride)
+                    .arg(&0u32);
                 builder.launch(cfg)?;
             }
             self.stream.synchronize()?;
@@ -964,7 +970,8 @@ impl GpuNplayerExtSampCompact {
                 .arg(&self.d_chance_ranks).arg(&self.d_remaining_deck)
                 .arg(&self.d_chance_sorted_strength).arg(&self.d_chance_sorted_indices)
                 .arg(&d_frame_data).arg(&np).arg(&batch_size).arg(&nh).arg(&nr)
-                .arg(&1.0f32).arg(&self.regret_floor).arg(&d_seeds).arg(&d_peak).arg(&stride);
+                .arg(&1.0f32).arg(&self.regret_floor).arg(&d_seeds).arg(&d_peak).arg(&stride)
+                .arg(&0u32);
             builder.launch(cfg)?;
         }
         self.stream.synchronize()?;
@@ -1030,6 +1037,7 @@ impl GpuNplayerMccfr {
 
         for _ in 0..num_iterations {
             self.iteration += 1;
+            let weight = self.iteration as f32;
 
             let mut rng = rand::thread_rng();
             seeds.clear();
@@ -1076,7 +1084,7 @@ impl GpuNplayerMccfr {
                     .arg(&batch_size)
                     .arg(&nh)
                     .arg(&nr)
-                    .arg(&1.0f32)
+                    .arg(&weight)
                     .arg(&self.regret_floor)
                     .arg(&d_seeds);
                 builder.launch(cfg)?;

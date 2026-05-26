@@ -54,7 +54,7 @@ impl CpuMccfr {
 
         for _ in 0..num_iterations {
             self.iteration += 1;
-            let weight = 1.0f32;
+            let weight = self.iteration as f32;
 
             let mut cfreach: Vec<Vec<f32>> = (0..np)
                 .map(|p| game.initial_weight(p as u8))

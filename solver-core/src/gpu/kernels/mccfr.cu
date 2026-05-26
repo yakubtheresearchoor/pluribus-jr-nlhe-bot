@@ -692,14 +692,15 @@ extern "C" __global__ void mccfr_nplayer_extsamp(
     float* frame_data,
     uint32_t num_players, uint32_t batch_size,
     int32_t nh, int32_t num_remaining,
-    float weight, float regret_floor, const uint32_t* seeds
+    float weight, float regret_floor, const uint32_t* seeds,
+    uint32_t deterministic_traverser
 ) {
     uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid >= batch_size) return;
 
     uint32_t rng = seeds[tid];
     rng = rng * 1103515245 + 12345;
-    uint32_t traverser = (rng >> 16) % num_players;
+    uint32_t traverser = (deterministic_traverser != 0) ? (tid % num_players) : ((rng >> 16) % num_players);
 
     int num_opp = (int)num_players - 1;
 
@@ -734,6 +735,7 @@ extern "C" __global__ void mccfr_nplayer_extsamp(
         int saved_deck_size;
         bool is_traverser;
         int sampled_action;
+        float importance_weight;
     };
 
     Frame stack[MAX_DEPTH];
@@ -873,9 +875,28 @@ extern "C" __global__ void mccfr_nplayer_extsamp(
                 stack[sp].state = STATE_ENTER;
                 sp++;
             } else {
+                float q_sum[4];
+                for (int a = 0; a < na; a++) {
+                    q_sum[a] = 0.0f;
+                    for (int h = 0; h < nh; h++) q_sum[a] += f_strat[a * nh + h];
+                }
+                float q_total = 0.0f;
+                for (int a = 0; a < na; a++) q_total += q_sum[a];
+
                 rng = rng * 1103515245 + 12345;
-                int sampled_a = (int)((rng >> 16) % (uint32_t)na);
+                int sampled_a = 0;
+                if (q_total > 0.0f) {
+                    float threshold = (float)((rng >> 16) & 0x7FFF) * q_total / 32768.0f;
+                    float cumsum = 0.0f;
+                    for (int a = 0; a < na; a++) {
+                        cumsum += q_sum[a];
+                        if (cumsum > threshold) { sampled_a = a; break; }
+                        sampled_a = a;
+                    }
+                }
                 f.sampled_action = sampled_a;
+
+                f.importance_weight = (q_sum[sampled_a] > 0.0f) ? (q_total / q_sum[sampled_a]) : (float)na;
 
                 int oi = (player < traverser) ? (int)player : (int)(player - 1);
                 float* reach_arr = opp_reach_all + oi * nh;
@@ -956,10 +977,8 @@ extern "C" __global__ void mccfr_nplayer_extsamp(
                     }
                 }
             } else {
-                int na = f.num_actions;
-                float importance_weight = (float)na;
                 for (int h = 0; h < nh; h++) {
-                    returned_cfv[h] *= importance_weight;
+                    returned_cfv[h] *= f.importance_weight;
                 }
 
                 int oi = (player < traverser) ? (int)player : (int)(player - 1);
@@ -1006,14 +1025,15 @@ extern "C" __global__ void mccfr_nplayer_extsamp_compact(
     int32_t nh, int32_t num_remaining,
     float weight, float regret_floor, const uint32_t* seeds,
     uint32_t* peak_cursor_out,
-    uint32_t frame_stride_per_traj
+    uint32_t frame_stride_per_traj,
+    uint32_t deterministic_traverser
 ) {
     uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid >= batch_size) return;
 
     uint32_t rng = seeds[tid];
     rng = rng * 1103515245 + 12345;
-    uint32_t traverser = (rng >> 16) % num_players;
+    uint32_t traverser = (deterministic_traverser != 0) ? (tid % num_players) : ((rng >> 16) % num_players);
 
     int num_opp = (int)num_players - 1;
 
@@ -1039,6 +1059,7 @@ extern "C" __global__ void mccfr_nplayer_extsamp_compact(
         int child_idx;
         bool is_traverser;
         int sampled_action;
+        float importance_weight;
         uint32_t frame_offset;
         const uint16_t* saved_sorted_opp_str;
         const uint16_t* saved_sorted_opp_idx;
@@ -1378,9 +1399,27 @@ extern "C" __global__ void mccfr_nplayer_extsamp_compact(
 
                 compute_strategy_nplayer(regrets, offset, na, nh, f_strat);
 
+                float q_sum[4];
+                for (int a = 0; a < na; a++) {
+                    q_sum[a] = 0.0f;
+                    for (int h = 0; h < nh; h++) q_sum[a] += f_strat[a * nh + h];
+                }
+                float q_total = 0.0f;
+                for (int a = 0; a < na; a++) q_total += q_sum[a];
+
                 rng = rng * 1103515245 + 12345;
-                int sampled_a = (int)((rng >> 16) % (uint32_t)na);
+                int sampled_a = 0;
+                if (q_total > 0.0f) {
+                    float threshold = (float)((rng >> 16) & 0x7FFF) * q_total / 32768.0f;
+                    float cumsum = 0.0f;
+                    for (int a = 0; a < na; a++) {
+                        cumsum += q_sum[a];
+                        if (cumsum > threshold) { sampled_a = a; break; }
+                        sampled_a = a;
+                    }
+                }
                 f.sampled_action = sampled_a;
+                f.importance_weight = (q_sum[sampled_a] > 0.0f) ? (q_total / q_sum[sampled_a]) : (float)na;
 
                 int oi = (player < traverser) ? (int)player : (int)(player - 1);
                 float* reach_arr = opp_reach_all + oi * nh;
@@ -1470,10 +1509,8 @@ extern "C" __global__ void mccfr_nplayer_extsamp_compact(
                 float* f_strat = my_base + f.frame_offset + OPP_FRAME_STRAT_OFF;
                 float* f_reach = my_base + f.frame_offset + OPP_FRAME_REACH_OFF;
 
-                int na = f.num_actions;
-                float importance_weight = (float)na;
                 for (int h = 0; h < nh; h++) {
-                    returned_cfv[h] *= importance_weight;
+                    returned_cfv[h] *= f.importance_weight;
                 }
 
                 cursor = f.frame_offset;

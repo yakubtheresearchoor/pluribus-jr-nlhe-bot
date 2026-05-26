@@ -143,8 +143,31 @@ fn ext_walk(
         let oi = if player < traverser { player } else { player - 1 };
         let saved_reach = opp_reach[oi].clone();
 
+        let mut q_sum = vec![0.0f32; na];
+        for a in 0..na {
+            for h in 0..nh { q_sum[a] += strategy[a][h]; }
+        }
+        let q_total: f32 = q_sum.iter().sum();
+
         *rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
-        let sampled_action = ((*rng >> 16) as usize) % na;
+        let sampled_action = if q_total > 0.0 {
+            let threshold = ((*rng >> 16) & 0x7FFF) as f32 * q_total / 32768.0f32;
+            let mut cumsum = 0.0f32;
+            let mut chosen = na - 1;
+            for a in 0..na {
+                cumsum += q_sum[a];
+                if cumsum > threshold { chosen = a; break; }
+            }
+            chosen
+        } else {
+            0
+        };
+
+        let importance_weight = if q_sum[sampled_action] > 0.0 {
+            q_total / q_sum[sampled_action]
+        } else {
+            na as f32
+        };
 
         for h in 0..nh { opp_reach[oi][h] = saved_reach[h] * strategy[sampled_action][h]; }
 
@@ -154,8 +177,7 @@ fn ext_walk(
             active_opp_str, active_opp_idx, active_pl_str, active_pl_idx,
             chance_sorted_str, chance_sorted_idx, remaining_deck, num_remaining, regret_floor);
 
-        let weight = na as f32;
-        for h in 0..nh { cfv[h] *= weight; }
+        for h in 0..nh { cfv[h] *= importance_weight; }
 
         opp_reach[oi] = saved_reach;
         cfv
