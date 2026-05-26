@@ -36,7 +36,7 @@ fn main() {
             .arg(format!("-o={}", ptx_path.display()))
             .arg(&src)
             .arg("-use_fast_math")
-            .arg("--generate-line-info");
+            .arg("-O3");
 
         if let Some(ref bindir) = msvc_bindir {
             cmd.arg(format!("--compiler-bindir={}", bindir.display()));

@@ -562,6 +562,35 @@ fn sc1_wall_clock_river() {
     let cpu_exp = exploitability(&tree, &game, &cpu_profile);
     let cpu_ips = cpu_iters as f64 / cpu_time.as_secs_f64();
 
+    // GPU vanilla batch=2 (minimum correct: each player gets 1 traversal)
+    let mut gpu_v2 = gpu.create_nplayer_solver(
+        &tree, nh,
+        &hand_ranks, &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
+        &same_hand_idx, &hand_cards, &initial_weight,
+        None, &[], None, None,
+    ).expect("solver creation failed");
+    let gpu_v2_start = std::time::Instant::now();
+    gpu_v2.run(2, gpu_iters).expect("GPU run failed");
+    let gpu_v2_time = gpu_v2_start.elapsed();
+    let gpu_v2_cum = gpu_v2.download_cum_strategy().expect("download failed");
+    let gpu_v2_profile = StrategyProfile::from_u32_offsets(&gpu_v2_cum, gpu_v2.node_offsets(), nh);
+    let gpu_v2_exp = exploitability(&tree, &game, &gpu_v2_profile);
+    let gpu_v2_ips = (gpu_iters * 2) as f64 / gpu_v2_time.as_secs_f64();
+
+    // GPU vanilla batch=2, 10000 iters (match CPU total traversals)
+    let mut gpu_v2_10k = gpu.create_nplayer_solver(
+        &tree, nh,
+        &hand_ranks, &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
+        &same_hand_idx, &hand_cards, &initial_weight,
+        None, &[], None, None,
+    ).expect("solver creation failed");
+    let gpu_v2_10k_start = std::time::Instant::now();
+    gpu_v2_10k.run(2, 10000).expect("GPU run failed");
+    let gpu_v2_10k_time = gpu_v2_10k_start.elapsed();
+    let gpu_v2_10k_cum = gpu_v2_10k.download_cum_strategy().expect("download failed");
+    let gpu_v2_10k_profile = StrategyProfile::from_u32_offsets(&gpu_v2_10k_cum, gpu_v2_10k.node_offsets(), nh);
+    let gpu_v2_10k_exp = exploitability(&tree, &game, &gpu_v2_10k_profile);
+
     // GPU vanilla batch=32
     let mut gpu_v32 = gpu.create_nplayer_solver(
         &tree, nh,
@@ -592,15 +621,19 @@ fn sc1_wall_clock_river() {
     let gpu_ext_exp = exploitability(&tree, &game, &gpu_ext_profile);
     let gpu_ext_ips = (gpu_iters * 32) as f64 / gpu_ext_time.as_secs_f64();
 
-    println!("\n=== SC1 River Wall-Clock ({}, {} nodes, {} hands) ===", "debug", tree.num_nodes(), nh);
-    println!("  CPU vanilla    {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
+    println!("\n=== SC1 River Wall-Clock (release, {} nodes, {} hands) ===", tree.num_nodes(), nh);
+    println!("  CPU vanilla       {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
         cpu_iters, cpu_time.as_secs_f64() * 1000.0, cpu_ips, cpu_exp);
-    println!("  GPU vanilla b32 {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
+    println!("  GPU vanilla b2    {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
+        gpu_iters, gpu_v2_time.as_secs_f64() * 1000.0, gpu_v2_ips, gpu_v2_exp);
+    println!("  GPU vanilla b2   10k iters: {:.0}ms exp={:.4}",
+        gpu_v2_10k_time.as_secs_f64() * 1000.0, gpu_v2_10k_exp);
+    println!("  GPU vanilla b32   {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
         gpu_iters, gpu_v32_time.as_secs_f64() * 1000.0, gpu_v32_ips, gpu_v32_exp);
-    println!("  GPU extsamp b32 {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
+    println!("  GPU extsamp b32   {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
         gpu_iters, gpu_ext_time.as_secs_f64() * 1000.0, gpu_ext_ips, gpu_ext_exp);
-    println!("  Throughput: vanilla={:.1}x, extsamp={:.1}x vs CPU",
-        gpu_v32_ips / cpu_ips, gpu_ext_ips / cpu_ips);
+    println!("  Throughput: v2={:.1}x, v32={:.1}x, extsamp={:.1}x vs CPU",
+        gpu_v2_ips / cpu_ips, gpu_v32_ips / cpu_ips, gpu_ext_ips / cpu_ips);
 
     assert!(cpu_exp < 1.0, "CPU should converge below 1.0, got {:.4}", cpu_exp);
 }
@@ -653,8 +686,8 @@ fn sc1_wall_clock_turn() {
     let gpu_v32_time = gpu_v32_start.elapsed();
     let gpu_v32_ips = (gpu_iters * 32) as f64 / gpu_v32_time.as_secs_f64();
 
-    println!("\n=== SC1 Turn Wall-Clock ({}, {} nodes, {} chance, {} hands) ===",
-        "debug", tree.num_nodes(), num_chance, nh);
+    println!("\n=== SC1 Turn Wall-Clock (release, {} nodes, {} chance, {} hands) ===",
+        tree.num_nodes(), num_chance, nh);
     println!("  GPU vanilla b32 {} iters: {:.0}ms ({:.0} traj/s)",
         gpu_iters, gpu_v32_time.as_secs_f64() * 1000.0, gpu_v32_ips);
     println!("  GPU extsamp b32 {} iters: {:.0}ms ({:.0} traj/s)",
