@@ -103,10 +103,24 @@ impl CpuMccfr {
             }
             let nh_t = self.num_hands[traverser as usize];
             let mut cfv = vec![0.0f32; nh_t];
-            for (outcome, &child) in children.iter().enumerate() {
-                let child_cfv = self.walk_cfr(tree, game, traverser, child as usize, cfreach, traverser_reach, weight);
-                for h in 0..nh_t {
-                    cfv[h] += game.chance_probability(outcome, h) * child_cfv[h];
+
+            let n_outcomes = game.num_chance_outcomes();
+            if n_outcomes > 0 && children.len() == 1 {
+                let child = children[0] as usize;
+                for outcome in 0..n_outcomes {
+                    game.set_chance_outcome(outcome);
+                    let child_cfv = self.walk_cfr(tree, game, traverser, child, cfreach, traverser_reach, weight);
+                    for h in 0..nh_t {
+                        cfv[h] += game.chance_probability(outcome, h) * child_cfv[h];
+                    }
+                }
+                game.clear_chance_outcome();
+            } else {
+                for (outcome, &child) in children.iter().enumerate() {
+                    let child_cfv = self.walk_cfr(tree, game, traverser, child as usize, cfreach, traverser_reach, weight);
+                    for h in 0..nh_t {
+                        cfv[h] += game.chance_probability(outcome, h) * child_cfv[h];
+                    }
                 }
             }
             return cfv;
