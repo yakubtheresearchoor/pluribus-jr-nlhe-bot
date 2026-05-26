@@ -5,6 +5,7 @@ use solver_core::gpu::GpuContext;
 use solver_core::solver::game::GameSpec;
 use solver_core::solver::mccfr::CpuMccfr;
 use solver_core::solver::poker_game::RiverPokerGame;
+use solver_core::solver::chance_table::ChanceTable;
 use solver_core::solver::best_response::{StrategyProfile, exploitability};
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
@@ -511,4 +512,153 @@ fn sc1_hu_river_cpu_vs_gpu_exploitability() {
     // Batch=32 should help over batch=1 (more parallel traversals)
     assert!(gpu_v32_exp <= gpu_v1_exp * 1.5,
         "b=32 should not be much worse than b=1: {:.4} vs {:.4}", gpu_v32_exp, gpu_v1_exp);
+}
+
+fn sc1_build_turn_tree() -> FlatTree {
+    let config = TreeConfig {
+        num_players: 2,
+        initial_state: BoardState::Turn,
+        starting_pot: 200,
+        starting_stacks: vec![9500, 9500],
+        initial_contributions: vec![0, 0],
+        rake_rate: 0.0,
+        rake_cap: 0.0,
+        bet_sizes: BetSizeOptions {
+            bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)],
+            raise: vec![BetSize::PotRelative(0.5)],
+        },
+        add_allin_threshold: 1.5,
+        force_allin_threshold: 0.15,
+        merging_threshold: 0.0,
+    };
+    build_tree(&config).expect("tree build failed")
+}
+
+#[test]
+fn sc1_wall_clock_river() {
+    let board = make_board();
+    let ranges = vec![uniform_range(), uniform_range()];
+    let game = RiverPokerGame::new(&board, &ranges, 2);
+    let nh = game.num_valid_hands();
+    let tree = build_river_tree();
+
+    let hand_ranks = game.hand_ranks_gpu();
+    let (s_opp_str, s_opp_idx, s_pl_str, s_pl_idx, same_hand_idx) = game.sorted_opp_arrays();
+    let hand_cards = game.hand_cards_gpu();
+    let initial_weight = game.initial_weight_flat(&ranges);
+    let gpu = GpuContext::new().expect("GPU init failed");
+
+    let cpu_iters = 1000;
+    let gpu_iters = 1000;
+
+    // CPU vanilla CFR
+    let mut cpu_solver = CpuMccfr::new(&tree, vec![nh, nh]);
+    let cpu_start = std::time::Instant::now();
+    cpu_solver.run(&tree, &game, cpu_iters);
+    let cpu_time = cpu_start.elapsed();
+    let cpu_profile = StrategyProfile::from_usize_offsets(
+        cpu_solver.cum_strategy_slice(), cpu_solver.node_offsets(), nh,
+    );
+    let cpu_exp = exploitability(&tree, &game, &cpu_profile);
+    let cpu_ips = cpu_iters as f64 / cpu_time.as_secs_f64();
+
+    // GPU vanilla batch=32
+    let mut gpu_v32 = gpu.create_nplayer_solver(
+        &tree, nh,
+        &hand_ranks, &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
+        &same_hand_idx, &hand_cards, &initial_weight,
+        None, &[], None, None,
+    ).expect("solver creation failed");
+    let gpu_v32_start = std::time::Instant::now();
+    gpu_v32.run(32, gpu_iters).expect("GPU run failed");
+    let gpu_v32_time = gpu_v32_start.elapsed();
+    let gpu_v32_cum = gpu_v32.download_cum_strategy().expect("download failed");
+    let gpu_v32_profile = StrategyProfile::from_u32_offsets(&gpu_v32_cum, gpu_v32.node_offsets(), nh);
+    let gpu_v32_exp = exploitability(&tree, &game, &gpu_v32_profile);
+    let gpu_v32_ips = (gpu_iters * 32) as f64 / gpu_v32_time.as_secs_f64();
+
+    // GPU extsamp compact batch=32
+    let mut gpu_ext = gpu.create_nplayer_extsamp_compact_solver(
+        &tree, nh,
+        &hand_ranks, &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
+        &same_hand_idx, &hand_cards, &initial_weight,
+        None, &[], None, None,
+    ).expect("solver creation failed");
+    let gpu_ext_start = std::time::Instant::now();
+    gpu_ext.run(32, gpu_iters).expect("GPU run failed");
+    let gpu_ext_time = gpu_ext_start.elapsed();
+    let gpu_ext_cum = gpu_ext.download_cum_strategy().expect("download failed");
+    let gpu_ext_profile = StrategyProfile::from_u32_offsets(&gpu_ext_cum, gpu_ext.node_offsets(), nh);
+    let gpu_ext_exp = exploitability(&tree, &game, &gpu_ext_profile);
+    let gpu_ext_ips = (gpu_iters * 32) as f64 / gpu_ext_time.as_secs_f64();
+
+    println!("\n=== SC1 River Wall-Clock ({}, {} nodes, {} hands) ===", "debug", tree.num_nodes(), nh);
+    println!("  CPU vanilla    {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
+        cpu_iters, cpu_time.as_secs_f64() * 1000.0, cpu_ips, cpu_exp);
+    println!("  GPU vanilla b32 {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
+        gpu_iters, gpu_v32_time.as_secs_f64() * 1000.0, gpu_v32_ips, gpu_v32_exp);
+    println!("  GPU extsamp b32 {} iters: {:.0}ms ({:.0} traj/s) exp={:.4}",
+        gpu_iters, gpu_ext_time.as_secs_f64() * 1000.0, gpu_ext_ips, gpu_ext_exp);
+    println!("  Throughput: vanilla={:.1}x, extsamp={:.1}x vs CPU",
+        gpu_v32_ips / cpu_ips, gpu_ext_ips / cpu_ips);
+
+    assert!(cpu_exp < 1.0, "CPU should converge below 1.0, got {:.4}", cpu_exp);
+}
+
+#[test]
+fn sc1_wall_clock_turn() {
+    let board: Vec<Card> = ["2h", "7d", "Ks", "4c"]
+        .iter()
+        .map(|s| card_from_str(s).unwrap())
+        .collect();
+    let ranges = vec![uniform_range(), uniform_range()];
+    let table = ChanceTable::compute_turn_start(&board, &ranges, 2);
+    let nh = table.num_valid_hands();
+    let tree = sc1_build_turn_tree();
+    let num_chance = tree.nodes.iter().filter(|n| n.is_chance()).count();
+    println!("Turn tree: {} nodes, {} chance, {} hands", tree.num_nodes(), num_chance, nh);
+
+    let (s_opp_str, s_opp_idx, s_pl_str, s_pl_idx, same_hand_idx) = table.sorted_opp_arrays();
+    let (ch_str, ch_idx) = table.chance_sorted_arrays_gpu();
+    let hand_cards = table.hand_cards_gpu();
+    let initial_weight = table.initial_weight_flat();
+
+    let gpu = GpuContext::new().expect("GPU init failed");
+
+    let gpu_iters = 1000;
+
+    // GPU extsamp compact batch=32 with chance
+    let mut gpu_ext = gpu.create_nplayer_extsamp_compact_solver(
+        &tree, nh,
+        &table.hand_ranks_gpu(), &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
+        &same_hand_idx, &hand_cards, &initial_weight,
+        Some(&table.chance_ranks_gpu()), &table.remaining_deck_gpu(),
+        Some(&ch_str), Some(&ch_idx),
+    ).expect("solver creation failed");
+    let gpu_ext_start = std::time::Instant::now();
+    gpu_ext.run(32, gpu_iters).expect("GPU run failed");
+    let gpu_ext_time = gpu_ext_start.elapsed();
+    let gpu_ext_ips = (gpu_iters * 32) as f64 / gpu_ext_time.as_secs_f64();
+
+    // GPU vanilla batch=32 with chance
+    let mut gpu_v32 = gpu.create_nplayer_solver(
+        &tree, nh,
+        &table.hand_ranks_gpu(), &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
+        &same_hand_idx, &hand_cards, &initial_weight,
+        Some(&table.chance_ranks_gpu()), &table.remaining_deck_gpu(),
+        Some(&ch_str), Some(&ch_idx),
+    ).expect("solver creation failed");
+    let gpu_v32_start = std::time::Instant::now();
+    gpu_v32.run(32, gpu_iters).expect("GPU run failed");
+    let gpu_v32_time = gpu_v32_start.elapsed();
+    let gpu_v32_ips = (gpu_iters * 32) as f64 / gpu_v32_time.as_secs_f64();
+
+    println!("\n=== SC1 Turn Wall-Clock ({}, {} nodes, {} chance, {} hands) ===",
+        "debug", tree.num_nodes(), num_chance, nh);
+    println!("  GPU vanilla b32 {} iters: {:.0}ms ({:.0} traj/s)",
+        gpu_iters, gpu_v32_time.as_secs_f64() * 1000.0, gpu_v32_ips);
+    println!("  GPU extsamp b32 {} iters: {:.0}ms ({:.0} traj/s)",
+        gpu_iters, gpu_ext_time.as_secs_f64() * 1000.0, gpu_ext_ips);
+    println!("  Extsamp/vanilla throughput: {:.1}x", gpu_ext_ips / gpu_v32_ips);
+    println!("  Note: exploitability requires TurnStartGame+best_response integration (future work)");
 }
