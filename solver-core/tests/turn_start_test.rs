@@ -3,6 +3,7 @@ use solver_core::solver::chance_table::ChanceTable;
 use solver_core::solver::game::GameSpec;
 use solver_core::solver::mccfr::CpuMccfr;
 use solver_core::solver::turn_start_game::TurnStartGame;
+use solver_core::solver::best_response::{StrategyProfile, exploitability};
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
 
@@ -81,4 +82,55 @@ fn cpu_turn_start_chance_probability() {
         println!("Hand {}: total_prob={:.6}, zeros={}/{}", h, total_prob, zero_count, n_outcomes);
         assert!((total_prob - 1.0).abs() < 0.01, "chance probs should sum to ~1.0, got {}", total_prob);
     }
+}
+
+#[test]
+fn cpu_turn_start_exploitability_convergence() {
+    let board: Vec<Card> = ["2h", "7d", "Ks", "4c"]
+        .iter()
+        .map(|s| card_from_str(s).unwrap())
+        .collect();
+    let ranges = vec![uniform_range(), uniform_range()];
+    let table = ChanceTable::compute_turn_start(&board, &ranges, 2);
+    let nh = table.num_valid_hands();
+
+    let game = TurnStartGame::new(table);
+
+    let config = TreeConfig {
+        num_players: 2,
+        initial_state: BoardState::Turn,
+        starting_pot: 200,
+        starting_stacks: vec![400, 400],
+        initial_contributions: vec![0, 0],
+        rake_rate: 0.0,
+        rake_cap: 0.0,
+        bet_sizes: BetSizeOptions {
+            bet: vec![BetSize::PotRelative(0.5)],
+            raise: vec![],
+        },
+        add_allin_threshold: 1.5,
+        force_allin_threshold: 0.15,
+        merging_threshold: 0.0,
+    };
+
+    let tree = build_tree(&config).expect("tree build failed");
+
+    let mut solver = CpuMccfr::new(&tree, vec![nh, nh]);
+
+    let mut prev_exp = f32::MAX;
+    let checkpoints = [100, 500, 1000];
+
+    for &target in &checkpoints {
+        solver.run(&tree, &game, target - solver.iteration_count());
+        let profile = StrategyProfile::from_usize_offsets(
+            solver.cum_strategy_slice(), solver.node_offsets(), nh,
+        );
+        let exp = exploitability(&tree, &game, &profile);
+        println!("Turn exploitability at {} iters: {:.4}", target, exp);
+        assert!(exp < prev_exp + 0.01,
+            "Exploitability should not increase: {:.4} -> {:.4} at {} iters", prev_exp, exp, target);
+        prev_exp = exp;
+    }
+
+    assert!(prev_exp < 5.0, "After 1000 iters, exploitability should be reasonable, got {:.4}", prev_exp);
 }

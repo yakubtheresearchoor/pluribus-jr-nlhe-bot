@@ -297,6 +297,10 @@ impl CpuMccfr {
         &self.node_data_offset
     }
 
+    pub fn iteration_count(&self) -> u32 {
+        self.iteration
+    }
+
     pub fn cum_strategy_slice(&self) -> &[f32] {
         &self.cum_strategy
     }
