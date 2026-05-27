@@ -165,7 +165,7 @@ impl GpuContext {
             total_data: total as usize,
             node_offsets,
             iteration: 0,
-            regret_floor: -1e7f32,
+            regret_floor: -1e30f32,
         })
     }
     pub fn create_nplayer_extsamp_solver(
@@ -259,7 +259,7 @@ impl GpuContext {
             total_data: total as usize,
             node_offsets,
             iteration: 0,
-            regret_floor: -1e7f32,
+            regret_floor: -1e30f32,
         })
     }
 
@@ -355,7 +355,7 @@ impl GpuContext {
             total_data: total as usize,
             node_offsets,
             iteration: 0,
-            regret_floor: -1e7f32,
+            regret_floor: -1e30f32,
             per_traj_stride: MAX_DEPTH * FRAME_STRIDE,
         };
 
@@ -486,7 +486,7 @@ impl GpuContext {
             total_data: total as usize,
             node_offsets,
             iteration: 0,
-            regret_floor: -1e7f32,
+            regret_floor: -1e30f32,
         })
     }
 
@@ -566,7 +566,7 @@ impl GpuContext {
             max_depth,
             level_counts,
             iteration: 0,
-            regret_floor: -1e7f32,
+            regret_floor: -1e30f32,
         })
     }
 }
@@ -854,6 +854,14 @@ impl GpuVectorCfr {
 
     pub fn download_strategy(&self) -> Result<Vec<f32>, DriverError> {
         self.stream.clone_dtoh(&self.d_strategy)
+    }
+
+    pub fn download_cfv(&self) -> Result<Vec<f32>, DriverError> {
+        self.stream.clone_dtoh(&self.d_cfv)
+    }
+
+    pub fn download_reach(&self) -> Result<Vec<f32>, DriverError> {
+        self.stream.clone_dtoh(&self.d_reach)
     }
 
     pub fn iteration_count(&self) -> u32 {

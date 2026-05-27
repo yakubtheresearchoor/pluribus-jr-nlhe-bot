@@ -42,7 +42,7 @@ impl VectorCfr {
             node_data_offset,
             num_infosets,
             iteration: 0,
-            regret_floor: -1e7,
+            regret_floor: -1e30,
         }
     }
 

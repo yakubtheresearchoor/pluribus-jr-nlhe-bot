@@ -36,7 +36,7 @@ impl CpuMccfr {
             cum_strategy: vec![0.0; total],
             node_data_offset: offsets,
             iteration: 0,
-            regret_floor: -1e7,
+            regret_floor: -1e30,
         }
     }
 
