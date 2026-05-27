@@ -279,6 +279,45 @@ extern "C" __global__ void vcfr_bottom_up(
         }
 
         if (all_equal) {
+            int num_active_opp = 0;
+            for (int p = 0; p < np; p++) {
+                if (p == (int)traverser) continue;
+                if (!(fold_mask & (1 << p))) num_active_opp++;
+            }
+
+            if (num_active_opp == 0) {
+                int32_t pot = 0;
+                for (int p = 0; p < np; p++) pot += contributions[node_id * np + p];
+                float payoff = (float)(pot - c_t);
+
+                float opp_reach_sum = 0.0f;
+                float opp_reach_minus[52];
+                for (int c = 0; c < 52; c++) opp_reach_minus[c] = 0.0f;
+                for (int oi = 0; oi < num_opp; oi++) {
+                    int opp = (oi < (int)traverser) ? oi : (oi + 1);
+                    const float* opp_r = reach + node_reach_base + opp * nh;
+                    for (int ho = 0; ho < nh; ho++) {
+                        float r = opp_r[ho];
+                        if (r != 0.0f) {
+                            opp_reach_sum += r;
+                            opp_reach_minus[hand_cards[ho * 2]] += r;
+                            opp_reach_minus[hand_cards[ho * 2 + 1]] += r;
+                        }
+                    }
+                }
+                if (opp_reach_sum > 0.0f) {
+                    for (int h = 0; h < nh; h++) {
+                        float cfreach = opp_reach_sum
+                            - opp_reach_minus[hand_cards[h * 2]]
+                            - opp_reach_minus[hand_cards[h * 2 + 1]];
+                        out[h] = payoff * cfreach;
+                    }
+                } else {
+                    for (int h = 0; h < nh; h++) out[h] = 0.0f;
+                }
+                return;
+            }
+
             float opp_reach_local[MAX_NA * 1326];
             for (int oi = 0; oi < num_opp; oi++) {
                 int opp = (oi < (int)traverser) ? oi : (oi + 1);
@@ -299,9 +338,128 @@ extern "C" __global__ void vcfr_bottom_up(
             );
             for (int h = 0; h < nh; h++) out[h] *= (float)c_t;
         } else {
-            // Side pot: simplified — treat as pot-level showdown
-            // Full side pot would need per-level processing (future work)
+            // Side pot: level-by-level payoff computation.
+            // Ported from showdown.rs:side_pot_showdown_cfv (post-CF7).
+            // Levels are sorted unique contribution values. At each level,
+            // eligible players contest a sub-pot of (level - prev_level) per player.
+            // Traverser wins pot_at_level uncontested if no eligible opponents.
+            // Otherwise, per-opponent sorted sweep computes win/loss at this level.
+            // Finally, subtract c_t (traverser's own contribution).
             for (int h = 0; h < nh; h++) out[h] = 0.0f;
+            int levels[8];
+            int num_levels = 0;
+            for (int p = 0; p < np && num_levels < 8; p++) {
+                int32_t c = contributions[node_id * np + p];
+                bool found = false;
+                for (int l = 0; l < num_levels; l++) {
+                    if (levels[l] == c) { found = true; break; }
+                }
+                if (!found) levels[num_levels++] = c;
+            }
+            // Bubble sort levels ascending
+            for (int i = 0; i < num_levels - 1; i++) {
+                for (int j = i + 1; j < num_levels; j++) {
+                    if (levels[j] < levels[i]) {
+                        int tmp = levels[i]; levels[i] = levels[j]; levels[j] = tmp;
+                    }
+                }
+            }
+
+            int prev_level = 0;
+            for (int li = 0; li < num_levels; li++) {
+                int level = levels[li];
+                int pot_contribution = level - prev_level;
+                if (pot_contribution == 0) { prev_level = level; continue; }
+
+                int total_counted = 0;
+                int eligible_opp_count = 0;
+                bool traverser_eligible = false;
+                for (int p = 0; p < np; p++) {
+                    if (contributions[node_id * np + p] >= level) {
+                        total_counted++;
+                        if (!(fold_mask & (1 << p))) {
+                            if (p == (int)traverser) {
+                                traverser_eligible = true;
+                            } else {
+                                eligible_opp_count++;
+                            }
+                        }
+                    }
+                }
+
+                int pot_at_level = pot_contribution * total_counted;
+
+                if (eligible_opp_count == 0) {
+                    if (traverser_eligible) {
+                        for (int h = 0; h < nh; h++) out[h] += (float)pot_at_level;
+                    }
+                    prev_level = level;
+                    continue;
+                }
+
+                if (traverser_eligible) {
+                    for (int opp_p = 0; opp_p < np; opp_p++) {
+                        if (opp_p == (int)traverser) continue;
+                        if (fold_mask & (1 << opp_p)) continue;
+                        if (contributions[node_id * np + opp_p] < level) continue;
+
+                        int oi = (opp_p < (int)traverser) ? opp_p : (opp_p - 1);
+                        const float* opp_r = reach + node_reach_base + opp_p * nh;
+                        const uint16_t* o_str = sorted_opp_strength + oi * nh;
+                        const uint16_t* o_idx = sorted_opp_indices + oi * nh;
+
+                        float cfreach_sum = 0.0f;
+                        float cfreach_minus[52];
+                        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+
+                        int i = 0;
+                        for (int si = 0; si < nh; si++) {
+                            uint16_t str_h = sorted_pl_strength[si];
+                            uint16_t h = sorted_pl_indices[si];
+                            while (i < nh && o_str[i] < str_h) {
+                                uint16_t ho = o_idx[i];
+                                float r = opp_r[ho];
+                                if (r != 0.0f) {
+                                    cfreach_sum += r;
+                                    cfreach_minus[hand_cards[ho * 2]] += r;
+                                    cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                }
+                                i++;
+                            }
+                            float cfreach = cfreach_sum
+                                - cfreach_minus[hand_cards[h * 2]]
+                                - cfreach_minus[hand_cards[h * 2 + 1]];
+                            out[h] += (float)pot_at_level * cfreach;
+                        }
+
+                        cfreach_sum = 0.0f;
+                        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                        i = nh - 1;
+                        for (int si = nh - 1; si >= 0; si--) {
+                            uint16_t str_h = sorted_pl_strength[si];
+                            uint16_t h = sorted_pl_indices[si];
+                            while (i >= 0 && o_str[i] > str_h) {
+                                uint16_t ho = o_idx[i];
+                                float r = opp_r[ho];
+                                if (r != 0.0f) {
+                                    cfreach_sum += r;
+                                    cfreach_minus[hand_cards[ho * 2]] += r;
+                                    cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                }
+                                i--;
+                            }
+                            float cfreach = cfreach_sum
+                                - cfreach_minus[hand_cards[h * 2]]
+                                - cfreach_minus[hand_cards[h * 2 + 1]];
+                            out[h] -= (float)pot_at_level * cfreach;
+                        }
+                    }
+                }
+
+                prev_level = level;
+            }
+
+            for (int h = 0; h < nh; h++) out[h] -= (float)c_t;
         }
         return;
     }
