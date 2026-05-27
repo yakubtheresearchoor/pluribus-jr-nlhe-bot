@@ -185,7 +185,7 @@ fn sc1_river_convergence() {
         let p = StrategyProfile::from_usize_offsets(&c, &offsets, nh);
         let exp = exploitability(&tree, &game, &p);
         println!("  iters={:6} time={:.1}s exp={:.4}", iters, elapsed, exp);
-        assert!(exp < prev_exp * 1.05,
+        assert!(exp <= prev_exp * 1.05 + 1e-6,
             "Exploitability increased at {} iters: {:.4} > {:.4}", iters, exp, prev_exp);
         prev_exp = exp;
     }

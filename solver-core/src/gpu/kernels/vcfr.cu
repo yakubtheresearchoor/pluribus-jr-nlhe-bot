@@ -87,13 +87,16 @@ __device__ void sorted_sweep_showdown_vcfr(
 // One thread per infoset. Regret-matching: positive regrets normalized.
 // strategy layout: infosets * MAX_NA * nh, stride MAX_NA*nh per infoset.
 extern "C" __global__ void vcfr_compute_strategies(
-    const float* __restrict__ regrets,
+    float* __restrict__ regrets,
     float* __restrict__ strategy,
     const uint32_t* __restrict__ decision_node_ids,
     const FlatNode* __restrict__ nodes,
     const uint32_t* __restrict__ infoset_offsets,
     int num_infosets,
-    int nh
+    int nh,
+    float alpha_t,
+    float beta_t,
+    int apply_discount
 ) {
     int infoset_id = threadIdx.x + blockIdx.x * blockDim.x;
     if (infoset_id >= num_infosets) return;
@@ -102,8 +105,14 @@ extern "C" __global__ void vcfr_compute_strategies(
     const FlatNode& node = nodes[node_id];
     int na = (int)node.num_children;
     int stride = MAX_NA * nh;
-    const float* r = regrets + infoset_id * stride;
+    float* r = regrets + infoset_id * stride;
     float* s = strategy + infoset_id * stride;
+
+    if (apply_discount) {
+        for (int i = 0; i < na * nh; i++) {
+            r[i] *= (r[i] >= 0.0f) ? alpha_t : beta_t;
+        }
+    }
 
     for (int h = 0; h < nh; h++) {
         float pos_sum = 0.0f;
@@ -210,7 +219,7 @@ extern "C" __global__ void vcfr_bottom_up(
     int num_players,
     int nh,
     uint32_t traverser,
-    float weight,
+    float gamma_t,
     float regret_floor
 ) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -504,7 +513,7 @@ extern "C" __global__ void vcfr_bottom_up(
             for (int h = 0; h < nh; h++) {
                 float inst_regret = cfv[child * nh + h] - cfv_avg[h];
                 uint32_t ridx = offset + a * nh + h;
-                regrets[ridx] += weight * inst_regret;
+                regrets[ridx] += inst_regret;
                 if (regrets[ridx] < regret_floor) regrets[ridx] = regret_floor;
             }
         }
@@ -514,7 +523,7 @@ extern "C" __global__ void vcfr_bottom_up(
             for (int h = 0; h < nh; h++) {
                 uint32_t cidx = offset + a * nh + h;
                 float t_reach = reach[node_reach_base + traverser * nh + h];
-                cum_strategy[cidx] += weight * t_reach * sigma[a * nh + h];
+                cum_strategy[cidx] = gamma_t * cum_strategy[cidx] + t_reach * sigma[a * nh + h];
             }
         }
     } else {
@@ -547,7 +556,7 @@ extern "C" __global__ void vcfr_update_avg_strategy(
     int num_players,
     int nh,
     uint32_t traverser,
-    float weight
+    float gamma_t
 ) {
     int infoset_id = threadIdx.x + blockIdx.x * blockDim.x;
     if (infoset_id >= num_infosets) return;
@@ -566,7 +575,7 @@ extern "C" __global__ void vcfr_update_avg_strategy(
     for (int a = 0; a < na; a++) {
         for (int h = 0; h < nh; h++) {
             float t_reach = reach[node_reach_base + traverser * nh + h];
-            cum[a * nh + h] += weight * t_reach * sigma[a * nh + h];
+            cum[a * nh + h] = gamma_t * cum[a * nh + h] + t_reach * sigma[a * nh + h];
         }
     }
 }

@@ -800,6 +800,30 @@ impl GpuMccfr {
     }
 }
 
+struct DcfrParams {
+    alpha_t: f32,
+    beta_t: f32,
+    gamma_t: f32,
+}
+
+impl DcfrParams {
+    fn new(current_iteration: u32) -> Self {
+        let nearest_lower_power_of_4 = match current_iteration {
+            0 => 0u32,
+            x => 1 << ((x.leading_zeros() ^ 31) & !1),
+        };
+        let t_alpha = (current_iteration as i32 - 1).max(0) as f64;
+        let t_gamma = (current_iteration - nearest_lower_power_of_4) as f64;
+        let pow_alpha = t_alpha * t_alpha.sqrt();
+        let pow_gamma = (t_gamma / (t_gamma + 1.0)).powi(3);
+        Self {
+            alpha_t: (pow_alpha / (pow_alpha + 1.0)) as f32,
+            beta_t: 0.5,
+            gamma_t: pow_gamma as f32,
+        }
+    }
+}
+
 fn mark_descendants(tree: &FlatTree, node_idx: usize, below_chance: &mut [bool]) {
     below_chance[node_idx] = true;
     for &child in tree.node_children(node_idx) {
@@ -864,13 +888,19 @@ impl GpuVectorCfr {
 
         for _ in 0..num_iterations {
             self.iteration += 1;
-            let weight = self.iteration as f32;
+            let params = DcfrParams::new(self.iteration);
+
+            // First traverser: apply discount + compute strategy
+            self.launch_compute_strategies(ni, nh_i32, params.alpha_t, params.beta_t, 1)?;
 
             for traverser in 0..np {
-                self.launch_compute_strategies(ni, nh_i32)?;
+                if traverser > 0 {
+                    // Subsequent traversers: recompute strategy from updated regrets (no re-discount)
+                    self.launch_compute_strategies(ni, nh_i32, 0.0, 0.0, 0)?;
+                }
                 self.launch_init_reach(np, nh)?;
                 self.launch_top_down(nh_i32, np_u32)?;
-                self.launch_bottom_up(traverser as u32, weight, nh_i32, np_u32)?;
+                self.launch_bottom_up(traverser as u32, params.gamma_t, nh_i32, np_u32)?;
             }
         }
 
@@ -878,7 +908,7 @@ impl GpuVectorCfr {
         Ok(())
     }
 
-    fn launch_compute_strategies(&mut self, num_infosets: i32, nh: i32) -> Result<(), DriverError> {
+    fn launch_compute_strategies(&mut self, num_infosets: i32, nh: i32, alpha_t: f32, beta_t: f32, apply_discount: i32) -> Result<(), DriverError> {
         let block = 256;
         let grid = ((num_infosets + block - 1) / block) as u32;
 
@@ -893,7 +923,10 @@ impl GpuVectorCfr {
                 .arg(&self.d_nodes)
                 .arg(&self.d_infoset_offsets)
                 .arg(&num_infosets)
-                .arg(&nh);
+                .arg(&nh)
+                .arg(&alpha_t)
+                .arg(&beta_t)
+                .arg(&apply_discount);
             builder.launch(cfg)?;
         }
         Ok(())
@@ -942,7 +975,7 @@ impl GpuVectorCfr {
         Ok(())
     }
 
-    fn launch_bottom_up(&mut self, traverser: u32, weight: f32, nh: i32, np: u32) -> Result<(), DriverError> {
+    fn launch_bottom_up(&mut self, traverser: u32, gamma_t: f32, nh: i32, np: u32) -> Result<(), DriverError> {
         let block = 1;
         let regret_floor = self.regret_floor;
         let nh_usize = nh as usize;
@@ -999,86 +1032,10 @@ impl GpuVectorCfr {
                             .arg(&np)
                             .arg(&nh)
                             .arg(&traverser)
-                            .arg(&weight)
+                            .arg(&gamma_t)
                             .arg(&regret_floor);
                         builder.launch(cfg)?;
                     }
-                }
-
-                {
-                    let num_cc = chance.num_chance_children as i32;
-                    let total = num_cc * nh;
-                    let grid = ((total + 255) / 256) as u32;
-                    let b = 256;
-                    let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (b, 1, 1), shared_mem_bytes: 0 };
-                    let outcome_i32 = outcome as i32;
-                    unsafe {
-                        let mut builder = self.stream.launch_builder(&self.vcfr_chance_accum_fn);
-                        builder
-                            .arg(d_cfv_accum)
-                            .arg(&self.d_cfv)
-                            .arg(d_chance_prob)
-                            .arg(d_chance_child_ids)
-                            .arg(&num_cc)
-                            .arg(&nh)
-                            .arg(&outcome_i32);
-                        builder.launch(cfg)?;
-                    }
-                }
-            }
-
-            {
-                let num_cc = chance.num_chance_children as i32;
-                let total = num_cc * nh;
-                let grid = ((total + 255) / 256) as u32;
-                let b = 256;
-                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (b, 1, 1), shared_mem_bytes: 0 };
-                unsafe {
-                    let mut builder = self.stream.launch_builder(&self.vcfr_chance_final_fn);
-                    builder
-                        .arg(&self.d_cfv)
-                        .arg(d_cfv_accum)
-                        .arg(d_chance_child_ids)
-                        .arg(&num_cc)
-                        .arg(&nh);
-                    builder.launch(cfg)?;
-                }
-            }
-
-            for level in (0..=self.max_depth).rev() {
-                let count = self.main_level_counts[level];
-                if count == 0 { continue; }
-                let grid = count as u32;
-                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
-
-                let level_nodes = self.d_main_level_nodes[level].as_ref().unwrap();
-                unsafe {
-                    let mut builder = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
-                    builder
-                        .arg(level_nodes)
-                        .arg(&count)
-                        .arg(&self.d_nodes)
-                        .arg(&self.d_children)
-                        .arg(&self.d_contributions)
-                        .arg(&self.d_folded_masks)
-                        .arg(&self.d_strategy)
-                        .arg(&self.d_infoset_offsets)
-                        .arg(&self.d_reach)
-                        .arg(&self.d_cfv)
-                        .arg(&self.d_regrets)
-                        .arg(&self.d_cum_strategy)
-                        .arg(&self.d_initial_weight)
-                        .arg(&self.d_sorted_opp_strength)
-                        .arg(&self.d_sorted_opp_indices)
-                        .arg(&self.d_sorted_player_strength)
-                        .arg(&self.d_sorted_player_indices)
-                        .arg(&self.d_hand_cards)
-                        .arg(&np)
-                        .arg(&nh)
-                        .arg(&traverser)
-                        .arg(&weight)
-                        .arg(&regret_floor);
-                    builder.launch(cfg)?;
                 }
             }
         } else {
@@ -1112,7 +1069,7 @@ impl GpuVectorCfr {
                         .arg(&np)
                         .arg(&nh)
                         .arg(&traverser)
-                        .arg(&weight)
+                        .arg(&gamma_t)
                         .arg(&regret_floor);
                     builder.launch(cfg)?;
                 }

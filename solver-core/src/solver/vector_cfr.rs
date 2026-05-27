@@ -3,6 +3,30 @@ use super::game::GameSpec;
 
 const UNUSED: usize = usize::MAX;
 
+struct DiscountParams {
+    alpha_t: f32,
+    beta_t: f32,
+    gamma_t: f32,
+}
+
+impl DiscountParams {
+    fn new(current_iteration: u32) -> Self {
+        let nearest_lower_power_of_4 = match current_iteration {
+            0 => 0u32,
+            x => 1 << ((x.leading_zeros() ^ 31) & !1),
+        };
+        let t_alpha = (current_iteration as i32 - 1).max(0) as f64;
+        let t_gamma = (current_iteration - nearest_lower_power_of_4) as f64;
+        let pow_alpha = t_alpha * t_alpha.sqrt();
+        let pow_gamma = (t_gamma / (t_gamma + 1.0)).powi(3);
+        Self {
+            alpha_t: (pow_alpha / (pow_alpha + 1.0)) as f32,
+            beta_t: 0.5,
+            gamma_t: pow_gamma as f32,
+        }
+    }
+}
+
 pub struct VectorCfr {
     num_players: u8,
     nh: usize,
@@ -91,6 +115,13 @@ impl VectorCfr {
         }
     }
 
+    fn discount_regrets(&mut self, params: &DiscountParams) {
+        for r in &mut self.regrets {
+            let coef = if *r >= 0.0 { params.alpha_t } else { params.beta_t };
+            *r *= coef;
+        }
+    }
+
     fn compute_reach(&self, tree: &FlatTree, game: &dyn GameSpec) -> Vec<f32> {
         let np = self.num_players as usize;
         let nh = self.nh;
@@ -156,7 +187,7 @@ impl VectorCfr {
         traverser: usize,
         node_idx: usize,
         reach: &[f32],
-        weight: f32,
+        gamma: f32,
     ) -> Vec<f32> {
         let np = self.num_players as usize;
         let nh = self.nh;
@@ -176,19 +207,19 @@ impl VectorCfr {
             let n_outcomes = game.num_chance_outcomes();
 
             if n_outcomes > 0 && children.len() == 1 {
-                let child = children[0] as usize;
-                for outcome in 0..n_outcomes {
-                    game.set_chance_outcome(outcome);
-                    let child_cfv = self.bottom_up_recursive(tree, game, traverser, child, reach, weight);
+            let child = children[0] as usize;
+            for outcome in 0..n_outcomes {
+                game.set_chance_outcome(outcome);
+                let child_cfv = self.bottom_up_recursive(tree, game, traverser, child, reach, gamma);
                     for h in 0..nh {
                         cfv[h] += game.chance_probability(outcome, h) * child_cfv[h];
                     }
                 }
                 game.clear_chance_outcome();
             } else {
-                for (outcome, &child) in children.iter().enumerate() {
-                    game.set_chance_outcome(outcome);
-                    let child_cfv = self.bottom_up_recursive(tree, game, traverser, child as usize, reach, weight);
+            for (outcome, &child) in children.iter().enumerate() {
+                game.set_chance_outcome(outcome);
+                let child_cfv = self.bottom_up_recursive(tree, game, traverser, child as usize, reach, gamma);
                     for h in 0..nh {
                         cfv[h] += game.chance_probability(outcome, h) * child_cfv[h];
                     }
@@ -205,7 +236,7 @@ impl VectorCfr {
 
         let mut cfv_all: Vec<Vec<f32>> = Vec::with_capacity(na);
         for &child in children {
-            cfv_all.push(self.bottom_up_recursive(tree, game, traverser, child as usize, reach, weight));
+            cfv_all.push(self.bottom_up_recursive(tree, game, traverser, child as usize, reach, gamma));
         }
 
         // CRITICAL: At opponent nodes, SUM child CFVs (do NOT weight by strategy).
@@ -227,7 +258,7 @@ impl VectorCfr {
                 for h in 0..nh {
                     let idx = offset + a * nh + h;
                     let regret = cfv_all[a][h] - cfv_avg[h];
-                    self.regrets[idx] += weight * regret;
+                    self.regrets[idx] += regret;
                     if self.regrets[idx] < self.regret_floor {
                         self.regrets[idx] = self.regret_floor;
                     }
@@ -239,7 +270,7 @@ impl VectorCfr {
                 for h in 0..nh {
                     let idx = offset + a * nh + h;
                     let t_reach = reach[reach_base + traverser * nh + h];
-                    self.cum_strategy[idx] += weight * t_reach * sigma[a * nh + h];
+                    self.cum_strategy[idx] = gamma * self.cum_strategy[idx] + t_reach * sigma[a * nh + h];
                 }
             }
         } else {
@@ -267,14 +298,15 @@ impl VectorCfr {
 
         for _ in 0..num_iterations {
             self.iteration += 1;
-            let weight = self.iteration as f32;
+            let params = DiscountParams::new(self.iteration);
 
+            self.discount_regrets(&params);
             self.compute_all_strategies(tree);
 
             let reach = self.compute_reach(tree, game);
 
             for traverser in 0..np {
-                let cfv = self.bottom_up_recursive(tree, game, traverser, 0, &reach, weight);
+                let cfv = self.bottom_up_recursive(tree, game, traverser, 0, &reach, params.gamma_t);
 
                 if traverser == 0 {
                     for h in 0..nh0 {
@@ -305,13 +337,15 @@ impl VectorCfr {
 
         for _ in 0..num_iterations {
             self.iteration += 1;
-            let weight = self.iteration as f32;
+            let params = DiscountParams::new(self.iteration);
+
+            self.discount_regrets(&params);
 
             for traverser in 0..np {
                 self.compute_all_strategies(tree);
                 let reach = self.compute_reach(tree, game);
 
-                let cfv = self.bottom_up_recursive(tree, game, traverser, 0, &reach, weight);
+                let cfv = self.bottom_up_recursive(tree, game, traverser, 0, &reach, params.gamma_t);
 
                 if traverser == 0 {
                     for h in 0..nh0 {
