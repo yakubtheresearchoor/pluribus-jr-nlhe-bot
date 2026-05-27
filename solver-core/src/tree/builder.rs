@@ -76,6 +76,8 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
 
     builder.build_recursive(root_idx, info);
 
+    builder.tree.compute_levels();
+
     Ok(builder.tree)
 }
 

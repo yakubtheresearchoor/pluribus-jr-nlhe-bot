@@ -72,6 +72,10 @@ impl FlatNode {
     }
 }
 
+pub const MAX_NA: usize = 4;
+
+pub const VCFR_NO_INFOSET: u32 = u32::MAX;
+
 pub const ACTION_LABEL_FOLD: u8 = 0;
 pub const ACTION_LABEL_CHECK: u8 = 1;
 pub const ACTION_LABEL_CALL: u8 = 2;
@@ -91,6 +95,12 @@ pub struct FlatTree {
     pub starting_stacks: Vec<i32>,
     pub rake_rate: f64,
     pub rake_cap: f64,
+    pub level_offsets: Vec<u32>,
+    pub level_nodes: Vec<u32>,
+    pub max_depth: u32,
+    pub infoset_offsets: Vec<u32>,
+    pub decision_node_ids: Vec<u32>,
+    pub num_infosets: u32,
 }
 
 impl FlatTree {
@@ -111,6 +121,12 @@ impl FlatTree {
             starting_stacks,
             rake_rate,
             rake_cap,
+            level_offsets: Vec::new(),
+            level_nodes: Vec::new(),
+            max_depth: 0,
+            infoset_offsets: Vec::new(),
+            decision_node_ids: Vec::new(),
+            num_infosets: 0,
         }
     }
 
@@ -170,5 +186,105 @@ impl FlatTree {
         self.children.extend(child_indices);
         self.nodes[node_idx].children_start = start;
         self.nodes[node_idx].num_children = count;
+    }
+
+    pub fn compute_levels(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+
+        let n = self.nodes.len();
+        let mut depths = vec![0u32; n];
+        let mut max_depth = 0u32;
+
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((0usize, 0u32));
+        while let Some((idx, depth)) = queue.pop_front() {
+            depths[idx] = depth;
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            for &child in self.node_children(idx) {
+                queue.push_back((child as usize, depth + 1));
+            }
+        }
+
+        let num_levels = (max_depth + 1) as usize;
+        let mut level_counts = vec![0u32; num_levels];
+        for &d in &depths {
+            level_counts[d as usize] += 1;
+        }
+
+        let mut level_offsets = Vec::with_capacity(num_levels + 1);
+        level_offsets.push(0);
+        let mut cumulative = 0u32;
+        for &count in &level_counts {
+            cumulative += count;
+            level_offsets.push(cumulative);
+        }
+
+        let mut level_nodes = vec![0u32; n];
+        let mut write_pos = level_offsets.clone();
+        for idx in 0..n {
+            let level = depths[idx] as usize;
+            level_nodes[write_pos[level] as usize] = idx as u32;
+            write_pos[level] += 1;
+        }
+
+        let mut infoset_offsets = vec![VCFR_NO_INFOSET; n];
+        let mut decision_node_ids = Vec::new();
+        let mut infoset_counter = 0u32;
+        for idx in 0..n {
+            if self.nodes[idx].is_player() {
+                infoset_offsets[idx] = infoset_counter;
+                decision_node_ids.push(idx as u32);
+                infoset_counter += 1;
+            }
+        }
+
+        self.level_offsets = level_offsets;
+        self.level_nodes = level_nodes;
+        self.max_depth = max_depth;
+        self.infoset_offsets = infoset_offsets;
+        self.decision_node_ids = decision_node_ids;
+        self.num_infosets = infoset_counter;
+    }
+
+    pub fn nodes_at_level(&self, level: u32) -> &[u32] {
+        if (level as usize) >= self.level_offsets.len() - 1 {
+            return &[];
+        }
+        let start = self.level_offsets[level as usize] as usize;
+        let end = self.level_offsets[level as usize + 1] as usize;
+        &self.level_nodes[start..end]
+    }
+
+    pub fn level_size(&self, level: u32) -> usize {
+        if (level as usize) >= self.level_offsets.len() - 1 {
+            return 0;
+        }
+        (self.level_offsets[level as usize + 1] - self.level_offsets[level as usize]) as usize
+    }
+
+    pub fn infoset_offset(&self, node_idx: usize) -> u32 {
+        self.infoset_offsets[node_idx]
+    }
+
+    pub fn max_level_size(&self) -> usize {
+        (0..=self.max_depth)
+            .map(|l| self.level_size(l))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn level_of(&self, node_idx: usize) -> u32 {
+        for level in 0..=self.max_depth {
+            let start = self.level_offsets[level as usize] as usize;
+            let end = self.level_offsets[level as usize + 1] as usize;
+            if (start..end).any(|i| self.level_nodes[i] as usize == node_idx) {
+                return level;
+            }
+        }
+        u32::MAX
     }
 }

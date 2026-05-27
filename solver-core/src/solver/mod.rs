@@ -2,6 +2,7 @@ pub mod state;
 pub mod config;
 pub mod game;
 pub mod mccfr;
+pub mod vector_cfr;
 pub mod showdown;
 pub mod poker_game;
 pub mod chance_table;
