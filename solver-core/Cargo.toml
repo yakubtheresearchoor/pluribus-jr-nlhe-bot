@@ -14,3 +14,6 @@ rand = "0.8"
 [features]
 default = []
 cuda = ["dep:cudarc"]
+
+[dev-dependencies]
+postflop-solver = { path = "../../binary-experimentation/postflop-solver" }
