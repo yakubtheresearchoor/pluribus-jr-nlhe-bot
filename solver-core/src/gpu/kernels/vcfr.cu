@@ -331,14 +331,77 @@ extern "C" __global__ void vcfr_bottom_up(
                 }
             }
 
-            sorted_sweep_showdown_vcfr(
-                opp_reach_local, num_opp, nh,
-                sorted_opp_strength, sorted_opp_indices,
-                sorted_pl_strength, sorted_pl_indices,
-                hand_cards,
-                out
-            );
-            for (int h = 0; h < nh; h++) out[h] *= (float)c_t;
+            if (num_active_opp == 1) {
+                sorted_sweep_showdown_vcfr(
+                    opp_reach_local, num_opp, nh,
+                    sorted_opp_strength, sorted_opp_indices,
+                    sorted_pl_strength, sorted_pl_indices,
+                    hand_cards,
+                    out
+                );
+                for (int h = 0; h < nh; h++) out[h] *= (float)c_t;
+            } else {
+                // N>2 product-based formula
+                float cum_weaker[5 * 1326];
+                float eff_total[5 * 1326];
+                for (int h = 0; h < nh; h++) { cum_weaker[h] = 0.0f; eff_total[h] = 0.0f; }
+
+                for (int oi = 0; oi < num_opp; oi++) {
+                    const float* opp_r = opp_reach_local + oi * nh;
+                    float cw[1326];
+                    float cfreach_sum = 0.0f;
+                    float cfreach_minus[52];
+                    for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                    int i = 0;
+
+                    for (int si = 0; si < nh; si++) {
+                        uint16_t str_h = sorted_pl_strength[si];
+                        uint16_t h = sorted_pl_indices[si];
+                        while (i < nh && sorted_opp_strength[oi * nh + i] < str_h) {
+                            uint16_t ho = sorted_opp_indices[oi * nh + i];
+                            float r = opp_r[ho];
+                            if (r != 0.0f) {
+                                cfreach_sum += r;
+                                cfreach_minus[hand_cards[ho * 2]] += r;
+                                cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                            }
+                            i++;
+                        }
+                        cw[h] = cfreach_sum
+                            - cfreach_minus[hand_cards[h * 2]]
+                            - cfreach_minus[hand_cards[h * 2 + 1]];
+                    }
+
+                    while (i < nh) {
+                        uint16_t ho = sorted_opp_indices[oi * nh + i];
+                        float r = opp_r[ho];
+                        if (r != 0.0f) {
+                            cfreach_sum += r;
+                            cfreach_minus[hand_cards[ho * 2]] += r;
+                            cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                        }
+                        i++;
+                    }
+
+                    for (int h = 0; h < nh; h++) {
+                        float eff = cfreach_sum
+                            - cfreach_minus[hand_cards[h * 2]]
+                            - cfreach_minus[hand_cards[h * 2 + 1]]
+                            + opp_r[h];
+                        if (oi == 0) {
+                            cum_weaker[h] = cw[h];
+                            eff_total[h] = eff;
+                        } else {
+                            cum_weaker[h] *= cw[h];
+                            eff_total[h] *= eff;
+                        }
+                    }
+                }
+
+                for (int h = 0; h < nh; h++) {
+                    out[h] = (float)c_t * ((float)(num_active_opp + 1) * cum_weaker[h] - eff_total[h]);
+                }
+            }
         } else {
             // Side pot: level-by-level payoff computation.
             // Ported from showdown.rs:side_pot_showdown_cfv (post-CF7).
