@@ -17,7 +17,7 @@ fn main() {
     let kernels_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/gpu/kernels");
 
-    let kernel_files = ["mccfr.cu", "test_showdown.cu"];
+    let kernel_files = ["mccfr.cu", "test_showdown.cu", "vcfr.cu"];
 
     for kernel in &kernel_files {
         let src = kernels_dir.join(kernel);

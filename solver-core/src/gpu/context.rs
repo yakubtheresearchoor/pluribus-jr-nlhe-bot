@@ -23,6 +23,9 @@ pub struct GpuContext {
     nplayer_extsamp_fn: CudaFunction,
     nplayer_extsamp_compact_fn: CudaFunction,
     test_showdown_fn: CudaFunction,
+    vcfr_strategies_fn: CudaFunction,
+    vcfr_top_down_fn: CudaFunction,
+    vcfr_bottom_up_fn: CudaFunction,
 }
 
 impl GpuContext {
@@ -41,10 +44,17 @@ impl GpuContext {
         let nplayer_extsamp_fn = module.load_function("mccfr_nplayer_extsamp")?;
         let nplayer_extsamp_compact_fn = module.load_function("mccfr_nplayer_extsamp_compact")?;
 
-        let test_ptx_path = PathBuf::from(out_dir).join("test_showdown.ptx");
+        let test_ptx_path = PathBuf::from(out_dir.clone()).join("test_showdown.ptx");
         let test_ptx = Ptx::from_file(&test_ptx_path);
         let test_module = ctx.load_module(test_ptx)?;
         let test_showdown_fn = test_module.load_function("test_showdown")?;
+
+        let vcfr_ptx_path = PathBuf::from(out_dir.clone()).join("vcfr.ptx");
+        let vcfr_ptx = Ptx::from_file(&vcfr_ptx_path);
+        let vcfr_module = ctx.load_module(vcfr_ptx)?;
+        let vcfr_strategies_fn = vcfr_module.load_function("vcfr_compute_strategies")?;
+        let vcfr_top_down_fn = vcfr_module.load_function("vcfr_top_down_reach")?;
+        let vcfr_bottom_up_fn = vcfr_module.load_function("vcfr_bottom_up")?;
 
         Ok(GpuContext {
             stream,
@@ -54,6 +64,9 @@ impl GpuContext {
             nplayer_extsamp_fn,
             nplayer_extsamp_compact_fn,
             test_showdown_fn,
+            vcfr_strategies_fn,
+            vcfr_top_down_fn,
+            vcfr_bottom_up_fn,
         })
     }
 
@@ -476,6 +489,86 @@ impl GpuContext {
             regret_floor: -1e7f32,
         })
     }
+
+    pub fn create_vcfr_solver(
+        &self,
+        tree: &FlatTree,
+        nh: usize,
+        sorted_opp_strength: &[u16],
+        sorted_opp_indices: &[u16],
+        sorted_player_strength: &[u16],
+        sorted_player_indices: &[u16],
+        hand_cards: &[u8],
+        initial_weight: &[f32],
+    ) -> Result<GpuVectorCfr, DriverError> {
+        let np = tree.num_players as usize;
+        let nn = tree.num_nodes();
+        let num_infosets = tree.num_infosets as usize;
+        let max_depth = tree.max_depth as usize;
+
+        let infoset_data_size = num_infosets * MAX_NA * nh;
+
+        let d_nodes: CudaSlice<FlatNode> = self.stream.clone_htod(&tree.nodes)?;
+        let d_children: CudaSlice<u32> = self.stream.clone_htod(&tree.children)?;
+        let d_contributions: CudaSlice<i32> = self.stream.clone_htod(&tree.contributions)?;
+        let d_folded_masks: CudaSlice<u16> = self.stream.clone_htod(&tree.folded_masks)?;
+        let d_infoset_offsets: CudaSlice<u32> = self.stream.clone_htod(&tree.infoset_offsets)?;
+        let d_decision_node_ids: CudaSlice<u32> = self.stream.clone_htod(&tree.decision_node_ids)?;
+        let d_regrets: CudaSlice<f32> = self.stream.alloc_zeros(infoset_data_size)?;
+        let d_strategy: CudaSlice<f32> = self.stream.alloc_zeros(infoset_data_size)?;
+        let d_cum_strategy: CudaSlice<f32> = self.stream.alloc_zeros(infoset_data_size)?;
+        let d_reach: CudaSlice<f32> = self.stream.alloc_zeros(nn * np * nh)?;
+        let d_cfv: CudaSlice<f32> = self.stream.alloc_zeros(nn * nh)?;
+        let d_initial_weight: CudaSlice<f32> = self.stream.clone_htod(initial_weight)?;
+        let d_sorted_opp_strength: CudaSlice<u16> = self.stream.clone_htod(sorted_opp_strength)?;
+        let d_sorted_opp_indices: CudaSlice<u16> = self.stream.clone_htod(sorted_opp_indices)?;
+        let d_sorted_player_strength: CudaSlice<u16> = self.stream.clone_htod(sorted_player_strength)?;
+        let d_sorted_player_indices: CudaSlice<u16> = self.stream.clone_htod(sorted_player_indices)?;
+        let d_hand_cards: CudaSlice<u8> = self.stream.clone_htod(hand_cards)?;
+
+        let mut d_level_nodes: Vec<CudaSlice<u32>> = Vec::with_capacity(max_depth + 1);
+        for level in 0..=max_depth {
+            let nodes = tree.nodes_at_level(level as u32);
+            d_level_nodes.push(self.stream.clone_htod(nodes)?);
+        }
+
+        let mut level_counts: Vec<i32> = Vec::with_capacity(max_depth + 1);
+        for level in 0..=max_depth {
+            level_counts.push(tree.level_size(level as u32) as i32);
+        }
+
+        Ok(GpuVectorCfr {
+            stream: self.stream.clone(),
+            vcfr_strategies_fn: self.vcfr_strategies_fn.clone(),
+            vcfr_top_down_fn: self.vcfr_top_down_fn.clone(),
+            vcfr_bottom_up_fn: self.vcfr_bottom_up_fn.clone(),
+            d_nodes,
+            d_children,
+            d_contributions,
+            d_folded_masks,
+            d_infoset_offsets,
+            d_decision_node_ids,
+            d_regrets,
+            d_strategy,
+            d_cum_strategy,
+            d_reach,
+            d_cfv,
+            d_initial_weight,
+            d_sorted_opp_strength,
+            d_sorted_opp_indices,
+            d_sorted_player_strength,
+            d_sorted_player_indices,
+            d_hand_cards,
+            d_level_nodes,
+            num_players: tree.num_players,
+            num_hands: nh,
+            num_infosets,
+            max_depth,
+            level_counts,
+            iteration: 0,
+            regret_floor: -1e7f32,
+        })
+    }
 }
 
 pub enum GpuGameType {
@@ -583,71 +676,192 @@ impl GpuMccfr {
         }
         Ok(result)
     }
+}
 
-    pub fn get_average_strategy_at(
-        &self,
-        node_idx: usize,
-        num_actions: usize,
-        nh: usize,
-    ) -> Result<Vec<Vec<f32>>, DriverError> {
-        let offset = self.node_offsets[node_idx];
-        if offset == UNUSED {
-            return Ok(vec![]);
-        }
-        let all = self.download_cum_strategy()?;
-        let mut result = vec![vec![0.0f32; nh]; num_actions];
-        for h in 0..nh {
-            let mut total = 0.0f32;
-            for a in 0..num_actions {
-                total += all[offset as usize + a * nh + h];
+pub struct GpuVectorCfr {
+    stream: Arc<CudaStream>,
+    vcfr_strategies_fn: CudaFunction,
+    vcfr_top_down_fn: CudaFunction,
+    vcfr_bottom_up_fn: CudaFunction,
+    d_nodes: CudaSlice<FlatNode>,
+    d_children: CudaSlice<u32>,
+    d_contributions: CudaSlice<i32>,
+    d_folded_masks: CudaSlice<u16>,
+    d_infoset_offsets: CudaSlice<u32>,
+    d_decision_node_ids: CudaSlice<u32>,
+    d_regrets: CudaSlice<f32>,
+    d_strategy: CudaSlice<f32>,
+    d_cum_strategy: CudaSlice<f32>,
+    d_reach: CudaSlice<f32>,
+    d_cfv: CudaSlice<f32>,
+    d_initial_weight: CudaSlice<f32>,
+    d_sorted_opp_strength: CudaSlice<u16>,
+    d_sorted_opp_indices: CudaSlice<u16>,
+    d_sorted_player_strength: CudaSlice<u16>,
+    d_sorted_player_indices: CudaSlice<u16>,
+    d_hand_cards: CudaSlice<u8>,
+    d_level_nodes: Vec<CudaSlice<u32>>,
+    num_players: u8,
+    num_hands: usize,
+    num_infosets: usize,
+    max_depth: usize,
+    level_counts: Vec<i32>,
+    iteration: u32,
+    regret_floor: f32,
+}
+
+impl GpuVectorCfr {
+    pub fn run(
+        &mut self,
+        num_iterations: u32,
+    ) -> Result<(), DriverError> {
+        let np = self.num_players as usize;
+        let nh = self.num_hands;
+        let ni = self.num_infosets as i32;
+        let nh_i32 = nh as i32;
+        let np_u32 = np as u32;
+
+        for _ in 0..num_iterations {
+            self.iteration += 1;
+            let weight = self.iteration as f32;
+
+            for traverser in 0..np {
+                self.launch_compute_strategies(ni, nh_i32)?;
+                self.launch_init_reach(np, nh)?;
+                self.launch_top_down(nh_i32, np_u32)?;
+                self.launch_bottom_up(traverser as u32, weight, nh_i32, np_u32)?;
             }
-            if total > 0.0 {
-                for a in 0..num_actions {
-                    result[a][h] = all[offset as usize + a * nh + h] / total;
-                }
-            } else {
-                let uniform = 1.0 / num_actions as f32;
-                for a in 0..num_actions {
-                    result[a][h] = uniform;
-                }
-            }
         }
-        Ok(result)
+
+        self.stream.synchronize()?;
+        Ok(())
     }
 
-    pub fn get_current_strategy_at(
-        &self,
-        node_idx: usize,
-        num_actions: usize,
-        nh: usize,
-    ) -> Result<Vec<Vec<f32>>, DriverError> {
-        let offset = self.node_offsets[node_idx];
-        if offset == UNUSED {
-            return Ok(vec![]);
+    fn launch_compute_strategies(&mut self, num_infosets: i32, nh: i32) -> Result<(), DriverError> {
+        let block = 256;
+        let grid = ((num_infosets + block - 1) / block) as u32;
+
+        let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block as u32, 1, 1), shared_mem_bytes: 0 };
+
+        unsafe {
+            let mut builder = self.stream.launch_builder(&self.vcfr_strategies_fn);
+            builder
+                .arg(&self.d_regrets)
+                .arg(&self.d_strategy)
+                .arg(&self.d_decision_node_ids)
+                .arg(&self.d_nodes)
+                .arg(&self.d_infoset_offsets)
+                .arg(&num_infosets)
+                .arg(&nh);
+            builder.launch(cfg)?;
         }
-        let regrets = self.download_regrets()?;
-        let mut result = vec![vec![0.0f32; nh]; num_actions];
-        for h in 0..nh {
-            let mut pos_sum = 0.0f32;
-            for a in 0..num_actions {
-                let r = regrets[offset as usize + a * nh + h];
-                if r > 0.0 {
-                    pos_sum += r;
-                }
-            }
-            if pos_sum > 0.0 {
-                for a in 0..num_actions {
-                    let r = regrets[offset as usize + a * nh + h];
-                    result[a][h] = if r > 0.0 { r / pos_sum } else { 0.0 };
-                }
-            } else {
-                let uniform = 1.0 / num_actions as f32;
-                for a in 0..num_actions {
-                    result[a][h] = uniform;
-                }
+        Ok(())
+    }
+
+    fn launch_init_reach(&mut self, np: usize, nh: usize) -> Result<(), DriverError> {
+        let nn = self.d_nodes.len();
+        let reach_size = nn * np * nh;
+
+        let init = self.stream.clone_dtoh(&self.d_initial_weight)?;
+        let mut reach = vec![0.0f32; reach_size];
+        for p in 0..np {
+            for h in 0..nh {
+                reach[p * nh + h] = init[p * nh + h];
             }
         }
-        Ok(result)
+        self.stream.memcpy_htod(&reach, &mut self.d_reach)?;
+        Ok(())
+    }
+
+    fn launch_top_down(&mut self, nh: i32, np: u32) -> Result<(), DriverError> {
+        let block = 256;
+
+        for level in 0..=self.max_depth {
+            let count = self.level_counts[level];
+            if count == 0 { continue; }
+            let grid = ((count + block as i32 - 1) / block as i32) as u32;
+
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+
+            unsafe {
+                let mut builder = self.stream.launch_builder(&self.vcfr_top_down_fn);
+                builder
+                    .arg(&self.d_level_nodes[level])
+                    .arg(&count)
+                    .arg(&self.d_nodes)
+                    .arg(&self.d_children)
+                    .arg(&self.d_strategy)
+                    .arg(&self.d_infoset_offsets)
+                    .arg(&self.d_reach)
+                    .arg(&np)
+                    .arg(&nh);
+                builder.launch(cfg)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn launch_bottom_up(&mut self, traverser: u32, weight: f32, nh: i32, np: u32) -> Result<(), DriverError> {
+        let block = 1;
+        let regret_floor = self.regret_floor;
+
+        for level in (0..=self.max_depth).rev() {
+            let count = self.level_counts[level];
+            if count == 0 { continue; }
+            let grid = count as u32;
+
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+
+            unsafe {
+                let mut builder = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
+                builder
+                    .arg(&self.d_level_nodes[level])
+                    .arg(&count)
+                    .arg(&self.d_nodes)
+                    .arg(&self.d_children)
+                    .arg(&self.d_contributions)
+                    .arg(&self.d_folded_masks)
+                    .arg(&self.d_strategy)
+                    .arg(&self.d_infoset_offsets)
+                    .arg(&self.d_reach)
+                    .arg(&self.d_cfv)
+                    .arg(&self.d_regrets)
+                    .arg(&self.d_cum_strategy)
+                    .arg(&self.d_initial_weight)
+                    .arg(&self.d_sorted_opp_strength)
+                    .arg(&self.d_sorted_opp_indices)
+                    .arg(&self.d_sorted_player_strength)
+                    .arg(&self.d_sorted_player_indices)
+                    .arg(&self.d_hand_cards)
+                    .arg(&np)
+                    .arg(&nh)
+                    .arg(&traverser)
+                    .arg(&weight)
+                    .arg(&regret_floor);
+                builder.launch(cfg)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn download_regrets(&self) -> Result<Vec<f32>, DriverError> {
+        self.stream.clone_dtoh(&self.d_regrets)
+    }
+
+    pub fn download_cum_strategy(&self) -> Result<Vec<f32>, DriverError> {
+        self.stream.clone_dtoh(&self.d_cum_strategy)
+    }
+
+    pub fn download_strategy(&self) -> Result<Vec<f32>, DriverError> {
+        self.stream.clone_dtoh(&self.d_strategy)
+    }
+
+    pub fn iteration_count(&self) -> u32 {
+        self.iteration
+    }
+
+    pub fn num_hands(&self) -> usize {
+        self.num_hands
     }
 }
 

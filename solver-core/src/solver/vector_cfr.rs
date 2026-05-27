@@ -208,6 +208,13 @@ impl VectorCfr {
             cfv_all.push(self.bottom_up_recursive(tree, game, traverser, child as usize, reach, weight));
         }
 
+        // CRITICAL: At opponent nodes, SUM child CFVs (do NOT weight by strategy).
+        // The pre-computed reach at each child already includes the opponent's
+        // strategy contribution from the top-down reach pass. Weighting by
+        // strategy again would double-count. At traverser nodes, the strategy
+        // weighting is correct because the traverser's own reach does NOT
+        // include this node's strategy — it only includes strategies from
+        // ancestral nodes.
         let mut cfv_avg = vec![0.0f32; nh];
         if owner == traverser {
             for a in 0..na {
@@ -362,6 +369,10 @@ impl VectorCfr {
 
     pub fn cum_strategy_slice(&self) -> &[f32] {
         &self.cum_strategy
+    }
+
+    pub fn regrets_slice(&self) -> &[f32] {
+        &self.regrets
     }
 
     pub fn node_offsets(&self) -> &[usize] {
