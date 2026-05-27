@@ -580,7 +580,7 @@ extern "C" __global__ void vcfr_bottom_up(
             for (int h = 0; h < nh; h++) {
                 uint32_t cidx = offset + a * nh + h;
                 float t_reach = reach[node_reach_base + traverser * nh + h];
-                cum_strategy[cidx] = gamma_t * cum_strategy[cidx] + sigma[a * nh + h];
+                cum_strategy[cidx] = gamma_t * cum_strategy[cidx] + t_reach * sigma[a * nh + h];
             }
         }
     } else {

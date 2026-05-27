@@ -1030,6 +1030,84 @@ impl GpuVectorCfr {
                         builder.launch(cfg)?;
                     }
                 }
+
+                {
+                    let num_cc = chance.num_chance_children as i32;
+                    let total = num_cc * nh;
+                    let grid = ((total + 255) / 256) as u32;
+                    let b = 256;
+                    let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (b, 1, 1), shared_mem_bytes: 0 };
+                    let outcome_i32 = outcome as i32;
+                    unsafe {
+                        let mut builder = self.stream.launch_builder(&self.vcfr_chance_accum_fn);
+                        builder
+                            .arg(d_cfv_accum)
+                            .arg(&self.d_cfv)
+                            .arg(d_chance_prob)
+                            .arg(d_chance_child_ids)
+                            .arg(&num_cc)
+                            .arg(&nh)
+                            .arg(&outcome_i32);
+                        builder.launch(cfg)?;
+                    }
+                }
+            }
+
+            {
+                let num_cc = chance.num_chance_children as i32;
+                let total = num_cc * nh;
+                let grid = ((total + 255) / 256) as u32;
+                let b = 256;
+                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (b, 1, 1), shared_mem_bytes: 0 };
+                unsafe {
+                    let mut builder = self.stream.launch_builder(&self.vcfr_chance_final_fn);
+                    builder
+                        .arg(&self.d_cfv)
+                        .arg(d_cfv_accum)
+                        .arg(d_chance_child_ids)
+                        .arg(&num_cc)
+                        .arg(&nh);
+                    builder.launch(cfg)?;
+                }
+            }
+
+            for level in (0..=self.max_depth).rev() {
+                let count = self.main_level_counts[level];
+                if count == 0 { continue; }
+                let grid = count as u32;
+                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+
+                let level_nodes = self.d_main_level_nodes[level].as_ref().unwrap();
+                unsafe {
+                    let mut builder = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
+                    builder
+                        .arg(level_nodes)
+                        .arg(&count)
+                        .arg(&self.d_nodes)
+                        .arg(&self.d_children)
+                        .arg(&self.d_contributions)
+                        .arg(&self.d_folded_masks)
+                        .arg(&self.d_strategy)
+                        .arg(&self.d_infoset_offsets)
+                        .arg(&self.d_reach)
+                        .arg(&self.d_cfv)
+                        .arg(&self.d_regrets)
+                        .arg(&self.d_cum_strategy)
+                        .arg(&self.d_initial_weight)
+                        .arg(&self.d_sorted_opp_strength)
+                        .arg(&self.d_sorted_opp_indices)
+                        .arg(&self.d_sorted_player_strength)
+                        .arg(&self.d_sorted_player_indices)
+                        .arg(&self.d_hand_cards)
+                        .arg(&np)
+                        .arg(&nh)
+                        .arg(&traverser)
+                        .arg(&alpha_t)
+                        .arg(&beta_t)
+                        .arg(&gamma_t)
+                        .arg(&regret_floor);
+                    builder.launch(cfg)?;
+                }
             }
         } else {
             for level in (0..=self.max_depth).rev() {

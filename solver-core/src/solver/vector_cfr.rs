@@ -273,7 +273,7 @@ impl VectorCfr {
                 for h in 0..nh {
                     let idx = offset + a * nh + h;
                     let t_reach = reach[reach_base + traverser * nh + h];
-                    self.cum_strategy[idx] = gamma * self.cum_strategy[idx] + sigma[a * nh + h];
+                    self.cum_strategy[idx] = gamma * self.cum_strategy[idx] + t_reach * sigma[a * nh + h];
                 }
             }
         } else {
