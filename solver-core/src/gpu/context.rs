@@ -887,20 +887,14 @@ impl GpuVectorCfr {
         let np_u32 = np as u32;
 
         for _ in 0..num_iterations {
-            self.iteration += 1;
             let params = DcfrParams::new(self.iteration);
-
-            // First traverser: apply discount + compute strategy
-            self.launch_compute_strategies(ni, nh_i32, params.alpha_t, params.beta_t, 1)?;
+            self.iteration += 1;
 
             for traverser in 0..np {
-                if traverser > 0 {
-                    // Subsequent traversers: recompute strategy from updated regrets (no re-discount)
-                    self.launch_compute_strategies(ni, nh_i32, 0.0, 0.0, 0)?;
-                }
+                self.launch_compute_strategies(ni, nh_i32)?;
                 self.launch_init_reach(np, nh)?;
                 self.launch_top_down(nh_i32, np_u32)?;
-                self.launch_bottom_up(traverser as u32, params.gamma_t, nh_i32, np_u32)?;
+                self.launch_bottom_up(traverser as u32, params.alpha_t, params.beta_t, params.gamma_t, nh_i32, np_u32)?;
             }
         }
 
@@ -908,7 +902,7 @@ impl GpuVectorCfr {
         Ok(())
     }
 
-    fn launch_compute_strategies(&mut self, num_infosets: i32, nh: i32, alpha_t: f32, beta_t: f32, apply_discount: i32) -> Result<(), DriverError> {
+    fn launch_compute_strategies(&mut self, num_infosets: i32, nh: i32) -> Result<(), DriverError> {
         let block = 256;
         let grid = ((num_infosets + block - 1) / block) as u32;
 
@@ -923,10 +917,7 @@ impl GpuVectorCfr {
                 .arg(&self.d_nodes)
                 .arg(&self.d_infoset_offsets)
                 .arg(&num_infosets)
-                .arg(&nh)
-                .arg(&alpha_t)
-                .arg(&beta_t)
-                .arg(&apply_discount);
+                .arg(&nh);
             builder.launch(cfg)?;
         }
         Ok(())
@@ -975,7 +966,7 @@ impl GpuVectorCfr {
         Ok(())
     }
 
-    fn launch_bottom_up(&mut self, traverser: u32, gamma_t: f32, nh: i32, np: u32) -> Result<(), DriverError> {
+    fn launch_bottom_up(&mut self, traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32, nh: i32, np: u32) -> Result<(), DriverError> {
         let block = 1;
         let regret_floor = self.regret_floor;
         let nh_usize = nh as usize;
@@ -1032,6 +1023,8 @@ impl GpuVectorCfr {
                             .arg(&np)
                             .arg(&nh)
                             .arg(&traverser)
+                            .arg(&alpha_t)
+                            .arg(&beta_t)
                             .arg(&gamma_t)
                             .arg(&regret_floor);
                         builder.launch(cfg)?;
@@ -1069,6 +1062,8 @@ impl GpuVectorCfr {
                         .arg(&np)
                         .arg(&nh)
                         .arg(&traverser)
+                        .arg(&alpha_t)
+                        .arg(&beta_t)
                         .arg(&gamma_t)
                         .arg(&regret_floor);
                     builder.launch(cfg)?;
