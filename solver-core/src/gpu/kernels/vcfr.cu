@@ -570,3 +570,42 @@ extern "C" __global__ void vcfr_update_avg_strategy(
         }
     }
 }
+
+extern "C" __global__ void vcfr_chance_accumulate(
+    float* __restrict__ cfv_accum,
+    const float* __restrict__ cfv,
+    const float* __restrict__ chance_prob,
+    const uint32_t* __restrict__ chance_child_ids,
+    int num_chance_children,
+    int nh,
+    int outcome
+) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int total = num_chance_children * nh;
+    if (idx >= total) return;
+
+    int cn = idx / nh;
+    int h = idx % nh;
+    uint32_t child_id = chance_child_ids[cn];
+    float prob = chance_prob[outcome * nh + h];
+
+    cfv_accum[child_id * nh + h] += prob * cfv[child_id * nh + h];
+}
+
+extern "C" __global__ void vcfr_chance_finalize(
+    float* __restrict__ cfv,
+    const float* __restrict__ cfv_accum,
+    const uint32_t* __restrict__ chance_child_ids,
+    int num_chance_children,
+    int nh
+) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int total = num_chance_children * nh;
+    if (idx >= total) return;
+
+    int cn = idx / nh;
+    int h = idx % nh;
+    uint32_t child_id = chance_child_ids[cn];
+
+    cfv[child_id * nh + h] = cfv_accum[child_id * nh + h];
+}

@@ -113,7 +113,7 @@ fn diagnose_first_divergence_point() {
     let gpu = GpuContext::new().expect("GPU init failed");
     let mut gpu_solver = gpu
         .create_vcfr_solver(
-            &tree, nh, &opp_str, &opp_idx, &pl_str, &pl_idx, &hand_cards, &initial_weight,
+            &tree, nh, &opp_str, &opp_idx, &pl_str, &pl_idx, &hand_cards, &initial_weight, None,
         )
         .expect("vcfr solver creation failed");
     gpu_solver.run(1).expect("GPU run failed");

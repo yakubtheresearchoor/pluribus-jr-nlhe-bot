@@ -107,7 +107,7 @@ fn run_comparison(
 
         // Vector CFR (GPU)
         let mut vcfr = gpu.create_vcfr_solver(
-            tree, nh, opp_str, opp_idx, pl_str, pl_idx, hand_cards, initial_weight,
+            tree, nh, opp_str, opp_idx, pl_str, pl_idx, hand_cards, initial_weight, None,
         ).expect("vcfr solver creation failed");
         vcfr.run(n_iters).expect("GPU run failed");
         let vcfr_cum = vcfr.download_cum_strategy().expect("download failed");

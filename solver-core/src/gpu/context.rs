@@ -15,6 +15,19 @@ const MAX_NH: usize = 1326;
 const MAX_DEPTH: usize = 16;
 const FRAME_STRIDE: usize = 2 * MAX_NA * MAX_NH + MAX_NH;
 
+pub struct ChanceGpuData {
+    pub chance_sorted_strength: Vec<u16>,
+    pub chance_sorted_indices: Vec<u16>,
+    pub chance_probabilities: Vec<f32>,
+    pub remaining_deck: Vec<u8>,
+}
+
+pub struct ChanceInfo {
+    pub num_outcomes: usize,
+    pub remaining_deck: Vec<u8>,
+    pub num_chance_children: usize,
+}
+
 pub struct GpuContext {
     stream: Arc<CudaStream>,
     kuhn_fn: CudaFunction,
@@ -26,6 +39,8 @@ pub struct GpuContext {
     vcfr_strategies_fn: CudaFunction,
     vcfr_top_down_fn: CudaFunction,
     vcfr_bottom_up_fn: CudaFunction,
+    vcfr_chance_accum_fn: CudaFunction,
+    vcfr_chance_final_fn: CudaFunction,
 }
 
 impl GpuContext {
@@ -55,6 +70,8 @@ impl GpuContext {
         let vcfr_strategies_fn = vcfr_module.load_function("vcfr_compute_strategies")?;
         let vcfr_top_down_fn = vcfr_module.load_function("vcfr_top_down_reach")?;
         let vcfr_bottom_up_fn = vcfr_module.load_function("vcfr_bottom_up")?;
+        let vcfr_chance_accum_fn = vcfr_module.load_function("vcfr_chance_accumulate")?;
+        let vcfr_chance_final_fn = vcfr_module.load_function("vcfr_chance_finalize")?;
 
         Ok(GpuContext {
             stream,
@@ -67,6 +84,8 @@ impl GpuContext {
             vcfr_strategies_fn,
             vcfr_top_down_fn,
             vcfr_bottom_up_fn,
+            vcfr_chance_accum_fn,
+            vcfr_chance_final_fn,
         })
     }
 
@@ -500,11 +519,13 @@ impl GpuContext {
         sorted_player_indices: &[u16],
         hand_cards: &[u8],
         initial_weight: &[f32],
+        chance_data: Option<ChanceGpuData>,
     ) -> Result<GpuVectorCfr, DriverError> {
         let np = tree.num_players as usize;
         let nn = tree.num_nodes();
         let num_infosets = tree.num_infosets as usize;
         let max_depth = tree.max_depth as usize;
+        let num_opp = np - 1;
 
         let infoset_data_size = num_infosets * MAX_NA * nh;
 
@@ -537,11 +558,102 @@ impl GpuContext {
             level_counts.push(tree.level_size(level as u32) as i32);
         }
 
+        let vcfr_chance_accum_fn = self.vcfr_chance_accum_fn.clone();
+        let vcfr_chance_final_fn = self.vcfr_chance_final_fn.clone();
+
+        let (chance_info, d_chance_sorted_strength, d_chance_sorted_indices,
+             d_chance_prob, d_chance_child_ids, d_cfv_accum,
+             d_below_chance_level_nodes, below_chance_level_counts,
+             d_main_level_nodes, main_level_counts) = if let Some(cd) = chance_data {
+            let num_outcomes = cd.remaining_deck.len();
+            let num_opp = np - 1;
+
+            assert_eq!(cd.chance_sorted_strength.len(), 52 * num_opp * nh);
+            assert_eq!(cd.chance_sorted_indices.len(), 52 * num_opp * nh);
+            assert_eq!(cd.chance_probabilities.len(), num_outcomes * nh);
+
+            let d_cstr: CudaSlice<u16> = self.stream.clone_htod(&cd.chance_sorted_strength)?;
+            let d_cidx: CudaSlice<u16> = self.stream.clone_htod(&cd.chance_sorted_indices)?;
+            let d_cprob: CudaSlice<f32> = self.stream.clone_htod(&cd.chance_probabilities)?;
+
+            let mut chance_nodes = Vec::new();
+            let mut chance_children = Vec::new();
+            let mut below_chance = vec![false; nn];
+            for i in 0..nn {
+                if tree.nodes[i].is_chance() {
+                    chance_nodes.push(i as u32);
+                    for &child in tree.node_children(i) {
+                        chance_children.push(child);
+                        mark_descendants(tree, child as usize, &mut below_chance);
+                    }
+                }
+            }
+
+            let num_chance_children = chance_children.len();
+            let d_ccids: CudaSlice<u32> = self.stream.clone_htod(&chance_children)?;
+            let d_cacc: CudaSlice<f32> = self.stream.alloc_zeros(nn * nh)?;
+
+            let mut d_bc_nodes: Vec<Option<CudaSlice<u32>>> = Vec::with_capacity(max_depth + 1);
+            let mut bc_counts: Vec<i32> = Vec::with_capacity(max_depth + 1);
+            let mut d_mn_nodes: Vec<Option<CudaSlice<u32>>> = Vec::with_capacity(max_depth + 1);
+            let mut mn_counts: Vec<i32> = Vec::with_capacity(max_depth + 1);
+
+            for level in 0..=max_depth {
+                let all_nodes = tree.nodes_at_level(level as u32);
+                let mut bc: Vec<u32> = Vec::new();
+                let mut mn: Vec<u32> = Vec::new();
+                for &nid in all_nodes {
+                    if below_chance[nid as usize] {
+                        bc.push(nid);
+                    } else {
+                        mn.push(nid);
+                    }
+                }
+                bc_counts.push(bc.len() as i32);
+                mn_counts.push(mn.len() as i32);
+                if !bc.is_empty() {
+                    d_bc_nodes.push(Some(self.stream.clone_htod(&bc)?));
+                } else {
+                    d_bc_nodes.push(None);
+                }
+                if !mn.is_empty() {
+                    d_mn_nodes.push(Some(self.stream.clone_htod(&mn)?));
+                } else {
+                    d_mn_nodes.push(None);
+                }
+            }
+
+            let info = ChanceInfo {
+                num_outcomes,
+                remaining_deck: cd.remaining_deck,
+                num_chance_children,
+            };
+
+            (Some(info), Some(d_cstr), Some(d_cidx), Some(d_cprob),
+             Some(d_ccids), Some(d_cacc),
+             d_bc_nodes, bc_counts, d_mn_nodes, mn_counts)
+        } else {
+            let mut d_bc_nodes = Vec::with_capacity(max_depth + 1);
+            let mut bc_counts = Vec::with_capacity(max_depth + 1);
+            let mut d_mn_nodes = Vec::with_capacity(max_depth + 1);
+            let mut mn_counts = Vec::with_capacity(max_depth + 1);
+            for level in 0..=max_depth {
+                d_bc_nodes.push(None);
+                bc_counts.push(0);
+                d_mn_nodes.push(None);
+                mn_counts.push(0);
+            }
+            (None, None, None, None, None, None,
+             d_bc_nodes, bc_counts, d_mn_nodes, mn_counts)
+        };
+
         Ok(GpuVectorCfr {
             stream: self.stream.clone(),
             vcfr_strategies_fn: self.vcfr_strategies_fn.clone(),
             vcfr_top_down_fn: self.vcfr_top_down_fn.clone(),
             vcfr_bottom_up_fn: self.vcfr_bottom_up_fn.clone(),
+            vcfr_chance_accum_fn,
+            vcfr_chance_final_fn,
             d_nodes,
             d_children,
             d_contributions,
@@ -567,6 +679,16 @@ impl GpuContext {
             level_counts,
             iteration: 0,
             regret_floor: -1e30f32,
+            chance_info,
+            d_chance_sorted_strength,
+            d_chance_sorted_indices,
+            d_chance_prob,
+            d_chance_child_ids,
+            d_cfv_accum,
+            d_below_chance_level_nodes,
+            below_chance_level_counts,
+            d_main_level_nodes,
+            main_level_counts,
         })
     }
 }
@@ -678,11 +800,20 @@ impl GpuMccfr {
     }
 }
 
+fn mark_descendants(tree: &FlatTree, node_idx: usize, below_chance: &mut [bool]) {
+    below_chance[node_idx] = true;
+    for &child in tree.node_children(node_idx) {
+        mark_descendants(tree, child as usize, below_chance);
+    }
+}
+
 pub struct GpuVectorCfr {
     stream: Arc<CudaStream>,
     vcfr_strategies_fn: CudaFunction,
     vcfr_top_down_fn: CudaFunction,
     vcfr_bottom_up_fn: CudaFunction,
+    vcfr_chance_accum_fn: CudaFunction,
+    vcfr_chance_final_fn: CudaFunction,
     d_nodes: CudaSlice<FlatNode>,
     d_children: CudaSlice<u32>,
     d_contributions: CudaSlice<i32>,
@@ -708,6 +839,16 @@ pub struct GpuVectorCfr {
     level_counts: Vec<i32>,
     iteration: u32,
     regret_floor: f32,
+    chance_info: Option<ChanceInfo>,
+    d_chance_sorted_strength: Option<CudaSlice<u16>>,
+    d_chance_sorted_indices: Option<CudaSlice<u16>>,
+    d_chance_prob: Option<CudaSlice<f32>>,
+    d_chance_child_ids: Option<CudaSlice<u32>>,
+    d_cfv_accum: Option<CudaSlice<f32>>,
+    d_below_chance_level_nodes: Vec<Option<CudaSlice<u32>>>,
+    below_chance_level_counts: Vec<i32>,
+    d_main_level_nodes: Vec<Option<CudaSlice<u32>>>,
+    main_level_counts: Vec<i32>,
 }
 
 impl GpuVectorCfr {
@@ -804,41 +945,177 @@ impl GpuVectorCfr {
     fn launch_bottom_up(&mut self, traverser: u32, weight: f32, nh: i32, np: u32) -> Result<(), DriverError> {
         let block = 1;
         let regret_floor = self.regret_floor;
+        let nh_usize = nh as usize;
+        let num_opp = (np - 1) as usize;
 
-        for level in (0..=self.max_depth).rev() {
-            let count = self.level_counts[level];
-            if count == 0 { continue; }
-            let grid = count as u32;
+        if self.chance_info.is_some() {
+            let chance = self.chance_info.as_ref().unwrap();
 
-            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+            self.stream.memset_zeros(self.d_cfv_accum.as_mut().unwrap())?;
 
-            unsafe {
-                let mut builder = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
-                builder
-                    .arg(&self.d_level_nodes[level])
-                    .arg(&count)
-                    .arg(&self.d_nodes)
-                    .arg(&self.d_children)
-                    .arg(&self.d_contributions)
-                    .arg(&self.d_folded_masks)
-                    .arg(&self.d_strategy)
-                    .arg(&self.d_infoset_offsets)
-                    .arg(&self.d_reach)
-                    .arg(&self.d_cfv)
-                    .arg(&self.d_regrets)
-                    .arg(&self.d_cum_strategy)
-                    .arg(&self.d_initial_weight)
-                    .arg(&self.d_sorted_opp_strength)
-                    .arg(&self.d_sorted_opp_indices)
-                    .arg(&self.d_sorted_player_strength)
-                    .arg(&self.d_sorted_player_indices)
-                    .arg(&self.d_hand_cards)
-                    .arg(&np)
-                    .arg(&nh)
-                    .arg(&traverser)
-                    .arg(&weight)
-                    .arg(&regret_floor);
-                builder.launch(cfg)?;
+            let d_cfv_accum = self.d_cfv_accum.as_ref().unwrap();
+            let d_chance_prob = self.d_chance_prob.as_ref().unwrap();
+            let d_chance_child_ids = self.d_chance_child_ids.as_ref().unwrap();
+            let d_cstr = self.d_chance_sorted_strength.as_ref().unwrap();
+            let d_cidx = self.d_chance_sorted_indices.as_ref().unwrap();
+
+            for outcome in 0..chance.num_outcomes {
+                let card = chance.remaining_deck[outcome] as usize;
+                let offset = card * num_opp * nh_usize;
+
+                let opp_str_view = d_cstr.slice(offset..offset + num_opp * nh_usize);
+                let opp_idx_view = d_cidx.slice(offset..offset + num_opp * nh_usize);
+                let pl_str_view = d_cstr.slice(offset..offset + nh_usize);
+                let pl_idx_view = d_cidx.slice(offset..offset + nh_usize);
+
+                for level in (0..=self.max_depth).rev() {
+                    let count = self.below_chance_level_counts[level];
+                    if count == 0 { continue; }
+                    let grid = count as u32;
+                    let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+
+                    let level_nodes = self.d_below_chance_level_nodes[level].as_ref().unwrap();
+                    unsafe {
+                        let mut builder = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
+                        builder
+                            .arg(level_nodes)
+                            .arg(&count)
+                            .arg(&self.d_nodes)
+                            .arg(&self.d_children)
+                            .arg(&self.d_contributions)
+                            .arg(&self.d_folded_masks)
+                            .arg(&self.d_strategy)
+                            .arg(&self.d_infoset_offsets)
+                            .arg(&self.d_reach)
+                            .arg(&self.d_cfv)
+                            .arg(&self.d_regrets)
+                            .arg(&self.d_cum_strategy)
+                            .arg(&self.d_initial_weight)
+                            .arg(&opp_str_view)
+                            .arg(&opp_idx_view)
+                            .arg(&pl_str_view)
+                            .arg(&pl_idx_view)
+                            .arg(&self.d_hand_cards)
+                            .arg(&np)
+                            .arg(&nh)
+                            .arg(&traverser)
+                            .arg(&weight)
+                            .arg(&regret_floor);
+                        builder.launch(cfg)?;
+                    }
+                }
+
+                {
+                    let num_cc = chance.num_chance_children as i32;
+                    let total = num_cc * nh;
+                    let grid = ((total + 255) / 256) as u32;
+                    let b = 256;
+                    let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (b, 1, 1), shared_mem_bytes: 0 };
+                    let outcome_i32 = outcome as i32;
+                    unsafe {
+                        let mut builder = self.stream.launch_builder(&self.vcfr_chance_accum_fn);
+                        builder
+                            .arg(d_cfv_accum)
+                            .arg(&self.d_cfv)
+                            .arg(d_chance_prob)
+                            .arg(d_chance_child_ids)
+                            .arg(&num_cc)
+                            .arg(&nh)
+                            .arg(&outcome_i32);
+                        builder.launch(cfg)?;
+                    }
+                }
+            }
+
+            {
+                let num_cc = chance.num_chance_children as i32;
+                let total = num_cc * nh;
+                let grid = ((total + 255) / 256) as u32;
+                let b = 256;
+                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (b, 1, 1), shared_mem_bytes: 0 };
+                unsafe {
+                    let mut builder = self.stream.launch_builder(&self.vcfr_chance_final_fn);
+                    builder
+                        .arg(&self.d_cfv)
+                        .arg(d_cfv_accum)
+                        .arg(d_chance_child_ids)
+                        .arg(&num_cc)
+                        .arg(&nh);
+                    builder.launch(cfg)?;
+                }
+            }
+
+            for level in (0..=self.max_depth).rev() {
+                let count = self.main_level_counts[level];
+                if count == 0 { continue; }
+                let grid = count as u32;
+                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+
+                let level_nodes = self.d_main_level_nodes[level].as_ref().unwrap();
+                unsafe {
+                    let mut builder = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
+                    builder
+                        .arg(level_nodes)
+                        .arg(&count)
+                        .arg(&self.d_nodes)
+                        .arg(&self.d_children)
+                        .arg(&self.d_contributions)
+                        .arg(&self.d_folded_masks)
+                        .arg(&self.d_strategy)
+                        .arg(&self.d_infoset_offsets)
+                        .arg(&self.d_reach)
+                        .arg(&self.d_cfv)
+                        .arg(&self.d_regrets)
+                        .arg(&self.d_cum_strategy)
+                        .arg(&self.d_initial_weight)
+                        .arg(&self.d_sorted_opp_strength)
+                        .arg(&self.d_sorted_opp_indices)
+                        .arg(&self.d_sorted_player_strength)
+                        .arg(&self.d_sorted_player_indices)
+                        .arg(&self.d_hand_cards)
+                        .arg(&np)
+                        .arg(&nh)
+                        .arg(&traverser)
+                        .arg(&weight)
+                        .arg(&regret_floor);
+                    builder.launch(cfg)?;
+                }
+            }
+        } else {
+            for level in (0..=self.max_depth).rev() {
+                let count = self.level_counts[level];
+                if count == 0 { continue; }
+                let grid = count as u32;
+                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+
+                unsafe {
+                    let mut builder = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
+                    builder
+                        .arg(&self.d_level_nodes[level])
+                        .arg(&count)
+                        .arg(&self.d_nodes)
+                        .arg(&self.d_children)
+                        .arg(&self.d_contributions)
+                        .arg(&self.d_folded_masks)
+                        .arg(&self.d_strategy)
+                        .arg(&self.d_infoset_offsets)
+                        .arg(&self.d_reach)
+                        .arg(&self.d_cfv)
+                        .arg(&self.d_regrets)
+                        .arg(&self.d_cum_strategy)
+                        .arg(&self.d_initial_weight)
+                        .arg(&self.d_sorted_opp_strength)
+                        .arg(&self.d_sorted_opp_indices)
+                        .arg(&self.d_sorted_player_strength)
+                        .arg(&self.d_sorted_player_indices)
+                        .arg(&self.d_hand_cards)
+                        .arg(&np)
+                        .arg(&nh)
+                        .arg(&traverser)
+                        .arg(&weight)
+                        .arg(&regret_floor);
+                    builder.launch(cfg)?;
+                }
             }
         }
         Ok(())

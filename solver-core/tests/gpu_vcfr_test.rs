@@ -98,6 +98,7 @@ fn gpu_vcfr_river_single_iter_bit_exact() {
             &pl_idx,
             &hand_cards,
             &initial_weight,
+            None,
         )
         .expect("vcfr solver creation failed");
 
@@ -172,6 +173,7 @@ fn gpu_vcfr_river_10_iter_bit_exact() {
             &pl_idx,
             &hand_cards,
             &initial_weight,
+            None,
         )
         .expect("vcfr solver creation failed");
 
@@ -229,6 +231,7 @@ fn gpu_vcfr_river_convergence() {
             &pl_idx,
             &hand_cards,
             &initial_weight,
+            None,
         )
         .expect("vcfr solver creation failed");
 

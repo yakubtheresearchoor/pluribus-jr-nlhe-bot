@@ -94,7 +94,7 @@ fn measure_drift_growth_rate() {
         let cpu_cum = cpu.cum_strategy_slice().to_vec();
 
         let mut gpu_solver = gpu
-            .create_vcfr_solver(&tree, nh, &opp_str, &opp_idx, &pl_str, &pl_idx, &hand_cards, &initial_weight)
+            .create_vcfr_solver(&tree, nh, &opp_str, &opp_idx, &pl_str, &pl_idx, &hand_cards, &initial_weight, None)
             .expect("vcfr solver creation failed");
         gpu_solver.run(n_iters).expect("GPU run failed");
         let gpu_reg = gpu_solver.download_regrets().expect("download failed");

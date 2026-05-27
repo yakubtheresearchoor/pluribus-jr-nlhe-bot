@@ -85,7 +85,7 @@ fn diagnose_production_tree() {
 
     let gpu = GpuContext::new().expect("GPU init failed");
     let mut vcfr = gpu.create_vcfr_solver(
-        &tree, nh, &opp_str, &opp_idx, &pl_str, &pl_idx, &hand_cards, &initial_weight,
+        &tree, nh, &opp_str, &opp_idx, &pl_str, &pl_idx, &hand_cards, &initial_weight, None,
     ).expect("vcfr creation failed");
     vcfr.run(100).expect("GPU run failed");
 
