@@ -337,15 +337,79 @@ pub fn side_pot_showdown_cfv(
                 filtered_opp.push(opp_reach[oi].to_vec());
             }
         }
-        let filtered_views: Vec<&[f32]> = filtered_opp.iter().map(|v| v.as_slice()).collect();
 
-        let sweep = sorted_sweep_showdown(
-            &filtered_views, hand_cards, nh,
-            sorted_opp_str, sorted_opp_idx,
-            sorted_pl_str, sorted_pl_idx,
-        );
+        if num_active_opp == 1 {
+            let filtered_views: Vec<&[f32]> = filtered_opp.iter().map(|v| v.as_slice()).collect();
+            let sweep = sorted_sweep_showdown(
+                &filtered_views, hand_cards, nh,
+                sorted_opp_str, sorted_opp_idx,
+                sorted_pl_str, sorted_pl_idx,
+            );
+            for h in 0..nh {
+                cfv[h] = c_t as f32 * sweep[h];
+            }
+            return cfv;
+        }
+
+        // N>2 equal-contribution showdown: product-based formula
+        // cfv[h] = c_t * ((num_active_opp + 1) * prod_oi(W_oi(h)) - prod_oi(R_eff_oi(h)))
+        // where W_oi(h) = cum weaker reach for opp oi (with card blocking)
+        //       R_eff_oi(h) = total reach of non-conflicting hands for opp oi
+        let mut cum_weaker: Vec<Vec<f32>> = Vec::with_capacity(num_opp);
+        let mut eff_total_reach: Vec<Vec<f32>> = Vec::with_capacity(num_opp);
+
+        for oi in 0..num_opp {
+            let reach = &filtered_opp[oi];
+            let mut cw = vec![0.0f32; nh];
+            let mut cfreach_sum = 0.0f32;
+            let mut cfreach_minus = vec![0.0f32; 52];
+            let mut i = 0;
+
+            for si in 0..nh {
+                let str_h = sorted_pl_str[si];
+                let h = sorted_pl_idx[si] as usize;
+                while i < nh && sorted_opp_str[oi * nh + i] < str_h {
+                    let ho = sorted_opp_idx[oi * nh + i] as usize;
+                    let r = reach[ho];
+                    if r != 0.0 {
+                        cfreach_sum += r;
+                        cfreach_minus[hand_cards[ho * 2] as usize] += r;
+                        cfreach_minus[hand_cards[ho * 2 + 1] as usize] += r;
+                    }
+                    i += 1;
+                }
+                cw[h] = cfreach_sum
+                    - cfreach_minus[hand_cards[h * 2] as usize]
+                    - cfreach_minus[hand_cards[h * 2 + 1] as usize];
+            }
+
+            while i < nh {
+                let ho = sorted_opp_idx[oi * nh + i] as usize;
+                let r = reach[ho];
+                if r != 0.0 {
+                    cfreach_sum += r;
+                    cfreach_minus[hand_cards[ho * 2] as usize] += r;
+                    cfreach_minus[hand_cards[ho * 2 + 1] as usize] += r;
+                }
+                i += 1;
+            }
+
+            let mut eff = vec![0.0f32; nh];
+            for h in 0..nh {
+                eff[h] = cfreach_sum
+                    - cfreach_minus[hand_cards[h * 2] as usize]
+                    - cfreach_minus[hand_cards[h * 2 + 1] as usize]
+                    + reach[h];
+            }
+
+            cum_weaker.push(cw);
+            eff_total_reach.push(eff);
+        }
+
         for h in 0..nh {
-            cfv[h] = c_t as f32 * sweep[h];
+            let beats_all: f32 = cum_weaker.iter().map(|cw| cw[h]).product();
+            let eff_product: f32 = eff_total_reach.iter().map(|er| er[h]).product();
+            cfv[h] = c_t as f32 * ((num_active_opp as f32 + 1.0) * beats_all - eff_product);
         }
         return cfv;
     }
