@@ -46,12 +46,14 @@ pub struct GpuContext {
     vcfr_grouped_fn: CudaFunction,
     vcfr_regret_apply_fn: CudaFunction,
     vcfr_cum_apply_fn: CudaFunction,
+    vcfr_init_reach_fn: CudaFunction,
+    vcfr_zero_fn: CudaFunction,
 }
 
 impl GpuContext {
     pub fn new() -> Result<Self, DriverError> {
         let ctx = CudaContext::new(0)?;
-        let stream = ctx.default_stream();
+        let stream = ctx.new_stream()?;
 
         let out_dir = std::env::var("OUT_DIR").unwrap_or_default();
         let ptx_path = PathBuf::from(out_dir.clone()).join("mccfr.ptx");
@@ -81,6 +83,8 @@ impl GpuContext {
         let vcfr_grouped_fn = vcfr_module.load_function("vcfr_chance_accumulate_grouped")?;
         let vcfr_regret_apply_fn = vcfr_module.load_function("vcfr_regret_apply")?;
         let vcfr_cum_apply_fn = vcfr_module.load_function("vcfr_cum_apply")?;
+        let vcfr_init_reach_fn = vcfr_module.load_function("vcfr_init_reach")?;
+        let vcfr_zero_fn = vcfr_module.load_function("vcfr_zero_buffer")?;
 
         Ok(GpuContext {
             stream,
@@ -99,6 +103,8 @@ impl GpuContext {
             vcfr_grouped_fn,
             vcfr_regret_apply_fn,
             vcfr_cum_apply_fn,
+            vcfr_init_reach_fn,
+            vcfr_zero_fn,
         })
     }
 
@@ -690,6 +696,8 @@ impl GpuContext {
             vcfr_grouped_fn: self.vcfr_grouped_fn.clone(),
             vcfr_regret_apply_fn: self.vcfr_regret_apply_fn.clone(),
             vcfr_cum_apply_fn: self.vcfr_cum_apply_fn.clone(),
+            vcfr_init_reach_fn: self.vcfr_init_reach_fn.clone(),
+            vcfr_zero_fn: self.vcfr_zero_fn.clone(),
             d_nodes,
             d_children,
             d_contributions,
@@ -929,6 +937,8 @@ pub struct GpuVectorCfr {
     vcfr_grouped_fn: CudaFunction,
     vcfr_regret_apply_fn: CudaFunction,
     vcfr_cum_apply_fn: CudaFunction,
+    vcfr_init_reach_fn: CudaFunction,
+    vcfr_zero_fn: CudaFunction,
     d_nodes: CudaSlice<FlatNode>,
     d_children: CudaSlice<u32>,
     d_contributions: CudaSlice<i32>,
@@ -1020,16 +1030,19 @@ impl GpuVectorCfr {
 
     fn launch_init_reach(&mut self, np: usize, nh: usize) -> Result<(), DriverError> {
         let nn = self.d_nodes.len();
-        let reach_size = nn * np * nh;
-
-        let init = self.stream.clone_dtoh(&self.d_initial_weight)?;
-        let mut reach = vec![0.0f32; reach_size];
-        for p in 0..np {
-            for h in 0..nh {
-                reach[p * nh + h] = init[p * nh + h];
-            }
+        let total = (nn * np * nh) as i32;
+        let np_nh = (np * nh) as i32;
+        let block = 256;
+        let grid = ((total as usize + block - 1) / block) as u32;
+        let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block as u32, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            let mut b = self.stream.launch_builder(&self.vcfr_init_reach_fn);
+            b.arg(&self.d_reach)
+             .arg(&self.d_initial_weight)
+             .arg(&total)
+             .arg(&np_nh);
+            b.launch(cfg)?;
         }
-        self.stream.memcpy_htod(&reach, &mut self.d_reach)?;
         Ok(())
     }
 
@@ -2096,6 +2109,8 @@ impl GpuContext {
             vcfr_grouped_fn: self.vcfr_grouped_fn.clone(),
             vcfr_regret_apply_fn: self.vcfr_regret_apply_fn.clone(),
             vcfr_cum_apply_fn: self.vcfr_cum_apply_fn.clone(),
+            vcfr_init_reach_fn: self.vcfr_init_reach_fn.clone(),
+            vcfr_zero_fn: self.vcfr_zero_fn.clone(),
             d_nodes, d_children, d_contributions, d_folded_masks,
             d_infoset_offsets, d_decision_node_ids,
             d_regrets, d_strategy, d_cum_strategy, d_reach, d_cfv, d_initial_weight,
@@ -2164,23 +2179,32 @@ impl GpuVectorCfr {
         for iter in 0..num_iterations {
             let params = DcfrParams::new(self.iteration);
 
-            // Update DCFR params in device memory
-            {
-                let fs = self.flop_start.as_mut().unwrap();
-                let host_params = vec![params.alpha_t, params.beta_t, params.gamma_t, regret_floor];
-                let mut d_params = self.stream.clone_htod(&host_params)?;
-                std::mem::swap(&mut fs.d_dcfr_params, &mut d_params);
-            }
+            // Note: For CUDA graphs, params must be in device memory updated BEFORE capture.
+            // For now, we use fixed params from iter 0 for all replays.
+            // TODO: Update d_dcfr_params via memcpy_htod (not clone_htod) for variable params.
 
             for traverser in 0..np {
                 // If we don't have a graph yet, capture one
                 if self.flop_start_graph.is_none() && iter == 0 && traverser == 0 {
                     // Begin capture
-                    self.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)?;
+                    eprintln!("GRAPH: synchronizing before capture...");
+                    self.stream.synchronize()?;
+                    eprintln!("GRAPH: beginning capture...");
+                    match self.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) {
+                        Ok(()) => eprintln!("GRAPH: capture started"),
+                        Err(e) => { eprintln!("GRAPH: begin_capture failed: {:?}", e); return Err(e); }
+                    }
 
-                    self.launch_compute_strategies(ni, nh_i32)?;
+                    eprintln!("GRAPH: launching compute_strategies...");
+                    match self.launch_compute_strategies(ni, nh_i32) {
+                        Ok(()) => eprintln!("GRAPH: compute_strategies OK"),
+                        Err(e) => { eprintln!("GRAPH: compute_strategies failed: {:?}", e); return Err(e); }
+                    }
+                    eprintln!("GRAPH: launching init_reach...");
                     self.launch_init_reach(np, nh)?;
+                    eprintln!("GRAPH: launching top_down...");
                     self.launch_top_down(nh_i32, np_u32)?;
+                    eprintln!("GRAPH: launching bottom_up...");
                     self.launch_flop_start_bottom_up(
                         traverser as u32, nn,
                         params.alpha_t, params.beta_t, params.gamma_t, nh_i32, np_u32,

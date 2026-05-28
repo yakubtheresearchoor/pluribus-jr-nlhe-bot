@@ -56,6 +56,7 @@ fn flop_start_cuda_graph() {
     // Test 2: With CUDA graphs
     println!("\n=== WITH CUDA GRAPHS ===");
     let mut solver2 = ctx.create_flop_start_vcfr(&tree, &table).expect("solver2");
+    std::env::set_var("RUST_BACKTRACE", "1");
     let t2 = std::time::Instant::now();
     solver2.run_flop_start_graph(11).expect("run");
     let with_graph = t2.elapsed().as_secs_f64() / 11.0 * 1000.0;

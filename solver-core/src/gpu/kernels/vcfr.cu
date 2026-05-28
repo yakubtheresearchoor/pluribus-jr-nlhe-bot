@@ -905,3 +905,29 @@ extern "C" __global__ void vcfr_cum_apply(
     cum_strategy[idx] = gamma_t * cum_strategy[idx] + cum_accum[idx];
     cum_accum[idx] = 0.0f;
 }
+
+// Initialize reach buffer: zero everything, then copy initial_weight
+// into reach[0..np*nh-1] (node 0's reach).
+// grid = ceil(np*nh / 256), block = 256
+extern "C" __global__ void vcfr_init_reach(
+    float* __restrict__ reach,
+    const float* __restrict__ initial_weight,
+    int total_reach_size,  // nn * np * nh
+    int np_nh              // np * nh (size of initial_weight)
+) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < np_nh) {
+        reach[idx] = initial_weight[idx];
+    } else if (idx < total_reach_size) {
+        reach[idx] = 0.0f;
+    }
+}
+
+// Zero a buffer. Graph-capturable alternative to cuMemsetD8Async.
+extern "C" __global__ void vcfr_zero_buffer(
+    float* __restrict__ buf,
+    int size
+) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < size) buf[idx] = 0.0f;
+}
