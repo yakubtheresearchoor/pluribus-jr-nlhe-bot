@@ -60,7 +60,7 @@ impl Hand {
         let mut rankset_of_count = [0i32; 5];
         let mut rank_count = [0i32; 13];
 
-        for &card in &self.cards {
+        for &card in &self.cards[..self.num_cards] {
             let rank = card / 4;
             let suit = card % 4;
             rankset |= 1 << rank;

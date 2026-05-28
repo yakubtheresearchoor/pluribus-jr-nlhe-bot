@@ -211,19 +211,27 @@ impl VectorCfr {
             if n_outcomes > 0 && children.len() == 1 {
             let child = children[0] as usize;
             for outcome in 0..n_outcomes {
+                // Clear previous outcome state first so chance_probability
+                // dispatches correctly for nested chance games.
+                if outcome > 0 { game.clear_chance_outcome(); }
+                // Compute probabilities BEFORE setting the new outcome,
+                // using the clean state for correct dispatch.
+                let probs: Vec<f32> = (0..nh).map(|h| game.chance_probability(outcome, h)).collect();
                 game.set_chance_outcome(outcome);
                 let child_cfv = self.bottom_up_recursive(tree, game, traverser, child, reach, alpha_t, beta_t, gamma);
                     for h in 0..nh {
-                        cfv[h] += game.chance_probability(outcome, h) * child_cfv[h];
+                        cfv[h] += probs[h] * child_cfv[h];
                     }
                 }
                 game.clear_chance_outcome();
             } else {
             for (outcome, &child) in children.iter().enumerate() {
+                if outcome > 0 { game.clear_chance_outcome(); }
+                let probs: Vec<f32> = (0..nh).map(|h| game.chance_probability(outcome, h)).collect();
                 game.set_chance_outcome(outcome);
                 let child_cfv = self.bottom_up_recursive(tree, game, traverser, child as usize, reach, alpha_t, beta_t, gamma);
                     for h in 0..nh {
-                        cfv[h] += game.chance_probability(outcome, h) * child_cfv[h];
+                        cfv[h] += probs[h] * child_cfv[h];
                     }
                 }
                 game.clear_chance_outcome();
