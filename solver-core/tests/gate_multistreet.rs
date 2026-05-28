@@ -104,7 +104,7 @@ fn make_gpu_vcfr(
     let (chance_sorted_str, chance_sorted_idx) = table.chance_sorted_arrays_gpu();
 
     let gpu = GpuContext::new().expect("GPU init failed");
-    gpu.create_vcfr_solver(
+    gpu.create_vcfr_solver_normalized(
         tree,
         nh,
         &opp_str,
@@ -119,6 +119,7 @@ fn make_gpu_vcfr(
             chance_probabilities: chance_probs.to_vec(),
             remaining_deck: table.remaining_deck.clone(),
         }),
+        table.num_combinations,
     ).expect("vcfr creation failed")
 }
 
