@@ -214,14 +214,11 @@ pub fn exploitability(
         let br_val = best_response_value(tree, game, strategy, p as u8);
         let sv_val = strategy_value(tree, game, strategy, p as u8);
         let reach = game.initial_weight(p as u8);
-        let reach_sum: f32 = reach.iter().sum();
 
-        if reach_sum > 0.0 {
-            for h in 0..br_val.len() {
-                total_exploit += (reach[h] / reach_sum) * (br_val[h] - sv_val[h]);
-            }
+        for h in 0..br_val.len() {
+            total_exploit += reach[h] * (br_val[h] - sv_val[h]);
         }
     }
 
-    total_exploit
+    total_exploit / np as f32
 }
