@@ -1,0 +1,43 @@
+ISOMORPHISM ANALYSIS FOR PLURIBUS-JUNIOR
+
+Method: For each flop texture, compute how many turn+river outcomes collapse
+to canonical representatives via suit isomorphism. Uses uniform ranges
+(best case for iso — non-uniform ranges reduce the benefit).
+
+Board Texture Distribution & Reduction:
+  Rainbow (55%):     0.98x ratio (2% fewer outcomes)
+  Two-tone (22%):    0.60x ratio (40% fewer)
+  Monotone (5%):     0.29x ratio (71% fewer)
+  Paired-rainbow (12%): 0.62x ratio (38% fewer)
+  Paired-two-tone (5%): 0.60x ratio (40% fewer)
+  Trips (1%):        0.31x ratio (69% fewer)
+
+Weighted average: 0.79x ratio (21% fewer outcomes)
+  → 2352 outcomes → ~1865 average canonical
+
+Performance projection:
+  Current: 2293ms/i
+  With iso (avg): 2293 × 0.79 ≈ 1811ms/i
+  With iso (best): 2293 × 0.29 = 665ms/i (monotone only)
+  With iso (worst): 2293 × 0.98 = 2247ms/i (rainbow, 55% of flops)
+
+The "roughly 6x" estimate was optimistic. Isomorphism provides:
+- Massive benefit on rare textures (monotone, trips): 3-3.5x
+- Moderate benefit on textured boards (paired, two-tone): 1.6-1.7x
+- Negligible benefit on rainbow boards (majority): 1.02x
+- Weighted average: 1.27x
+
+The rainbow-board problem is fundamental: with 3 different suits on the
+flop, no two suits have the same rankset, so no turn isomorphism exists.
+River isomorphism only helps when adding the 4th card makes two suits'
+ranksets match, which is uncommon (~2% reduction).
+
+Implementation priority: Isomorphism is still worth doing (1.27x average),
+but it's not the silver bullet. The convergence problem (15.4% exploitability
+at 50 iters, target 3-5%) must be solved independently via streaming reduction
+(Phase 2).
+
+The streaming reduction addresses the ATOMIC APPROXIMATION in the batched
+kernel, which is the root cause of slow convergence. Without fixing this,
+even a free 6x speedup would leave the solver at ~10 iters in budget with
+111% exploitability — still not viable.
