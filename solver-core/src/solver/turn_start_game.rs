@@ -69,7 +69,7 @@ impl GameSpec for TurnStartGame {
             .map(|p| cfreach[p].as_slice())
             .collect();
 
-        match self.current_river_card.get() {
+        let cfv = match self.current_river_card.get() {
             Some(_card) => {
                 let card = self.current_river_card.get().unwrap();
                 let card_idx = card as usize;
@@ -109,6 +109,16 @@ impl GameSpec for TurnStartGame {
                     tree.starting_pot,
                 )
             }
+        };
+
+        // Normalize by num_combinations
+        let nc = self.table.num_combinations as f32;
+        if nc > 0.0 {
+            let mut result = cfv;
+            for h in 0..nh { result[h] /= nc; }
+            result
+        } else {
+            cfv
         }
     }
 

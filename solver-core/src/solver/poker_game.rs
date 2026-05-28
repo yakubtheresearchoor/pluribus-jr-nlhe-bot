@@ -15,6 +15,7 @@ pub struct RiverPokerGame {
     sorted_pl_strength: Vec<u16>,
     sorted_pl_indices: Vec<u16>,
     hand_cards: Vec<u8>,
+    num_combinations: f64,
 }
 
 impl RiverPokerGame {
@@ -105,6 +106,36 @@ impl RiverPokerGame {
             hand_cards[i * 2 + 1] = c2;
         }
 
+        // Compute num_combinations: sum of w0[h0] × w1[h1] for non-conflicting pairs
+        let nc = if num_players == 2 {
+            let w0 = &initial_weights[0];
+            let w1 = &initial_weights[1];
+            let mut nc = 0.0f64;
+            for h0 in 0..num_valid {
+                let (c1a, c2a) = index_to_card_pair(valid_hand_indices[h0] as usize);
+                let mask0: u64 = (1u64 << c1a) | (1u64 << c2a);
+                for h1 in 0..num_valid {
+                    if mask0 & ((1u64 << hand_cards[h1 * 2]) | (1u64 << hand_cards[h1 * 2 + 1])) == 0 {
+                        nc += w0[h0] as f64 * w1[h1] as f64;
+                    }
+                }
+            }
+            nc
+        } else {
+            // For N > 2, approximate with pairwise products
+            let w0 = &initial_weights[0];
+            let w1 = if initial_weights.len() > 1 { &initial_weights[1] } else { &initial_weights[0] };
+            let mut nc = 0.0f64;
+            for h0 in 0..num_valid {
+                for h1 in 0..w1.len().min(num_valid) {
+                    if conflict[h0 * num_valid + h1] == 0 {
+                        nc += w0[h0] as f64 * w1[h1] as f64;
+                    }
+                }
+            }
+            nc
+        };
+
         RiverPokerGame {
             hand_ranks,
             valid_hand_indices,
@@ -117,6 +148,7 @@ impl RiverPokerGame {
             sorted_pl_strength,
             sorted_pl_indices,
             hand_cards,
+            num_combinations: nc,
         }
     }
 
@@ -208,7 +240,7 @@ impl GameSpec for RiverPokerGame {
             .map(|p| cfreach[p].as_slice())
             .collect();
 
-        crate::solver::showdown::side_pot_showdown_cfv(
+        let mut cfv = crate::solver::showdown::side_pot_showdown_cfv(
             &opp_reach,
             &self.hand_cards,
             nh,
@@ -221,11 +253,24 @@ impl GameSpec for RiverPokerGame {
             traverser as usize,
             self.num_players,
             tree.starting_pot,
-        )
+        );
+
+        // Normalize CFV by num_combinations (matching external solver convention)
+        let nc = self.num_combinations as f32;
+        if nc > 0.0 {
+            for h in 0..nh {
+                cfv[h] /= nc;
+            }
+        }
+        cfv
     }
 
     fn chance_probability(&self, _outcome: usize, _hand: usize) -> f32 {
         0.0
+    }
+
+    fn num_combinations(&self) -> f64 {
+        self.num_combinations
     }
 }
 

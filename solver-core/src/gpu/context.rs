@@ -521,6 +521,25 @@ impl GpuContext {
         initial_weight: &[f32],
         chance_data: Option<ChanceGpuData>,
     ) -> Result<GpuVectorCfr, DriverError> {
+        self.create_vcfr_solver_normalized(
+            tree, nh, sorted_opp_strength, sorted_opp_indices,
+            sorted_player_strength, sorted_player_indices,
+            hand_cards, initial_weight, chance_data, 1.0)
+    }
+
+    pub fn create_vcfr_solver_normalized(
+        &self,
+        tree: &FlatTree,
+        nh: usize,
+        sorted_opp_strength: &[u16],
+        sorted_opp_indices: &[u16],
+        sorted_player_strength: &[u16],
+        sorted_player_indices: &[u16],
+        hand_cards: &[u8],
+        initial_weight: &[f32],
+        chance_data: Option<ChanceGpuData>,
+        num_combinations: f64,
+    ) -> Result<GpuVectorCfr, DriverError> {
         let np = tree.num_players as usize;
         let nn = tree.num_nodes();
         let num_infosets = tree.num_infosets as usize;
@@ -690,6 +709,7 @@ impl GpuContext {
             d_main_level_nodes,
             main_level_counts,
             starting_pot: tree.starting_pot,
+            num_combinations: num_combinations as f32,
         })
     }
 }
@@ -870,6 +890,7 @@ pub struct GpuVectorCfr {
     d_chance_prob: Option<CudaSlice<f32>>,
     d_chance_child_ids: Option<CudaSlice<u32>>,
     starting_pot: i32,
+    num_combinations: f32,
     d_cfv_accum: Option<CudaSlice<f32>>,
     d_below_chance_level_nodes: Vec<Option<CudaSlice<u32>>>,
     below_chance_level_counts: Vec<i32>,
@@ -1029,7 +1050,8 @@ impl GpuVectorCfr {
                             .arg(&beta_t)
                             .arg(&gamma_t)
                             .arg(&regret_floor)
-                            .arg(&self.starting_pot);
+                            .arg(&self.starting_pot)
+                            .arg(&self.num_combinations);
                         builder.launch(cfg)?;
                     }
                 }
@@ -1109,7 +1131,8 @@ impl GpuVectorCfr {
                         .arg(&beta_t)
                         .arg(&gamma_t)
                         .arg(&regret_floor)
-                        .arg(&self.starting_pot);
+                        .arg(&self.starting_pot)
+                        .arg(&self.num_combinations);
                     builder.launch(cfg)?;
                 }
             }
@@ -1148,7 +1171,8 @@ impl GpuVectorCfr {
                         .arg(&beta_t)
                         .arg(&gamma_t)
                         .arg(&regret_floor)
-                        .arg(&self.starting_pot);
+                        .arg(&self.starting_pot)
+                        .arg(&self.num_combinations);
                     builder.launch(cfg)?;
                 }
             }

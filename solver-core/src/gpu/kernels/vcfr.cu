@@ -214,7 +214,8 @@ extern "C" __global__ void vcfr_bottom_up(
     float beta_t,
     float gamma_t,
     float regret_floor,
-    int32_t starting_pot
+    int32_t starting_pot,
+    float num_combinations
 ) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx >= level_count) return;
@@ -273,6 +274,7 @@ extern "C" __global__ void vcfr_bottom_up(
             } else {
                 for (int h = 0; h < nh; h++) out[h] = 0.0f;
             }
+            if (num_combinations > 0.0f) { for (int h = 0; h < nh; h++) out[h] /= num_combinations; }
             return;
         }
 
@@ -320,6 +322,7 @@ extern "C" __global__ void vcfr_bottom_up(
                 } else {
                     for (int h = 0; h < nh; h++) out[h] = 0.0f;
                 }
+                if (num_combinations > 0.0f) { for (int h = 0; h < nh; h++) out[h] /= num_combinations; }
                 return;
             }
 
@@ -531,6 +534,7 @@ extern "C" __global__ void vcfr_bottom_up(
 
             for (int h = 0; h < nh; h++) out[h] -= ((float)starting_pot / (float)np + (float)c_t);
         }
+        if (num_combinations > 0.0f) { for (int h = 0; h < nh; h++) out[h] /= num_combinations; }
         return;
     }
 
@@ -585,7 +589,7 @@ extern "C" __global__ void vcfr_bottom_up(
             for (int h = 0; h < nh; h++) {
                 uint32_t cidx = offset + a * nh + h;
                 float t_reach = reach[node_reach_base + traverser * nh + h];
-                cum_strategy[cidx] = gamma_t * cum_strategy[cidx] + t_reach * sigma[a * nh + h];
+                cum_strategy[cidx] = gamma_t * cum_strategy[cidx] + sigma[a * nh + h];
             }
         }
     } else {
@@ -637,7 +641,7 @@ extern "C" __global__ void vcfr_update_avg_strategy(
     for (int a = 0; a < na; a++) {
         for (int h = 0; h < nh; h++) {
             float t_reach = reach[node_reach_base + traverser * nh + h];
-            cum[a * nh + h] = gamma_t * cum[a * nh + h] + t_reach * sigma[a * nh + h];
+            cum[a * nh + h] = gamma_t * cum[a * nh + h] + sigma[a * nh + h];
         }
     }
 }

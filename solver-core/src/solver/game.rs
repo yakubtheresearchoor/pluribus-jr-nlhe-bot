@@ -11,6 +11,7 @@ pub trait GameSpec {
         cfreach: &[Vec<f32>],
     ) -> Vec<f32>;
     fn chance_probability(&self, outcome: usize, hand: usize) -> f32;
+    fn num_combinations(&self) -> f64 { 1.0 } // default: no normalization
     fn num_chance_outcomes(&self) -> usize {
         0
     }

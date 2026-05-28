@@ -13,6 +13,7 @@ pub struct ChanceTable {
     pub chance_sorted_indices: Vec<u16>,
     pub initial_weights: Vec<Vec<f32>>,
     pub num_players: u8,
+    pub num_combinations: f64,
 }
 
 impl ChanceTable {
@@ -123,6 +124,25 @@ impl ChanceTable {
             initial_weights.push(w);
         }
 
+        // Compute num_combinations for CFV normalization
+        let nc = if num_players == 2 {
+            let w0 = &initial_weights[0];
+            let w1 = &initial_weights[1];
+            let mut nc = 0.0f64;
+            for h0 in 0..num_valid {
+                let mask0: u64 = (1u64 << hand_cards[h0 * 2]) | (1u64 << hand_cards[h0 * 2 + 1]);
+                for h1 in 0..num_valid {
+                    let mask1: u64 = (1u64 << hand_cards[h1 * 2]) | (1u64 << hand_cards[h1 * 2 + 1]);
+                    if mask0 & mask1 == 0 {
+                        nc += w0[h0] as f64 * w1[h1] as f64;
+                    }
+                }
+            }
+            nc
+        } else {
+            1.0 // Multi-player: use pairwise normalization later
+        };
+
         ChanceTable {
             hand_ranks_base,
             valid_hand_indices,
@@ -135,6 +155,7 @@ impl ChanceTable {
             chance_sorted_indices,
             initial_weights,
             num_players,
+            num_combinations: nc,
         }
     }
 
