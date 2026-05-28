@@ -821,14 +821,14 @@ impl GpuMccfr {
     }
 }
 
-struct DcfrParams {
-    alpha_t: f32,
-    beta_t: f32,
-    gamma_t: f32,
+pub struct DcfrParams {
+    pub alpha_t: f32,
+    pub beta_t: f32,
+    pub gamma_t: f32,
 }
 
 impl DcfrParams {
-    fn new(current_iteration: u32) -> Self {
+    pub fn new(current_iteration: u32) -> Self {
         let nearest_lower_power_of_4 = match current_iteration {
             0 => 0u32,
             x => 1 << ((x.leading_zeros() ^ 31) & !1),
@@ -845,7 +845,7 @@ impl DcfrParams {
     }
 }
 
-fn mark_descendants(tree: &FlatTree, node_idx: usize, below_chance: &mut [bool]) {
+pub fn mark_descendants(tree: &FlatTree, node_idx: usize, below_chance: &mut [bool]) {
     below_chance[node_idx] = true;
     for &child in tree.node_children(node_idx) {
         mark_descendants(tree, child as usize, below_chance);
@@ -1730,5 +1730,55 @@ impl GpuNplayerMccfr {
             }
         }
         Ok(result)
+    }
+}
+
+// === Flop-start GPU data ===
+
+pub struct FlopStartGpuData {
+    pub turn_deck: Vec<u8>,
+    pub river_decks_flat: Vec<u8>,
+    pub turn_chance_prob: Vec<f32>,
+    pub river_chance_prob: Vec<f32>,
+    pub river_sorted_str: Vec<u16>,
+    pub river_sorted_idx: Vec<u16>,
+    pub turn_sorted_str: Vec<u16>,
+    pub turn_sorted_idx: Vec<u16>,
+}
+
+impl FlopStartGpuData {
+    pub fn from_table(table: &crate::solver::flop_start_game::FlopChanceTable) -> Self {
+        let nh = table.num_valid;
+        let turn_deck = table.remaining_deck.clone();
+        let mut river_decks_flat = Vec::with_capacity(turn_deck.len() * 48);
+        for &tc in &turn_deck {
+            river_decks_flat.extend_from_slice(&table.river_decks[tc as usize]);
+        }
+        let mut turn_chance_prob = vec![0.0f32; turn_deck.len() * nh];
+        for (oi, _) in turn_deck.iter().enumerate() {
+            for h in 0..nh {
+                turn_chance_prob[oi * nh + h] = table.chance_probability_turn(oi, h);
+            }
+        }
+        let mut river_chance_prob = vec![0.0f32; turn_deck.len() * 48 * nh];
+        for (ti, &tc) in turn_deck.iter().enumerate() {
+            let n_river = table.river_decks[tc as usize].len();
+            for ri in 0..n_river {
+                for h in 0..nh {
+                    river_chance_prob[(ti * 48 + ri) * nh + h] =
+                        table.chance_probability_river(tc, ri, h);
+                }
+            }
+        }
+        FlopStartGpuData {
+            turn_deck,
+            river_decks_flat,
+            turn_chance_prob,
+            river_chance_prob,
+            river_sorted_str: table.river_sorted_str.clone(),
+            river_sorted_idx: table.river_sorted_idx.clone(),
+            turn_sorted_str: table.turn_sorted_str.clone(),
+            turn_sorted_idx: table.turn_sorted_idx.clone(),
+        }
     }
 }
