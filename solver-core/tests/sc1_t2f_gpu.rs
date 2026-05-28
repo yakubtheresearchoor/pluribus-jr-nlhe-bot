@@ -49,7 +49,7 @@ fn sc1_t2f_gpu_actual() {
     println!("Warmup: 1 iter {:.2}s", warmup);
 
     // Measurement
-    let n = 3u32;
+    let n = 10u32;
     let t1 = std::time::Instant::now();
     solver.run_flop_start(n).expect("run");
     let elapsed = t1.elapsed().as_secs_f64();
@@ -68,8 +68,10 @@ fn sc1_t2f_gpu_actual() {
     } else {
         println!("  VERDICT: GPU flop-start TOO SLOW ({:.0}ms/i)", ms_per_iter);
     }
-    println!("  Serial kernel launches: ~{} per iteration",
-        table.remaining_deck.len() * (table.river_decks[0].len() * 6 + 10));
-    println!("  Next: batched kernel to reduce launch count");
+    println!("  Kernel launches: ~{} per iteration",
+        49 * (6 + 2 + 6 + 2) + 2 + 6);
+    println!("  Comparison: serial=24,486ms, full-batch=2,035ms, per-turn-batch={:.0}ms", ms_per_iter);
+    println!("  Speedup vs serial: {:.0}x", 24486.0 / ms_per_iter);
+    println!("  Speedup vs full-batch: {:.1}x", 2035.0 / ms_per_iter);
     println!("{}", "=".repeat(60));
 }
