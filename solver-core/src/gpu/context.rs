@@ -41,6 +41,9 @@ pub struct GpuContext {
     vcfr_bottom_up_fn: CudaFunction,
     vcfr_chance_accum_fn: CudaFunction,
     vcfr_chance_final_fn: CudaFunction,
+    vcfr_batched_fn: CudaFunction,
+    vcfr_grouped_fn: CudaFunction,
+    vcfr_regret_apply_fn: CudaFunction,
 }
 
 impl GpuContext {
@@ -72,6 +75,9 @@ impl GpuContext {
         let vcfr_bottom_up_fn = vcfr_module.load_function("vcfr_bottom_up")?;
         let vcfr_chance_accum_fn = vcfr_module.load_function("vcfr_chance_accumulate")?;
         let vcfr_chance_final_fn = vcfr_module.load_function("vcfr_chance_finalize")?;
+        let vcfr_batched_fn = vcfr_module.load_function("vcfr_bottom_up_batched")?;
+        let vcfr_grouped_fn = vcfr_module.load_function("vcfr_chance_accumulate_grouped")?;
+        let vcfr_regret_apply_fn = vcfr_module.load_function("vcfr_regret_apply")?;
 
         Ok(GpuContext {
             stream,
@@ -86,6 +92,9 @@ impl GpuContext {
             vcfr_bottom_up_fn,
             vcfr_chance_accum_fn,
             vcfr_chance_final_fn,
+            vcfr_batched_fn,
+            vcfr_grouped_fn,
+            vcfr_regret_apply_fn,
         })
     }
 
@@ -673,6 +682,9 @@ impl GpuContext {
             vcfr_bottom_up_fn: self.vcfr_bottom_up_fn.clone(),
             vcfr_chance_accum_fn,
             vcfr_chance_final_fn,
+            vcfr_batched_fn: self.vcfr_batched_fn.clone(),
+            vcfr_grouped_fn: self.vcfr_grouped_fn.clone(),
+            vcfr_regret_apply_fn: self.vcfr_regret_apply_fn.clone(),
             d_nodes,
             d_children,
             d_contributions,
@@ -854,26 +866,51 @@ pub fn mark_descendants(tree: &FlatTree, node_idx: usize, below_chance: &mut [bo
 }
 
 struct FlopStartData {
-    turn_deck: Vec<u8>,
-    river_decks_flat: Vec<u8>,
-    d_turn_chance_prob: CudaSlice<f32>,
-    d_river_chance_prob: CudaSlice<f32>,
+    // Repacked sorted arrays for batched access (contiguous per outcome)
+    // River sorted: [num_river_outcomes * num_opp * nh]
     d_river_sorted_str: CudaSlice<u16>,
     d_river_sorted_idx: CudaSlice<u16>,
+    // River sorted (player): [num_river_outcomes * nh]
+    d_river_pl_str: CudaSlice<u16>,
+    d_river_pl_idx: CudaSlice<u16>,
+    // Turn sorted: [num_turn_outcomes * num_opp * nh]
     d_turn_sorted_str: CudaSlice<u16>,
     d_turn_sorted_idx: CudaSlice<u16>,
-    d_river_accum: CudaSlice<f32>,
-    d_turn_accum: CudaSlice<f32>,
+    d_turn_pl_str: CudaSlice<u16>,
+    d_turn_pl_idx: CudaSlice<u16>,
+    // Chance probabilities
+    // River: [num_river_outcomes * nh]
+    d_river_chance_prob: CudaSlice<f32>,
+    // Turn: [num_turn_outcomes * nh]
+    d_turn_chance_prob: CudaSlice<f32>,
+    // Outcome-to-group mapping: river outcome → turn card index
+    d_river_outcome_group: CudaSlice<i32>,
+    // Per-turn-card accumulators for river CFV
+    d_river_accum: CudaSlice<f32>, // [num_turn * nn * nh]
+    // Per-outcome CFV batch for river zone
+    d_river_cfv_batch: CudaSlice<f32>, // [num_river_outcomes * nn * nh]
+    // Turn accum
+    d_turn_accum: CudaSlice<f32>, // [nn * nh]
+    // Chance children
     d_river_chance_children: CudaSlice<u32>,
     d_turn_chance_children: CudaSlice<u32>,
     river_cc_count: i32,
     turn_cc_count: i32,
+    // Zone nodes per level
     d_river_zone_nodes: Vec<Option<CudaSlice<u32>>>,
     river_zone_counts: Vec<i32>,
     d_turn_zone_nodes: Vec<Option<CudaSlice<u32>>>,
     turn_zone_counts: Vec<i32>,
     d_flop_zone_nodes: Vec<Option<CudaSlice<u32>>>,
     flop_zone_counts: Vec<i32>,
+    // Counts
+    num_turn_outcomes: i32,
+    num_river_outcomes: i32,  // total across all turn cards
+    river_outcomes_per_turn: Vec<i32>, // how many river outcomes per turn card
+    river_outcome_offset: Vec<i32>,    // cumulative offset for each turn card
+    // Regret accumulator
+    d_regret_accum: CudaSlice<f32>,
+    regret_accum_size: i32,
 }
 
 pub struct GpuVectorCfr {
@@ -883,6 +920,9 @@ pub struct GpuVectorCfr {
     vcfr_bottom_up_fn: CudaFunction,
     vcfr_chance_accum_fn: CudaFunction,
     vcfr_chance_final_fn: CudaFunction,
+    vcfr_batched_fn: CudaFunction,
+    vcfr_grouped_fn: CudaFunction,
+    vcfr_regret_apply_fn: CudaFunction,
     d_nodes: CudaSlice<FlatNode>,
     d_children: CudaSlice<u32>,
     d_contributions: CudaSlice<i32>,
@@ -1808,6 +1848,7 @@ impl FlopStartGpuData {
     }
 }
 // Flop-start constructor and run method — appended to context.rs
+// ─── Batched flop-start GPU solver ──────────────────────────────
 
 impl GpuContext {
     pub fn create_flop_start_vcfr(
@@ -1823,6 +1864,7 @@ impl GpuContext {
         let num_opp = np - 1;
         let infoset_data_size = num_infosets * MAX_NA * nh;
 
+        // ── Standard tree/strategy buffers ──
         let d_nodes = self.stream.clone_htod(&tree.nodes)?;
         let d_children = self.stream.clone_htod(&tree.children)?;
         let d_contributions = self.stream.clone_htod(&tree.contributions)?;
@@ -1851,38 +1893,7 @@ impl GpuContext {
             level_counts.push(tree.level_size(level as u32) as i32);
         }
 
-        // Flop-start data
-        let turn_deck = table.remaining_deck.clone();
-        let mut river_decks_flat = Vec::new();
-        for &tc in &turn_deck {
-            river_decks_flat.extend_from_slice(&table.river_decks[tc as usize]);
-        }
-
-        let n_turn = turn_deck.len();
-        let mut tp = vec![0.0f32; n_turn * nh];
-        for (oi, _) in turn_deck.iter().enumerate() {
-            for h in 0..nh { tp[oi * nh + h] = table.chance_probability_turn(oi, h); }
-        }
-        let mut rp = vec![0.0f32; n_turn * 48 * nh];
-        for (ti, &tc) in turn_deck.iter().enumerate() {
-            let nr = table.river_decks[tc as usize].len();
-            for ri in 0..nr {
-                for h in 0..nh {
-                    rp[(ti * 48 + ri) * nh + h] = table.chance_probability_river(tc, ri, h);
-                }
-            }
-        }
-
-        let d_tcp = self.stream.clone_htod(&tp)?;
-        let d_rcp = self.stream.clone_htod(&rp)?;
-        let d_rss = self.stream.clone_htod(&table.river_sorted_str)?;
-        let d_rsi = self.stream.clone_htod(&table.river_sorted_idx)?;
-        let d_tss = self.stream.clone_htod(&table.turn_sorted_str)?;
-        let d_tsi = self.stream.clone_htod(&table.turn_sorted_idx)?;
-        let d_racc = self.stream.alloc_zeros(nn * nh)?;
-        let d_tacc = self.stream.alloc_zeros(nn * nh)?;
-
-        // Zone splits
+        // ── Zone splits ──
         let mut below_river = vec![false; nn];
         let mut below_turn = vec![false; nn];
         let mut river_cc = Vec::new();
@@ -1930,23 +1941,147 @@ impl GpuContext {
             (rz_v, rzc_v, tz_v, tzc_v, fz_v, fzc_v)
         };
 
+        // ── Repack river sorted arrays (contiguous per outcome) ──
+        let turn_deck = &table.remaining_deck;
+        let n_turn = turn_deck.len();
+
+        // Build flat river outcome list: outcome_id → (turn_idx, river_card)
+        let mut river_outcomes = Vec::new(); // (turn_idx, river_card)
+        let mut river_outcomes_per_turn = Vec::new();
+        let mut river_outcome_offset = vec![0i32; n_turn + 1];
+        for (ti, &tc) in turn_deck.iter().enumerate() {
+            let river_deck = &table.river_decks[tc as usize];
+            river_outcomes_per_turn.push(river_deck.len() as i32);
+            for &rc in river_deck {
+                river_outcomes.push((ti, rc));
+            }
+            river_outcome_offset[ti + 1] = river_outcomes.len() as i32;
+        }
+        let n_river = river_outcomes.len();
+
+        // River sorted arrays: repacked to [n_river * num_opp * nh]
+        let mut rv_opp_str = vec![0u16; n_river * num_opp * nh];
+        let mut rv_opp_idx = vec![0u16; n_river * num_opp * nh];
+        let mut rv_pl_str = vec![0u16; n_river * nh];
+        let mut rv_pl_idx = vec![0u16; n_river * nh];
+
+        for (oi, &(ti, rc)) in river_outcomes.iter().enumerate() {
+            let tc = turn_deck[ti];
+            let src_off = tc as usize * 52 * num_opp * nh + rc as usize * num_opp * nh;
+            let dst_off_opp = oi * num_opp * nh;
+            let dst_off_pl = oi * nh;
+            // For 2-player, opp and pl sorted arrays are the same (from table)
+            let src_base = tc as usize * 52 * num_opp * nh + rc as usize * num_opp * nh;
+            rv_opp_str[dst_off_opp..dst_off_opp + num_opp * nh]
+                .copy_from_slice(&table.river_sorted_str[src_base..src_base + num_opp * nh]);
+            rv_opp_idx[dst_off_opp..dst_off_opp + num_opp * nh]
+                .copy_from_slice(&table.river_sorted_idx[src_base..src_base + num_opp * nh]);
+            // Player sorted = first opponent's sorted (for 2-player, same array)
+            rv_pl_str[dst_off_pl..dst_off_pl + nh]
+                .copy_from_slice(&table.river_sorted_str[src_base..src_base + nh]);
+            rv_pl_idx[dst_off_pl..dst_off_pl + nh]
+                .copy_from_slice(&table.river_sorted_idx[src_base..src_base + nh]);
+        }
+
+        // River chance probs: [n_river * nh]
+        let mut rv_prob = vec![0.0f32; n_river * nh];
+        for (oi, &(ti, rc)) in river_outcomes.iter().enumerate() {
+            let tc = turn_deck[ti];
+            for h in 0..nh {
+                // Find the river outcome index within this turn card
+                let river_deck = &table.river_decks[tc as usize];
+                let ri = river_deck.iter().position(|&c| c == rc).unwrap();
+                rv_prob[oi * nh + h] = table.chance_probability_river(tc, ri, h);
+            }
+        }
+
+        // Outcome-to-group: river outcome → turn card index
+        let mut rv_group = vec![0i32; n_river];
+        for (oi, &(ti, _)) in river_outcomes.iter().enumerate() {
+            rv_group[oi] = ti as i32;
+        }
+
+        let d_rv_opp_str = self.stream.clone_htod(&rv_opp_str)?;
+        let d_rv_opp_idx = self.stream.clone_htod(&rv_opp_idx)?;
+        let d_rv_pl_str = self.stream.clone_htod(&rv_pl_str)?;
+        let d_rv_pl_idx = self.stream.clone_htod(&rv_pl_idx)?;
+        let d_rv_prob = self.stream.clone_htod(&rv_prob)?;
+        let d_rv_group = self.stream.clone_htod(&rv_group)?;
+        let d_rv_accum = self.stream.alloc_zeros(n_turn * nn * nh)?;
+        let d_rv_cfv_batch = self.stream.alloc_zeros(n_river * nn * nh)?;
+
+        // ── Turn sorted arrays: repacked to [n_turn * num_opp * nh] ──
+        let mut tn_opp_str = vec![0u16; n_turn * num_opp * nh];
+        let mut tn_opp_idx = vec![0u16; n_turn * num_opp * nh];
+        let mut tn_pl_str = vec![0u16; n_turn * nh];
+        let mut tn_pl_idx = vec![0u16; n_turn * nh];
+
+        for (ti, &tc) in turn_deck.iter().enumerate() {
+            let src_off = tc as usize * num_opp * nh;
+            let dst_off_opp = ti * num_opp * nh;
+            let dst_off_pl = ti * nh;
+            tn_opp_str[dst_off_opp..dst_off_opp + num_opp * nh]
+                .copy_from_slice(&table.turn_sorted_str[src_off..src_off + num_opp * nh]);
+            tn_opp_idx[dst_off_opp..dst_off_opp + num_opp * nh]
+                .copy_from_slice(&table.turn_sorted_idx[src_off..src_off + num_opp * nh]);
+            tn_pl_str[dst_off_pl..dst_off_pl + nh]
+                .copy_from_slice(&table.turn_sorted_str[src_off..src_off + nh]);
+            tn_pl_idx[dst_off_pl..dst_off_pl + nh]
+                .copy_from_slice(&table.turn_sorted_idx[src_off..src_off + nh]);
+        }
+
+        // Turn chance probs: [n_turn * nh]
+        let mut tn_prob = vec![0.0f32; n_turn * nh];
+        for (ti, _) in turn_deck.iter().enumerate() {
+            for h in 0..nh {
+                tn_prob[ti * nh + h] = table.chance_probability_turn(ti, h);
+            }
+        }
+
+        let d_tn_opp_str = self.stream.clone_htod(&tn_opp_str)?;
+        let d_tn_opp_idx = self.stream.clone_htod(&tn_opp_idx)?;
+        let d_tn_pl_str = self.stream.clone_htod(&tn_pl_str)?;
+        let d_tn_pl_idx = self.stream.clone_htod(&tn_pl_idx)?;
+        let d_tn_prob = self.stream.clone_htod(&tn_prob)?;
+        let d_tn_accum = self.stream.alloc_zeros(nn * nh)?;
+
+        // Regret accumulator
+        let d_regret_accum = self.stream.alloc_zeros(infoset_data_size)?;
+
         let fs = Box::new(FlopStartData {
-            turn_deck, river_decks_flat,
-            d_turn_chance_prob: d_tcp, d_river_chance_prob: d_rcp,
-            d_river_sorted_str: d_rss, d_river_sorted_idx: d_rsi,
-            d_turn_sorted_str: d_tss, d_turn_sorted_idx: d_tsi,
-            d_river_accum: d_racc, d_turn_accum: d_tacc,
-            d_river_chance_children: d_rcc, d_turn_chance_children: d_tcc,
-            river_cc_count: river_cc.len() as i32, turn_cc_count: turn_cc.len() as i32,
+            d_river_sorted_str: d_rv_opp_str,
+            d_river_sorted_idx: d_rv_opp_idx,
+            d_river_pl_str: d_rv_pl_str,
+            d_river_pl_idx: d_rv_pl_idx,
+            d_turn_sorted_str: d_tn_opp_str,
+            d_turn_sorted_idx: d_tn_opp_idx,
+            d_turn_pl_str: d_tn_pl_str,
+            d_turn_pl_idx: d_tn_pl_idx,
+            d_river_chance_prob: d_rv_prob,
+            d_turn_chance_prob: d_tn_prob,
+            d_river_outcome_group: d_rv_group,
+            d_river_accum: d_rv_accum,
+            d_river_cfv_batch: d_rv_cfv_batch,
+            d_turn_accum: d_tn_accum,
+            d_river_chance_children: d_rcc,
+            d_turn_chance_children: d_tcc,
+            river_cc_count: river_cc.len() as i32,
+            turn_cc_count: turn_cc.len() as i32,
             d_river_zone_nodes: d_rz, river_zone_counts: rzc,
             d_turn_zone_nodes: d_tz, turn_zone_counts: tzc,
             d_flop_zone_nodes: d_fz, flop_zone_counts: fzc,
+            num_turn_outcomes: n_turn as i32,
+            num_river_outcomes: n_river as i32,
+            river_outcomes_per_turn: river_outcomes_per_turn.clone(),
+            river_outcome_offset: river_outcome_offset,
+            d_regret_accum: d_regret_accum,
+            regret_accum_size: infoset_data_size as i32,
         });
 
-        // Placeholder chance buffers (unused but required by struct)
+        // Placeholder chance buffers
         let e_u16: CudaSlice<u16> = self.stream.alloc_zeros(1)?;
-        let e_u32: CudaSlice<u32> = self.stream.alloc_zeros(1)?;
         let e_f32: CudaSlice<f32> = self.stream.alloc_zeros(1)?;
+        let e_u32: CudaSlice<u32> = self.stream.alloc_zeros(1)?;
         let mut d_bc = Vec::new(); let mut bc_c = Vec::new();
         let mut d_mn = Vec::new(); let mut mn_c = Vec::new();
         for _ in 0..=max_depth { d_bc.push(None); bc_c.push(0); d_mn.push(None); mn_c.push(0); }
@@ -1958,6 +2093,9 @@ impl GpuContext {
             vcfr_bottom_up_fn: self.vcfr_bottom_up_fn.clone(),
             vcfr_chance_accum_fn: self.vcfr_chance_accum_fn.clone(),
             vcfr_chance_final_fn: self.vcfr_chance_final_fn.clone(),
+            vcfr_batched_fn: self.vcfr_batched_fn.clone(),
+            vcfr_grouped_fn: self.vcfr_grouped_fn.clone(),
+            vcfr_regret_apply_fn: self.vcfr_regret_apply_fn.clone(),
             d_nodes, d_children, d_contributions, d_folded_masks,
             d_infoset_offsets, d_decision_node_ids,
             d_regrets, d_strategy, d_cum_strategy, d_reach, d_cfv, d_initial_weight,
@@ -1982,12 +2120,17 @@ impl GpuContext {
 }
 
 impl GpuVectorCfr {
+    /// Run VCFR iterations on a flop-start tree using batched kernels.
     pub fn run_flop_start(&mut self, num_iterations: u32) -> Result<(), DriverError> {
         let np = self.num_players as usize;
         let nh = self.num_hands;
         let ni = self.num_infosets as i32;
         let nh_i32 = nh as i32;
         let np_u32 = np as u32;
+        let nn = {
+            // Get nn from cfv buffer size
+            self.d_cfv.len() / nh
+        };
 
         for _ in 0..num_iterations {
             let params = DcfrParams::new(self.iteration);
@@ -1996,152 +2139,230 @@ impl GpuVectorCfr {
                 self.launch_compute_strategies(ni, nh_i32)?;
                 self.launch_init_reach(np, nh)?;
                 self.launch_top_down(nh_i32, np_u32)?;
-                self.launch_bottom_up_flop(traverser as u32,
-                    params.alpha_t, params.beta_t, params.gamma_t, nh_i32, np_u32)?;
+                self.launch_flop_start_bottom_up(
+                    traverser as u32, nn,
+                    params.alpha_t, params.beta_t, params.gamma_t, nh_i32, np_u32,
+                )?;
             }
         }
         self.stream.synchronize()?;
         Ok(())
     }
 
-    fn launch_bottom_up_flop(
-        &mut self, traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
+    fn launch_flop_start_bottom_up(
+        &mut self, traverser: u32, nn: usize,
+        alpha_t: f32, beta_t: f32, gamma_t: f32,
         nh: i32, np: u32,
     ) -> Result<(), DriverError> {
-        let fs = self.flop_start.as_mut().expect("flop_start");
+        let fs = self.flop_start.as_mut().expect("flop_start data");
         let nh_usize = nh as usize;
-        let num_opp = (np - 1) as usize;
-        let block: u32 = 1;
+        let nn_usize = nn;
+        let num_opp = (np - 1) as i32;
         let regret_floor = self.regret_floor;
+        let cfv_batch_stride = (nn_usize * nh_usize) as i32;
+        let sorted_opp_stride = (num_opp as usize * nh_usize) as i32;
+        let sorted_pl_stride = nh;
+
+        // ════════════════════════════════════════
+        // Phase 1: River zone (all 2352 outcomes)
+        // ════════════════════════════════════════
+
+        // Zero accumulators
+        self.stream.memset_zeros(&mut fs.d_river_accum)?;
+        self.stream.memset_zeros(&mut fs.d_river_cfv_batch)?;
+        self.stream.memset_zeros(&mut fs.d_regret_accum)?;
+
+        // Bottom-up for each level in river zone (batched)
+        for level in (0..=self.max_depth).rev() {
+            let count = fs.river_zone_counts[level];
+            if count == 0 { continue; }
+
+            let num_outcomes = fs.num_river_outcomes;
+            let grid = (num_outcomes * count) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (1u32, 1, 1), shared_mem_bytes: 0 };
+            let ln = fs.d_river_zone_nodes[level].as_ref().unwrap();
+
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_batched_fn);
+                b.arg(ln).arg(&count).arg(&num_outcomes)
+                    .arg(&cfv_batch_stride).arg(&sorted_opp_stride)
+                    .arg(&self.d_nodes).arg(&self.d_children)
+                    .arg(&self.d_contributions).arg(&self.d_folded_masks)
+                    .arg(&self.d_strategy).arg(&self.d_infoset_offsets)
+                    .arg(&self.d_reach)
+                    .arg(&fs.d_river_cfv_batch)  // cfv batch
+                    .arg(&self.d_regrets)
+                    .arg(&fs.d_regret_accum)     // regret accum
+                    .arg(&self.d_cum_strategy)
+                    .arg(&self.d_initial_weight)
+                    .arg(&fs.d_river_sorted_str)
+                    .arg(&fs.d_river_sorted_idx)
+                    .arg(&fs.d_river_pl_str)
+                    .arg(&fs.d_river_pl_idx)
+                    .arg(&self.d_hand_cards)
+                    .arg(&np).arg(&nh).arg(&traverser)
+                    .arg(&alpha_t).arg(&beta_t).arg(&gamma_t)
+                    .arg(&regret_floor)
+                    .arg(&self.starting_pot).arg(&self.num_combinations);
+                b.launch(cfg)?;
+            }
+        }
+
+        // Grouped accumulation: river outcomes → per-turn-card accumulators
+        {
+            let total = fs.num_river_outcomes as usize * fs.river_cc_count as usize * nh_usize;
+            let grid = ((total + 255) / 256) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
+            let nn_i32 = nn_usize as i32;
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_grouped_fn);
+                b.arg(&fs.d_river_accum)      // accum: [n_turn * nn * nh]
+                    .arg(&fs.d_river_cfv_batch) // batch: [n_river * nn * nh]
+                    .arg(&fs.d_river_chance_prob) // prob: [n_river * nh]
+                    .arg(&fs.d_river_chance_children)
+                    .arg(&fs.d_river_outcome_group)
+                    .arg(&fs.num_river_outcomes)
+                    .arg(&fs.river_cc_count)
+                    .arg(&nn_i32)
+                    .arg(&nh);
+                b.launch(cfg)?;
+            }
+        }
+
+        // Apply regret discount (from river zone traverser nodes)
+        {
+            let total = fs.regret_accum_size as usize;
+            let grid = ((total + 255) / 256) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_regret_apply_fn);
+                b.arg(&self.d_regrets).arg(&fs.d_regret_accum)
+                    .arg(&fs.regret_accum_size)
+                    .arg(&alpha_t).arg(&beta_t).arg(&regret_floor);
+                b.launch(cfg)?;
+            }
+        }
+
+        // Finalize river: the river accum IS the turn CFV batch — same layout, same buffer
+        // No copy needed. d_turn_cfv_batch was already set to d_river_accum.
+        // (We allocated them as separate buffers for clarity but they contain the same data
+        //  after the grouped accumulation writes to d_river_accum.)
+        // Actually, we DO need to copy because they're separate allocations.
+        // Use a simple kernel copy instead of stream.copy.
+        // Better: just reuse d_river_accum directly as d_turn_cfv_batch.
+        // For now, let the turn zone read from d_river_accum instead of d_turn_cfv_batch.
+
+        // ════════════════════════════════════════
+        // Phase 2: Turn zone (49 outcomes)
+        // ════════════════════════════════════════
 
         self.stream.memset_zeros(&mut fs.d_turn_accum)?;
-        let n_rpt = if fs.turn_deck.is_empty() { 0 } else { fs.river_decks_flat.len() / fs.turn_deck.len() };
+        self.stream.memset_zeros(&mut fs.d_regret_accum)?;
 
-        for (ti, &tc) in fs.turn_deck.iter().enumerate() {
-            self.stream.memset_zeros(&mut fs.d_river_accum)?;
+        // Bottom-up for each level in turn zone (batched with 49 outcomes)
+        for level in (0..=self.max_depth).rev() {
+            let count = fs.turn_zone_counts[level];
+            if count == 0 { continue; }
 
-            for ri in 0..n_rpt {
-                let rc = fs.river_decks_flat[ti * n_rpt + ri];
-                let r_off = tc as usize * 52 * num_opp * nh_usize + rc as usize * num_opp * nh_usize;
-                let os = fs.d_river_sorted_str.slice(r_off..r_off + num_opp * nh_usize);
-                let oi = fs.d_river_sorted_idx.slice(r_off..r_off + num_opp * nh_usize);
-                let ps = fs.d_river_sorted_str.slice(r_off..r_off + nh_usize);
-                let pi = fs.d_river_sorted_idx.slice(r_off..r_off + nh_usize);
+            let num_outcomes = fs.num_turn_outcomes;
+            let grid = (num_outcomes * count) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (1u32, 1, 1), shared_mem_bytes: 0 };
+            let ln = fs.d_turn_zone_nodes[level].as_ref().unwrap();
 
-                for level in (0..=self.max_depth).rev() {
-                    let count = fs.river_zone_counts[level];
-                    if count == 0 { continue; }
-                    let grid = count as u32;
-                    let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
-                    let ln = fs.d_river_zone_nodes[level].as_ref().unwrap();
-                    unsafe {
-                        let mut b = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
-                        b.arg(ln).arg(&count)
-                            .arg(&self.d_nodes).arg(&self.d_children)
-                            .arg(&self.d_contributions).arg(&self.d_folded_masks)
-                            .arg(&self.d_strategy).arg(&self.d_infoset_offsets)
-                            .arg(&self.d_reach).arg(&self.d_cfv)
-                            .arg(&self.d_regrets).arg(&self.d_cum_strategy)
-                            .arg(&self.d_initial_weight)
-                            .arg(&os).arg(&oi).arg(&ps).arg(&pi)
-                            .arg(&self.d_hand_cards)
-                            .arg(&np).arg(&nh).arg(&traverser)
-                            .arg(&alpha_t).arg(&beta_t).arg(&gamma_t)
-                            .arg(&regret_floor)
-                            .arg(&self.starting_pot).arg(&self.num_combinations);
-                        b.launch(cfg)?;
-                    }
-                }
-                // Accumulate
-                let p_off = (ti * 48 + ri) * nh_usize;
-                let pv = fs.d_river_chance_prob.slice(p_off..p_off + nh_usize);
-                let total = fs.river_cc_count * nh;
-                let grid = ((total + 255) / 256) as u32;
-                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
-                let z: i32 = 0;
-                unsafe {
-                    let mut b = self.stream.launch_builder(&self.vcfr_chance_accum_fn);
-                    b.arg(&fs.d_river_accum).arg(&self.d_cfv).arg(&pv)
-                        .arg(&fs.d_river_chance_children).arg(&fs.river_cc_count).arg(&nh).arg(&z);
-                    b.launch(cfg)?;
-                }
-            }
-            // Finalize river
-            { let total = fs.river_cc_count * nh;
-              let grid = ((total + 255) / 256) as u32;
-              let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
-              unsafe {
-                  let mut b = self.stream.launch_builder(&self.vcfr_chance_final_fn);
-                  b.arg(&self.d_cfv).arg(&fs.d_river_accum)
-                      .arg(&fs.d_river_chance_children).arg(&fs.river_cc_count).arg(&nh);
-                  b.launch(cfg)?;
-              }
-            }
-
-            // Turn zone
-            let t_off = tc as usize * num_opp * nh_usize;
-            let tos = fs.d_turn_sorted_str.slice(t_off..t_off + num_opp * nh_usize);
-            let toi = fs.d_turn_sorted_idx.slice(t_off..t_off + num_opp * nh_usize);
-            let tps = fs.d_turn_sorted_str.slice(t_off..t_off + nh_usize);
-            let tpi = fs.d_turn_sorted_idx.slice(t_off..t_off + nh_usize);
-
-            for level in (0..=self.max_depth).rev() {
-                let count = fs.turn_zone_counts[level];
-                if count == 0 { continue; }
-                let grid = count as u32;
-                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
-                let ln = fs.d_turn_zone_nodes[level].as_ref().unwrap();
-                unsafe {
-                    let mut b = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
-                    b.arg(ln).arg(&count)
-                        .arg(&self.d_nodes).arg(&self.d_children)
-                        .arg(&self.d_contributions).arg(&self.d_folded_masks)
-                        .arg(&self.d_strategy).arg(&self.d_infoset_offsets)
-                        .arg(&self.d_reach).arg(&self.d_cfv)
-                        .arg(&self.d_regrets).arg(&self.d_cum_strategy)
-                        .arg(&self.d_initial_weight)
-                        .arg(&tos).arg(&toi).arg(&tps).arg(&tpi)
-                        .arg(&self.d_hand_cards)
-                        .arg(&np).arg(&nh).arg(&traverser)
-                        .arg(&alpha_t).arg(&beta_t).arg(&gamma_t)
-                        .arg(&regret_floor)
-                        .arg(&self.starting_pot).arg(&self.num_combinations);
-                    b.launch(cfg)?;
-                }
-            }
-            // Accumulate turn
-            { let p_off = ti * nh_usize;
-              let pv = fs.d_turn_chance_prob.slice(p_off..p_off + nh_usize);
-              let total = fs.turn_cc_count * nh;
-              let grid = ((total + 255) / 256) as u32;
-              let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
-              let z: i32 = 0;
-              unsafe {
-                  let mut b = self.stream.launch_builder(&self.vcfr_chance_accum_fn);
-                  b.arg(&fs.d_turn_accum).arg(&self.d_cfv).arg(&pv)
-                      .arg(&fs.d_turn_chance_children).arg(&fs.turn_cc_count).arg(&nh).arg(&z);
-                  b.launch(cfg)?;
-              }
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_batched_fn);
+                b.arg(ln).arg(&count).arg(&num_outcomes)
+                    .arg(&cfv_batch_stride).arg(&sorted_opp_stride)
+                    .arg(&self.d_nodes).arg(&self.d_children)
+                    .arg(&self.d_contributions).arg(&self.d_folded_masks)
+                    .arg(&self.d_strategy).arg(&self.d_infoset_offsets)
+                    .arg(&self.d_reach)
+                    .arg(&fs.d_river_accum)   // reuse river accum as turn CFV batch
+                    .arg(&self.d_regrets)
+                    .arg(&fs.d_regret_accum)
+                    .arg(&self.d_cum_strategy)
+                    .arg(&self.d_initial_weight)
+                    .arg(&fs.d_turn_sorted_str)
+                    .arg(&fs.d_turn_sorted_idx)
+                    .arg(&fs.d_turn_pl_str)
+                    .arg(&fs.d_turn_pl_idx)
+                    .arg(&self.d_hand_cards)
+                    .arg(&np).arg(&nh).arg(&traverser)
+                    .arg(&alpha_t).arg(&beta_t).arg(&gamma_t)
+                    .arg(&regret_floor)
+                    .arg(&self.starting_pot).arg(&self.num_combinations);
+                b.launch(cfg)?;
             }
         }
-        // Finalize turn
-        { let total = fs.turn_cc_count * nh;
-          let grid = ((total + 255) / 256) as u32;
-          let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
-          unsafe {
-              let mut b = self.stream.launch_builder(&self.vcfr_chance_final_fn);
-              b.arg(&self.d_cfv).arg(&fs.d_turn_accum)
-                  .arg(&fs.d_turn_chance_children).arg(&fs.turn_cc_count).arg(&nh);
-              b.launch(cfg)?;
-          }
+
+        // Accumulate turn outcomes into single accumulator
+        {
+            let total = fs.num_turn_outcomes as usize * fs.turn_cc_count as usize * nh_usize;
+            let grid = ((total + 255) / 256) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
+            let nn_i32 = nn_usize as i32;
+
+            // Build a trivial outcome_to_group (all zeros — accumulate into one group)
+            // We can reuse the single-accum chance_accumulate kernel
+            // Actually, let's just use a simple accumulation: each outcome contributes prob * cfv
+            // Use the grouped kernel with group=0 for all outcomes
+            let ones_group = vec![0i32; fs.num_turn_outcomes as usize];
+            let d_ones_group = self.stream.clone_htod(&ones_group)?;
+
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_grouped_fn);
+                b.arg(&fs.d_turn_accum)        // accum: [nn * nh] (group 0)
+                    .arg(&fs.d_river_accum)  // reuse river accum (same data)
+                    .arg(&fs.d_turn_chance_prob) // prob: [n_turn * nh]
+                    .arg(&fs.d_turn_chance_children)
+                    .arg(&d_ones_group)
+                    .arg(&fs.num_turn_outcomes)
+                    .arg(&fs.turn_cc_count)
+                    .arg(&nn_i32)
+                    .arg(&nh);
+                b.launch(cfg)?;
+            }
         }
 
-        // Flop zone
+        // Apply regret discount (from turn zone)
+        {
+            let total = fs.regret_accum_size as usize;
+            let grid = ((total + 255) / 256) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_regret_apply_fn);
+                b.arg(&self.d_regrets).arg(&fs.d_regret_accum)
+                    .arg(&fs.regret_accum_size)
+                    .arg(&alpha_t).arg(&beta_t).arg(&regret_floor);
+                b.launch(cfg)?;
+            }
+        }
+
+        // Finalize turn: copy accumulated CFV into main cfv buffer
+        {
+            let total = fs.turn_cc_count as usize * nh_usize;
+            let grid = ((total + 255) / 256) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_chance_final_fn);
+                b.arg(&self.d_cfv).arg(&fs.d_turn_accum)
+                    .arg(&fs.d_turn_chance_children)
+                    .arg(&fs.turn_cc_count).arg(&nh);
+                b.launch(cfg)?;
+            }
+        }
+
+        // ════════════════════════════════════════
+        // Phase 3: Flop zone (single outcome)
+        // ════════════════════════════════════════
+
+        self.stream.memset_zeros(&mut fs.d_regret_accum)?;
+
         for level in (0..=self.max_depth).rev() {
             let count = fs.flop_zone_counts[level];
             if count == 0 { continue; }
             let grid = count as u32;
-            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (1u32, 1, 1), shared_mem_bytes: 0 };
             let ln = fs.d_flop_zone_nodes[level].as_ref().unwrap();
             unsafe {
                 let mut b = self.stream.launch_builder(&self.vcfr_bottom_up_fn);
@@ -2162,6 +2383,21 @@ impl GpuVectorCfr {
                 b.launch(cfg)?;
             }
         }
+
+        // Final regret apply (flop zone)
+        {
+            let total = fs.regret_accum_size as usize;
+            let grid = ((total + 255) / 256) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_regret_apply_fn);
+                b.arg(&self.d_regrets).arg(&fs.d_regret_accum)
+                    .arg(&fs.regret_accum_size)
+                    .arg(&alpha_t).arg(&beta_t).arg(&regret_floor);
+                b.launch(cfg)?;
+            }
+        }
+
         Ok(())
     }
 }
