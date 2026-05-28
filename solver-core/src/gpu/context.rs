@@ -44,6 +44,7 @@ pub struct GpuContext {
     vcfr_batched_fn: CudaFunction,
     vcfr_grouped_fn: CudaFunction,
     vcfr_regret_apply_fn: CudaFunction,
+    vcfr_cum_apply_fn: CudaFunction,
 }
 
 impl GpuContext {
@@ -78,6 +79,7 @@ impl GpuContext {
         let vcfr_batched_fn = vcfr_module.load_function("vcfr_bottom_up_batched")?;
         let vcfr_grouped_fn = vcfr_module.load_function("vcfr_chance_accumulate_grouped")?;
         let vcfr_regret_apply_fn = vcfr_module.load_function("vcfr_regret_apply")?;
+        let vcfr_cum_apply_fn = vcfr_module.load_function("vcfr_cum_apply")?;
 
         Ok(GpuContext {
             stream,
@@ -95,6 +97,7 @@ impl GpuContext {
             vcfr_batched_fn,
             vcfr_grouped_fn,
             vcfr_regret_apply_fn,
+            vcfr_cum_apply_fn,
         })
     }
 
@@ -685,6 +688,7 @@ impl GpuContext {
             vcfr_batched_fn: self.vcfr_batched_fn.clone(),
             vcfr_grouped_fn: self.vcfr_grouped_fn.clone(),
             vcfr_regret_apply_fn: self.vcfr_regret_apply_fn.clone(),
+            vcfr_cum_apply_fn: self.vcfr_cum_apply_fn.clone(),
             d_nodes,
             d_children,
             d_contributions,
@@ -908,6 +912,7 @@ struct FlopStartData {
     d_regret_accum: CudaSlice<f32>,
     regret_accum_size: i32,
     max_river: i32,
+    d_cum_accum: CudaSlice<f32>,
 }
 
 pub struct GpuVectorCfr {
@@ -920,6 +925,7 @@ pub struct GpuVectorCfr {
     vcfr_batched_fn: CudaFunction,
     vcfr_grouped_fn: CudaFunction,
     vcfr_regret_apply_fn: CudaFunction,
+    vcfr_cum_apply_fn: CudaFunction,
     d_nodes: CudaSlice<FlatNode>,
     d_children: CudaSlice<u32>,
     d_contributions: CudaSlice<i32>,
@@ -2032,6 +2038,7 @@ impl GpuContext {
 
         // Regret accumulator
         let d_regret_accum = self.stream.alloc_zeros(infoset_data_size)?;
+        let d_cum_accum = self.stream.alloc_zeros(infoset_data_size)?;
 
         let fs = Box::new(FlopStartData {
             d_river_sorted_str: d_rv_opp_str,
@@ -2060,6 +2067,7 @@ impl GpuContext {
             river_outcomes_per_turn: river_counts,
             river_outcome_offset: vec![],
             d_regret_accum: d_regret_accum,
+            d_cum_accum: d_cum_accum,
             regret_accum_size: infoset_data_size as i32,
             max_river: max_river as i32,
         });
@@ -2081,6 +2089,7 @@ impl GpuContext {
             vcfr_batched_fn: self.vcfr_batched_fn.clone(),
             vcfr_grouped_fn: self.vcfr_grouped_fn.clone(),
             vcfr_regret_apply_fn: self.vcfr_regret_apply_fn.clone(),
+            vcfr_cum_apply_fn: self.vcfr_cum_apply_fn.clone(),
             d_nodes, d_children, d_contributions, d_folded_masks,
             d_infoset_offsets, d_decision_node_ids,
             d_regrets, d_strategy, d_cum_strategy, d_reach, d_cfv, d_initial_weight,
@@ -2152,13 +2161,16 @@ impl GpuVectorCfr {
         // Clear turn CFV batch (accumulates per-turn-card results)
         self.stream.memset_zeros(&mut fs.d_turn_cfv_batch)?;
 
+        // Clear accumulators ONCE (accumulate across all turn cards)
+        self.stream.memset_zeros(&mut fs.d_regret_accum)?;
+        self.stream.memset_zeros(&mut fs.d_cum_accum)?;
+
         for ti in 0..n_turn {
             let n_river = fs.river_outcomes_per_turn[ti] as i32;
 
             // Zero river CFV batch and accumulator for this turn card
             self.stream.memset_zeros(&mut fs.d_river_cfv_batch)?;
             self.stream.memset_zeros(&mut fs.d_river_accum)?;
-            self.stream.memset_zeros(&mut fs.d_regret_accum)?;
 
             // Sorted array offsets for this turn card's river outcomes
             let rv_sos_offset = ti * max_river * num_opp as usize * nh_usize;
@@ -2198,10 +2210,12 @@ impl GpuVectorCfr {
                         .arg(&self.d_regrets)
                         .arg(&fs.d_regret_accum)
                         .arg(&self.d_cum_strategy)
+                        .arg(&fs.d_cum_accum)
                         .arg(&self.d_initial_weight)
                         .arg(&rv_opp_str).arg(&rv_opp_idx)
                         .arg(&rv_pl_str).arg(&rv_pl_idx)
                         .arg(&self.d_hand_cards)
+                        .arg(&rv_prob)  // chance_prob for river outcomes
                         .arg(&np).arg(&nh).arg(&traverser)
                         .arg(&alpha_t).arg(&beta_t).arg(&gamma_t)
                         .arg(&regret_floor)
@@ -2257,86 +2271,12 @@ impl GpuVectorCfr {
                 // Simplest correct approach: finalize into a view of turn_cfv_batch
                 // Unfortunately cudarc doesn't let us offset CudaSlice easily.
                 // Use the chance_finalize on the main cfv, then copy the relevant portion.
-                // This is wasteful but correct.
-
+                // Finalize river into main CFV
                 unsafe {
                     let mut b = self.stream.launch_builder(&self.vcfr_chance_final_fn);
                     b.arg(&self.d_cfv).arg(&fs.d_river_accum)
                         .arg(&fs.d_river_chance_children)
                         .arg(&fs.river_cc_count).arg(&nh);
-                    b.launch(cfg)?;
-                }
-
-                // Now copy the chance children's CFV from self.d_cfv to turn_cfv_batch
-                // The chance_finalize wrote cfv[child*nh+h] for each river chance child.
-                // We need turn_cfv_batch[ti*nn*nh+child*nh+h] = cfv[child*nh+h]
-                // This is a gather operation. Use the chance_accumulate with prob=1.0 on the turn CFV batch.
-
-                // Actually, we can use a different approach: just launch the chance_accumulate
-                // kernel with the turn_cfv_batch as accumulator and probability=1.0 for each child.
-                // But that adds to the accumulator, and we need to set it.
-
-                // OK, let me just use the turn zone's CFV batch directly:
-                // After finalizing river into self.d_cfv, the chance children have their CFV set.
-                // We need these values in turn_cfv_batch at offset ti*nn*nh.
-                // For the turn zone bottom_up, the kernel reads cfv_o = cfv + outcome * cfv_batch_stride.
-                // So turn_cfv_batch[ti * nn * nh + child * nh + h] should have the river-finalized CFV.
-
-                // Since self.d_cfv now has the river-finalized values at the chance children,
-                // and the turn zone will read from turn_cfv_batch[ti * nn * nh + ...],
-                // we need to copy d_cfv to the right offset in turn_cfv_batch.
-
-                // Use the chance_accumulate kernel as a copy:
-                // turn_accum[ti*nn*nh + child*nh + h] += 1.0 * cfv[child*nh+h]
-                // But we need to ADD, not SET. So first memset the turn_cfv_batch portion to 0.
-                // Actually, turn_cfv_batch was already memset to 0 at the start.
-
-                // Hmm, but we already memset it to 0 for ALL turn cards. We need to write
-                // just this turn card's portion. We can't easily memset a portion.
-
-                // OK, simplest approach: use the chance_accum kernel with turn_cfv_batch
-                // as the accumulator, prob=1.0, outcome=ti.
-                // But the chance_accum kernel uses outcome*nh as prob offset, not turn_cfv_batch offset.
-
-                // Let me think differently. The turn zone batched kernel reads from
-                // turn_cfv_batch[outcome * nn * nh + child * nh + h].
-                // For each turn card ti, the children's CFV should be the river-finalized value.
-                // I can use the chance_accum kernel: memset the entire turn_cfv_batch to 0,
-                // then for each turn card, add the river-finalized CFV into the right slot.
-
-                // The chance_accum kernel does: accum[child*nh+h] += prob[outcome*nh+h] * cfv[child*nh+h]
-                // If I use turn_cfv_batch as accum and d_cfv as cfv, with outcome=ti and prob=ones:
-                // turn_cfv_batch[child*nh+h] += 1.0 * cfv[child*nh+h]
-                // But this writes to turn_cfv_batch[child*nh+h], not turn_cfv_batch[ti*nn*nh+child*nh+h].
-
-                // I need a different kernel for this. Or I can restructure the data layout.
-
-                // SIMPLEST FIX: Don't use a turn CFV batch at all.
-                // Instead, for each turn card, after finalizing river into d_cfv,
-                // run the turn zone bottom-up with the SINGLE-outcome kernel (original vcfr_bottom_up).
-                // This processes one turn card at a time for the turn zone.
-                // Then accumulate the turn zone result.
-                // Total extra launches: 49 × ~6 levels = ~294 launches.
-                // Still way better than the original 14,600.
-
-                // Actually, let me reconsider the entire structure:
-                // - River zone: batch 48 outcomes per turn card, finalize into d_cfv
-                // - Turn zone: process EACH turn card individually with the ORIGINAL kernel
-                // - Accumulate turn results
-                // This avoids the turn CFV batch entirely.
-                break; // placeholder — will restructure below
-            }
-
-            // Apply regret discount for river zone traverser nodes
-            {
-                let total = fs.regret_accum_size as usize;
-                let grid = ((total + 255) / 256) as u32;
-                let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
-                unsafe {
-                    let mut b = self.stream.launch_builder(&self.vcfr_regret_apply_fn);
-                    b.arg(&self.d_regrets).arg(&fs.d_regret_accum)
-                        .arg(&fs.regret_accum_size)
-                        .arg(&alpha_t).arg(&beta_t).arg(&regret_floor);
                     b.launch(cfg)?;
                 }
             }
@@ -2393,6 +2333,34 @@ impl GpuVectorCfr {
                         .arg(&fs.turn_cc_count).arg(&nh).arg(&ti_i32);
                     b.launch(cfg)?;
                 }
+            }
+        }
+
+        // Apply river zone regret discount ONCE (not per turn card)
+        {
+            let total = fs.regret_accum_size as usize;
+            let grid = ((total + 255) / 256) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_regret_apply_fn);
+                b.arg(&self.d_regrets).arg(&fs.d_regret_accum)
+                    .arg(&fs.regret_accum_size)
+                    .arg(&alpha_t).arg(&beta_t).arg(&regret_floor);
+                b.launch(cfg)?;
+            }
+        }
+
+        // Apply river zone cum_strategy accumulation ONCE
+        {
+            let total = fs.regret_accum_size as usize;
+            let grid = ((total + 255) / 256) as u32;
+            let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256u32, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                let mut b = self.stream.launch_builder(&self.vcfr_cum_apply_fn);
+                b.arg(&self.d_cum_strategy).arg(&fs.d_cum_accum)
+                    .arg(&fs.regret_accum_size)
+                    .arg(&gamma_t);
+                b.launch(cfg)?;
             }
         }
 

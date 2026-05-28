@@ -198,12 +198,14 @@ extern "C" __global__ void vcfr_bottom_up_batched(
     float* __restrict__ regrets,
     float* __restrict__ regret_accum,    // [num_infosets * MAX_NA * nh]
     float* __restrict__ cum_strategy,
+    float* __restrict__ cum_accum,        // [num_infosets * MAX_NA * nh] — batched accumulation
     const float* __restrict__ initial_weight,
     const uint16_t* __restrict__ sorted_opp_strength,  // [num_outcomes * sorted_opp_stride]
     const uint16_t* __restrict__ sorted_opp_indices,
     const uint16_t* __restrict__ sorted_pl_strength,   // [num_outcomes * nh]
     const uint16_t* __restrict__ sorted_pl_indices,
     const uint8_t* __restrict__ hand_cards,
+    const float* __restrict__ chance_prob,   // [num_outcomes * nh]
     int num_players,
     int nh,
     uint32_t traverser,
@@ -575,15 +577,17 @@ extern "C" __global__ void vcfr_bottom_up_batched(
             for (int h = 0; h < nh; h++) {
                 float inst_regret = cfv_o[child * nh + h] - cfv_avg[h];
                 uint32_t ridx = offset + a * nh + h;
-                // Batched: accumulate instant regret atomically
-                atomicAdd(&regret_accum[ridx], inst_regret);
+                // Weight by chance probability for correct expected regret
+                float cp = chance_prob[outcome * nh + h];
+                atomicAdd(&regret_accum[ridx], cp * inst_regret);
             }
         }
 
         for (int a = 0; a < na; a++) {
             for (int h = 0; h < nh; h++) {
                 uint32_t cidx = offset + a * nh + h;
-                atomicAdd(&cum_strategy[cidx], sigma[a * nh + h]);
+                float cp = chance_prob[outcome * nh + h];
+                atomicAdd(&cum_accum[cidx], cp * sigma[a * nh + h]);
             }
         }
     } else {
@@ -884,4 +888,20 @@ extern "C" __global__ void vcfr_regret_apply(
     regrets[idx] = coef * old_r + ir;
     if (regrets[idx] < regret_floor) regrets[idx] = regret_floor;
     regret_accum[idx] = 0.0f;
+}
+
+// Apply cum_strategy accumulation with gamma discount:
+// cum_strategy[idx] = gamma_t * cum_strategy[idx] + cum_accum[idx]
+// Then reset cum_accum to 0.
+extern "C" __global__ void vcfr_cum_apply(
+    float* __restrict__ cum_strategy,
+    float* __restrict__ cum_accum,
+    int total_size,
+    float gamma_t
+) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= total_size) return;
+
+    cum_strategy[idx] = gamma_t * cum_strategy[idx] + cum_accum[idx];
+    cum_accum[idx] = 0.0f;
 }
