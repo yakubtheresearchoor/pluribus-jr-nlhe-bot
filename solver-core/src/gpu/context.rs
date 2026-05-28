@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    sys,
+    CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -725,6 +726,7 @@ impl GpuContext {
             d_main_level_nodes,
             main_level_counts,
             flop_start: None,
+            flop_start_graph: None,
             starting_pot: tree.starting_pot,
             num_combinations: num_combinations as f32,
         })
@@ -913,6 +915,7 @@ struct FlopStartData {
     regret_accum_size: i32,
     max_river: i32,
     d_cum_accum: CudaSlice<f32>,
+    d_dcfr_params: CudaSlice<f32>,  // [alpha_t, beta_t, gamma_t, regret_floor]
 }
 
 pub struct GpuVectorCfr {
@@ -964,6 +967,7 @@ pub struct GpuVectorCfr {
     d_main_level_nodes: Vec<Option<CudaSlice<u32>>>,
     main_level_counts: Vec<i32>,
     flop_start: Option<Box<FlopStartData>>,
+    flop_start_graph: Option<CudaGraph>,
 }
 
 impl GpuVectorCfr {
@@ -2039,6 +2043,7 @@ impl GpuContext {
         // Regret accumulator
         let d_regret_accum = self.stream.alloc_zeros(infoset_data_size)?;
         let d_cum_accum = self.stream.alloc_zeros(infoset_data_size)?;
+        let d_dcfr_params = self.stream.alloc_zeros(4)?;  // [alpha, beta, gamma, floor]
 
         let fs = Box::new(FlopStartData {
             d_river_sorted_str: d_rv_opp_str,
@@ -2070,6 +2075,7 @@ impl GpuContext {
             d_cum_accum: d_cum_accum,
             regret_accum_size: infoset_data_size as i32,
             max_river: max_river as i32,
+            d_dcfr_params: d_dcfr_params,
         });
 
         let e_u16: CudaSlice<u16> = self.stream.alloc_zeros(1)?;
@@ -2109,6 +2115,7 @@ impl GpuContext {
             d_below_chance_level_nodes: d_bc, below_chance_level_counts: bc_c,
             d_main_level_nodes: d_mn, main_level_counts: mn_c,
             flop_start: Some(fs),
+            flop_start_graph: None,
         })
     }
 }
@@ -2134,6 +2141,78 @@ impl GpuVectorCfr {
                     params.alpha_t, params.beta_t, params.gamma_t, nh_i32, np_u32,
                 )?;
             }
+        }
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Run flop-start VCFR with CUDA graph capture/replay.
+    /// Captures the kernel launch graph on the first iteration, then replays
+    /// for subsequent iterations. Eliminates per-launch overhead on Windows WDDM.
+    ///
+    /// The DCFR params (alpha, beta, gamma) are stored in device memory
+    /// and updated between replays.
+    pub fn run_flop_start_graph(&mut self, num_iterations: u32) -> Result<(), DriverError> {
+        let np = self.num_players as usize;
+        let nh = self.num_hands;
+        let ni = self.num_infosets as i32;
+        let nh_i32 = nh as i32;
+        let np_u32 = np as u32;
+        let nn = self.d_cfv.len() / nh;
+        let regret_floor = self.regret_floor;
+
+        for iter in 0..num_iterations {
+            let params = DcfrParams::new(self.iteration);
+
+            // Update DCFR params in device memory
+            {
+                let fs = self.flop_start.as_mut().unwrap();
+                let host_params = vec![params.alpha_t, params.beta_t, params.gamma_t, regret_floor];
+                let mut d_params = self.stream.clone_htod(&host_params)?;
+                std::mem::swap(&mut fs.d_dcfr_params, &mut d_params);
+            }
+
+            for traverser in 0..np {
+                // If we don't have a graph yet, capture one
+                if self.flop_start_graph.is_none() && iter == 0 && traverser == 0 {
+                    // Begin capture
+                    self.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)?;
+
+                    self.launch_compute_strategies(ni, nh_i32)?;
+                    self.launch_init_reach(np, nh)?;
+                    self.launch_top_down(nh_i32, np_u32)?;
+                    self.launch_flop_start_bottom_up(
+                        traverser as u32, nn,
+                        params.alpha_t, params.beta_t, params.gamma_t, nh_i32, np_u32,
+                    )?;
+
+                    // End capture and store graph
+                    // We capture only one traverser's worth of launches
+                    let graph = self.stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?;
+                    self.flop_start_graph = graph;
+
+                    // Now replay it immediately (completes the first traverser)
+                    if let Some(ref g) = self.flop_start_graph {
+                        g.launch()?;
+                    }
+                    continue;
+                }
+
+                // Replay the captured graph
+                if let Some(ref g) = self.flop_start_graph {
+                    g.launch()?;
+                } else {
+                    // Fallback: run without graph
+                    self.launch_compute_strategies(ni, nh_i32)?;
+                    self.launch_init_reach(np, nh)?;
+                    self.launch_top_down(nh_i32, np_u32)?;
+                    self.launch_flop_start_bottom_up(
+                        traverser as u32, nn,
+                        params.alpha_t, params.beta_t, params.gamma_t, nh_i32, np_u32,
+                    )?;
+                }
+            }
+            self.iteration += 1;
         }
         self.stream.synchronize()?;
         Ok(())
