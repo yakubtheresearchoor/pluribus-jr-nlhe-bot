@@ -689,6 +689,7 @@ impl GpuContext {
             below_chance_level_counts,
             d_main_level_nodes,
             main_level_counts,
+            starting_pot: tree.starting_pot,
         })
     }
 }
@@ -868,6 +869,7 @@ pub struct GpuVectorCfr {
     d_chance_sorted_indices: Option<CudaSlice<u16>>,
     d_chance_prob: Option<CudaSlice<f32>>,
     d_chance_child_ids: Option<CudaSlice<u32>>,
+    starting_pot: i32,
     d_cfv_accum: Option<CudaSlice<f32>>,
     d_below_chance_level_nodes: Vec<Option<CudaSlice<u32>>>,
     below_chance_level_counts: Vec<i32>,
@@ -1026,7 +1028,8 @@ impl GpuVectorCfr {
                             .arg(&alpha_t)
                             .arg(&beta_t)
                             .arg(&gamma_t)
-                            .arg(&regret_floor);
+                            .arg(&regret_floor)
+                            .arg(&self.starting_pot);
                         builder.launch(cfg)?;
                     }
                 }
@@ -1105,7 +1108,8 @@ impl GpuVectorCfr {
                         .arg(&alpha_t)
                         .arg(&beta_t)
                         .arg(&gamma_t)
-                        .arg(&regret_floor);
+                        .arg(&regret_floor)
+                        .arg(&self.starting_pot);
                     builder.launch(cfg)?;
                 }
             }
@@ -1143,7 +1147,8 @@ impl GpuVectorCfr {
                         .arg(&alpha_t)
                         .arg(&beta_t)
                         .arg(&gamma_t)
-                        .arg(&regret_floor);
+                        .arg(&regret_floor)
+                        .arg(&self.starting_pot);
                     builder.launch(cfg)?;
                 }
             }

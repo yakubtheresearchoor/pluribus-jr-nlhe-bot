@@ -213,7 +213,8 @@ extern "C" __global__ void vcfr_bottom_up(
     float alpha_t,
     float beta_t,
     float gamma_t,
-    float regret_floor
+    float regret_floor,
+    int32_t starting_pot
 ) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx >= level_count) return;
@@ -236,13 +237,14 @@ extern "C" __global__ void vcfr_bottom_up(
         float* out = cfv + node_id * nh;
 
         if (num_active <= 1 || (fold_mask & (1 << traverser))) {
-            int32_t pot = 0;
-            for (int p = 0; p < np; p++) pot += contributions[node_id * np + p];
+            int32_t total_pot = starting_pot;
+            for (int p = 0; p < np; p++) total_pot += contributions[node_id * np + p];
+            float traverser_investment = (float)starting_pot / (float)np + (float)c_t;
             float payoff;
             if (fold_mask & (1 << traverser)) {
-                payoff = -(float)c_t;
+                payoff = -traverser_investment;
             } else {
-                payoff = (float)(pot - c_t);
+                payoff = (float)total_pot - traverser_investment;
             }
 
             float opp_reach_sum = 0.0f;
@@ -288,9 +290,10 @@ extern "C" __global__ void vcfr_bottom_up(
             }
 
             if (num_active_opp == 0) {
-                int32_t pot = 0;
-                for (int p = 0; p < np; p++) pot += contributions[node_id * np + p];
-                float payoff = (float)(pot - c_t);
+                int32_t total_pot = starting_pot;
+                for (int p = 0; p < np; p++) total_pot += contributions[node_id * np + p];
+                float traverser_investment = (float)starting_pot / (float)np + (float)c_t;
+                float payoff = (float)total_pot - traverser_investment;
 
                 float opp_reach_sum = 0.0f;
                 float opp_reach_minus[52];
@@ -339,7 +342,7 @@ extern "C" __global__ void vcfr_bottom_up(
                     hand_cards,
                     out
                 );
-                for (int h = 0; h < nh; h++) out[h] *= (float)c_t;
+                for (int h = 0; h < nh; h++) out[h] *= ((float)starting_pot / (float)np + (float)c_t);
             } else {
                 // N>2 product-based formula
                 float cum_weaker[5 * 1326];
@@ -399,7 +402,7 @@ extern "C" __global__ void vcfr_bottom_up(
                 }
 
                 for (int h = 0; h < nh; h++) {
-                    out[h] = (float)c_t * ((float)(num_active_opp + 1) * cum_weaker[h] - eff_total[h]);
+                    out[h] = ((float)starting_pot / (float)np + (float)c_t) * ((float)(num_active_opp + 1) * cum_weaker[h] - eff_total[h]);
                 }
             }
         } else {
@@ -453,6 +456,8 @@ extern "C" __global__ void vcfr_bottom_up(
                 }
 
                 int pot_at_level = pot_contribution * total_counted;
+                // Add starting_pot to the first (lowest) level — the main pot
+                if (li == 0) pot_at_level += starting_pot;
 
                 if (eligible_opp_count == 0) {
                     if (traverser_eligible) {
@@ -524,7 +529,7 @@ extern "C" __global__ void vcfr_bottom_up(
                 prev_level = level;
             }
 
-            for (int h = 0; h < nh; h++) out[h] -= (float)c_t;
+            for (int h = 0; h < nh; h++) out[h] -= ((float)starting_pot / (float)np + (float)c_t);
         }
         return;
     }

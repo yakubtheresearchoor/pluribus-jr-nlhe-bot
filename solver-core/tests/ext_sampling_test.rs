@@ -77,6 +77,7 @@ fn ext_walk(
             active_opp_str, active_opp_idx,
             active_pl_str, active_pl_idx,
             &node_contrib, fold_mask, traverser, num_players,
+            0, // starting_pot=0 for ext_sampling tests
         );
     }
 
@@ -1705,7 +1706,7 @@ fn nplayer_cpu_evaluate_terminal_3player() {
     let cfv = side_pot_showdown_cfv(
         &opp_views, &hand_cards, nh,
         &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
-        &contrib_equal, 0u16, 0, 3,
+        &contrib_equal, 0u16, 0, 3, 0
     );
     assert_eq!(cfv.len(), nh);
     let has_pos = cfv.iter().any(|&v| v > 0.0);
@@ -1727,7 +1728,7 @@ fn nplayer_cpu_evaluate_terminal_3player() {
     let cfv_fold = side_pot_showdown_cfv(
         &opp_views, &hand_cards, nh,
         &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
-        &contrib_fold1, 2u16, 0, 3,
+        &contrib_fold1, 2u16, 0, 3, 0
     );
     assert_eq!(cfv_fold.len(), nh);
     assert!(cfv_fold[hi_as] > cfv_fold[hi_lo],
@@ -1737,7 +1738,7 @@ fn nplayer_cpu_evaluate_terminal_3player() {
     let cfv_self_fold = side_pot_showdown_cfv(
         &opp_views, &hand_cards, nh,
         &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
-        &contrib_equal, 1u16, 0, 3,
+        &contrib_equal, 1u16, 0, 3, 0
     );
     assert!(cfv_self_fold.iter().all(|&v| v <= 0.0),
         "P0 self-fold: all CFVs should be <= 0");
@@ -1747,7 +1748,7 @@ fn nplayer_cpu_evaluate_terminal_3player() {
     let cfv_one = side_pot_showdown_cfv(
         &opp_views, &hand_cards, nh,
         &s_opp_str, &s_opp_idx, &s_pl_str, &s_pl_idx,
-        &contrib_one, 3u16, 2, 3,
+        &contrib_one, 3u16, 2, 3, 0
     );
     assert!(cfv_one.iter().all(|&v| v >= 0.0),
         "P2 last standing: all CFVs should be >= 0");

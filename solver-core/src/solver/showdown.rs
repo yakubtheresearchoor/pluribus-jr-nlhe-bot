@@ -241,6 +241,7 @@ pub fn side_pot_showdown_cfv(
     fold_mask: u16,
     traverser: usize,
     num_players: u8,
+    starting_pot: i32,
 ) -> Vec<f32> {
     let num_opp = opp_reach.len();
     let np = num_players as usize;
@@ -255,11 +256,12 @@ pub fn side_pot_showdown_cfv(
     }
 
     if num_active <= 1 || fold_mask & (1u16 << traverser) != 0 {
-        let pot: i32 = contributions.iter().sum();
+        let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+        let traverser_investment = starting_pot as f32 / np as f32 + c_t as f32;
         let payoff = if fold_mask & (1u16 << traverser) != 0 {
-            -(c_t as f32)
+            -traverser_investment
         } else {
-            (pot - c_t) as f32
+            total_pot as f32 - traverser_investment
         };
 
         let mut opp_reach_sum = 0.0f32;
@@ -303,8 +305,9 @@ pub fn side_pot_showdown_cfv(
             .count();
 
         if num_active_opp == 0 {
-            let pot: i32 = contributions.iter().sum();
-            let payoff = (pot - c_t) as f32;
+            let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+            let traverser_investment = starting_pot as f32 / np as f32 + c_t as f32;
+            let payoff = total_pot as f32 - traverser_investment;
             let mut opp_reach_sum = 0.0f32;
             let mut opp_reach_minus = vec![0.0f32; 52];
             for oi in 0..num_opp {
@@ -346,13 +349,14 @@ pub fn side_pot_showdown_cfv(
                 sorted_pl_str, sorted_pl_idx,
             );
             for h in 0..nh {
-                cfv[h] = c_t as f32 * sweep[h];
+                cfv[h] = (starting_pot as f32 / np as f32 + c_t as f32) * sweep[h];
             }
             return cfv;
         }
 
         // N>2 equal-contribution showdown: product-based formula
-        // cfv[h] = c_t * ((num_active_opp + 1) * prod_oi(W_oi(h)) - prod_oi(R_eff_oi(h)))
+        // cfv[h] = half_pot * ((num_active_opp + 1) * prod_oi(W_oi(h)) - prod_oi(R_eff_oi(h)))
+        // where half_pot = starting_pot/np + c_t (effective per-player pot share)
         // where W_oi(h) = cum weaker reach for opp oi (with card blocking)
         //       R_eff_oi(h) = total reach of non-conflicting hands for opp oi
         let mut cum_weaker: Vec<Vec<f32>> = Vec::with_capacity(num_opp);
@@ -409,7 +413,7 @@ pub fn side_pot_showdown_cfv(
         for h in 0..nh {
             let beats_all: f32 = cum_weaker.iter().map(|cw| cw[h]).product();
             let eff_product: f32 = eff_total_reach.iter().map(|er| er[h]).product();
-            cfv[h] = c_t as f32 * ((num_active_opp as f32 + 1.0) * beats_all - eff_product);
+            cfv[h] = (starting_pot as f32 / np as f32 + c_t as f32) * ((num_active_opp as f32 + 1.0) * beats_all - eff_product);
         }
         return cfv;
     }
@@ -423,7 +427,7 @@ pub fn side_pot_showdown_cfv(
     levels.dedup();
 
     let mut prev_level = 0i32;
-    for &level in &levels {
+    for (level_idx, &level) in levels.iter().enumerate() {
         let pot_contribution = level - prev_level;
         if pot_contribution == 0 { continue; }
 
@@ -433,9 +437,12 @@ pub fn side_pot_showdown_cfv(
             .collect();
         if eligible.is_empty() { continue; }
 
-        let pot_at_level = pot_contribution * (0..np)
-            .filter(|&p| contributions[p] >= level)
-            .count() as i32;
+        let num_eligible = (0..np).filter(|&p| contributions[p] >= level).count() as i32;
+        let mut pot_at_level = pot_contribution * num_eligible;
+        // Add starting_pot to the first (lowest) level — the main pot shared by all active players
+        if level_idx == 0 {
+            pot_at_level += starting_pot;
+        }
         let traverser_eligible = contributions[traverser] >= level;
 
         let eligible_opp: Vec<usize> = eligible.iter()
@@ -508,7 +515,7 @@ pub fn side_pot_showdown_cfv(
         prev_level = level;
     }
 
-    for h in 0..nh { cfv[h] -= c_t as f32; }
+    for h in 0..nh { cfv[h] -= starting_pot as f32 / np as f32 + c_t as f32; }
     cfv
 }
 

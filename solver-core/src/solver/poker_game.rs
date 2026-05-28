@@ -220,6 +220,7 @@ impl GameSpec for RiverPokerGame {
             fold_mask,
             traverser as usize,
             self.num_players,
+            tree.starting_pot,
         )
     }
 

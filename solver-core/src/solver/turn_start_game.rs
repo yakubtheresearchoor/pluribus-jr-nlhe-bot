@@ -90,6 +90,7 @@ impl GameSpec for TurnStartGame {
                     fold_mask,
                     traverser as usize,
                     self.table.num_players,
+                    tree.starting_pot,
                 )
             }
             None => {
@@ -105,6 +106,7 @@ impl GameSpec for TurnStartGame {
                     fold_mask,
                     traverser as usize,
                     self.table.num_players,
+                    tree.starting_pot,
                 )
             }
         }
