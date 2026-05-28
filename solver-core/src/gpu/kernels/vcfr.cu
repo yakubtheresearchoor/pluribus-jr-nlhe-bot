@@ -931,3 +931,463 @@ extern "C" __global__ void vcfr_zero_buffer(
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < size) buf[idx] = 0.0f;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// STREAMING bottom-up: processes all outcomes for one level SEQUENTIALLY
+// within each thread. Grid = level_count, blockDim = 1.
+//
+// Each thread handles one node, looping over all outcomes.
+// At traverser player nodes, applies per-outcome DCFR discount:
+//   regret = coef * regret + cp * inst_regret
+// This gives the geometric discount schedule that matches the external
+// solver's per-outcome regret update.
+//
+// cum_strategy is accumulated into cum_accum with cp weighting
+// (applied once after all outcomes via vcfr_cum_apply).
+// ═══════════════════════════════════════════════════════════════════════
+
+extern "C" __global__ void vcfr_streaming_level(
+    const uint32_t* __restrict__ level_nodes,
+    int level_count,
+    int num_outcomes,
+    int cfv_batch_stride,        // nn * nh — stride per outcome in cfv buffer
+    int sorted_opp_stride,      // num_opp * nh — stride per outcome in sorted arrays
+    const FlatNode* __restrict__ nodes,
+    const uint32_t* __restrict__ children,
+    const int32_t* __restrict__ contributions,
+    const uint16_t* __restrict__ folded_masks,
+    const float* __restrict__ strategy,
+    const uint32_t* __restrict__ infoset_offsets,
+    const float* __restrict__ reach,
+    float* __restrict__ cfv,             // [num_outcomes * nn * nh]
+    float* __restrict__ regrets,         // shared regrets, directly updated
+    float* __restrict__ cum_accum,       // [num_infosets * MAX_NA * nh] — batched accumulation
+    const float* __restrict__ initial_weight,
+    const uint16_t* __restrict__ sorted_opp_strength,  // [num_outcomes * sorted_opp_stride]
+    const uint16_t* __restrict__ sorted_opp_indices,
+    const uint16_t* __restrict__ sorted_pl_strength,   // [num_outcomes * nh]
+    const uint16_t* __restrict__ sorted_pl_indices,
+    const uint8_t* __restrict__ hand_cards,
+    const float* __restrict__ chance_prob,   // [num_outcomes * nh]
+    int num_players,
+    int nh,
+    uint32_t traverser,
+    float alpha_t,
+    float beta_t,
+    float gamma_t,
+    float regret_floor,
+    int32_t starting_pot,
+    float num_combinations
+) {
+    int node_in_level = blockIdx.x;
+    if (node_in_level >= level_count) return;
+
+    uint32_t node_id = level_nodes[node_in_level];
+    const FlatNode& node = nodes[node_id];
+    int np = num_players;
+    int num_opp = np - 1;
+
+    // ═══ TERMINAL NODE ═══
+    if (node.node_type == NODE_TYPE_TERMINAL) {
+        int node_reach_base = node_id * np * nh;
+        int32_t c_t = contributions[node_id * np + traverser];
+        uint16_t fold_mask = folded_masks[node_id];
+
+        int num_active = 0;
+        for (int p = 0; p < np; p++) {
+            if (!(fold_mask & (1 << p))) num_active++;
+        }
+
+        for (int outcome = 0; outcome < num_outcomes; outcome++) {
+            int sos_off = outcome * sorted_opp_stride;
+            int sps_off = outcome * nh;
+            const uint16_t* opp_str = sorted_opp_strength + sos_off;
+            const uint16_t* opp_idx = sorted_opp_indices + sos_off;
+            const uint16_t* pl_str = sorted_pl_strength + sps_off;
+            const uint16_t* pl_idx = sorted_pl_indices + sps_off;
+            float* out = cfv + outcome * cfv_batch_stride + node_id * nh;
+
+            if (num_active <= 1 || (fold_mask & (1 << traverser))) {
+                int32_t total_pot = starting_pot;
+                for (int p = 0; p < np; p++) total_pot += contributions[node_id * np + p];
+                float traverser_investment = (float)starting_pot / (float)np + (float)c_t;
+                float payoff;
+                if (fold_mask & (1 << traverser)) {
+                    payoff = -traverser_investment;
+                } else {
+                    payoff = (float)total_pot - traverser_investment;
+                }
+
+                float opp_reach_sum = 0.0f;
+                float opp_reach_minus[52];
+                for (int c = 0; c < 52; c++) opp_reach_minus[c] = 0.0f;
+
+                for (int oi = 0; oi < num_opp; oi++) {
+                    int opp = (oi < (int)traverser) ? oi : (oi + 1);
+                    const float* opp_r = reach + node_reach_base + opp * nh;
+                    for (int ho = 0; ho < nh; ho++) {
+                        float r = opp_r[ho];
+                        if (r != 0.0f) {
+                            opp_reach_sum += r;
+                            opp_reach_minus[hand_cards[ho * 2]] += r;
+                            opp_reach_minus[hand_cards[ho * 2 + 1]] += r;
+                        }
+                    }
+                }
+                if (opp_reach_sum > 0.0f) {
+                    for (int h = 0; h < nh; h++) {
+                        float cfreach = opp_reach_sum
+                            - opp_reach_minus[hand_cards[h * 2]]
+                            - opp_reach_minus[hand_cards[h * 2 + 1]];
+                        out[h] = payoff * cfreach;
+                    }
+                } else {
+                    for (int h = 0; h < nh; h++) out[h] = 0.0f;
+                }
+                if (num_combinations > 0.0f) { for (int h = 0; h < nh; h++) out[h] /= num_combinations; }
+                continue;  // next outcome
+            }
+
+            bool all_equal = true;
+            for (int p = 0; p < np; p++) {
+                if (fold_mask & (1 << p)) continue;
+                if (contributions[node_id * np + p] != c_t) { all_equal = false; break; }
+            }
+
+            if (all_equal) {
+                int num_active_opp = 0;
+                for (int p = 0; p < np; p++) {
+                    if (p == (int)traverser) continue;
+                    if (!(fold_mask & (1 << p))) num_active_opp++;
+                }
+
+                if (num_active_opp == 0) {
+                    int32_t total_pot = starting_pot;
+                    for (int p = 0; p < np; p++) total_pot += contributions[node_id * np + p];
+                    float traverser_investment = (float)starting_pot / (float)np + (float)c_t;
+                    float payoff = (float)total_pot - traverser_investment;
+                    float opp_reach_sum = 0.0f;
+                    float opp_reach_minus[52];
+                    for (int c = 0; c < 52; c++) opp_reach_minus[c] = 0.0f;
+                    for (int oi = 0; oi < num_opp; oi++) {
+                        int opp = (oi < (int)traverser) ? oi : (oi + 1);
+                        const float* opp_r = reach + node_reach_base + opp * nh;
+                        for (int ho = 0; ho < nh; ho++) {
+                            float r = opp_r[ho];
+                            if (r != 0.0f) {
+                                opp_reach_sum += r;
+                                opp_reach_minus[hand_cards[ho * 2]] += r;
+                                opp_reach_minus[hand_cards[ho * 2 + 1]] += r;
+                            }
+                        }
+                    }
+                    if (opp_reach_sum > 0.0f) {
+                        for (int h = 0; h < nh; h++) {
+                            float cfreach = opp_reach_sum
+                                - opp_reach_minus[hand_cards[h * 2]]
+                                - opp_reach_minus[hand_cards[h * 2 + 1]];
+                            out[h] = payoff * cfreach;
+                        }
+                    } else {
+                        for (int h = 0; h < nh; h++) out[h] = 0.0f;
+                    }
+                    if (num_combinations > 0.0f) { for (int h = 0; h < nh; h++) out[h] /= num_combinations; }
+                    continue;
+                }
+
+                float opp_reach_local[MAX_NA * 1326];
+                for (int oi = 0; oi < num_opp; oi++) {
+                    int opp = (oi < (int)traverser) ? oi : (oi + 1);
+                    if (fold_mask & (1 << opp)) {
+                        for (int h = 0; h < nh; h++) opp_reach_local[oi * nh + h] = 0.0f;
+                    } else {
+                        const float* opp_r = reach + node_reach_base + opp * nh;
+                        for (int h = 0; h < nh; h++) opp_reach_local[oi * nh + h] = opp_r[h];
+                    }
+                }
+
+                if (num_active_opp == 1) {
+                    sorted_sweep_showdown_vcfr(
+                        opp_reach_local, num_opp, nh,
+                        opp_str, opp_idx,
+                        pl_str, pl_idx,
+                        hand_cards,
+                        out
+                    );
+                    for (int h = 0; h < nh; h++) out[h] *= ((float)starting_pot / (float)np + (float)c_t);
+                } else {
+                    float cum_weaker[5 * 1326];
+                    float eff_total[5 * 1326];
+                    for (int h = 0; h < nh; h++) { cum_weaker[h] = 0.0f; eff_total[h] = 0.0f; }
+
+                    for (int oi = 0; oi < num_opp; oi++) {
+                        const float* opp_r = opp_reach_local + oi * nh;
+                        float cw[1326];
+                        float cfreach_sum = 0.0f;
+                        float cfreach_minus[52];
+                        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                        int i = 0;
+
+                        for (int si = 0; si < nh; si++) {
+                            uint16_t str_h = pl_str[si];
+                            uint16_t h = pl_idx[si];
+                            while (i < nh && opp_str[oi * nh + i] < str_h) {
+                                uint16_t ho = opp_idx[oi * nh + i];
+                                float r = opp_r[ho];
+                                if (r != 0.0f) {
+                                    cfreach_sum += r;
+                                    cfreach_minus[hand_cards[ho * 2]] += r;
+                                    cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                }
+                                i++;
+                            }
+                            cw[h] = cfreach_sum
+                                - cfreach_minus[hand_cards[h * 2]]
+                                - cfreach_minus[hand_cards[h * 2 + 1]];
+                        }
+
+                        while (i < nh) {
+                            uint16_t ho = opp_idx[oi * nh + i];
+                            float r = opp_r[ho];
+                            if (r != 0.0f) {
+                                cfreach_sum += r;
+                                cfreach_minus[hand_cards[ho * 2]] += r;
+                                cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                            }
+                            i++;
+                        }
+
+                        for (int h = 0; h < nh; h++) {
+                            float eff = cfreach_sum
+                                - cfreach_minus[hand_cards[h * 2]]
+                                - cfreach_minus[hand_cards[h * 2 + 1]]
+                                + opp_r[h];
+                            if (oi == 0) {
+                                cum_weaker[h] = cw[h];
+                                eff_total[h] = eff;
+                            } else {
+                                cum_weaker[h] *= cw[h];
+                                eff_total[h] *= eff;
+                            }
+                        }
+                    }
+
+                    for (int h = 0; h < nh; h++) {
+                        out[h] = ((float)starting_pot / (float)np + (float)c_t) * ((float)(num_active_opp + 1) * cum_weaker[h] - eff_total[h]);
+                    }
+                }
+            } else {
+                // Side pot
+                for (int h = 0; h < nh; h++) out[h] = 0.0f;
+                int levels[8];
+                int num_levels = 0;
+                for (int p = 0; p < np && num_levels < 8; p++) {
+                    int32_t c = contributions[node_id * np + p];
+                    bool found = false;
+                    for (int l = 0; l < num_levels; l++) {
+                        if (levels[l] == c) { found = true; break; }
+                    }
+                    if (!found) levels[num_levels++] = c;
+                }
+                for (int i = 0; i < num_levels - 1; i++) {
+                    for (int j = i + 1; j < num_levels; j++) {
+                        if (levels[j] < levels[i]) {
+                            int tmp = levels[i]; levels[i] = levels[j]; levels[j] = tmp;
+                        }
+                    }
+                }
+
+                int prev_level = 0;
+                for (int li = 0; li < num_levels; li++) {
+                    int level = levels[li];
+                    int pot_contribution = level - prev_level;
+                    if (pot_contribution == 0) { prev_level = level; continue; }
+
+                    int total_counted = 0;
+                    int eligible_opp_count = 0;
+                    bool traverser_eligible = false;
+                    for (int p = 0; p < np; p++) {
+                        if (contributions[node_id * np + p] >= level) {
+                            total_counted++;
+                            if (!(fold_mask & (1 << p))) {
+                                if (p == (int)traverser) {
+                                    traverser_eligible = true;
+                                } else {
+                                    eligible_opp_count++;
+                                }
+                            }
+                        }
+                    }
+
+                    int pot_at_level = pot_contribution * total_counted;
+                    if (li == 0) pot_at_level += starting_pot;
+
+                    if (eligible_opp_count == 0) {
+                        if (traverser_eligible) {
+                            for (int h = 0; h < nh; h++) out[h] += (float)pot_at_level;
+                        }
+                        prev_level = level;
+                        continue;
+                    }
+
+                    if (traverser_eligible) {
+                        for (int opp_p = 0; opp_p < np; opp_p++) {
+                            if (opp_p == (int)traverser) continue;
+                            if (fold_mask & (1 << opp_p)) continue;
+                            if (contributions[node_id * np + opp_p] < level) continue;
+
+                            int oi = (opp_p < (int)traverser) ? opp_p : (opp_p - 1);
+                            const float* opp_r = reach + node_reach_base + opp_p * nh;
+                            const uint16_t* o_str = opp_str + oi * nh;
+                            const uint16_t* o_idx = opp_idx + oi * nh;
+
+                            float cfreach_sum = 0.0f;
+                            float cfreach_minus[52];
+                            for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+
+                            int i = 0;
+                            for (int si = 0; si < nh; si++) {
+                                uint16_t str_h = pl_str[si];
+                                uint16_t h = pl_idx[si];
+                                while (i < nh && o_str[i] < str_h) {
+                                    uint16_t ho = o_idx[i];
+                                    float r = opp_r[ho];
+                                    if (r != 0.0f) {
+                                        cfreach_sum += r;
+                                        cfreach_minus[hand_cards[ho * 2]] += r;
+                                        cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                    }
+                                    i++;
+                                }
+                                float cfreach = cfreach_sum
+                                    - cfreach_minus[hand_cards[h * 2]]
+                                    - cfreach_minus[hand_cards[h * 2 + 1]];
+                                out[h] += (float)pot_at_level * cfreach;
+                            }
+
+                            cfreach_sum = 0.0f;
+                            for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                            i = nh - 1;
+                            for (int si = nh - 1; si >= 0; si--) {
+                                uint16_t str_h = pl_str[si];
+                                uint16_t h = pl_idx[si];
+                                while (i >= 0 && o_str[i] > str_h) {
+                                    uint16_t ho = o_idx[i];
+                                    float r = opp_r[ho];
+                                    if (r != 0.0f) {
+                                        cfreach_sum += r;
+                                        cfreach_minus[hand_cards[ho * 2]] += r;
+                                        cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                    }
+                                    i--;
+                                }
+                                float cfreach = cfreach_sum
+                                    - cfreach_minus[hand_cards[h * 2]]
+                                    - cfreach_minus[hand_cards[h * 2 + 1]];
+                                out[h] -= (float)pot_at_level * cfreach;
+                            }
+                        }
+                    }
+
+                    prev_level = level;
+                }
+
+                for (int h = 0; h < nh; h++) out[h] -= ((float)starting_pot / (float)np + (float)c_t);
+            }
+            if (num_combinations > 0.0f) { for (int h = 0; h < nh; h++) out[h] /= num_combinations; }
+        }
+        return;
+    }
+
+    // ═══ CHANCE NODE ═══
+    if (node.node_type == NODE_TYPE_CHANCE) {
+        for (int outcome = 0; outcome < num_outcomes; outcome++) {
+            float* cfv_o = cfv + outcome * cfv_batch_stride;
+            float* out = cfv_o + node_id * nh;
+            for (int h = 0; h < nh; h++) out[h] = 0.0f;
+            for (int a = 0; a < (int)node.num_children; a++) {
+                uint32_t child = children[node.children_start + a];
+                for (int h = 0; h < nh; h++) {
+                    out[h] += cfv_o[child * nh + h];
+                }
+            }
+        }
+        return;
+    }
+
+    // ═══ PLAYER NODE ═══
+    int owner = (int)node.player_id;
+    int na = (int)node.num_children;
+    uint32_t infoset_id = infoset_offsets[node_id];
+    int stride = MAX_NA * nh;
+    const float* sigma = strategy + infoset_id * stride;
+    int offset = infoset_id * stride;
+
+    if (owner == (int)traverser) {
+        // Process outcomes SEQUENTIALLY — per-outcome DCFR discount
+        for (int outcome = 0; outcome < num_outcomes; outcome++) {
+            int cfv_off = outcome * cfv_batch_stride;
+            float* cfv_o = cfv + cfv_off;
+            int cp_base = outcome * nh;
+
+            // Compute strategy-weighted average CFV
+            float cfv_avg[1326];
+            for (int h = 0; h < nh; h++) cfv_avg[h] = 0.0f;
+            for (int a = 0; a < na; a++) {
+                uint32_t child = children[node.children_start + a];
+                for (int h = 0; h < nh; h++) {
+                    cfv_avg[h] += sigma[a * nh + h] * cfv_o[child * nh + h];
+                }
+            }
+
+            // Per-outcome DCFR regret update with chance probability weighting
+            for (int a = 0; a < na; a++) {
+                uint32_t child = children[node.children_start + a];
+                for (int h = 0; h < nh; h++) {
+                    float inst_regret = cfv_o[child * nh + h] - cfv_avg[h];
+                    uint32_t ridx = offset + a * nh + h;
+                    float cp = chance_prob[cp_base + h];
+                    float coef = (regrets[ridx] >= 0.0f) ? alpha_t : beta_t;
+                    regrets[ridx] = coef * regrets[ridx] + cp * inst_regret;
+                    if (regrets[ridx] < regret_floor) regrets[ridx] = regret_floor;
+                }
+            }
+
+            // Accumulate cum_strategy with cp weighting
+            for (int a = 0; a < na; a++) {
+                for (int h = 0; h < nh; h++) {
+                    uint32_t cidx = offset + a * nh + h;
+                    float cp = chance_prob[cp_base + h];
+                    atomicAdd(&cum_accum[cidx], cp * sigma[a * nh + h]);
+                    // NOTE: atomicAdd used for safety; in practice each
+                    // infoset has at most one node per level so direct
+                    // accumulation would work. The atomicAdd overhead is
+                    // negligible since this is not on the convergence path.
+                }
+            }
+
+            // Write CFV for this node at this outcome
+            float* out = cfv_o + node_id * nh;
+            for (int h = 0; h < nh; h++) {
+                out[h] = cfv_avg[h];
+            }
+        }
+    } else {
+        // Opponent node: sum child CFVs (no regret update)
+        for (int outcome = 0; outcome < num_outcomes; outcome++) {
+            float* cfv_o = cfv + outcome * cfv_batch_stride;
+            float cfv_avg[1326];
+            for (int h = 0; h < nh; h++) cfv_avg[h] = 0.0f;
+            for (int a = 0; a < na; a++) {
+                uint32_t child = children[node.children_start + a];
+                for (int h = 0; h < nh; h++) {
+                    cfv_avg[h] += cfv_o[child * nh + h];
+                }
+            }
+            float* out = cfv_o + node_id * nh;
+            for (int h = 0; h < nh; h++) {
+                out[h] = cfv_avg[h];
+            }
+        }
+    }
+}

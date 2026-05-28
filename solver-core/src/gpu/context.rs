@@ -48,6 +48,7 @@ pub struct GpuContext {
     vcfr_cum_apply_fn: CudaFunction,
     vcfr_init_reach_fn: CudaFunction,
     vcfr_zero_fn: CudaFunction,
+    vcfr_streaming_fn: CudaFunction,
 }
 
 impl GpuContext {
@@ -85,6 +86,7 @@ impl GpuContext {
         let vcfr_cum_apply_fn = vcfr_module.load_function("vcfr_cum_apply")?;
         let vcfr_init_reach_fn = vcfr_module.load_function("vcfr_init_reach")?;
         let vcfr_zero_fn = vcfr_module.load_function("vcfr_zero_buffer")?;
+        let vcfr_streaming_fn = vcfr_module.load_function("vcfr_streaming_level")?;
 
         Ok(GpuContext {
             stream,
@@ -105,6 +107,7 @@ impl GpuContext {
             vcfr_cum_apply_fn,
             vcfr_init_reach_fn,
             vcfr_zero_fn,
+            vcfr_streaming_fn,
         })
     }
 
@@ -698,6 +701,7 @@ impl GpuContext {
             vcfr_cum_apply_fn: self.vcfr_cum_apply_fn.clone(),
             vcfr_init_reach_fn: self.vcfr_init_reach_fn.clone(),
             vcfr_zero_fn: self.vcfr_zero_fn.clone(),
+            vcfr_streaming_fn: self.vcfr_streaming_fn.clone(),
             d_nodes,
             d_children,
             d_contributions,
@@ -939,6 +943,7 @@ pub struct GpuVectorCfr {
     vcfr_cum_apply_fn: CudaFunction,
     vcfr_init_reach_fn: CudaFunction,
     vcfr_zero_fn: CudaFunction,
+    vcfr_streaming_fn: CudaFunction,
     d_nodes: CudaSlice<FlatNode>,
     d_children: CudaSlice<u32>,
     d_contributions: CudaSlice<i32>,
@@ -2111,6 +2116,7 @@ impl GpuContext {
             vcfr_cum_apply_fn: self.vcfr_cum_apply_fn.clone(),
             vcfr_init_reach_fn: self.vcfr_init_reach_fn.clone(),
             vcfr_zero_fn: self.vcfr_zero_fn.clone(),
+            vcfr_streaming_fn: self.vcfr_streaming_fn.clone(),
             d_nodes, d_children, d_contributions, d_folded_masks,
             d_infoset_offsets, d_decision_node_ids,
             d_regrets, d_strategy, d_cum_strategy, d_reach, d_cfv, d_initial_weight,
@@ -2259,10 +2265,8 @@ impl GpuVectorCfr {
 
         // ══════════════════════════════════════════════════
         // Phase 1: River zone — per turn card, batch river outcomes
-        // Finalize into turn CFV batch (not main CFV)
         // ══════════════════════════════════════════════════
 
-        // Clear accumulators ONCE (accumulate across all turn cards)
         self.stream.memset_zeros(&mut fs.d_regret_accum)?;
         self.stream.memset_zeros(&mut fs.d_cum_accum)?;
         self.stream.memset_zeros(&mut fs.d_turn_cfv_batch)?;
@@ -2274,7 +2278,6 @@ impl GpuVectorCfr {
             self.stream.memset_zeros(&mut fs.d_river_cfv_batch)?;
             self.stream.memset_zeros(&mut fs.d_river_accum)?;
 
-            // Sorted array slices for this turn card's river outcomes
             let rv_sos_offset = ti * max_river * (num_opp as usize) * nh_usize;
             let rv_sps_offset = ti * max_river * nh_usize;
             let rv_prob_offset = ti * max_river * nh_usize;
@@ -2290,7 +2293,6 @@ impl GpuVectorCfr {
             let rv_prob = fs.d_river_chance_prob.slice(
                 rv_prob_offset..rv_prob_offset + (n_river as usize) * nh_usize);
 
-            // Batched bottom-up for river zone
             for level in (0..=self.max_depth).rev() {
                 let count = fs.river_zone_counts[level];
                 if count == 0 { continue; }
@@ -2316,7 +2318,7 @@ impl GpuVectorCfr {
                         .arg(&rv_opp_str).arg(&rv_opp_idx)
                         .arg(&rv_pl_str).arg(&rv_pl_idx)
                         .arg(&self.d_hand_cards)
-                        .arg(&rv_prob)  // chance_prob for probability weighting
+                        .arg(&rv_prob)
                         .arg(&np).arg(&nh).arg(&traverser)
                         .arg(&alpha_t).arg(&beta_t).arg(&gamma_t)
                         .arg(&regret_floor)
@@ -2325,7 +2327,6 @@ impl GpuVectorCfr {
                 }
             }
 
-            // Accumulate river outcomes: sum prob * cfv into river_accum
             {
                 let total = (n_river as usize) * (fs.river_cc_count as usize) * nh_usize;
                 let grid = ((total + 255) / 256) as u32;
@@ -2340,8 +2341,6 @@ impl GpuVectorCfr {
                 }
             }
 
-            // Finalize river into turn CFV batch at offset ti*nn*nh
-            // Use chance_final on a slice of turn_cfv_batch
             {
                 let turn_offset = ti * nn_usize * nh_usize;
                 let turn_slice_len = nn_usize * nh_usize;
@@ -2363,8 +2362,6 @@ impl GpuVectorCfr {
         // Phase 2: Turn zone — batched with 49 outcomes
         // ══════════════════════════════════════════════════
 
-        // Turn sorted arrays: already repacked in [n_turn * num_opp * nh]
-        // Turn chance prob: [n_turn * nh]
         let tn_opp_str = fs.d_turn_sorted_str.slice(
             0..n_turn * (num_opp as usize) * nh_usize);
         let tn_opp_idx = fs.d_turn_sorted_idx.slice(
@@ -2374,7 +2371,6 @@ impl GpuVectorCfr {
         let tn_pl_idx = fs.d_turn_pl_idx.slice(
             0..n_turn * nh_usize);
 
-        // Batched bottom-up for turn zone (49 outcomes)
         for level in (0..=self.max_depth).rev() {
             let count = fs.turn_zone_counts[level];
             if count == 0 { continue; }
@@ -2392,7 +2388,7 @@ impl GpuVectorCfr {
                     .arg(&self.d_contributions).arg(&self.d_folded_masks)
                     .arg(&self.d_strategy).arg(&self.d_infoset_offsets)
                     .arg(&self.d_reach)
-                    .arg(&fs.d_turn_cfv_batch)  // turn CFV batch
+                    .arg(&fs.d_turn_cfv_batch)
                     .arg(&self.d_regrets)
                     .arg(&fs.d_regret_accum)
                     .arg(&self.d_cum_strategy)
@@ -2401,7 +2397,7 @@ impl GpuVectorCfr {
                     .arg(&tn_opp_str).arg(&tn_opp_idx)
                     .arg(&tn_pl_str).arg(&tn_pl_idx)
                     .arg(&self.d_hand_cards)
-                    .arg(&fs.d_turn_chance_prob)  // turn chance prob for weighting
+                    .arg(&fs.d_turn_chance_prob)
                     .arg(&np).arg(&nh).arg(&traverser)
                     .arg(&alpha_t).arg(&beta_t).arg(&gamma_t)
                     .arg(&regret_floor)
@@ -2410,7 +2406,7 @@ impl GpuVectorCfr {
             }
         }
 
-        // Apply regret discount ONCE (river + turn zones)
+        // Apply regret discount ONCE
         {
             let total = fs.regret_accum_size as usize;
             let grid = ((total + 255) / 256) as u32;
@@ -2438,9 +2434,8 @@ impl GpuVectorCfr {
             }
         }
 
-        // Accumulate turn outcomes into single CFV: turn_accum[child*nh+h] += prob * turn_batch[outcome*nn*nh+child*nh+h]
+        // Accumulate turn outcomes into single CFV
         {
-            // Build outcome_to_group: all zeros (single group)
             let ones_group = vec![0i32; n_turn];
             let d_ones_group = self.stream.clone_htod(&ones_group)?;
             let total = n_turn * (fs.turn_cc_count as usize) * nh_usize;
