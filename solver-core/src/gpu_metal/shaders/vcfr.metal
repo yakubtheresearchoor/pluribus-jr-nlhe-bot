@@ -524,7 +524,10 @@ kernel void vcfr_bottom_up(
                 }
             } else {
             // Multiway side pot handling (3+ players)
-            // Side pot handling
+            // Uses product formula per pot level, matching the equal-contribution code.
+            // For each level with K eligible opponents:
+            //   cfv[h] += pot_at_level * ((K+1) * prod(W_oi) - prod(R_oi))
+            // where W_oi = cum weaker reach, R_oi = effective total reach for opp oi
             for (int h = 0; h < nh; h++) out[h] = 0.0f;
             int levels[8];
             int num_levels = 0;
@@ -576,24 +579,99 @@ kernel void vcfr_bottom_up(
                 }
 
                 if (traverser_eligible) {
-                    for (int opp_p = 0; opp_p < np; opp_p++) {
-                        if (opp_p == int(params.traverser) || (fold_mask & (1 << opp_p)) ||
-                            contributions[node_id * np + opp_p] < level) continue;
+                    if (eligible_opp_count == 1) {
+                        // Single eligible opponent: pairwise sweep (exact for 1 opp)
+                        for (int opp_p = 0; opp_p < np; opp_p++) {
+                            if (opp_p == int(params.traverser) || (fold_mask & (1 << opp_p)) ||
+                                contributions[node_id * np + opp_p] < level) continue;
 
-                        int oi = (opp_p < int(params.traverser)) ? opp_p : (opp_p - 1);
-                        const device float* opp_r = reach + node_reach_base + opp_p * nh;
-                        const device uint16_t* o_str = sorted_opp_strength + oi * nh;
-                        const device uint16_t* o_idx = sorted_opp_indices + oi * nh;
+                            int oi = (opp_p < int(params.traverser)) ? opp_p : (opp_p - 1);
+                            const device float* opp_r = reach + node_reach_base + opp_p * nh;
+                            const device uint16_t* o_str = sorted_opp_strength + oi * nh;
+                            const device uint16_t* o_idx = sorted_opp_indices + oi * nh;
 
-                        // Wins sweep
-                        float cfreach_sum = 0.0f;
-                        float cfreach_minus[52];
-                        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
-                        int i = 0;
-                        for (int si = 0; si < nh; si++) {
-                            uint16_t str_h = sorted_pl_strength[si];
-                            uint16_t h = sorted_pl_indices[si];
-                            while (i < nh && o_str[i] < str_h) {
+                            // Wins sweep
+                            float cfreach_sum = 0.0f;
+                            float cfreach_minus[52];
+                            for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                            int i = 0;
+                            for (int si = 0; si < nh; si++) {
+                                uint16_t str_h = sorted_pl_strength[si];
+                                uint16_t h = sorted_pl_indices[si];
+                                while (i < nh && o_str[i] < str_h) {
+                                    uint16_t ho = o_idx[i];
+                                    float r = opp_r[ho];
+                                    if (r != 0.0f) {
+                                        cfreach_sum += r;
+                                        cfreach_minus[hand_cards[ho * 2]] += r;
+                                        cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                    }
+                                    i++;
+                                }
+                                float cfreach = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]];
+                                out[h] += float(pot_at_level) * cfreach;
+                            }
+
+                            // Losses sweep
+                            cfreach_sum = 0.0f;
+                            for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                            i = nh - 1;
+                            for (int si = nh - 1; si >= 0; si--) {
+                                uint16_t str_h = sorted_pl_strength[si];
+                                uint16_t h = sorted_pl_indices[si];
+                                while (i >= 0 && o_str[i] > str_h) {
+                                    uint16_t ho = o_idx[i];
+                                    float r = opp_r[ho];
+                                    if (r != 0.0f) {
+                                        cfreach_sum += r;
+                                        cfreach_minus[hand_cards[ho * 2]] += r;
+                                        cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                    }
+                                    i--;
+                                }
+                                float cfreach = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]];
+                                out[h] -= float(pot_at_level) * cfreach;
+                            }
+                        }
+                    } else {
+                        // Multiple eligible opponents: product formula (exact)
+                        float cum_weaker[1326];
+                        float eff_total[1326];
+                        for (int h = 0; h < nh; h++) { cum_weaker[h] = 1.0f; eff_total[h] = 1.0f; }
+
+                        for (int opp_p = 0; opp_p < np; opp_p++) {
+                            if (opp_p == int(params.traverser) || (fold_mask & (1 << opp_p)) ||
+                                contributions[node_id * np + opp_p] < level) continue;
+
+                            int oi = (opp_p < int(params.traverser)) ? opp_p : (opp_p - 1);
+                            const device float* opp_r = reach + node_reach_base + opp_p * nh;
+                            const device uint16_t* o_str = sorted_opp_strength + oi * nh;
+                            const device uint16_t* o_idx = sorted_opp_indices + oi * nh;
+
+                            float cw[1326];
+                            float cfreach_sum = 0.0f;
+                            float cfreach_minus[52];
+                            for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                            int i = 0;
+
+                            for (int si = 0; si < nh; si++) {
+                                uint16_t str_h = sorted_pl_strength[si];
+                                uint16_t h = sorted_pl_indices[si];
+                                while (i < nh && o_str[i] < str_h) {
+                                    uint16_t ho = o_idx[i];
+                                    float r = opp_r[ho];
+                                    if (r != 0.0f) {
+                                        cfreach_sum += r;
+                                        cfreach_minus[hand_cards[ho * 2]] += r;
+                                        cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                    }
+                                    i++;
+                                }
+                                cw[h] = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]];
+                            }
+
+                            // Finish sweep for total effective reach
+                            while (i < nh) {
                                 uint16_t ho = o_idx[i];
                                 float r = opp_r[ho];
                                 if (r != 0.0f) {
@@ -603,29 +681,20 @@ kernel void vcfr_bottom_up(
                                 }
                                 i++;
                             }
-                            float cfreach = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]];
-                            out[h] += float(pot_at_level) * cfreach;
+
+                            for (int h = 0; h < nh; h++) {
+                                float eff = cfreach_sum
+                                    - cfreach_minus[hand_cards[h * 2]]
+                                    - cfreach_minus[hand_cards[h * 2 + 1]]
+                                    + opp_r[h];
+                                cum_weaker[h] *= cw[h];
+                                eff_total[h] *= eff;
+                            }
                         }
 
-                        // Losses sweep
-                        cfreach_sum = 0.0f;
-                        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
-                        i = nh - 1;
-                        for (int si = nh - 1; si >= 0; si--) {
-                            uint16_t str_h = sorted_pl_strength[si];
-                            uint16_t h = sorted_pl_indices[si];
-                            while (i >= 0 && o_str[i] > str_h) {
-                                uint16_t ho = o_idx[i];
-                                float r = opp_r[ho];
-                                if (r != 0.0f) {
-                                    cfreach_sum += r;
-                                    cfreach_minus[hand_cards[ho * 2]] += r;
-                                    cfreach_minus[hand_cards[ho * 2 + 1]] += r;
-                                }
-                                i--;
-                            }
-                            float cfreach = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]];
-                            out[h] -= float(pot_at_level) * cfreach;
+                        for (int h = 0; h < nh; h++) {
+                            out[h] += float(pot_at_level)
+                                * (float(eligible_opp_count + 1) * cum_weaker[h] - eff_total[h]);
                         }
                     }
                 }
@@ -1078,7 +1147,7 @@ kernel void vcfr_streaming_level(
                     }
                 }
             } else {
-                // Side pot (same logic as vcfr_bottom_up)
+                // Side pot: product formula per pot level (exact multiway)
                 for (int h = 0; h < nh; h++) out[h] = 0.0f;
                 int levels[8]; int num_levels = 0;
                 for (int p = 0; p < np && num_levels < 8; p++) {
@@ -1099,17 +1168,37 @@ kernel void vcfr_streaming_level(
                     if (li == 0) pot_at_level += params.starting_pot;
                     if (eligible_opp_count == 0) { if (traverser_eligible) { for (int h = 0; h < nh; h++) out[h] += (float)pot_at_level; } prev_level = level; continue; }
                     if (traverser_eligible) {
-                        for (int opp_p = 0; opp_p < np; opp_p++) {
-                            if (opp_p == (int)params.traverser || (fold_mask & (1 << opp_p)) || contributions[node_id * np + opp_p] < level) continue;
-                            int oi = (opp_p < (int)params.traverser) ? opp_p : (opp_p - 1);
-                            const device float* opp_r = reach + node_reach_base + opp_p * nh;
-                            const device uint16_t* o_str = opp_str + oi * nh;
-                            const device uint16_t* o_idx = opp_idx + oi * nh;
-                            float cfreach_sum = 0.0f; float cfreach_minus[52]; for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
-                            int i = 0;
-                            for (int si = 0; si < nh; si++) { uint16_t str_h = pl_str[si]; uint16_t h = pl_idx[si]; while (i < nh && o_str[i] < str_h) { uint16_t ho = o_idx[i]; float r = opp_r[ho]; if (r != 0.0f) { cfreach_sum += r; cfreach_minus[hand_cards[ho * 2]] += r; cfreach_minus[hand_cards[ho * 2 + 1]] += r; } i++; } float cfreach = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]]; out[h] += (float)pot_at_level * cfreach; }
-                            cfreach_sum = 0.0f; for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f; i = nh - 1;
-                            for (int si = nh - 1; si >= 0; si--) { uint16_t str_h = pl_str[si]; uint16_t h = pl_idx[si]; while (i >= 0 && o_str[i] > str_h) { uint16_t ho = o_idx[i]; float r = opp_r[ho]; if (r != 0.0f) { cfreach_sum += r; cfreach_minus[hand_cards[ho * 2]] += r; cfreach_minus[hand_cards[ho * 2 + 1]] += r; } i--; } float cfreach = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]]; out[h] -= (float)pot_at_level * cfreach; }
+                        if (eligible_opp_count == 1) {
+                            // Single eligible opponent: pairwise sweep (exact)
+                            for (int opp_p = 0; opp_p < np; opp_p++) {
+                                if (opp_p == (int)params.traverser || (fold_mask & (1 << opp_p)) || contributions[node_id * np + opp_p] < level) continue;
+                                int oi = (opp_p < (int)params.traverser) ? opp_p : (opp_p - 1);
+                                const device float* opp_r = reach + node_reach_base + opp_p * nh;
+                                const device uint16_t* o_str = opp_str + oi * nh;
+                                const device uint16_t* o_idx = opp_idx + oi * nh;
+                                float cfreach_sum = 0.0f; float cfreach_minus[52]; for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                                int i = 0;
+                                for (int si = 0; si < nh; si++) { uint16_t str_h = pl_str[si]; uint16_t h = pl_idx[si]; while (i < nh && o_str[i] < str_h) { uint16_t ho = o_idx[i]; float r = opp_r[ho]; if (r != 0.0f) { cfreach_sum += r; cfreach_minus[hand_cards[ho * 2]] += r; cfreach_minus[hand_cards[ho * 2 + 1]] += r; } i++; } float cfreach = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]]; out[h] += (float)pot_at_level * cfreach; }
+                                cfreach_sum = 0.0f; for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f; i = nh - 1;
+                                for (int si = nh - 1; si >= 0; si--) { uint16_t str_h = pl_str[si]; uint16_t h = pl_idx[si]; while (i >= 0 && o_str[i] > str_h) { uint16_t ho = o_idx[i]; float r = opp_r[ho]; if (r != 0.0f) { cfreach_sum += r; cfreach_minus[hand_cards[ho * 2]] += r; cfreach_minus[hand_cards[ho * 2 + 1]] += r; } i--; } float cfreach = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]]; out[h] -= (float)pot_at_level * cfreach; }
+                            }
+                        } else {
+                            // Multiple eligible opponents: product formula (exact)
+                            float cum_weaker[1326];
+                            float eff_total[1326];
+                            for (int h = 0; h < nh; h++) { cum_weaker[h] = 1.0f; eff_total[h] = 1.0f; }
+                            for (int opp_p = 0; opp_p < np; opp_p++) {
+                                if (opp_p == (int)params.traverser || (fold_mask & (1 << opp_p)) || contributions[node_id * np + opp_p] < level) continue;
+                                int oi = (opp_p < (int)params.traverser) ? opp_p : (opp_p - 1);
+                                const device float* opp_r = reach + node_reach_base + opp_p * nh;
+                                const device uint16_t* o_str = opp_str + oi * nh;
+                                const device uint16_t* o_idx = opp_idx + oi * nh;
+                                float cw[1326]; float cfreach_sum = 0.0f; float cfreach_minus[52]; for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f; int i = 0;
+                                for (int si = 0; si < nh; si++) { uint16_t str_h = pl_str[si]; uint16_t h = pl_idx[si]; while (i < nh && o_str[i] < str_h) { uint16_t ho = o_idx[i]; float r = opp_r[ho]; if (r != 0.0f) { cfreach_sum += r; cfreach_minus[hand_cards[ho * 2]] += r; cfreach_minus[hand_cards[ho * 2 + 1]] += r; } i++; } cw[h] = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]]; }
+                                while (i < nh) { uint16_t ho = o_idx[i]; float r = opp_r[ho]; if (r != 0.0f) { cfreach_sum += r; cfreach_minus[hand_cards[ho * 2]] += r; cfreach_minus[hand_cards[ho * 2 + 1]] += r; } i++; }
+                                for (int h = 0; h < nh; h++) { float eff = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]] + opp_r[h]; cum_weaker[h] *= cw[h]; eff_total[h] *= eff; }
+                            }
+                            for (int h = 0; h < nh; h++) { out[h] += float(pot_at_level) * (float(eligible_opp_count + 1) * cum_weaker[h] - eff_total[h]); }
                         }
                     }
                     prev_level = level;
@@ -1519,6 +1608,7 @@ kernel void vcfr_bottom_up_batched(
                 }
             } else {
             // Multiway side pot handling (3+ players)
+            // Uses product formula per pot level (exact multiway computation)
             for (int h = 0; h < nh; h++) out[h] = 0.0f;
             int levels[8];
             int num_levels = 0;
@@ -1573,25 +1663,105 @@ kernel void vcfr_bottom_up_batched(
                 }
 
                 if (traverser_eligible) {
-                    for (int opp_p = 0; opp_p < np; opp_p++) {
-                        if (opp_p == int(params.traverser)) continue;
-                        if (fold_mask & (1 << opp_p)) continue;
-                        if (contributions[int(node_id) * np + opp_p] < level) continue;
+                    if (eligible_opp_count == 1) {
+                        // Single eligible opponent: pairwise sweep (exact)
+                        for (int opp_p = 0; opp_p < np; opp_p++) {
+                            if (opp_p == int(params.traverser)) continue;
+                            if (fold_mask & (1 << opp_p)) continue;
+                            if (contributions[int(node_id) * np + opp_p] < level) continue;
 
-                        int oi = (opp_p < int(params.traverser)) ? opp_p : (opp_p - 1);
-                        const device float* opp_r = reach + node_reach_base + opp_p * nh;
-                        const device uint16_t* o_str = opp_str + oi * nh;
-                        const device uint16_t* o_idx = opp_idx + oi * nh;
+                            int oi = (opp_p < int(params.traverser)) ? opp_p : (opp_p - 1);
+                            const device float* opp_r = reach + node_reach_base + opp_p * nh;
+                            const device uint16_t* o_str = opp_str + oi * nh;
+                            const device uint16_t* o_idx = opp_idx + oi * nh;
 
-                        // Wins sweep (ascending)
-                        float cfreach_sum = 0.0f;
-                        float cfreach_minus[52];
-                        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
-                        int i = 0;
-                        for (int si = 0; si < nh; si++) {
-                            uint16_t str_h = pl_str[si];
-                            uint16_t h = pl_idx[si];
-                            while (i < nh && o_str[i] < str_h) {
+                            // Wins sweep (ascending)
+                            float cfreach_sum = 0.0f;
+                            float cfreach_minus[52];
+                            for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                            int i = 0;
+                            for (int si = 0; si < nh; si++) {
+                                uint16_t str_h = pl_str[si];
+                                uint16_t h = pl_idx[si];
+                                while (i < nh && o_str[i] < str_h) {
+                                    uint16_t ho = o_idx[i];
+                                    float r = opp_r[ho];
+                                    if (r != 0.0f) {
+                                        cfreach_sum += r;
+                                        cfreach_minus[hand_cards[ho * 2]] += r;
+                                        cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                    }
+                                    i++;
+                                }
+                                float cfreach = cfreach_sum
+                                    - cfreach_minus[hand_cards[h * 2]]
+                                    - cfreach_minus[hand_cards[h * 2 + 1]];
+                                out[h] += float(pot_at_level) * cfreach;
+                            }
+
+                            // Losses sweep (descending)
+                            cfreach_sum = 0.0f;
+                            for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                            i = nh - 1;
+                            for (int si = nh - 1; si >= 0; si--) {
+                                uint16_t str_h = pl_str[si];
+                                uint16_t h = pl_idx[si];
+                                while (i >= 0 && o_str[i] > str_h) {
+                                    uint16_t ho = o_idx[i];
+                                    float r = opp_r[ho];
+                                    if (r != 0.0f) {
+                                        cfreach_sum += r;
+                                        cfreach_minus[hand_cards[ho * 2]] += r;
+                                        cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                    }
+                                    i--;
+                                }
+                                float cfreach = cfreach_sum
+                                    - cfreach_minus[hand_cards[h * 2]]
+                                    - cfreach_minus[hand_cards[h * 2 + 1]];
+                                out[h] -= float(pot_at_level) * cfreach;
+                            }
+                        }
+                    } else {
+                        // Multiple eligible opponents: product formula (exact)
+                        float cum_weaker[1326];
+                        float eff_total[1326];
+                        for (int h = 0; h < nh; h++) { cum_weaker[h] = 1.0f; eff_total[h] = 1.0f; }
+
+                        for (int opp_p = 0; opp_p < np; opp_p++) {
+                            if (opp_p == int(params.traverser)) continue;
+                            if (fold_mask & (1 << opp_p)) continue;
+                            if (contributions[int(node_id) * np + opp_p] < level) continue;
+
+                            int oi = (opp_p < int(params.traverser)) ? opp_p : (opp_p - 1);
+                            const device float* opp_r = reach + node_reach_base + opp_p * nh;
+                            const device uint16_t* o_str = opp_str + oi * nh;
+                            const device uint16_t* o_idx = opp_idx + oi * nh;
+
+                            float cw[1326];
+                            float cfreach_sum = 0.0f;
+                            float cfreach_minus[52];
+                            for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+                            int i = 0;
+
+                            for (int si = 0; si < nh; si++) {
+                                uint16_t str_h = pl_str[si];
+                                uint16_t h = pl_idx[si];
+                                while (i < nh && o_str[i] < str_h) {
+                                    uint16_t ho = o_idx[i];
+                                    float r = opp_r[ho];
+                                    if (r != 0.0f) {
+                                        cfreach_sum += r;
+                                        cfreach_minus[hand_cards[ho * 2]] += r;
+                                        cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                                    }
+                                    i++;
+                                }
+                                cw[h] = cfreach_sum - cfreach_minus[hand_cards[h * 2]] - cfreach_minus[hand_cards[h * 2 + 1]];
+                            }
+
+                            // Finish sweep for total effective reach
+                            while (i < nh) {
                                 uint16_t ho = o_idx[i];
                                 float r = opp_r[ho];
                                 if (r != 0.0f) {
@@ -1601,33 +1771,20 @@ kernel void vcfr_bottom_up_batched(
                                 }
                                 i++;
                             }
-                            float cfreach = cfreach_sum
-                                - cfreach_minus[hand_cards[h * 2]]
-                                - cfreach_minus[hand_cards[h * 2 + 1]];
-                            out[h] += float(pot_at_level) * cfreach;
+
+                            for (int h = 0; h < nh; h++) {
+                                float eff = cfreach_sum
+                                    - cfreach_minus[hand_cards[h * 2]]
+                                    - cfreach_minus[hand_cards[h * 2 + 1]]
+                                    + opp_r[h];
+                                cum_weaker[h] *= cw[h];
+                                eff_total[h] *= eff;
+                            }
                         }
 
-                        // Losses sweep (descending)
-                        cfreach_sum = 0.0f;
-                        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
-                        i = nh - 1;
-                        for (int si = nh - 1; si >= 0; si--) {
-                            uint16_t str_h = pl_str[si];
-                            uint16_t h = pl_idx[si];
-                            while (i >= 0 && o_str[i] > str_h) {
-                                uint16_t ho = o_idx[i];
-                                float r = opp_r[ho];
-                                if (r != 0.0f) {
-                                    cfreach_sum += r;
-                                    cfreach_minus[hand_cards[ho * 2]] += r;
-                                    cfreach_minus[hand_cards[ho * 2 + 1]] += r;
-                                }
-                                i--;
-                            }
-                            float cfreach = cfreach_sum
-                                - cfreach_minus[hand_cards[h * 2]]
-                                - cfreach_minus[hand_cards[h * 2 + 1]];
-                            out[h] -= float(pot_at_level) * cfreach;
+                        for (int h = 0; h < nh; h++) {
+                            out[h] += float(pot_at_level)
+                                * (float(eligible_opp_count + 1) * cum_weaker[h] - eff_total[h]);
                         }
                     }
                 }
@@ -1643,7 +1800,6 @@ kernel void vcfr_bottom_up_batched(
         if (params.num_combinations > 0.0f) {
             for (int h = 0; h < nh; h++) out[h] /= params.num_combinations;
         }
-
         return;
     }
 
@@ -1714,9 +1870,9 @@ kernel void vcfr_bottom_up_batched(
         }
     }
 
-    device float* out = cfv_o + int(node_id) * nh;
+    device float* out_node = cfv_o + int(node_id) * nh;
     for (int h = 0; h < nh; h++) {
-        out[h] = cfv_avg[h];
+        out_node[h] = cfv_avg[h];
     }
 }
 

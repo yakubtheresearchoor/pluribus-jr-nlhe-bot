@@ -512,7 +512,11 @@ pub fn side_pot_showdown_cfv(
         }
 
         if traverser_eligible {
-            for &opp_p in &eligible_opp {
+            let num_eligible_opp = eligible_opp.len();
+
+            if num_eligible_opp == 1 {
+                // Single eligible opponent: simple pairwise sweep (exact)
+                let opp_p = eligible_opp[0];
                 let oi = if opp_p < traverser { opp_p } else { opp_p - 1 };
                 let reach = opp_reach[oi];
                 let o_str = &sorted_opp_str[oi * nh..(oi + 1) * nh];
@@ -561,6 +565,69 @@ pub fn side_pot_showdown_cfv(
                         - cfreach_minus[hand_cards[h * 2] as usize]
                         - cfreach_minus[hand_cards[h * 2 + 1] as usize];
                     cfv[h] -= pot_at_level as f32 * cfreach;
+                }
+            } else {
+                // Multiple eligible opponents: product formula (exact)
+                // cfv[h] += pot_at_level * ((K+1) * prod(W_oi) - prod(R_oi))
+                // where K = num_eligible_opp, W_oi = cum weaker reach for opp oi,
+                // R_oi = effective total reach for opp oi
+                let mut cum_weaker: Vec<f32> = vec![1.0f32; nh];
+                let mut eff_total: Vec<f32> = vec![1.0f32; nh];
+
+                for &opp_p in &eligible_opp {
+                    let oi = if opp_p < traverser { opp_p } else { opp_p - 1 };
+                    let reach = opp_reach[oi];
+                    let o_str = &sorted_opp_str[oi * nh..(oi + 1) * nh];
+                    let o_idx = &sorted_opp_idx[oi * nh..(oi + 1) * nh];
+
+                    let mut cw = vec![0.0f32; nh];
+                    let mut cfreach_sum = 0.0f32;
+                    let mut cfreach_minus = vec![0.0f32; 52];
+                    let mut i = 0;
+
+                    for si in 0..nh {
+                        let str_h = sorted_pl_str[si];
+                        let h = sorted_pl_idx[si] as usize;
+                        while i < nh && o_str[i] < str_h {
+                            let ho = o_idx[i] as usize;
+                            let r = reach[ho];
+                            if r != 0.0 {
+                                cfreach_sum += r;
+                                cfreach_minus[hand_cards[ho * 2] as usize] += r;
+                                cfreach_minus[hand_cards[ho * 2 + 1] as usize] += r;
+                            }
+                            i += 1;
+                        }
+                        cw[h] = cfreach_sum
+                            - cfreach_minus[hand_cards[h * 2] as usize]
+                            - cfreach_minus[hand_cards[h * 2 + 1] as usize];
+                    }
+
+                    // Finish sweep for total effective reach
+                    while i < nh {
+                        let ho = o_idx[i] as usize;
+                        let r = reach[ho];
+                        if r != 0.0 {
+                            cfreach_sum += r;
+                            cfreach_minus[hand_cards[ho * 2] as usize] += r;
+                            cfreach_minus[hand_cards[ho * 2 + 1] as usize] += r;
+                        }
+                        i += 1;
+                    }
+
+                    for h in 0..nh {
+                        let eff = cfreach_sum
+                            - cfreach_minus[hand_cards[h * 2] as usize]
+                            - cfreach_minus[hand_cards[h * 2 + 1] as usize]
+                            + reach[h];
+                        cum_weaker[h] *= cw[h];
+                        eff_total[h] *= eff;
+                    }
+                }
+
+                for h in 0..nh {
+                    cfv[h] += pot_at_level as f32
+                        * ((num_eligible_opp as f32 + 1.0) * cum_weaker[h] - eff_total[h]);
                 }
             }
         }

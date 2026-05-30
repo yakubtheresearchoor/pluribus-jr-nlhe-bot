@@ -204,8 +204,8 @@ fn test_3player_gpu_convergence_detail() {
     let mut gpu = MetalFlopStartSolver::new(&ctx, &tree, &game, &cpu_proxy);
 
     // Run 50 iterations, measuring exploitability every 10
-    for batch in 0..20 {
-        gpu.run(&ctx, &tree, &game, 5);
+    for batch in 0..10 {
+        gpu.run(&ctx, &tree, &game, 10);
         
         // Measure exploitability via CPU proxy
         cpu_proxy.set_iteration(gpu.iteration());
@@ -257,7 +257,7 @@ fn test_3player_gpu_convergence_detail() {
         }
         let pot_size = 15.0f32;
         let expl_pct = total_expl / pot_size * 100.0;
-        eprintln!("GPU iter {:3}: expl={:.4} ({:.2}% of pot)", (batch+1)*5, total_expl, expl_pct);
+        eprintln!("GPU iter {:3}: expl={:.4} ({:.2}% of pot)", (batch+1)*10, total_expl, expl_pct);
         
         // Check if regrets are changing
         let reg = gpu.download_regrets();
