@@ -207,7 +207,10 @@ impl FlopChanceTable {
             initial_weights.push(w);
         }
 
-        // num_combinations
+        // num_combinations: count of non-conflicting hand tuples across all players.
+        // For 2 players, this is the standard pairwise count.
+        // For N>2 with small nh, enumerate exactly.
+        // For N>2 with large nh, fall back to pairwise (p0 × p1).
         let nc = if num_players == 2 {
             let w0 = &initial_weights[0];
             let w1 = &initial_weights[1];
@@ -222,7 +225,54 @@ impl FlopChanceTable {
                 }
             }
             nc
-        } else { 1.0 };
+        } else {
+            let np = num_players as usize;
+            let max_enumerate = 1_000_000usize;
+            if num_valid.pow(np as u32) <= max_enumerate {
+                // Recursive enumeration of non-conflicting hand tuples
+                fn enumerate(
+                    player: usize, np: usize, nh: usize,
+                    combined_mask: u64,
+                    hand_cards: &[u8],
+                    weights: &[Vec<f32>],
+                    current_weight: f64,
+                ) -> f64 {
+                    if player == np {
+                        return current_weight;
+                    }
+                    let mut total = 0.0f64;
+                    for h in 0..nh {
+                        let mask_h: u64 = (1u64 << hand_cards[h * 2]) | (1u64 << hand_cards[h * 2 + 1]);
+                        if combined_mask & mask_h != 0 { continue; }
+                        let w = weights[player][h] as f64;
+                        if w == 0.0 { continue; }
+                        total += enumerate(
+                            player + 1, np, nh,
+                            combined_mask | mask_h,
+                            hand_cards, weights,
+                            current_weight * w,
+                        );
+                    }
+                    total
+                }
+                enumerate(0, np, num_valid, 0, &hand_cards[..], &initial_weights, 1.0)
+            } else {
+                // Fall back to pairwise (p0 × p1) — approximate normalization
+                let w0 = &initial_weights[0];
+                let w1 = &initial_weights[1];
+                let mut nc = 0.0f64;
+                for h0 in 0..num_valid {
+                    let mask0: u64 = (1u64 << hand_cards[h0 * 2]) | (1u64 << hand_cards[h0 * 2 + 1]);
+                    for h1 in 0..num_valid {
+                        let mask1: u64 = (1u64 << hand_cards[h1 * 2]) | (1u64 << hand_cards[h1 * 2 + 1]);
+                        if mask0 & mask1 == 0 {
+                            nc += w0[h0] as f64 * w1[h1] as f64;
+                        }
+                    }
+                }
+                nc
+            }
+        };
 
         FlopChanceTable {
             hand_ranks_base, valid_hand_indices, num_valid, conflict, hand_cards,
@@ -314,6 +364,55 @@ impl FlopChanceTable {
         let blocked = river_deck.iter().filter(|&&rc| rc == c1 || rc == c2).count();
         1.0 / (river_deck.len() as f32 - blocked as f32)
     }
+
+    /// Pre-compute turn chance probabilities for all (outcome, hand) pairs.
+    /// Returns [n_turn * nh] where index = outcome * nh + hand.
+    pub fn compute_turn_chance_prob(&self) -> Vec<f32> {
+        let n_turn = self.remaining_deck.len();
+        let nh = self.num_valid;
+        let mut prob = vec![0.0f32; n_turn * nh];
+        for ti in 0..n_turn {
+            for h in 0..nh {
+                prob[ti * nh + h] = self.chance_probability_turn(ti, h);
+            }
+        }
+        prob
+    }
+
+    /// Pre-compute river chance probabilities for all (turn, river, hand) triples.
+    /// Returns [n_turn * max_n_river * nh] where index = (ti * max_n_river + ri) * nh + h.
+    /// Slots for invalid (turn, river) pairs are zero.
+    pub fn compute_river_chance_prob(&self) -> Vec<f32> {
+        let n_turn = self.remaining_deck.len();
+        let nh = self.num_valid;
+        let max_n_river = self.river_decks.iter().map(|d| d.len()).max().unwrap_or(0);
+        let mut prob = vec![0.0f32; n_turn * max_n_river * nh];
+        for (ti, &tc) in self.remaining_deck.iter().enumerate() {
+            let n_river = self.river_decks[tc as usize].len();
+            for ri in 0..n_river {
+                for h in 0..nh {
+                    let idx = (ti * max_n_river + ri) * nh + h;
+                    prob[idx] = self.chance_probability_river(tc, ri, h);
+                }
+            }
+        }
+        prob
+    }
+
+    /// Pre-compute player sorted strength/indices per turn card.
+    /// For 2-player, same as opponent sorted arrays.
+    /// Returns [n_turn * nh].
+    pub fn compute_turn_pl_sorted(&self) -> (Vec<u16>, Vec<u16>) {
+        // For 2-player, player sorted = opponent sorted (same hand ranking)
+        (self.turn_sorted_str.clone(), self.turn_sorted_idx.clone())
+    }
+
+    /// Pre-compute player sorted strength/indices per (turn, river) pair.
+    /// For 2-player, same as opponent sorted arrays.
+    /// Returns [n_turn * max_n_river * nh].
+    pub fn compute_river_pl_sorted(&self) -> (Vec<u16>, Vec<u16>) {
+        (self.river_sorted_str.clone(), self.river_sorted_idx.clone())
+    }
 }
 
 impl FlopStartGame {
@@ -372,10 +471,41 @@ impl GameSpec for FlopStartGame {
             contributions[p] = tree.get_contribution(node_idx, p as u8);
         }
 
-        let opp_reach: Vec<&[f32]> = (0..np)
+        // Filter opponent reach to exclude hands conflicting with turn/river cards.
+        // The initial_weight already excludes flop-blocking hands, but opponent hands
+        // containing the turn or river card are still included and must be zeroed out.
+        let board_cards: Vec<u8> = match (self.current_turn_card.get(), self.current_river_card.get()) {
+            (Some(tc), Some(rc)) => vec![tc, rc],
+            (Some(tc), None) => vec![tc],
+            (None, _) => vec![],
+        };
+
+        let filtered_opp_reach: Vec<Vec<f32>> = (0..np)
             .filter(|&p| p != traverser as usize)
-            .map(|p| cfreach[p].as_slice())
+            .map(|p| {
+                let raw = &cfreach[p];
+                if board_cards.is_empty() {
+                    raw.to_vec()
+                } else {
+                    let mut filtered = raw.clone();
+                    for h in 0..nh {
+                        if filtered[h] != 0.0 {
+                            let c1 = self.table.hand_cards[h * 2];
+                            let c2 = self.table.hand_cards[h * 2 + 1];
+                            for &bc in &board_cards {
+                                if c1 == bc || c2 == bc {
+                                    filtered[h] = 0.0;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    filtered
+                }
+            })
             .collect();
+
+        let opp_reach: Vec<&[f32]> = filtered_opp_reach.iter().map(|v| v.as_slice()).collect();
 
         // Select sorted arrays based on current turn + river cards
         let cfv = match (self.current_turn_card.get(), self.current_river_card.get()) {

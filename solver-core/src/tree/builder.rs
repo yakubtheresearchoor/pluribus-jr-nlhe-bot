@@ -76,6 +76,18 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
 
     builder.build_recursive(root_idx, info);
 
+    // Fix up node_type for player nodes that were incorrectly set to TERMINAL
+    // This can happen when build_recursive reassigns player_id for inactive players
+    // and then the node gets children set. The node_type should be PLAYER, not TERMINAL.
+    for i in 0..builder.tree.nodes.len() {
+        let n = &builder.tree.nodes[i];
+        if n.node_type == NODE_TYPE_TERMINAL && n.num_children > 0 {
+            // This node has children but is marked as terminal.
+            // It should be a player node (chance nodes are created with FlatNode::chance()).
+            builder.tree.nodes[i].node_type = NODE_TYPE_PLAYER;
+        }
+    }
+
     builder.tree.compute_levels();
 
     Ok(builder.tree)

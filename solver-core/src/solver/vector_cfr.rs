@@ -423,4 +423,74 @@ impl VectorCfr {
     pub fn iteration_count(&self) -> u32 {
         self.iteration
     }
+
+    // ---- Diagnostic methods ----
+
+    pub fn strategy_slice(&self) -> &[f32] {
+        &self.strategy
+    }
+
+    pub fn reach_slice(&self) -> Vec<f32> {
+        // Recompute reach from current state
+        unreachable!("Use compute_reach directly")
+    }
+
+    /// Run one iteration of the `run()` algorithm (not sequential),
+    /// returning diagnostic state for a specific traverser.
+    /// This matches Metal's `run()` flow: strategies once, reach once, bottom-up per traverser.
+    pub fn run_one_iteration_diagnostic(
+        &mut self,
+        tree: &FlatTree,
+        game: &dyn GameSpec,
+        traverser: usize,
+    ) -> CpuDiagnosticSnapshot {
+        let np = self.num_players as usize;
+        let nh = self.nh;
+
+        let params = DiscountParams::new(self.iteration);
+        self.iteration += 1;
+
+        // Step 1: compute strategies (once)
+        self.compute_all_strategies(tree);
+        let strategies = self.strategy.clone();
+
+        // Step 2+3: compute reach (once)
+        let reach = self.compute_reach(tree, game);
+
+        // Step 4: bottom-up for this traverser
+        let cfv = self.bottom_up_recursive(
+            tree, game, traverser, 0, &reach,
+            params.alpha_t, params.beta_t, params.gamma_t,
+        );
+        let regrets = self.regrets.clone();
+        let cum_strategy = self.cum_strategy.clone();
+
+        CpuDiagnosticSnapshot {
+            strategies,
+            reach,
+            cfv,
+            regrets,
+            cum_strategy,
+            traverser,
+            alpha_t: params.alpha_t,
+            beta_t: params.beta_t,
+            gamma_t: params.gamma_t,
+            nh,
+            np,
+        }
+    }
+}
+
+pub struct CpuDiagnosticSnapshot {
+    pub strategies: Vec<f32>,
+    pub reach: Vec<f32>,
+    pub cfv: Vec<f32>,
+    pub regrets: Vec<f32>,
+    pub cum_strategy: Vec<f32>,
+    pub traverser: usize,
+    pub alpha_t: f32,
+    pub beta_t: f32,
+    pub gamma_t: f32,
+    pub nh: usize,
+    pub np: usize,
 }

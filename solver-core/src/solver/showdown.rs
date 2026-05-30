@@ -287,6 +287,16 @@ pub fn side_pot_showdown_cfv(
         return cfv;
     }
 
+    // Compute min contribution among active (non-folded) players.
+    // For 2-player showdowns, the at-risk amount for BOTH players is
+    // starting_pot/np + min_active_contrib, regardless of who bet more.
+    // The excess contribution is returned to the larger contributor.
+    let min_active_contrib: i32 = (0..np)
+        .filter(|&p| fold_mask & (1u16 << p) == 0)
+        .map(|p| contributions[p])
+        .min()
+        .unwrap_or(0);
+
     let mut all_active_equal = true;
     let mut ref_contrib: Option<i32> = None;
     for p in 0..np {
@@ -297,6 +307,49 @@ pub fn side_pot_showdown_cfv(
         } else {
             ref_contrib = Some(cp);
         }
+    }
+
+    // For 2-player showdowns (including unequal contributions),
+    // use the simple sweep formula with min_active_contrib.
+    // This correctly handles side pots: each player's at-risk is
+    // starting_pot/np + min_active_contrib, because the excess
+    // is returned to the larger contributor.
+    if np == 2 && fold_mask & (1u16 << traverser) == 0 {
+        let num_active_opp = (0..np)
+            .filter(|&p| p != traverser && fold_mask & (1u16 << p) == 0)
+            .count();
+
+        if num_active_opp == 0 {
+            // No active opponent: traverser wins the pot
+            let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+            let traverser_investment = starting_pot as f32 / np as f32 + c_t as f32;
+            let payoff = total_pot as f32 - traverser_investment;
+            for h in 0..nh { cfv[h] = payoff; }
+            return cfv;
+        }
+
+        let mut filtered_opp: Vec<Vec<f32>> = Vec::with_capacity(num_opp);
+        for oi in 0..num_opp {
+            let p = if oi < traverser { oi } else { oi + 1 };
+            if fold_mask & (1u16 << p) != 0 {
+                filtered_opp.push(vec![0.0f32; nh]);
+            } else {
+                filtered_opp.push(opp_reach[oi].to_vec());
+            }
+        }
+
+        let filtered_views: Vec<&[f32]> = filtered_opp.iter().map(|v| v.as_slice()).collect();
+        let sweep = sorted_sweep_showdown(
+            &filtered_views, hand_cards, nh,
+            sorted_opp_str, sorted_opp_idx,
+            sorted_pl_str, sorted_pl_idx,
+        );
+
+        let half_pot = starting_pot as f32 / np as f32 + min_active_contrib as f32;
+        for h in 0..nh {
+            cfv[h] = half_pot * sweep[h];
+        }
+        return cfv;
     }
 
     if all_active_equal {

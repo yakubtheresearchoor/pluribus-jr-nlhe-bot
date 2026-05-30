@@ -5,3 +5,5 @@ pub mod card;
 pub mod solver;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+#[cfg(feature = "metal")]
+pub mod gpu_metal;
