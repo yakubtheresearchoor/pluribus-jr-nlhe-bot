@@ -207,71 +207,43 @@ impl FlopChanceTable {
             initial_weights.push(w);
         }
 
-        // num_combinations: count of non-conflicting hand tuples across all players.
-        // For 2 players, this is the standard pairwise count.
-        // For N>2 with small nh, enumerate exactly.
-        // For N>2 with large nh, fall back to pairwise (p0 × p1).
-        let nc = if num_players == 2 {
-            let w0 = &initial_weights[0];
-            let w1 = &initial_weights[1];
-            let mut nc = 0.0f64;
-            for h0 in 0..num_valid {
-                let mask0: u64 = (1u64 << hand_cards[h0 * 2]) | (1u64 << hand_cards[h0 * 2 + 1]);
-                for h1 in 0..num_valid {
-                    let mask1: u64 = (1u64 << hand_cards[h1 * 2]) | (1u64 << hand_cards[h1 * 2 + 1]);
-                    if mask0 & mask1 == 0 {
-                        nc += w0[h0] as f64 * w1[h1] as f64;
-                    }
-                }
-            }
-            nc
-        } else {
+        // num_combinations: count of non-conflicting hand tuples across all
+        // players, reach-weighted by initial weights. MUST enumerate the same
+        // set as the showdown numerator, or zero-sum breaks — the same lesson
+        // the 3-player port re-established. Done via recursive enumeration
+        // (equivalent to total_valid_reach_product at the top-level reach
+        // state). No nh^np cap, no pairwise fallback: at production nh=50
+        // 6max this is ~15.6B steps once per solve at startup; the same I-E
+        // formula that will eventually replace the brute-force showdown will
+        // also replace this. For now both share the same O(nh^K) ceiling.
+        let nc = {
             let np = num_players as usize;
-            let max_enumerate = 1_000_000usize;
-            if num_valid.pow(np as u32) <= max_enumerate {
-                // Recursive enumeration of non-conflicting hand tuples
-                fn enumerate(
-                    player: usize, np: usize, nh: usize,
-                    combined_mask: u64,
-                    hand_cards: &[u8],
-                    weights: &[Vec<f32>],
-                    current_weight: f64,
-                ) -> f64 {
-                    if player == np {
-                        return current_weight;
-                    }
-                    let mut total = 0.0f64;
-                    for h in 0..nh {
-                        let mask_h: u64 = (1u64 << hand_cards[h * 2]) | (1u64 << hand_cards[h * 2 + 1]);
-                        if combined_mask & mask_h != 0 { continue; }
-                        let w = weights[player][h] as f64;
-                        if w == 0.0 { continue; }
-                        total += enumerate(
-                            player + 1, np, nh,
-                            combined_mask | mask_h,
-                            hand_cards, weights,
-                            current_weight * w,
-                        );
-                    }
-                    total
+            fn enumerate(
+                player: usize, np: usize, nh: usize,
+                combined_mask: u64,
+                hand_cards: &[u8],
+                weights: &[Vec<f32>],
+                current_weight: f64,
+            ) -> f64 {
+                if player == np {
+                    return current_weight;
                 }
-                enumerate(0, np, num_valid, 0, &hand_cards[..], &initial_weights, 1.0)
-            } else {
-                // Fall back to pairwise (p0 × p1) — approximate normalization
-                let w0 = &initial_weights[0];
-                let w1 = &initial_weights[1];
-                let mut nc = 0.0f64;
-                for h0 in 0..num_valid {
-                    let mask0: u64 = (1u64 << hand_cards[h0 * 2]) | (1u64 << hand_cards[h0 * 2 + 1]);
-                    for h1 in 0..num_valid {
-                        let mask1: u64 = (1u64 << hand_cards[h1 * 2]) | (1u64 << hand_cards[h1 * 2 + 1]);
-                        if mask0 & mask1 == 0 {
-                            nc += w0[h0] as f64 * w1[h1] as f64;
-                        }
-                    }
+                let mut total = 0.0f64;
+                for h in 0..nh {
+                    let mask_h: u64 = (1u64 << hand_cards[h * 2]) | (1u64 << hand_cards[h * 2 + 1]);
+                    if combined_mask & mask_h != 0 { continue; }
+                    let w = weights[player][h] as f64;
+                    if w == 0.0 { continue; }
+                    total += enumerate(
+                        player + 1, np, nh,
+                        combined_mask | mask_h,
+                        hand_cards, weights,
+                        current_weight * w,
+                    );
                 }
-                nc
+                total
             }
+            enumerate(0, np, num_valid, 0, &hand_cards[..], &initial_weights, 1.0)
         };
 
         FlopChanceTable {

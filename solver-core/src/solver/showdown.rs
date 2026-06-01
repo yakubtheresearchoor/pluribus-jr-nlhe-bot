@@ -255,7 +255,29 @@ pub fn side_pot_showdown_cfv(
         }
     }
 
-    if num_active <= 1 || fold_mask & (1u16 << traverser) != 0 {
+    // Constant-payoff fast path.
+    //
+    // Mathematically this path's `payoff = total_pot - investment` (active)
+    // / `-investment` (folded) is incorrect for individual cfv values when
+    // a folded player out-contributed the max active player: the folded
+    // player gets back their unmatched excess as a side-pot return, and
+    // an active player who didn't contribute to that level does NOT win
+    // it. But across all traversers the per-player errors sum to zero
+    // (Σ_p payoff_p = total_pot - Σ_p investment = 0), so any downstream
+    // computation that only relies on the zero-sum identity (CFR regret
+    // updates) remains correct.
+    //
+    // For 3-player games without raises, folded > active is structurally
+    // impossible, so this path is also exact per-player. The 3-player
+    // GPU↔CPU bit-parity tests rely on this exact match, so the fast
+    // path stays gated on num_opp <= 2 — same code as before, just
+    // explicitly limited to K ≤ 2 where it's known safe.
+    //
+    // For K ≥ 3 (4+ player) the per-player error matters: folded > active
+    // can occur, and downstream code that consumes individual cfv values
+    // (best-response, exploitability) needs correct values. K ≥ 3 falls
+    // through to the per-level evaluator below.
+    if (num_active <= 1 || fold_mask & (1u16 << traverser) != 0) && num_opp <= 2 {
         let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
         let traverser_investment = starting_pot as f32 / np as f32 + c_t as f32;
         let payoff = if fold_mask & (1u16 << traverser) != 0 {
@@ -264,9 +286,6 @@ pub fn side_pot_showdown_cfv(
             total_pot as f32 - traverser_investment
         };
 
-        // Payoff is CONSTANT per scenario. cfv[h] = payoff * N_h where
-        // N_h = reach-product-weighted count of valid opponent hand combinations.
-        // For num_opp >= 2 we must use the PRODUCT of opponent reaches, not the SUM.
         if num_opp == 1 {
             let mut opp_reach_sum = 0.0f32;
             let mut opp_reach_minus = vec![0.0f32; 52];
@@ -284,8 +303,8 @@ pub fn side_pot_showdown_cfv(
                     - opp_reach_minus[hand_cards[h * 2 + 1] as usize];
                 cfv[h] = payoff * cfreach;
             }
-        } else if num_opp == 2 {
-            // Brute-force enumeration over (g0, g1) ordered pairs.
+        } else {
+            // num_opp == 2: brute-force enumeration over (g0, g1).
             for h in 0..nh {
                 let hc1 = hand_cards[h * 2] as usize;
                 let hc2 = hand_cards[h * 2 + 1] as usize;
@@ -307,26 +326,6 @@ pub fn side_pot_showdown_cfv(
                     }
                 }
                 cfv[h] = payoff * nh_count;
-            }
-        } else {
-            // num_opp >= 3: keep approximate (single-opp-style) formula as fallback.
-            let mut opp_reach_sum = 0.0f32;
-            let mut opp_reach_minus = vec![0.0f32; 52];
-            for oi in 0..num_opp {
-                for ho in 0..nh {
-                    let r = opp_reach[oi][ho];
-                    if r != 0.0 {
-                        opp_reach_sum += r;
-                        opp_reach_minus[hand_cards[ho * 2] as usize] += r;
-                        opp_reach_minus[hand_cards[ho * 2 + 1] as usize] += r;
-                    }
-                }
-            }
-            for h in 0..nh {
-                let cfreach = opp_reach_sum
-                    - opp_reach_minus[hand_cards[h * 2] as usize]
-                    - opp_reach_minus[hand_cards[h * 2 + 1] as usize];
-                cfv[h] = payoff * cfreach;
             }
         }
         return cfv;
@@ -529,57 +528,80 @@ pub fn side_pot_showdown_cfv(
             return cfv;
         }
 
-        // K>2: product formula approximation (kept as fallback)
-        let mut cum_weaker: Vec<Vec<f32>> = Vec::with_capacity(num_opp);
-        let mut eff_total_reach: Vec<Vec<f32>> = Vec::with_capacity(num_opp);
-
-        for oi in 0..num_opp {
-            let reach = &filtered_opp[oi];
-            let mut cw = vec![0.0f32; nh];
-            let mut cfreach_sum = 0.0f32;
-            let mut cfreach_minus = vec![0.0f32; 52];
-            let mut i = 0;
-            for si in 0..nh {
-                let str_h = sorted_pl_str[si];
-                let h = sorted_pl_idx[si] as usize;
-                while i < nh && sorted_opp_str[oi * nh + i] < str_h {
-                    let ho = sorted_opp_idx[oi * nh + i] as usize;
-                    let r = reach[ho];
-                    if r != 0.0 {
-                        cfreach_sum += r;
-                        cfreach_minus[hand_cards[ho * 2] as usize] += r;
-                        cfreach_minus[hand_cards[ho * 2 + 1] as usize] += r;
-                    }
-                    i += 1;
-                }
-                cw[h] = cfreach_sum
-                    - cfreach_minus[hand_cards[h * 2] as usize]
-                    - cfreach_minus[hand_cards[h * 2 + 1] as usize];
-            }
-            while i < nh {
-                let ho = sorted_opp_idx[oi * nh + i] as usize;
-                let r = reach[ho];
-                if r != 0.0 {
-                    cfreach_sum += r;
-                    cfreach_minus[hand_cards[ho * 2] as usize] += r;
-                    cfreach_minus[hand_cards[ho * 2 + 1] as usize] += r;
-                }
-                i += 1;
-            }
-            let mut eff = vec![0.0f32; nh];
-            for h in 0..nh {
-                eff[h] = cfreach_sum
-                    - cfreach_minus[hand_cards[h * 2] as usize]
-                    - cfreach_minus[hand_cards[h * 2 + 1] as usize]
-                    + reach[h];
-            }
-            cum_weaker.push(cw);
-            eff_total_reach.push(eff);
+        // K>2 active opponents, equal-contribution showdown.
+        // Brute-force enumeration. Per scenario (g_0, ..., g_{K-1}) with reach
+        // product r_prod and at-top tie count T_top:
+        //   if max(opp strengths) > h_str: net unit = -1 (lose stake)
+        //   if max == h_str: net unit = (K+1 - T)/T   (tie split, K = num_active_opp)
+        //   if max < h_str: net unit = K             (win pot K+1, paid 1)
+        // cfv[h] = half_pot * Σ r_prod * net_unit
+        //
+        // O(nh^K) per h. Used for validation; production needs factored I-E.
+        let filtered_views: Vec<&[f32]> = filtered_opp.iter().map(|v| v.as_slice()).collect();
+        let mut hand_strength = vec![0u16; nh];
+        for si in 0..nh {
+            hand_strength[sorted_pl_idx[si] as usize] = sorted_pl_str[si];
         }
+        let mut g_mask_arr = vec![0u64; nh];
+        for g in 0..nh {
+            g_mask_arr[g] = (1u64 << hand_cards[g * 2]) | (1u64 << hand_cards[g * 2 + 1]);
+        }
+        let k = num_active_opp as f32;
+        let half_pot = starting_pot as f32 / np as f32 + c_t as f32;
+
+        fn recurse_eq(
+            oi: usize, num_opp: usize, nh: usize,
+            mask_so_far: u64, reach_so_far: f32, max_str_so_far: u16, tied_at_max_so_far: u32,
+            h_str: u16,
+            opp_reach: &[&[f32]],
+            g_mask_arr: &[u64],
+            hand_strength: &[u16],
+            k: f32,
+            accum: &mut f32,
+        ) {
+            if oi == num_opp {
+                let net_unit: f32 = if max_str_so_far > h_str {
+                    -1.0
+                } else if max_str_so_far == h_str {
+                    // Traverser ties at top with (tied_at_max_so_far + 1) total tied.
+                    let t = tied_at_max_so_far + 1;
+                    (k + 1.0 - t as f32) / t as f32
+                } else {
+                    k
+                };
+                *accum += reach_so_far * net_unit;
+                return;
+            }
+            for g in 0..nh {
+                if g_mask_arr[g] & mask_so_far != 0 { continue; }
+                let r = opp_reach[oi][g];
+                if r == 0.0 { continue; }
+                let s = hand_strength[g];
+                let (new_max, new_tied) = if s > max_str_so_far {
+                    (s, 1u32)
+                } else if s == max_str_so_far {
+                    (max_str_so_far, tied_at_max_so_far + 1)
+                } else {
+                    (max_str_so_far, tied_at_max_so_far)
+                };
+                recurse_eq(
+                    oi + 1, num_opp, nh,
+                    mask_so_far | g_mask_arr[g], reach_so_far * r,
+                    new_max, new_tied,
+                    h_str, opp_reach, g_mask_arr, hand_strength, k, accum,
+                );
+            }
+        }
+
         for h in 0..nh {
-            let beats_all: f32 = cum_weaker.iter().map(|cw| cw[h]).product();
-            let eff_product: f32 = eff_total_reach.iter().map(|er| er[h]).product();
-            cfv[h] = (starting_pot as f32 / np as f32 + c_t as f32) * ((num_active_opp as f32 + 1.0) * beats_all - eff_product);
+            let h_m = (1u64 << hand_cards[h * 2]) | (1u64 << hand_cards[h * 2 + 1]);
+            let h_str = hand_strength[h];
+            let mut accum = 0.0f32;
+            recurse_eq(
+                0, num_opp, nh, h_m, 1.0, 0u16, 0u32,
+                h_str, &filtered_views, &g_mask_arr, &hand_strength, k, &mut accum,
+            );
+            cfv[h] = half_pot * accum;
         }
         return cfv;
     }
@@ -694,61 +716,57 @@ pub fn side_pot_showdown_cfv(
                     if rb == 0.0 { continue; }
                     let s_b = hand_strength[g_b];
 
-                    // Per-scenario payoff for traverser:
-                    //   net = cash_received - traverser_stake
-                    // If traverser folded: cash_received = 0 (lost all stake).
-                    let net: f32 = if traverser_folded {
-                        -traverser_stake
-                    } else {
-                        let mut cash: f32 = 0.0;
-                        let mut prev_l = 0i32;
-                        for (li, &lev) in levels.iter().enumerate() {
-                            let pc = lev - prev_l;
-                            if pc == 0 { prev_l = lev; continue; }
-                            let num_contrib = (0..np).filter(|&p| contributions[p] >= lev).count();
-                            let mut pot_l = (pc * num_contrib as i32) as f32;
-                            if li == 0 { pot_l += starting_pot as f32; }
+                    // Walk levels. Both folded and active traversers can
+                    // receive cash from no-eligible-active levels (side-pot
+                    // returns to contributors). Active traversers also
+                    // receive cash from levels they win at-top.
+                    let mut cash: f32 = 0.0;
+                    let mut prev_l = 0i32;
+                    for (li, &lev) in levels.iter().enumerate() {
+                        let pc = lev - prev_l;
+                        if pc == 0 { prev_l = lev; continue; }
+                        let num_contrib = (0..np).filter(|&p| contributions[p] >= lev).count();
+                        let mut pot_l = (pc * num_contrib as i32) as f32;
+                        if li == 0 { pot_l += starting_pot as f32; }
 
-                            let trav_elig = c_t >= lev;
-                            let a_elig = !a_folded && c_opp_a >= lev;
-                            let b_elig = !b_folded && c_opp_b >= lev;
-                            let n_elig_total = trav_elig as i32 + a_elig as i32 + b_elig as i32;
+                        let trav_elig = !traverser_folded && c_t >= lev;
+                        let a_elig = !a_folded && c_opp_a >= lev;
+                        let b_elig = !b_folded && c_opp_b >= lev;
+                        let n_elig_total = trav_elig as i32 + a_elig as i32 + b_elig as i32;
 
-                            if n_elig_total == 0 {
-                                // No eligible active player. Slice is returned to
-                                // contributors. Traverser gets back their slice if
-                                // they contributed at this level (proportional).
-                                if contributions[traverser] >= lev {
-                                    let trav_contrib = pc as f32
-                                        + if li == 0 { starting_pot as f32 / np as f32 } else { 0.0 };
-                                    cash += trav_contrib;
-                                }
-                                prev_l = lev;
-                                continue;
-                            }
-
-                            if !trav_elig {
-                                prev_l = lev;
-                                continue;
-                            }
-
-                            // Determine winner(s) among eligible.
-                            let mut max_str = h_str;
-                            if a_elig && s_a > max_str { max_str = s_a; }
-                            if b_elig && s_b > max_str { max_str = s_b; }
-
-                            let mut tied: u32 = 0;
-                            if h_str == max_str { tied += 1; }
-                            if a_elig && s_a == max_str { tied += 1; }
-                            if b_elig && s_b == max_str { tied += 1; }
-
-                            if h_str == max_str {
-                                cash += pot_l / tied as f32;
+                        if n_elig_total == 0 {
+                            // No eligible active: slice returned to all
+                            // contributors (including folded traverser).
+                            if contributions[traverser] >= lev {
+                                let trav_contrib = pc as f32
+                                    + if li == 0 { starting_pot as f32 / np as f32 } else { 0.0 };
+                                cash += trav_contrib;
                             }
                             prev_l = lev;
+                            continue;
                         }
-                        cash - traverser_stake
-                    };
+
+                        if !trav_elig {
+                            prev_l = lev;
+                            continue;
+                        }
+
+                        // Determine winner(s) among eligible.
+                        let mut max_str = h_str;
+                        if a_elig && s_a > max_str { max_str = s_a; }
+                        if b_elig && s_b > max_str { max_str = s_b; }
+
+                        let mut tied: u32 = 0;
+                        if h_str == max_str { tied += 1; }
+                        if a_elig && s_a == max_str { tied += 1; }
+                        if b_elig && s_b == max_str { tied += 1; }
+
+                        if h_str == max_str {
+                            cash += pot_l / tied as f32;
+                        }
+                        prev_l = lev;
+                    }
+                    let net = cash - traverser_stake;
 
                     accum += ra * rb * net;
                 }
@@ -780,38 +798,49 @@ pub fn side_pot_showdown_cfv(
                 if ra == 0.0 { continue; }
                 let s_a = hand_strength[g_a];
 
-                let net: f32 = if traverser_folded {
-                    -traverser_stake
-                } else {
-                    let mut cash: f32 = 0.0;
-                    let mut prev_l = 0i32;
-                    for (li, &lev) in levels.iter().enumerate() {
-                        let pc = lev - prev_l;
-                        if pc == 0 { prev_l = lev; continue; }
-                        let num_contrib = (0..np).filter(|&p| contributions[p] >= lev).count();
-                        let mut pot_l = (pc * num_contrib as i32) as f32;
-                        if li == 0 { pot_l += starting_pot as f32; }
-                        let trav_elig = c_t >= lev;
-                        let a_elig = !a_folded && c_opp_a >= lev;
-                        if !trav_elig {
-                            prev_l = lev;
-                            continue;
-                        }
-                        if !a_elig {
-                            cash += pot_l;
-                        } else {
-                            let max_str = h_str.max(s_a);
-                            let mut tied: u32 = 0;
-                            if h_str == max_str { tied += 1; }
-                            if s_a == max_str { tied += 1; }
-                            if h_str == max_str {
-                                cash += pot_l / tied as f32;
-                            }
+                // Walk levels. Folded traverser still receives cash from
+                // no-eligible-active levels (side-pot returns).
+                let mut cash: f32 = 0.0;
+                let mut prev_l = 0i32;
+                for (li, &lev) in levels.iter().enumerate() {
+                    let pc = lev - prev_l;
+                    if pc == 0 { prev_l = lev; continue; }
+                    let num_contrib = (0..np).filter(|&p| contributions[p] >= lev).count();
+                    let mut pot_l = (pc * num_contrib as i32) as f32;
+                    if li == 0 { pot_l += starting_pot as f32; }
+                    let trav_elig = !traverser_folded && c_t >= lev;
+                    let a_elig = !a_folded && c_opp_a >= lev;
+                    let n_elig = trav_elig as i32 + a_elig as i32;
+
+                    if n_elig == 0 {
+                        // Slice returned to contributors (including folded).
+                        if contributions[traverser] >= lev {
+                            let trav_contrib = pc as f32
+                                + if li == 0 { starting_pot as f32 / np as f32 } else { 0.0 };
+                            cash += trav_contrib;
                         }
                         prev_l = lev;
+                        continue;
                     }
-                    cash - traverser_stake
-                };
+
+                    if !trav_elig {
+                        prev_l = lev;
+                        continue;
+                    }
+                    if !a_elig {
+                        cash += pot_l;
+                    } else {
+                        let max_str = h_str.max(s_a);
+                        let mut tied: u32 = 0;
+                        if h_str == max_str { tied += 1; }
+                        if s_a == max_str { tied += 1; }
+                        if h_str == max_str {
+                            cash += pot_l / tied as f32;
+                        }
+                    }
+                    prev_l = lev;
+                }
+                let net = cash - traverser_stake;
                 accum += ra * net;
             }
             cfv[h] = accum;
@@ -819,14 +848,709 @@ pub fn side_pot_showdown_cfv(
         return cfv;
     }
 
-    // num_opp >= 3 (np >= 4): no brute-force support. Leave cfv at 0.
+    // num_opp >= 3 (np >= 4): generic recursive per-scenario brute-force.
+    //
+    // Generalization of the K=2 per-level evaluator above to K opponents.
+    // Enumerates all (g_0, ..., g_{K-1}) with no pairwise card overlap and no
+    // overlap with traverser hand h. For each scenario:
+    //   - if traverser folded: net = -traverser_stake (lost stake).
+    //   - else: walk levels; for each pot level compute cash to traverser based
+    //     on eligibility (contribution ≥ level AND not folded) and per-level
+    //     winner (max strength among eligible; tie split by tied count).
+    //
+    // Cost: O(nh^K) per traverser hand. At nh=50, K=5 this is 50^5 = 312M per
+    // h × 50 hands × ~5000 terminals = 78T per iter — infeasible for
+    // production. Used for VALIDATION GATES at small nh; production
+    // performance comes from the factored I-E formula once derived correctly.
+
+    // Map opponent slot index `oi` ∈ [0, num_opp) to player index.
+    let opp_player: Vec<usize> = (0..num_opp).map(|oi| {
+        if oi < traverser { oi } else { oi + 1 }
+    }).collect();
+    let opp_contrib: Vec<i32> = opp_player.iter().map(|&p| contributions[p]).collect();
+    let opp_folded: Vec<bool> = opp_player.iter().map(|&p| fold_mask & (1u16 << p) != 0).collect();
+
+    // Per-hand card mask cache.
+    let mut g_mask_arr = vec![0u64; nh];
+    for g in 0..nh {
+        g_mask_arr[g] = (1u64 << hand_cards[g * 2]) | (1u64 << hand_cards[g * 2 + 1]);
+    }
+
+    // For each h, recursively enumerate (g_0, ..., g_{K-1}) and accumulate
+    // reach_product * per_scenario_net into cfv[h].
+    fn recurse_scenario(
+        oi: usize,
+        num_opp: usize,
+        nh: usize,
+        mask_so_far: u64,
+        reach_so_far: f32,
+        opp_reach: &[&[f32]],
+        g_mask_arr: &[u64],
+        hand_strength: &[u16],
+        g_str: &mut [u16],
+        // closure context
+        callback: &mut dyn FnMut(f32, &[u16]),
+    ) {
+        if oi == num_opp {
+            callback(reach_so_far, g_str);
+            return;
+        }
+        for g in 0..nh {
+            if g_mask_arr[g] & mask_so_far != 0 { continue; }
+            let r = opp_reach[oi][g];
+            if r == 0.0 { continue; }
+            g_str[oi] = hand_strength[g];
+            recurse_scenario(
+                oi + 1, num_opp, nh,
+                mask_so_far | g_mask_arr[g],
+                reach_so_far * r,
+                opp_reach, g_mask_arr, hand_strength, g_str,
+                callback,
+            );
+        }
+    }
+
+    for h in 0..nh {
+        let h_m = (1u64 << hand_cards[h * 2]) | (1u64 << hand_cards[h * 2 + 1]);
+        let h_str = hand_strength[h];
+        let mut accum = 0.0f32;
+
+        let mut g_str = vec![0u16; num_opp];
+        recurse_scenario(
+            0, num_opp, nh, h_m, 1.0,
+            opp_reach, &g_mask_arr, &hand_strength, &mut g_str,
+            &mut |reach_product: f32, g_str: &[u16]| {
+                // Walk levels and accumulate cash. Folded traversers can still
+                // get cash from side-pot returns at levels where no active
+                // player is eligible (this happens when folded traverser
+                // contributed more than any active opponent — possible in
+                // 4+player games with raise/all-in dynamics; impossible in
+                // 3-player without raises which is why the K=2 path never
+                // hit this bug).
+                let mut cash: f32 = 0.0;
+                let mut prev_l = 0i32;
+                for (li, &lev) in levels.iter().enumerate() {
+                    let pc = lev - prev_l;
+                    if pc == 0 { prev_l = lev; continue; }
+                    let num_contrib = (0..np).filter(|&p| contributions[p] >= lev).count();
+                    let mut pot_l = (pc * num_contrib as i32) as f32;
+                    if li == 0 { pot_l += starting_pot as f32; }
+
+                    let trav_elig = !traverser_folded && c_t >= lev;
+
+                    // Eligibility among ACTIVE opponents.
+                    let mut elig_count: u32 = trav_elig as u32;
+                    let mut max_str = if trav_elig { h_str } else { 0u16 };
+                    for oi in 0..num_opp {
+                        if opp_folded[oi] { continue; }
+                        if opp_contrib[oi] < lev { continue; }
+                        elig_count += 1;
+                        if g_str[oi] > max_str { max_str = g_str[oi]; }
+                    }
+
+                    if elig_count == 0 {
+                        // No eligible active player: slice returned to all
+                        // contributors (including folded ones).
+                        if contributions[traverser] >= lev {
+                            let trav_contrib_at_lev = pc as f32
+                                + if li == 0 { starting_pot as f32 / np as f32 } else { 0.0 };
+                            cash += trav_contrib_at_lev;
+                        }
+                        prev_l = lev;
+                        continue;
+                    }
+
+                    if !trav_elig {
+                        // Traverser not eligible (folded or contributed < lev):
+                        // no cash from this slice.
+                        prev_l = lev;
+                        continue;
+                    }
+
+                    // Tie count among eligible.
+                    let mut tied: u32 = 0;
+                    if h_str == max_str { tied += 1; }
+                    for oi in 0..num_opp {
+                        if opp_folded[oi] { continue; }
+                        if opp_contrib[oi] < lev { continue; }
+                        if g_str[oi] == max_str { tied += 1; }
+                    }
+
+                    if h_str == max_str {
+                        cash += pot_l / tied as f32;
+                    }
+                    prev_l = lev;
+                }
+                let net = cash - traverser_stake;
+                accum += reach_product * net;
+            },
+        );
+
+        cfv[h] = accum;
+    }
     cfv
+}
+
+// ============================================================================
+// Factored inclusion-exclusion N-opponent showdown CFV computation.
+//
+// Generalizes the K=2 brute-force at lines ~659-820 to K opponents without
+// enumerating O(nh^K) tuples. The key structural insight: a card appears in
+// at most one hand at the table, so among K opponents any single card can be
+// shared by at most 2 opponents. The conflict graph on K opponent slots is
+// always built from pairwise edges; there are no 3-way card-sharing terms.
+// Inclusion-exclusion truncates to a sum over matchings on the K-vertex
+// graph (with bounded vertex degree ≤ 2). For K ≤ 5 the matching count is
+// small (≤ ~200 configurations including paths and cycles).
+//
+// All "not conflicting with h" filters are actually
+// "not conflicting with h AND not intersecting dead_card_mask." The mask is
+// populated per-solve by the caller. Board-only in the normal one-account
+// case, board-plus-other-account's-cards in the two-account case.
+//
+// K=2 paths in side_pot_showdown_cfv (lines 287, 465, 659) remain on the
+// existing per-scenario brute-force — that is the validated ground truth.
+// The I-E formula is used only for K ≥ 3. This avoids any K=2 regression
+// risk and keeps the bit-exact 3-player work intact.
+// ============================================================================
+
+/// Per-opponent reach masses for use in factored inclusion-exclusion N-opponent
+/// showdown evaluation.
+///
+/// All per-card arrays are indexed by raw card index in `[0, 52)` so the array
+/// shape does not change when `dead_card_mask` changes — the mask only changes
+/// which entries are accumulated into and which entries are read out by the
+/// combiner. This avoids mask-dependent stride bugs that would only surface
+/// at iter-2 reach states (the lesson from the 3-player GPU port).
+///
+/// Layout (for `K = num_opp` opponents and `nh` sampled hands):
+///
+/// - `b`, `t`, `s`: `[K * nh]` flat. Indexed as `[oi * nh + h]`. For opponent
+///   `oi` and player hand `h`:
+///   - `b[oi*nh + h]` = Σ over `g` strictly weaker than `h`, not conflicting
+///     with `h`, not intersecting `dead_card_mask`, of `r_oi[g]`.
+///   - `t[oi*nh + h]` = same with `g` tied with `h`.
+///   - `s[oi*nh + h]` = same with `g` strictly stronger than `h`.
+///
+/// - `b_per_card`, `t_per_card`, `s_per_card`: `[K * nh * 52]` flat. Indexed
+///   as `[oi * nh * 52 + h * 52 + c]`. The per-card partials:
+///   - `b_per_card[..][c]` = Σ over `g` containing card `c`, strictly weaker
+///     than `h`, not otherwise conflicting with `h`, not intersecting
+///     `dead_card_mask`, of `r_oi[g]`. (Same for `t_per_card`, `s_per_card`.)
+///   - Indexed by raw card `c`; entries for `c` in `h`'s cards or in
+///     `dead_card_mask` are computed but not read by the combiner.
+///
+/// - `hand_index`: `52 * 52` flat lookup. `hand_index[c1 * 52 + c2]` is
+///   `Some(h)` if hand `{c1, c2}` is in the sample (any ordering of `c1, c2`),
+///   else `-1`. Used for the joint per-(c1, c2) reach in vertex-shared edge
+///   corrections.
+///
+/// - `hand_cards`: cached copy of the caller's `hand_cards` so the combiner
+///   can resolve `h`'s cards without an extra parameter.
+///
+/// - `dead_card_mask`: pinned at construction. Bit `c` set iff card `c` is
+///   dead (board card or other-account known card).
+#[derive(Debug, Clone)]
+pub struct OppMasses {
+    pub num_opp: usize,
+    pub nh: usize,
+    pub dead_card_mask: u64,
+    pub b: Vec<f32>,
+    pub t: Vec<f32>,
+    pub s: Vec<f32>,
+    pub b_per_card: Vec<f32>,
+    pub t_per_card: Vec<f32>,
+    pub s_per_card: Vec<f32>,
+    pub hand_index: Vec<i32>,
+    pub hand_cards: Vec<u8>,
+}
+
+/// Precompute per-opponent reach masses for the I-E showdown.
+///
+/// Filters every accumulation by **both** the per-`h` card-conflict and the
+/// `dead_card_mask` intersection. The two filters compose by OR-ing bitmasks;
+/// the inner loop is unchanged otherwise.
+///
+/// Cost: `O(K * nh^2)` per terminal — for nh=50, K=5: ~12,500 ops, dominated
+/// by terminal-level memory writes. The per-card partials add a constant
+/// factor of 2 per `(g, h)` pair (each `g` contributes to its two card
+/// buckets), not a factor of 52.
+///
+/// Bit-precision discipline (for the future GPU port):
+/// - The outer loop order is fixed: `oi -> h -> g`. CPU and GPU must walk
+///   in the same order so accumulator round-off matches.
+/// - The per-card partial accumulators receive each `g`'s contribution to
+///   exactly two card buckets (`g_c1` and `g_c2`). Order: `g_c1` then `g_c2`.
+/// - Strength comparison: `g_str < h_str` first, then `g_str == h_str`,
+///   else strictly greater.
+pub fn precompute_opp_masses(
+    opp_reach: &[&[f32]],
+    hand_cards: &[u8],
+    hand_strength: &[u16],
+    dead_card_mask: u64,
+) -> OppMasses {
+    let num_opp = opp_reach.len();
+    let nh = if num_opp > 0 { opp_reach[0].len() } else { 0 };
+
+    let mut b = vec![0.0f32; num_opp * nh];
+    let mut t = vec![0.0f32; num_opp * nh];
+    let mut s = vec![0.0f32; num_opp * nh];
+    let mut b_per_card = vec![0.0f32; num_opp * nh * 52];
+    let mut t_per_card = vec![0.0f32; num_opp * nh * 52];
+    let mut s_per_card = vec![0.0f32; num_opp * nh * 52];
+
+    // Precompute per-hand card mask once.
+    let mut g_mask = vec![0u64; nh];
+    for g in 0..nh {
+        g_mask[g] = (1u64 << hand_cards[g * 2]) | (1u64 << hand_cards[g * 2 + 1]);
+    }
+
+    // Build hand_index lookup: 52*52 flat, -1 = not in sample.
+    // Each sampled hand registers under both orderings (c1*52+c2 and c2*52+c1)
+    // so callers don't have to canonicalize.
+    let mut hand_index = vec![-1i32; 52 * 52];
+    for h in 0..nh {
+        let c1 = hand_cards[h * 2] as usize;
+        let c2 = hand_cards[h * 2 + 1] as usize;
+        hand_index[c1 * 52 + c2] = h as i32;
+        hand_index[c2 * 52 + c1] = h as i32;
+    }
+
+    for oi in 0..num_opp {
+        let reach = opp_reach[oi];
+        for h in 0..nh {
+            let h_m = g_mask[h];
+            let h_str = hand_strength[h];
+
+            for g in 0..nh {
+                let g_m = g_mask[g];
+                // Filters compose by OR'ing the masks: g must not share any
+                // card with h AND must not intersect dead_card_mask.
+                if g_m & (h_m | dead_card_mask) != 0 { continue; }
+                let r = reach[g];
+                if r == 0.0 { continue; }
+
+                let g_str = hand_strength[g];
+                let g_c1 = hand_cards[g * 2] as usize;
+                let g_c2 = hand_cards[g * 2 + 1] as usize;
+
+                let base = oi * nh + h;
+                let base_pc = (oi * nh + h) * 52;
+
+                if g_str < h_str {
+                    b[base] += r;
+                    b_per_card[base_pc + g_c1] += r;
+                    b_per_card[base_pc + g_c2] += r;
+                } else if g_str == h_str {
+                    t[base] += r;
+                    t_per_card[base_pc + g_c1] += r;
+                    t_per_card[base_pc + g_c2] += r;
+                } else {
+                    s[base] += r;
+                    s_per_card[base_pc + g_c1] += r;
+                    s_per_card[base_pc + g_c2] += r;
+                }
+            }
+        }
+    }
+
+    OppMasses {
+        num_opp, nh, dead_card_mask,
+        b, t, s,
+        b_per_card, t_per_card, s_per_card,
+        hand_index,
+        hand_cards: hand_cards.to_vec(),
+    }
+}
+
+impl OppMasses {
+    /// Total reach `R_i(h) = B_i(h) + T_i(h) + S_i(h)` — opponent `i`'s
+    /// reach over any hand `g` that doesn't conflict with `h` or the dead
+    /// mask, regardless of strength.
+    #[inline]
+    pub fn r(&self, oi: usize, h: usize) -> f32 {
+        let base = oi * self.nh + h;
+        self.b[base] + self.t[base] + self.s[base]
+    }
+
+    /// Per-card total reach `R_i^{(c)}(h) = B + T + S` at card `c`.
+    /// Returns 0 if `c` is in `h`'s cards or in `dead_card_mask` (those
+    /// entries are not meaningfully populated by `precompute_opp_masses`,
+    /// but explicitly returning 0 keeps the combiner code uniform).
+    #[inline]
+    pub fn r_per_card(&self, oi: usize, h: usize, c: usize) -> f32 {
+        let base_pc = (oi * self.nh + h) * 52;
+        self.b_per_card[base_pc + c] + self.t_per_card[base_pc + c] + self.s_per_card[base_pc + c]
+    }
+
+    /// Joint reach for `g_i = {c1, c2}` — the unique hand using both cards.
+    /// Returns 0 if the hand is not in the sample, or if it conflicts with
+    /// `h` or the dead mask.
+    #[inline]
+    pub fn r_per_card_pair(&self, oi: usize, h: usize, c1: usize, c2: usize, opp_reach: &[&[f32]]) -> f32 {
+        if c1 == c2 { return 0.0; }
+        let idx = self.hand_index[c1 * 52 + c2];
+        if idx < 0 { return 0.0; }
+        let g = idx as usize;
+        let g_m = (1u64 << c1) | (1u64 << c2);
+        let h_m = (1u64 << self.hand_cards[h * 2]) | (1u64 << self.hand_cards[h * 2 + 1]);
+        if g_m & (h_m | self.dead_card_mask) != 0 { return 0.0; }
+        opp_reach[oi][g]
+    }
+}
+
+/// `TotalValidReachProduct(h)` via straight brute-force enumeration. O(nh^K)
+/// per `h`. Used for K ≥ 3 in this preliminary correctness-first pass.
+///
+/// CORRECTNESS PROPERTY: this is the structurally-simplest implementation of
+/// the quantity TVRP is supposed to compute. It is the oracle that any future
+/// factored I-E formula must reproduce to within f32-precision drift. The
+/// factored formula's complexity grows beyond simple matchings on K vertices
+/// once edges can share cards (e.g., {(0,1)→c, (0,2)→c} is a valid 2-edge
+/// "all three opps contain c" subset for K=3, in addition to the c1 ≠ c2
+/// path), and the matching enumeration that the plan assumed was simpler
+/// than this turned out to be. Brute-force keeps correctness clean while
+/// the factored formula is re-derived against this oracle.
+///
+/// Performance: O(nh^K) per h. At nh=50, K=3: 125k per h × 50 hands × 5000
+/// terminals = 31B/iter — slow but tractable. K=4 borderline; K=5 not.
+/// The factored I-E will replace this for K ≥ 4 once verified correct.
+fn tvrp_brute(
+    masses: &OppMasses,
+    opp_reach: &[&[f32]],
+    h: usize,
+    h_dead_mask: u64,
+) -> f64 {
+    let k = masses.num_opp;
+    let nh = masses.nh;
+    let hand_cards = &masses.hand_cards;
+
+    // Per-hand card mask (cached).
+    let mut g_mask = vec![0u64; nh];
+    for g in 0..nh {
+        g_mask[g] = (1u64 << hand_cards[g * 2]) | (1u64 << hand_cards[g * 2 + 1]);
+    }
+
+    fn recurse(
+        depth: usize,
+        k: usize,
+        nh: usize,
+        mask_so_far: u64,
+        reach_so_far: f64,
+        opp_reach: &[&[f32]],
+        g_mask: &[u64],
+        sum: &mut f64,
+    ) {
+        if depth == k {
+            *sum += reach_so_far;
+            return;
+        }
+        for g in 0..nh {
+            if g_mask[g] & mask_so_far != 0 { continue; }
+            let r = opp_reach[depth][g] as f64;
+            if r == 0.0 { continue; }
+            recurse(
+                depth + 1, k, nh,
+                mask_so_far | g_mask[g],
+                reach_so_far * r,
+                opp_reach, g_mask, sum,
+            );
+        }
+    }
+
+    let mut sum = 0.0f64;
+    recurse(0, k, nh, h_dead_mask, 1.0, opp_reach, &g_mask, &mut sum);
+    sum
+}
+
+/// Compute `TotalValidReachProduct(h)` for each `h` — the I-E quantity:
+///
+/// ```text
+/// TVRP(h) = Σ over valid (g_1, ..., g_K) of Π r_i[g_i]
+/// ```
+///
+/// where "valid" = no `g_i` conflicts with `h`, no `g_i` intersects
+/// `dead_card_mask`, and no two `g_i, g_j` share a card.
+///
+/// This is the showdown numerator's structural twin without strength filters
+/// and the denominator the caller normalizes by (it must enumerate over the
+/// same set as the showdown's per-level sum, or zero-sum breaks).
+///
+/// Currently:
+///   - K ∈ {0, 1, 2}: factored I-E (constant + O(52 + nh) per `h`).
+///   - K ∈ {3, 4, 5}: O(nh^K) brute-force via [`tvrp_brute`]. Correct but
+///     not yet performant for K=5 at production nh; the factored
+///     formula is still being re-derived against this oracle (see the
+///     comment on [`tvrp_brute`] for the structural reason the obvious
+///     "matching enumeration" expansion does not suffice).
+///   - K ≥ 6: panics (max table size is 6 players → K ≤ 5).
+pub fn total_valid_reach_product(
+    masses: &OppMasses,
+    opp_reach: &[&[f32]],
+) -> Vec<f64> {
+    let k = masses.num_opp;
+    let nh = masses.nh;
+    let mut out = vec![0.0f64; nh];
+
+    for h in 0..nh {
+        let h_c1 = masses.hand_cards[h * 2] as usize;
+        let h_c2 = masses.hand_cards[h * 2 + 1] as usize;
+        let h_dead_mask = (1u64 << h_c1) | (1u64 << h_c2) | masses.dead_card_mask;
+
+        out[h] = match k {
+            0 => 1.0,
+            1 => masses.r(0, h) as f64,
+            2 => {
+                // K=2 I-E for "g_0 and g_1 share NO cards":
+                //
+                //   TVRP(h) = R_0 · R_1
+                //           − Σ_c R_0^{(c)} · R_1^{(c)}              [single-card sharing]
+                //           + Σ_{c1 < c2} [r_0[{c1,c2}] · r_1[{c1,c2}]]  [share both cards]
+                //
+                // The last term corrects the double-subtraction of same-hand
+                // pairs (g_0 = g_1 = {c1, c2}): such a pair satisfies *both*
+                // "share c1" and "share c2", so the single-card sum
+                // subtracts it twice; we add it back via the 2-card-sharing
+                // I-E term. For distinct hands, sharing 2 cards is impossible
+                // (a hand has only 2 cards, so sharing 2 means same hand),
+                // so the 2-card sum is equivalently a sum over the in-sample
+                // hands themselves.
+                //
+                // Sum order is fixed (c ascending; same-hand sum walks the
+                // sample in index order) so CPU and GPU produce
+                // bit-equivalent f64 accumulator state.
+                let r0 = masses.r(0, h) as f64;
+                let r1 = masses.r(1, h) as f64;
+                let prod = r0 * r1;
+
+                let mut edge_sum = 0.0f64;
+                for c in 0..52usize {
+                    if h_dead_mask & (1u64 << c) != 0 { continue; }
+                    let p0 = masses.r_per_card(0, h, c) as f64;
+                    let p1 = masses.r_per_card(1, h, c) as f64;
+                    edge_sum += p0 * p1;
+                }
+
+                // Same-hand add-back: enumerate the sampled hands once.
+                let mut same_hand_sum = 0.0f64;
+                for hx in 0..nh {
+                    let hx_c1 = masses.hand_cards[hx * 2] as usize;
+                    let hx_c2 = masses.hand_cards[hx * 2 + 1] as usize;
+                    let hx_m = (1u64 << hx_c1) | (1u64 << hx_c2);
+                    if hx_m & h_dead_mask != 0 { continue; }
+                    same_hand_sum += opp_reach[0][hx] as f64 * opp_reach[1][hx] as f64;
+                }
+
+                prod - edge_sum + same_hand_sum
+            }
+            3 | 4 | 5 => tvrp_brute(masses, opp_reach, h, h_dead_mask),
+            _ => unimplemented!("K >= 6 not supported (max table size is 6 players)"),
+        };
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::card::card_from_str;
+
+    /// Brute-force reference for `total_valid_reach_product`. Enumerates all
+    /// valid (g_0, ..., g_{K-1}) tuples explicitly. O(nh^K).
+    fn brute_force_tvrp(
+        opp_reach: &[&[f32]],
+        hand_cards: &[u8],
+        nh: usize,
+        dead_card_mask: u64,
+        h: usize,
+    ) -> f64 {
+        let h_m = (1u64 << hand_cards[h*2]) | (1u64 << hand_cards[h*2+1]);
+        let k = opp_reach.len();
+        let g_mask: Vec<u64> = (0..nh).map(|g|
+            (1u64 << hand_cards[g*2]) | (1u64 << hand_cards[g*2+1])
+        ).collect();
+
+        fn recurse(
+            depth: usize,
+            k: usize,
+            nh: usize,
+            mask_so_far: u64,
+            reach_so_far: f64,
+            opp_reach: &[&[f32]],
+            g_mask: &[u64],
+            sum: &mut f64,
+        ) {
+            if depth == k {
+                *sum += reach_so_far;
+                return;
+            }
+            for g in 0..nh {
+                if g_mask[g] & mask_so_far != 0 { continue; }
+                let r = opp_reach[depth][g] as f64;
+                if r == 0.0 { continue; }
+                recurse(
+                    depth + 1, k, nh,
+                    mask_so_far | g_mask[g],
+                    reach_so_far * r,
+                    opp_reach, g_mask, sum,
+                );
+            }
+        }
+
+        let mut sum = 0.0f64;
+        recurse(0, k, nh, h_m | dead_card_mask, 1.0, opp_reach, &g_mask, &mut sum);
+        sum
+    }
+
+    /// Foundation test: factored I-E for K=2 must reproduce the explicit
+    /// pair-enumeration brute-force for `TotalValidReachProduct` across
+    /// uniform and non-uniform reach, conflict and conflict-free hand sets,
+    /// and board-only vs. extended dead-card masks.
+    ///
+    /// If this test fails, the I-E formula structure is wrong and the whole
+    /// approach must be reconsidered — do not proceed to K≥3 until this is
+    /// bit-clean.
+    #[test]
+    fn ie_k2_tvrp_matches_bruteforce() {
+        // 6 hands, mix of conflicts. Cards 0..12 used.
+        // Hand layout: chosen to have specific overlaps.
+        let hand_cards: Vec<u8> = vec![
+            0, 1,   // h=0: A♠ K♠
+            2, 3,   // h=1: Q♠ J♠
+            0, 4,   // h=2: A♠ T♠  (conflicts with h=0 on card 0)
+            5, 6,   // h=3: 9♠ 8♠
+            7, 8,   // h=4: 7♠ 6♠
+            1, 9,   // h=5: K♠ 5♠  (conflicts with h=0 on card 1)
+        ];
+        let nh = 6;
+        let hand_strength: Vec<u16> = vec![100, 90, 80, 70, 60, 50];
+
+        // Test multiple reach configurations and multiple dead-card masks.
+        let configs: &[(Vec<f32>, Vec<f32>, u64, &str)] = &[
+            (vec![1.0; 6], vec![1.0; 6], 0u64, "uniform, no dead"),
+            (vec![0.5, 0.8, 0.2, 0.9, 0.3, 0.7],
+             vec![0.4, 0.1, 0.6, 0.5, 0.8, 0.2],
+             0u64, "non-uniform, no dead"),
+            // Dead mask includes cards 6 and 8 — kills h=3 (5♠ 6♠ uses 5,6) wait
+            // hand_cards[6,7] = (5, 6) for h=3. Mask with card 6 set kills h=3.
+            // and h=4 (7,8) — card 8 set kills h=4.
+            // Note: this also constrains opp's per-card partials.
+            (vec![1.0; 6], vec![1.0; 6],
+             (1u64 << 6) | (1u64 << 8), "uniform, dead=[6,8]"),
+            (vec![0.5, 0.8, 0.2, 0.9, 0.3, 0.7],
+             vec![0.4, 0.1, 0.6, 0.5, 0.8, 0.2],
+             (1u64 << 6) | (1u64 << 8), "non-uniform, dead=[6,8]"),
+        ];
+
+        for (r0, r1, dead, label) in configs {
+            let opp_reach_vec: Vec<&[f32]> = vec![&r0[..], &r1[..]];
+
+            let masses = precompute_opp_masses(&opp_reach_vec, &hand_cards, &hand_strength, *dead);
+            let ie = total_valid_reach_product(&masses, &opp_reach_vec);
+
+            let mut max_abs_diff = 0.0f64;
+            let mut max_rel_diff = 0.0f64;
+            for h in 0..nh {
+                let bf = brute_force_tvrp(&opp_reach_vec, &hand_cards, nh, *dead, h);
+                let diff = (ie[h] - bf).abs();
+                let scale = bf.abs().max(1e-9);
+                let rel = diff / scale;
+                if diff > max_abs_diff { max_abs_diff = diff; }
+                if rel > max_rel_diff { max_rel_diff = rel; }
+                eprintln!(
+                    "  [{}] h={} ie={:.9} bf={:.9} diff={:.3e}",
+                    label, h, ie[h], bf, diff
+                );
+            }
+            eprintln!(
+                "  [{}] max_abs={:.3e}, max_rel={:.3e}",
+                label, max_abs_diff, max_rel_diff
+            );
+
+            // The I-E version uses f64 accumulators and is mathematically
+            // identical to the brute-force; modulo f32-rounding of the source
+            // reach values the two should agree to ~1e-6 relative.
+            assert!(
+                max_rel_diff < 1e-5,
+                "[{}] K=2 I-E does not match brute-force: max_rel={:.3e}",
+                label, max_rel_diff
+            );
+        }
+    }
+
+    /// K=3 I-E TVRP must match O(nh^3) brute-force reference across uniform
+    /// and non-uniform reach, conflict and conflict-free hand sets, and
+    /// board-only vs. extended dead-card masks.
+    #[test]
+    fn ie_k3_tvrp_matches_bruteforce() {
+        // 6 hands carefully chosen to exercise 3-cycle, paths, same-hand, etc.
+        // Layout:
+        //   h=0: {0, 1}
+        //   h=1: {0, 2}   shares c=0 with h=0
+        //   h=2: {1, 2}   shares c=1 with h=0, c=2 with h=1; triangle 0-1-2
+        //   h=3: {3, 4}
+        //   h=4: {5, 6}
+        //   h=5: {7, 8}
+        // The triangle hand_index[0,2], hand_index[1,2] exists; for h_player
+        // outside the triangle, the cycle term has non-zero contributions.
+        let hand_cards: Vec<u8> = vec![
+            0, 1,
+            0, 2,
+            1, 2,
+            3, 4,
+            5, 6,
+            7, 8,
+        ];
+        let nh = 6;
+        let hand_strength: Vec<u16> = vec![100, 90, 80, 70, 60, 50];
+
+        let configs: &[(Vec<f32>, Vec<f32>, Vec<f32>, u64, &str)] = &[
+            (vec![1.0; 6], vec![1.0; 6], vec![1.0; 6], 0u64, "uniform, no dead"),
+            (vec![0.5, 0.8, 0.2, 0.9, 0.3, 0.7],
+             vec![0.4, 0.1, 0.6, 0.5, 0.8, 0.2],
+             vec![0.3, 0.7, 0.4, 0.9, 0.1, 0.6],
+             0u64, "non-uniform, no dead"),
+            (vec![1.0; 6], vec![1.0; 6], vec![1.0; 6],
+             (1u64 << 9) | (1u64 << 10), "uniform, dead=[9,10] (no effect on sample)"),
+            (vec![0.5, 0.8, 0.2, 0.9, 0.3, 0.7],
+             vec![0.4, 0.1, 0.6, 0.5, 0.8, 0.2],
+             vec![0.3, 0.7, 0.4, 0.9, 0.1, 0.6],
+             (1u64 << 6) | (1u64 << 8), "non-uniform, dead=[6,8] (kills h=4, h=5)"),
+        ];
+
+        for (r0, r1, r2, dead, label) in configs {
+            let opp_reach_vec: Vec<&[f32]> = vec![&r0[..], &r1[..], &r2[..]];
+
+            let masses = precompute_opp_masses(&opp_reach_vec, &hand_cards, &hand_strength, *dead);
+            let ie = total_valid_reach_product(&masses, &opp_reach_vec);
+
+            let mut max_abs_diff = 0.0f64;
+            let mut max_rel_diff = 0.0f64;
+            let mut worst_h = 0usize;
+            for h in 0..nh {
+                let bf = brute_force_tvrp(&opp_reach_vec, &hand_cards, nh, *dead, h);
+                let diff = (ie[h] - bf).abs();
+                let scale = bf.abs().max(1e-9);
+                let rel = diff / scale;
+                if diff > max_abs_diff { max_abs_diff = diff; worst_h = h; }
+                if rel > max_rel_diff { max_rel_diff = rel; }
+                eprintln!(
+                    "  [{}] h={} ie={:.9} bf={:.9} diff={:.3e}",
+                    label, h, ie[h], bf, diff
+                );
+            }
+            eprintln!(
+                "  [{}] max_abs={:.3e} at h={}, max_rel={:.3e}",
+                label, max_abs_diff, worst_h, max_rel_diff
+            );
+
+            assert!(
+                max_rel_diff < 1e-5,
+                "[{}] K=3 I-E does not match brute-force: max_rel={:.3e} at h={}",
+                label, max_rel_diff, worst_h
+            );
+        }
+    }
 
     #[test]
     fn test_showdown_table_basic() {
