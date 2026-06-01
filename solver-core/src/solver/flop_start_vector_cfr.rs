@@ -1426,17 +1426,20 @@ fn normalize_strategy(strategy: &mut [f32], na: usize, nh: usize) {
 /// Note: regret_matching_into is defined above (it was in the head section).
 
 /// Regret matching: compute strategy from regrets.
+/// Bug B fix: regret matching epsilon to prevent ULP-level strategy flips.
+const REGRET_MATCH_EPS: f32 = 1e-5;
+
 fn regret_matching_into(regrets: &[f32], na: usize, nh: usize, strategy: &mut [f32]) {
     for h in 0..nh {
         let mut pos_sum = 0.0f32;
         for a in 0..na {
             let r = regrets[a * nh + h];
-            if r > 0.0 { pos_sum += r; }
+            if r > REGRET_MATCH_EPS { pos_sum += r; }
         }
         if pos_sum > 0.0 {
             for a in 0..na {
                 let r = regrets[a * nh + h];
-                strategy[a * nh + h] = if r > 0.0 { r / pos_sum } else { 0.0 };
+                strategy[a * nh + h] = if r > REGRET_MATCH_EPS { r / pos_sum } else { 0.0 };
             }
         } else {
             let uniform = 1.0 / na as f32;

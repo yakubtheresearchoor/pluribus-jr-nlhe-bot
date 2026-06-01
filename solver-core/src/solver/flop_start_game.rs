@@ -402,6 +402,29 @@ impl FlopChanceTable {
     /// Pre-compute player sorted strength/indices per turn card.
     /// For 2-player, same as opponent sorted arrays.
     /// Returns [n_turn * nh].
+    pub fn compute_river_board_mask(&self) -> Vec<f32> {
+        let n_turn = self.remaining_deck.len();
+        let nh = self.num_valid;
+        let max_n_river = self.river_decks.iter().map(|d| d.len()).max().unwrap_or(0);
+        let mut mask = vec![0.0f32; n_turn * max_n_river * nh];
+        for (ti, &tc) in self.remaining_deck.iter().enumerate() {
+            let n_river = self.river_decks[tc as usize].len();
+            for ri in 0..n_river {
+                let rc = self.river_decks[tc as usize][ri];
+                for h in 0..nh {
+                    let idx = (ti * max_n_river + ri) * nh + h;
+                    let (c1, c2) = crate::card::index_to_card_pair(self.valid_hand_indices[h] as usize);
+                    if c1 == tc || c2 == tc || c1 == rc || c2 == rc {
+                        mask[idx] = 0.0;
+                    } else {
+                        mask[idx] = 1.0;
+                    }
+                }
+            }
+        }
+        mask
+    }
+
     pub fn compute_turn_pl_sorted(&self) -> (Vec<u16>, Vec<u16>) {
         // For 2-player, player sorted = opponent sorted (same hand ranking)
         (self.turn_sorted_str.clone(), self.turn_sorted_idx.clone())

@@ -24,9 +24,9 @@ use metal::ComputePipelineState;
 const UNUSED: u32 = u32::MAX;
 
 pub struct DcfrParams {
-    alpha_t: f32,
-    beta_t: f32,
-    gamma_t: f32,
+    pub alpha_t: f32,
+    pub beta_t: f32,
+    pub gamma_t: f32,
 }
 
 impl DcfrParams {
@@ -104,6 +104,7 @@ pub struct MetalFlopStartSolver {
     d_turn_pl_str: MetalBuffer<u16>,
     d_turn_pl_idx: MetalBuffer<u16>,
     d_river_chance_prob: MetalBuffer<f32>,
+    d_river_board_mask: MetalBuffer<f32>,
     d_turn_chance_prob: MetalBuffer<f32>,
 
     // Batched CFV buffers
@@ -290,6 +291,8 @@ impl MetalFlopStartSolver {
         let river_chance_prob = table.compute_river_chance_prob();
         let turn_chance_prob = table.compute_turn_chance_prob();
         let d_river_chance_prob = MetalBuffer::from_slice(device, &river_chance_prob);
+        let river_board_mask = table.compute_river_board_mask();
+        let d_river_board_mask = MetalBuffer::from_slice(device, &river_board_mask);
         let d_turn_chance_prob = MetalBuffer::from_slice(device, &turn_chance_prob);
 
         let d_river_cfv_batch = MetalBuffer::zeros(device, max_river * nn * nh);
@@ -386,6 +389,7 @@ impl MetalFlopStartSolver {
             d_turn_pl_str,
             d_turn_pl_idx,
             d_river_chance_prob,
+            d_river_board_mask,
             d_turn_chance_prob,
             d_river_cfv_batch,
             d_river_accum,
@@ -433,6 +437,111 @@ impl MetalFlopStartSolver {
             turn_zone_nodes_flat: vec![],
             river_zone_nodes_flat: vec![],
         }
+    }
+
+    /// Debug: run one traverser pass on GPU and return intermediate CFVs.
+    /// Computes strategies, reach, and CFVs for the given traverser.
+    /// Returns: (river_cfvs_per_outcome, river_reach, turn_reach, flop_reach, flop_cfv)
+    /// Does NOT update iteration counter or regrets (saves/restores).
+    pub fn debug_traverser_cfvs(
+        &mut self,
+        ctx: &MetalContext,
+        tree: &FlatTree,
+        game: &FlopStartGame,
+        traverser: usize,
+    ) -> (Vec<(usize, usize, Vec<f32>)>, Vec<f32>, Vec<f32>) {
+        let np = self.num_players as usize;
+        let nh = self.nh;
+        let nn = self.nn;
+
+        // Save regrets & cum before debug pass
+        let saved_reg = self.download_regrets();
+        let saved_cum = self.download_cum_strategy();
+
+        let params = DcfrParams::new(self.iteration);
+
+        self.compute_all_strategies(ctx);
+        self.compute_reach_flop(ctx);
+        let flop_reach = self.download_reach();
+
+        self.zero_buffer_name(ctx, 100); // d_cfv
+        self.zero_buffer_name(ctx, 2);   // turn_cfv_batch
+
+        let mut river_cfvs = Vec::new();
+
+        for ti in 0..self.n_turn {
+            let n_river = self.river_outcomes_per_turn[ti];
+            self.zero_buffer_name(ctx, 0); // river_cfv_batch
+            self.zero_buffer_name(ctx, 1); // river_accum
+
+            self.compute_reach_turn(ctx, ti);
+            let _turn_reach = self.download_turn_reach();
+
+            for ri in 0..n_river {
+                self.compute_reach_river(ctx, ti, ri);
+                self.bottom_up_river(ctx, ti, ri, traverser as u32, &params);
+
+                // Download river CFV for this outcome
+                let rcfv = self.download_river_cfv_batch();
+                // The CFV for this ri is at offset ri * nn * nh
+                let start = ri * nn * nh;
+                let end = start + nn * nh;
+                river_cfvs.push((ti, ri, rcfv[start..end].to_vec()));
+            }
+
+            self.chance_accumulate_river(ctx, ti, n_river);
+            self.chance_finalize_river(ctx, ti);
+            self.bottom_up_turn(ctx, ti, traverser as u32, &params);
+        }
+
+        self.chance_accumulate_turn(ctx);
+        self.chance_finalize_turn(ctx);
+        self.bottom_up_flop(ctx, traverser as u32, &params);
+
+        let flop_cfv = self.download_cfv();
+
+        // Restore regrets & cum
+        self.upload_regrets(&saved_reg);
+        self.d_cum_strategy.as_mut_slice().copy_from_slice(&saved_cum);
+
+        (river_cfvs, flop_reach, flop_cfv)
+    }
+
+    /// Run a single traverser pass (strategies → reach → bottom-up → regret update).
+    /// Increments iteration counter on first traverser. Matches one step of the inner loop of run().
+    pub fn run_single_traverser(
+        &mut self,
+        ctx: &MetalContext,
+        traverser: usize,
+        increment_iter: bool,
+    ) {
+        if increment_iter {
+            let _params = DcfrParams::new(self.iteration);
+            self.iteration += 1;
+        }
+        let params = DcfrParams::new(self.iteration - 1); // use the params for this iteration
+
+        self.compute_all_strategies(ctx);
+        self.compute_reach_flop(ctx);
+        self.zero_buffer_name(ctx, 100);
+        self.zero_buffer_name(ctx, 2);
+
+        for ti in 0..self.n_turn {
+            let n_river = self.river_outcomes_per_turn[ti];
+            self.zero_buffer_name(ctx, 0);
+            self.zero_buffer_name(ctx, 1);
+            self.compute_reach_turn(ctx, ti);
+            for ri in 0..n_river {
+                self.compute_reach_river(ctx, ti, ri);
+                self.bottom_up_river(ctx, ti, ri, traverser as u32, &params);
+            }
+            self.chance_accumulate_river(ctx, ti, n_river);
+            self.chance_finalize_river(ctx, ti);
+            self.bottom_up_turn(ctx, ti, traverser as u32, &params);
+        }
+        self.chance_accumulate_turn(ctx);
+        self.chance_finalize_turn(ctx);
+        self.bottom_up_flop(ctx, traverser as u32, &params);
     }
 
     /// Run N iterations of the flop-start VCFR solver on Metal.
@@ -738,7 +847,7 @@ impl MetalFlopStartSolver {
         let rc_card = self.river_decks[tc_card][ri] as usize;
         let sos_byte_off = ((tc_card * 52 + rc_card) * num_opp * nh) * 2; // u16 = 2 bytes
         let sps_byte_off = ((tc_card * 52 + rc_card) * num_opp * nh) * 2;
-        let prob_byte_off = (ti * self.max_river * nh) * 4; // f32 = 4 bytes
+        let prob_byte_off = ((ti * self.max_river + ri) * nh) * 4; // f32 = 4 bytes
 
         for level in (0..=self.max_depth).rev() {
             let count = self.river_zone_counts[level];
@@ -796,7 +905,7 @@ impl MetalFlopStartSolver {
             enc.set_buffer(15, Some(self.d_river_pl_str.as_ref()), sps_byte_off as u64);
             enc.set_buffer(16, Some(self.d_river_pl_idx.as_ref()), sps_byte_off as u64);
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
-            enc.set_buffer(18, Some(self.d_river_chance_prob.as_ref()), prob_byte_off as u64);
+            enc.set_buffer(18, Some(self.d_river_board_mask.as_ref()), prob_byte_off as u64);
             enc.set_buffer(19, Some(self.d_debug_out.as_ref()), 0);
 
             let grid_size = metal::MTLSize { width: count as u64, height: 1, depth: 1 };
@@ -821,9 +930,10 @@ impl MetalFlopStartSolver {
         let cum_byte_off = (self.turn_offset + ti * self.turn_stride) * 4;
         let cfv_byte_off = ti * self.nn * self.nh * 4;
 
-        // Turn zone uses sorted arrays for this turn card
-        let sos_byte_off = (ti * num_opp * nh) * 2;
-        let sps_byte_off = (ti * num_opp * nh) * 2;
+        // Turn zone uses sorted arrays for this turn card (indexed by raw card value)
+        let tc_card = self.turn_deck[ti] as usize;
+        let sos_byte_off = (tc_card * num_opp * nh) * 2;
+        let sps_byte_off = (tc_card * num_opp * nh) * 2;
 
         for level in (0..=self.max_depth).rev() {
             let count = self.turn_zone_counts[level];
@@ -880,7 +990,7 @@ impl MetalFlopStartSolver {
             enc.set_buffer(15, Some(self.d_turn_pl_str.as_ref()), sps_byte_off as u64);
             enc.set_buffer(16, Some(self.d_turn_pl_idx.as_ref()), sps_byte_off as u64);
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
-            enc.set_buffer(18, Some(self.d_turn_chance_prob.as_ref()), 0);
+            enc.set_buffer(18, Some(self.d_turn_chance_prob.as_ref()), (ti * nh * 4) as u64);
 
             let grid_size = metal::MTLSize { width: count as u64, height: 1, depth: 1 };
             let tg_size = metal::MTLSize { width: 1, height: 1, depth: 1 };
@@ -1092,7 +1202,7 @@ impl MetalFlopStartSolver {
         }
     }
 
-    fn chance_finalize_turn(&self, ctx: &MetalContext) {
+    pub fn chance_finalize_turn(&self, ctx: &MetalContext) {
         // No-op: chance_accumulate_turn now writes directly to d_cfv.
         // d_cfv was zeroed at the start of each traverser iteration.
         let _ = ctx;
@@ -1100,7 +1210,7 @@ impl MetalFlopStartSolver {
 
     // ─── Helpers ───
 
-    fn zero_buffer_name(&self, ctx: &MetalContext, name: u8) {
+    pub fn zero_buffer_name(&self, ctx: &MetalContext, name: u8) {
         let len = match name {
             0 => self.d_river_cfv_batch.len(),
             1 => self.d_river_accum.len(),
@@ -1238,6 +1348,10 @@ impl MetalFlopStartSolver {
     pub fn upload_regrets(&mut self, data: &[f32]) {
         self.d_regrets.as_mut_slice().copy_from_slice(data);
     }
+    pub fn upload_cum_strategy(&mut self, data: &[f32]) {
+        self.d_cum_strategy.as_mut_slice().copy_from_slice(data);
+    }
+    pub fn river_outcomes_per_turn(&self) -> &[usize] { &self.river_outcomes_per_turn }
     pub fn compute_all_strategies(&self, ctx: &MetalContext) {
         // Flop zone: single outcome
         self.compute_strategies_single(
