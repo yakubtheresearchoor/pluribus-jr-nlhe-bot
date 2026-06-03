@@ -883,7 +883,8 @@ fn ref_count(cfg: &TreeConfig, s: &RefState) -> (usize, usize, usize) {
             .iter()
             .all(|&p| s.commits[p] >= ref_max_committable(cfg, p));
         if all_allin {
-            if s.street == 2 {
+            // Chronological street ordinal (Preflop=0, Flop=1, Turn=2, River=3).
+            if s.street == 3 {
                 return (0, 0, 1);
             }
             let mut next = s.clone();
@@ -911,7 +912,10 @@ fn ref_count(cfg: &TreeConfig, s: &RefState) -> (usize, usize, usize) {
     let round_complete = all_acted && (cum_eq || no_betting);
 
     if round_complete {
-        if s.street == 2 {
+        // River-end check: use chronological street ordinal (Preflop=0,
+        // Flop=1, Turn=2, River=3 via BoardState::street()). River is
+        // street == 3 regardless of where the tree started.
+        if s.street == 3 {
             return (0, 0, 1); // river end → terminal
         }
         let mut next = s.clone();
@@ -953,14 +957,30 @@ fn ref_count(cfg: &TreeConfig, s: &RefState) -> (usize, usize, usize) {
 
 fn ref_initial(cfg: &TreeConfig) -> RefState {
     let np = cfg.num_players as usize;
+    // Use chronological street ordinal (Preflop=0, Flop=1, Turn=2, River=3
+    // via BoardState::street()), NOT the enum repr value (where Preflop=3
+    // for backward compat with existing hardcoded board_state == 1/2 checks).
+    // This lets the same increment-based street logic handle both
+    // postflop-start (street 1..3) and preflop-start (street 0..3) chains.
+    //
+    // First-actor dispatch: button in HU preflop, leftmost-active in postflop
+    // (matches builder's first_preflop_player vs first_postflop_player).
+    let to_act: u8 = match cfg.initial_state {
+        BoardState::Preflop => {
+            // HU button = highest-indexed active = num_players - 1.
+            // Multiway preflop ordering is deferred (matches builder caveat).
+            cfg.num_players - 1
+        }
+        _ => 0,
+    };
     RefState {
-        street: cfg.initial_state as u8,
+        street: cfg.initial_state.street(),
         commits: cfg.initial_contributions.clone(),
         round_start: cfg.initial_contributions.clone(),
         folded: vec![false; np],
         has_acted: vec![false; np],
         allin_flag: false,
-        to_act: 0, // postflop street-start = leftmost active = p0 (always for full table)
+        to_act,
     }
 }
 
@@ -1151,4 +1171,43 @@ fn count_6p_symmetric() {
 #[test]
 fn count_3p_asymmetric() {
     run_count_check(&config_3p_asymmetric(), "3p asymmetric [10,5,5]");
+}
+
+// ============================================================================
+// Preflop completeness check (#41 P2.3)
+// ============================================================================
+// HU preflop config: same blinds as `hu_asymmetric_cfg` but starting at
+// Preflop. The four-zone tree (PRE → CHANCE → FLOP → CHANCE → TURN →
+// CHANCE → RIVER) must contain exactly what the abstraction implies —
+// the same completeness discipline applied to postflop, now extended to
+// the new preflop component.
+//
+// The convenient structural fact to verify: HU preflop tree has 308
+// nodes (per preflop_tree_smoke.rs). The unshortcuted reference must
+// match exactly. If it doesn't, the preflop tree is silently dropping
+// lines (the over-correction failure mode the validation arc taught us
+// to verify, not assume).
+
+fn config_hu_preflop_asymmetric() -> TreeConfig {
+    TreeConfig {
+        num_players: 2,
+        initial_state: BoardState::Preflop,
+        starting_pot: 3,
+        starting_stacks: vec![100, 100],
+        initial_contributions: vec![2, 1],
+        rake_rate: 0.0,
+        rake_cap: 0.0,
+        bet_sizes: BetSizeOptions {
+            bet: vec![BetSize::PotRelative(1.0)],
+            raise: vec![],
+        },
+        add_allin_threshold: 1.0,
+        force_allin_threshold: 1.0,
+        merging_threshold: 0.0,
+    }
+}
+
+#[test]
+fn count_hu_preflop_asymmetric() {
+    run_count_check(&config_hu_preflop_asymmetric(), "HU PREFLOP asymmetric [2,1]");
 }

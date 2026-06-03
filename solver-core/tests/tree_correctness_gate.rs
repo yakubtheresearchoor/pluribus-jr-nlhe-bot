@@ -377,8 +377,27 @@ fn tree_correctness_gate_multi_config() {
             }
         );
 
+        // Config I: 2p heads-up PREFLOP — preflop integration component
+        // gate. Same blind structure as Config E but starting at Preflop.
+        // The preflop tree has a four-zone structure (PRE → CHANCE → FLOP
+        // → CHANCE → TURN → CHANCE → RIVER) and the root acts player 1
+        // (button = SB acts first preflop in HU, opposite of postflop's
+        // BB-first). Per-PLAYER-node legality rules are identical to
+        // postflop; this config verifies they pass on the preflop tree.
+        let v_i = run_gate(
+            "2p HU PREFLOP [2,1], 1 bet PotRel(1.0)",
+            TreeConfig {
+                num_players: 2, initial_state: BoardState::Preflop, starting_pot: 3,
+                starting_stacks: vec![100; 2],
+                initial_contributions: vec![2, 1],
+                rake_rate: 0.0, rake_cap: 0.0,
+                bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
+                add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            }
+        );
+
         v_a.total() + v_b.total() + v_c.total() + v_d.total() + v_e.total()
-            + v_f.total() + v_g.total() + v_h.total()
+            + v_f.total() + v_g.total() + v_h.total() + v_i.total()
     };
 
     eprintln!("\n=== ROLLUP ===");

@@ -20,11 +20,44 @@ pub enum BoardState {
     Flop = 0,
     Turn = 1,
     River = 2,
+    // Preflop = 3 (appended for backward compatibility with hardcoded
+    // board_state == 1/2 checks in gpu/context.rs and flop_start_vector_cfr.rs).
+    // The repr value (3) is distinct from the street ordinal (0); see
+    // street() and num_remaining_streets() for chronological semantics.
+    Preflop = 3,
 }
 
 impl BoardState {
+    /// Chronological street ordinal: Preflop=0, Flop=1, Turn=2, River=3.
+    /// Distinct from the repr value (where Preflop=3 for backward compat).
     pub fn street(&self) -> u8 {
-        *self as u8
+        match self {
+            BoardState::Preflop => 0,
+            BoardState::Flop => 1,
+            BoardState::Turn => 2,
+            BoardState::River => 3,
+        }
+    }
+
+    /// Number of streets remaining INCLUDING this one.
+    /// Preflop=4, Flop=3, Turn=2, River=1.
+    pub fn num_remaining_streets(&self) -> i32 {
+        match self {
+            BoardState::Preflop => 4,
+            BoardState::Flop => 3,
+            BoardState::Turn => 2,
+            BoardState::River => 1,
+        }
+    }
+
+    /// Next street in chronological order, or None if River (no next street).
+    pub fn next(&self) -> Option<BoardState> {
+        match self {
+            BoardState::Preflop => Some(BoardState::Flop),
+            BoardState::Flop => Some(BoardState::Turn),
+            BoardState::Turn => Some(BoardState::River),
+            BoardState::River => None,
+        }
     }
 }
 

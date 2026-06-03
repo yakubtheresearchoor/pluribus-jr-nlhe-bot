@@ -50,7 +50,14 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
     // Bounded above by `max_committable(p) = starting_stacks[p] + initial_contributions[p]`.
     let stacks: Vec<i32> = config.initial_contributions.clone();
 
-    let first_player = builder.first_postflop_player(&active_players);
+    // Dispatch first-actor by initial street: preflop reverses postflop's
+    // action order (button acts first preflop in HU vs BB acting first
+    // postflop). See `first_preflop_player` for the HU convention and the
+    // multiway caveat.
+    let first_player = match config.initial_state {
+        BoardState::Preflop => builder.first_preflop_player(&active_players),
+        _ => builder.first_postflop_player(&active_players),
+    };
 
     let root = FlatNode::player(first_player, config.initial_state, 0);
     let root_idx = builder.tree.alloc_node(root);
@@ -288,6 +295,33 @@ impl<'a> TreeBuilder<'a> {
         0
     }
 
+    /// First player to act PREFLOP. Distinct from `first_postflop_player`.
+    ///
+    /// HU CONVENTION (np=2): the button = SB = highest-indexed active
+    /// player acts first preflop. Postflop, BB (= lowest-indexed active
+    /// player) acts first. This is the action-order reversal the
+    /// `hu_completeness.rs` scope note explicitly flagged as needing new
+    /// machinery, NOT reusable from `first_postflop_player`.
+    ///
+    /// MULTIWAY (np > 2): standard preflop convention has UTG (the seat
+    /// after BB) acting first. Identifying UTG requires knowing which
+    /// seat is the BB, which is not currently encoded in TreeConfig
+    /// beyond the initial_contributions structure. For multiway preflop,
+    /// this function returns the highest-indexed active player (button
+    /// position), which is HU-correct but NOT multiway-correct (the
+    /// button acts LAST preflop in multiway, not first). Multiway
+    /// preflop ordering is a deferred configuration question; the first
+    /// preflop component validation focuses on HU per the plan.
+    fn first_preflop_player(&self, active: &[bool]) -> u8 {
+        let num_players = self.config.num_players as usize;
+        for i in (0..num_players).rev() {
+            if active[i] {
+                return i as u8;
+            }
+        }
+        0
+    }
+
     fn next_active_player(&self, current: usize, active: &[bool]) -> Option<usize> {
         let num_players = self.config.num_players as usize;
         for offset in 1..=num_players {
@@ -391,18 +425,14 @@ impl<'a> TreeBuilder<'a> {
             let all_allin = (0..self.config.num_players as usize)
                 .all(|p| !info.active[p] || info.stacks[p] >= self.max_committable(p));
             if all_allin {
-                match info.board_state {
-                    BoardState::Flop => {
+                match info.board_state.next() {
+                    Some(next_street) => {
+                        // All-in on Preflop/Flop/Turn → chance to next street.
                         let mut child_info = info.clone_for_child();
-                        child_info.board_state = BoardState::Turn;
+                        child_info.board_state = next_street;
                         self.add_chance_child(node_idx, child_info);
                     }
-                    BoardState::Turn => {
-                        let mut child_info = info.clone_for_child();
-                        child_info.board_state = BoardState::River;
-                        self.add_chance_child(node_idx, child_info);
-                    }
-                    BoardState::River => {
+                    None => {
                         // All all-in on river → showdown terminal.
                         self.tree.nodes[node_idx].node_type = NODE_TYPE_TERMINAL;
                         self.tree.set_folded_mask(node_idx, info.folded_mask());
@@ -420,18 +450,18 @@ impl<'a> TreeBuilder<'a> {
         // solely on `is_round_complete_after_action` which checks that ALL
         // active players have acted and all have equal stacks.
         if self.is_round_complete_after_action(&info) {
-            if info.board_state == BoardState::River {
-                self.tree.nodes[node_idx].node_type = NODE_TYPE_TERMINAL;
-                self.tree.set_folded_mask(node_idx, info.folded_mask());
-                return;
+            match info.board_state.next() {
+                None => {
+                    // River round complete → terminal showdown.
+                    self.tree.nodes[node_idx].node_type = NODE_TYPE_TERMINAL;
+                    self.tree.set_folded_mask(node_idx, info.folded_mask());
+                }
+                Some(next_street) => {
+                    let mut child_info = info.clone_for_child();
+                    child_info.board_state = next_street;
+                    self.add_chance_child(node_idx, child_info);
+                }
             }
-            let mut child_info = info.clone_for_child();
-            match info.board_state {
-                BoardState::Flop => child_info.board_state = BoardState::Turn,
-                BoardState::Turn => child_info.board_state = BoardState::River,
-                BoardState::River => unreachable!(),
-            }
-            self.add_chance_child(node_idx, child_info);
             return;
         }
 
@@ -581,11 +611,7 @@ impl<'a> TreeBuilder<'a> {
             (player_remaining - to_call.min(player_remaining)) as f64
                 / (pot + to_call.min(player_remaining) * (info.num_active() as i32)) as f64;
 
-        let num_remaining_streets = match info.board_state {
-            BoardState::Flop => 3,
-            BoardState::Turn => 2,
-            BoardState::River => 1,
-        };
+        let num_remaining_streets = info.board_state.num_remaining_streets();
 
         let bet_options = &self.config.bet_sizes;
 
