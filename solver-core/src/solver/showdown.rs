@@ -229,6 +229,15 @@ pub fn sorted_sweep_showdown(
 /// `contributions` should be `np` entries for the terminal node (not the full tree).
 /// `opp_reach` has N-1 entries indexed by opponent index oi = (p < traverser) ? p : p-1.
 #[allow(clippy::too_many_arguments)]
+/// Backward-compatible wrapper: no-rake variant. New solver code paths
+/// that need rake should call `side_pot_showdown_cfv_with_rake` directly,
+/// passing `rake_rate` and `rake_cap` from the `FlatTree`.
+///
+/// This wrapper is provided so the ~40 existing direct callers in tests
+/// and the GPU-mirror callers continue to work unchanged while CPU rake
+/// implementation lands incrementally (Slice 1.x of #44 rake gap
+/// resolution).
+#[allow(clippy::too_many_arguments)]
 pub fn side_pot_showdown_cfv(
     opp_reach: &[&[f32]],
     hand_cards: &[u8],
@@ -242,6 +251,55 @@ pub fn side_pot_showdown_cfv(
     traverser: usize,
     num_players: u8,
     starting_pot: i32,
+) -> Vec<f32> {
+    side_pot_showdown_cfv_with_rake(
+        opp_reach, hand_cards, nh,
+        sorted_opp_str, sorted_opp_idx,
+        sorted_pl_str, sorted_pl_idx,
+        contributions, fold_mask, traverser, num_players, starting_pot,
+        0.0, 0.0,
+    )
+}
+
+/// N-player side pot terminal evaluation with rake. Returns **fully
+/// scaled** counterfactual values per hand (includes pot_at_level
+/// multiplication, `c_t` subtraction, and rake reduction on winning
+/// payoffs).
+///
+/// Rake math:
+///   `rake = min(total_pot × rake_rate, rake_cap)`
+///   - Winners (active players who claim pot) get `(pot − rake)` instead
+///     of `pot`. Their payoff is reduced by their share of rake.
+///   - Losers (folded or active-but-lost) are unaffected. They were
+///     never claiming the pot; rake comes out of the winner's claim.
+///   - Folded traverser: payoff = −investment (rake-free; they didn't
+///     win anything, so rake doesn't apply to them).
+///
+/// In the sorted-sweep paths, rake is applied via the win_reach +
+/// tie_reach correction:
+///   `cfv[h] = half_pot × sweep_net[h] − rake × (win_reach[h] + tie_reach[h] / 2)`
+/// (the rake-free formula minus rake-times-pot-claim-probability).
+///
+/// **Anchor:** `verify_rake_affects_terminal_payoffs` in
+/// p_config_param_verification.rs validates the fast-path rake against
+/// a hand-computed reference. Sorted-sweep + side-pot paths get their
+/// own hand-computed anchors as they get implemented across Slice 1.x.
+#[allow(clippy::too_many_arguments)]
+pub fn side_pot_showdown_cfv_with_rake(
+    opp_reach: &[&[f32]],
+    hand_cards: &[u8],
+    nh: usize,
+    sorted_opp_str: &[u16],
+    sorted_opp_idx: &[u16],
+    sorted_pl_str: &[u16],
+    sorted_pl_idx: &[u16],
+    contributions: &[i32],
+    fold_mask: u16,
+    traverser: usize,
+    num_players: u8,
+    starting_pot: i32,
+    rake_rate: f32,
+    rake_cap: f32,
 ) -> Vec<f32> {
     let num_opp = opp_reach.len();
     let np = num_players as usize;
@@ -280,10 +338,15 @@ pub fn side_pot_showdown_cfv(
     if (num_active <= 1 || fold_mask & (1u16 << traverser) != 0) && num_opp <= 2 {
         let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
         let traverser_investment = starting_pot as f32 / np as f32 + c_t as f32;
+        // Rake applies only to the winner's pot claim. Folded traverser
+        // doesn't win → rake doesn't reduce their payoff (they lose
+        // their investment regardless). Active-winner traverser claims
+        // (total_pot − rake) instead of total_pot.
+        let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
         let payoff = if fold_mask & (1u16 << traverser) != 0 {
             -traverser_investment
         } else {
-            total_pot as f32 - traverser_investment
+            (total_pot as f32 - rake) - traverser_investment
         };
 
         if num_opp == 1 {

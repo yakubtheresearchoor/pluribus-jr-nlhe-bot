@@ -21,7 +21,7 @@
 
 use solver_core::card::card_from_str;
 use solver_core::solver::flop_start_game::FlopChanceTable;
-use solver_core::solver::showdown::side_pot_showdown_cfv;
+use solver_core::solver::showdown::{side_pot_showdown_cfv, side_pot_showdown_cfv_with_rake};
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
 
@@ -236,47 +236,179 @@ fn verify_starting_pot_flows_to_terminal_payoffs() {
 //   - Run all existing tests (use rake_rate=0.0, should pass unchanged)
 //   - Re-enable this test (removes #[ignore])
 
+// Hand-computed rake reference for the FAST PATH (folded or single-active).
+//
+// Case: HU, traverser=0 ACTIVE (NOT folded), num_opp=1 OPP IS FOLDED.
+// This triggers the fast path (num_active <= 1) with traverser as the
+// active winner. With:
+//   contributions = [50, 50]  (each player put in 50)
+//   starting_pot = 0
+//   total_pot = 0 + 100 = 100
+//   rake_rate = 0.05, rake_cap = 1000 (cap not binding)
+//   rake = min(100 * 0.05, 1000) = 5
+// Expected:
+//   traverser_investment = 0/2 + 50 = 50
+//   payoff (active winner) = (total_pot - rake) - investment = 95 - 50 = 45
+// Compare with rake-free baseline:
+//   payoff = total_pot - investment = 100 - 50 = 50
+// Difference: rake = 5. CFV[h] = payoff × cfreach. With nh=2 non-conflict
+// combos and uniform opp_reach=1, cfreach[h]=1, so CFV[h] = payoff.
+//   Rake-free CFV: [50, 50]
+//   Rake CFV:      [45, 45]
+
 #[test]
-#[ignore = "rake_rate/rake_cap not wired into side_pot_showdown_cfv \
-            (signature lacks rake params; nothing reads tree.rake_rate / \
-            tree.rake_cap in any solver path). Gap surfaced by \
-            pre-blueprint config-param verification. Awaits \
-            implementation per the comment above."]
-fn verify_rake_affects_terminal_payoffs() {
-    // This test asserts the EXPECTED behavior. Currently fails because
-    // rake is unimplemented.
-    let nh = 1usize;
-    let hand_cards = vec![0u8, 1u8];
+fn verify_rake_fast_path_matches_hand_computed_reference() {
+    let nh = 2usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8];
+    // OPP folded (fold_mask bit 1). Traverser=0 active winner.
     let opp_reach_data = vec![1.0f32; nh];
     let opp_reach_slices: Vec<&[f32]> = vec![&opp_reach_data];
-    let sorted_str = vec![100u16; nh];
-    let sorted_idx = vec![0u16; nh];
+    let sorted_str = vec![100u16, 200u16];
+    let sorted_idx = vec![0u16, 1u16];
     let contributions = vec![50i32, 50i32];
-    let fold_mask = 0u16;
+    let fold_mask: u16 = 1u16 << 1; // opp folded
 
+    // Rake-free baseline (uses the wrapper, which passes 0.0, 0.0)
     let cfv_no_rake = side_pot_showdown_cfv(
         &opp_reach_slices, &hand_cards, nh,
         &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
-        &contributions, fold_mask, 0, 2, 100,
+        &contributions, fold_mask, 0, 2, 0,
+    );
+    // With rake: 5% rate, cap=1000 (not binding)
+    let cfv_with_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+        &contributions, fold_mask, 0, 2, 0,
+        0.05, 1000.0,
     );
 
-    // TODO: when rake parameters are added to side_pot_showdown_cfv,
-    // this test should call it with rake_rate=0.05 + rake_cap=30 and
-    // compare against the no-rake baseline. They should differ.
-    //
-    // For now, the test body just asserts the current state (no rake
-    // in signature → can't even construct the rake-applied call).
+    eprintln!("fast-path active-winner test:");
+    eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
+    eprintln!("  rake-5%  CFV: {:?}", cfv_with_rake);
 
-    // The signature doesn't accept rake. This test fails at the
-    // documentation level: the IDEAL test would pass two configs and
-    // verify they differ. Until the implementation exists, this is the
-    // signal:
-    panic!(
-        "rake_rate/rake_cap are NOT in side_pot_showdown_cfv signature. \
-         Cannot construct a rake-applied call to compare against no-rake \
-         baseline {:?}. Implementation gap.",
-        cfv_no_rake,
+    // Hand-computed: rake-free payoff = 50; rake payoff = 45.
+    // CFV[h] = payoff × cfreach. With nh=2 non-conflict, cfreach=1.
+    // (Actually cfreach = opp_reach_sum - opp_reach_minus[c1] - opp_reach_minus[c2]
+    //  + opp_reach[h] = 2 - 1 - 1 + 1 = 1; same for h=1)
+    let expected_no_rake = [50.0f32, 50.0f32];
+    let expected_with_rake = [45.0f32, 45.0f32];
+    for h in 0..nh {
+        assert!((cfv_no_rake[h] - expected_no_rake[h]).abs() < 1e-4,
+            "rake-free CFV[{}] = {}, expected {} (hand-computed)",
+            h, cfv_no_rake[h], expected_no_rake[h]);
+        assert!((cfv_with_rake[h] - expected_with_rake[h]).abs() < 1e-4,
+            "rake-5% CFV[{}] = {}, expected {} (hand-computed: \
+             (total_pot=100 - rake=5) - investment=50 = 45)",
+            h, cfv_with_rake[h], expected_with_rake[h]);
+    }
+
+    eprintln!("✓ Fast path (active winner, opp folded): rake applied correctly");
+    eprintln!("  Hand-computed: payoff = (pot - rake) - investment = (100-5) - 50 = 45");
+}
+
+#[test]
+fn verify_rake_cap_binds() {
+    // Same setup as above, but rake_cap = 3 (less than total_pot * rake_rate = 5).
+    // Expected rake = min(5, 3) = 3.
+    // payoff = 100 - 3 - 50 = 47.
+    let nh = 2usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8];
+    let opp_reach_data = vec![1.0f32; nh];
+    let opp_reach_slices: Vec<&[f32]> = vec![&opp_reach_data];
+    let sorted_str = vec![100u16, 200u16];
+    let sorted_idx = vec![0u16, 1u16];
+    let contributions = vec![50i32, 50i32];
+    let fold_mask: u16 = 1u16 << 1;
+
+    let cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+        &contributions, fold_mask, 0, 2, 0,
+        0.05, 3.0, // cap = 3 < uncapped rake = 5
     );
+    eprintln!("rake-cap-binding test: CFV = {:?}", cfv);
+    let expected = [47.0f32, 47.0f32];
+    for h in 0..nh {
+        assert!((cfv[h] - expected[h]).abs() < 1e-4,
+            "CFV[{}] = {}, expected {} (rake capped at 3: payoff = 100-3-50)",
+            h, cfv[h], expected[h]);
+    }
+    eprintln!("✓ rake_cap binds correctly when total_pot × rake_rate exceeds cap");
+}
+
+#[test]
+fn verify_rake_does_not_apply_to_folded_traverser() {
+    // Traverser folded → payoff = −investment, unchanged by rake.
+    // Setup: same pot, but traverser=0 folded.
+    let nh = 2usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8];
+    let opp_reach_data = vec![1.0f32; nh];
+    let opp_reach_slices: Vec<&[f32]> = vec![&opp_reach_data];
+    let sorted_str = vec![100u16, 200u16];
+    let sorted_idx = vec![0u16, 1u16];
+    let contributions = vec![50i32, 50i32];
+    let fold_mask: u16 = 1u16 << 0; // traverser folded
+
+    let cfv_no_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+        &contributions, fold_mask, 0, 2, 0,
+        0.0, 0.0,
+    );
+    let cfv_with_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+        &contributions, fold_mask, 0, 2, 0,
+        0.05, 1000.0,
+    );
+    eprintln!("folded-traverser test:");
+    eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
+    eprintln!("  rake-5%  CFV: {:?}", cfv_with_rake);
+    for h in 0..nh {
+        assert!(
+            (cfv_no_rake[h] - cfv_with_rake[h]).abs() < 1e-6,
+            "folded traverser CFV[{}] should be RAKE-INVARIANT (loser doesn't pay rake); \
+             rake-free = {}, rake-5% = {}",
+            h, cfv_no_rake[h], cfv_with_rake[h],
+        );
+    }
+    eprintln!("✓ Folded traverser payoff is rake-invariant (rake comes out of winner's claim)");
+}
+
+#[test]
+fn verify_rake_affects_terminal_payoffs() {
+    // The originally-#[ignore]'d test from the gap-discovery commit, now
+    // unblocked: rake parameter flows to payoffs. Uses fast path so this
+    // test passes once Slice 1.1+1.2 lands. Sorted-sweep + side-pot paths
+    // get their own anchors in Slice 1.3+1.4.
+    let nh = 2usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8];
+    let opp_reach_data = vec![1.0f32; nh];
+    let opp_reach_slices: Vec<&[f32]> = vec![&opp_reach_data];
+    let sorted_str = vec![100u16, 200u16];
+    let sorted_idx = vec![0u16, 1u16];
+    let contributions = vec![50i32, 50i32];
+    let fold_mask: u16 = 1u16 << 1; // active winner, opp folded → fast path
+
+    let cfv_no_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+        &contributions, fold_mask, 0, 2, 0,
+        0.0, 0.0,
+    );
+    let cfv_with_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+        &contributions, fold_mask, 0, 2, 0,
+        0.05, 1000.0,
+    );
+    assert!(
+        cfv_no_rake.iter().zip(&cfv_with_rake).any(|(a, b)| (a - b).abs() > 1e-4),
+        "rake_rate changing from 0 to 0.05 must change CFV. \
+         rake-free: {:?}; rake-5%: {:?}",
+        cfv_no_rake, cfv_with_rake,
+    );
+    eprintln!("✓ rake_rate is a live parameter affecting terminal payoffs");
 }
 
 // ─────────────────────────────────────────────────────────────────────
