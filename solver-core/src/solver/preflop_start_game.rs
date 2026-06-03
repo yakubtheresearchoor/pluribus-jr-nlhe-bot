@@ -320,6 +320,45 @@ pub fn reduce_cfv_combo_to_class(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// P1.5.5a runtime-shape function (test target for P2.5a)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Compute per-class preflop CFV via the runtime path: loop over 1,755
+/// canonical flops, call `v_flop_fn(F_canon, combo)` for each surviving
+/// combo, reduce combo CFV to class CFV via `reduce_cfv_combo_to_class`,
+/// aggregate across canonicals via `aggregate_preflop_chance` with
+/// orbit weights.
+///
+/// This is the RUNTIME path P2.5a tests. It will also be the bottom-up
+/// pass used by P1.5.5b's orchestrator (with `v_flop_fn` replaced by a
+/// real per-flop solver instead of the test stub).
+///
+/// Returns `[NUM_PREFLOP_CLASSES]` per-class CFV.
+pub fn compute_preflop_cfv_per_canonical_pass(
+    table: &PreflopChanceTable,
+    v_flop_fn: impl Fn([Card; 3], (Card, Card)) -> f32,
+) -> Vec<f32> {
+    let n_canon = table.num_canonical_flops();
+    let mut per_canonical_v_class: Vec<Vec<f32>> = Vec::with_capacity(n_canon);
+    for canonical_idx in 0..n_canon {
+        let f_canon = table.canonical_flops[canonical_idx];
+        let layout = flop_combo_layout(f_canon);
+        let v_combo: Vec<f32> = layout.iter()
+            .map(|&combo| v_flop_fn(f_canon, combo))
+            .collect();
+        // Runtime uses P1.5.5a's reduce. P2.5a's reference does NOT use this;
+        // it computes class CFV by explicit enumeration so the per-class
+        // survivor-count arithmetic is independently anchored.
+        let v_class = reduce_cfv_combo_to_class(f_canon, &v_combo, &layout);
+        per_canonical_v_class.push(v_class);
+    }
+    // Runtime uses P1.5.4's orbit-weighted aggregation. P2.5a's reference
+    // does NOT use this; it sums with explicit 1/19,600 unit weights per
+    // actual flop so the orbit weighting is independently anchored.
+    aggregate_preflop_chance(table, &per_canonical_v_class)
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // P1.5.4: aggregate_preflop_chance (orbit-weighted CFV aggregation)
 // ─────────────────────────────────────────────────────────────────────
 
