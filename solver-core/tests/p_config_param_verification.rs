@@ -279,7 +279,7 @@ fn verify_rake_fast_path_matches_hand_computed_reference() {
         &opp_reach_slices, &hand_cards, nh,
         &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
         &contributions, fold_mask, 0, 2, 0,
-        0.05, 1000.0,
+        0.05, 1000.0, true,
     );
 
     eprintln!("fast-path active-winner test:");
@@ -324,7 +324,7 @@ fn verify_rake_cap_binds() {
         &opp_reach_slices, &hand_cards, nh,
         &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
         &contributions, fold_mask, 0, 2, 0,
-        0.05, 3.0, // cap = 3 < uncapped rake = 5
+        0.05, 3.0, true, // cap = 3 < uncapped rake = 5
     );
     eprintln!("rake-cap-binding test: CFV = {:?}", cfv);
     let expected = [47.0f32, 47.0f32];
@@ -353,13 +353,13 @@ fn verify_rake_does_not_apply_to_folded_traverser() {
         &opp_reach_slices, &hand_cards, nh,
         &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
         &contributions, fold_mask, 0, 2, 0,
-        0.0, 0.0,
+        0.0, 0.0, true,
     );
     let cfv_with_rake = side_pot_showdown_cfv_with_rake(
         &opp_reach_slices, &hand_cards, nh,
         &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
         &contributions, fold_mask, 0, 2, 0,
-        0.05, 1000.0,
+        0.05, 1000.0, true,
     );
     eprintln!("folded-traverser test:");
     eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
@@ -486,13 +486,13 @@ fn verify_rake_sorted_sweep_payoffs_hu_realistic() {
         &opp_reach_slices, &hand_cards, nh,
         &opp_str, &opp_idx, &pl_str, &pl_idx,
         &contributions, fold_mask, 0, 2, 0,
-        0.0, 0.0,
+        0.0, 0.0, true,
     );
     let cfv = side_pot_showdown_cfv_with_rake(
         &opp_reach_slices, &hand_cards, nh,
         &opp_str, &opp_idx, &pl_str, &pl_idx,
         &contributions, fold_mask, 0, 2, 0,
-        0.05, 1000.0,
+        0.05, 1000.0, true,
     );
     eprintln!("HU-realistic showdown:");
     eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
@@ -549,13 +549,13 @@ fn verify_rake_brute_force_3p_strict_win_hand_computed() {
         &opp_reach_views, &hand_cards, nh,
         &opp_str, &opp_idx, &pl_str, &pl_idx,
         &contributions, fold_mask, 0, 3, 0,
-        0.0, 0.0,
+        0.0, 0.0, true,
     );
     let cfv = side_pot_showdown_cfv_with_rake(
         &opp_reach_views, &hand_cards, nh,
         &opp_str, &opp_idx, &pl_str, &pl_idx,
         &contributions, fold_mask, 0, 3, 0,
-        0.05, 1000.0,
+        0.05, 1000.0, true,
     );
     eprintln!("3p brute-force strict-win:");
     eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
@@ -608,13 +608,13 @@ fn verify_rake_brute_force_3p_tie_at_top_hand_computed() {
         &opp_reach_views, &hand_cards, nh,
         &opp_str, &opp_idx, &pl_str, &pl_idx,
         &contributions, fold_mask, 0, 3, 0,
-        0.0, 0.0,
+        0.0, 0.0, true,
     );
     let cfv = side_pot_showdown_cfv_with_rake(
         &opp_reach_views, &hand_cards, nh,
         &opp_str, &opp_idx, &pl_str, &pl_idx,
         &contributions, fold_mask, 0, 3, 0,
-        0.05, 1000.0,
+        0.05, 1000.0, true,
     );
     eprintln!("3p brute-force tie-at-top:");
     eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
@@ -633,6 +633,179 @@ fn verify_rake_brute_force_3p_tie_at_top_hand_computed() {
         cfv[0]);
 
     eprintln!("✓ Brute-force 3p tie-at-top T=2: rake shared 50/50 between winners");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Slice 1.5: side-pot rake (site convention: main pot only,
+// single per-hand cap, no flop no drop)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Setup for 3p multiway all-in with side pot:
+//   contributions = [50, 100, 100]  (p0 short-stack, p1+p2 deep)
+//   starting_pot = 0
+//   Levels: [50, 100]
+//   Main pot (level 0): 50 × 3 = 150  (everyone contributes)
+//   Side pot (level 1): 50 × 2 = 100  (only p1, p2 contest)
+//   rake_rate = 0.05, rake_cap = 1000 → rake on main = 7.5 (cap not binding)
+//   Side pot UN-RAKED.
+//
+// Combos: A=(0,1)=str200, B=(2,3)=str100, C=(4,5)=str50
+//   Sorted asc: pl_str = [50, 100, 200], pl_idx = [2, 1, 0]
+
+#[test]
+fn verify_rake_side_pot_short_winner_main_pot_only() {
+    // Traverser = p0 (short, c_t=50). Holding A (best). Strict win at main
+    // pot (level 0), but NOT eligible for side pot (their contribution 50 <
+    // level 100). Expected cash = (150 - 7.5)/1 = 142.5. net = 92.5.
+    // 2 valid (g_a, g_b) scenarios. accum = 185.
+    let nh = 3usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8, 4u8, 5u8];
+    let pl_str = vec![50u16, 100u16, 200u16];
+    let pl_idx = vec![2u16, 1u16, 0u16];
+    let opp_str = pl_str.clone();
+    let opp_idx = pl_idx.clone();
+    let contributions = vec![50i32, 100i32, 100i32];
+    let fold_mask = 0u16;
+    let opp_reach = vec![vec![1.0f32; nh]; 2];
+    let opp_reach_views: Vec<&[f32]> = opp_reach.iter().map(|v| v.as_slice()).collect();
+
+    let cfv_no_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 3, 0,
+        0.0, 0.0, true,
+    );
+    let cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 3, 0,
+        0.05, 1000.0, true,
+    );
+    eprintln!("3p side-pot, trav=p0 short winner:");
+    eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
+    eprintln!("  rake-5%  CFV: {:?}", cfv);
+
+    assert!((cfv_no_rake[0] - 200.0).abs() < 1e-3,
+        "rake-free cfv[0]={}, expected 200", cfv_no_rake[0]);
+    assert!((cfv[0] - 185.0).abs() < 1e-3,
+        "rake cfv[0]={}, expected 185 (= 200 − rake×2 scenarios = 200 − 15)",
+        cfv[0]);
+    // Differences should equal exactly rake × num_scenarios = 7.5 × 2 = 15
+    assert!((cfv_no_rake[0] - cfv[0] - 15.0).abs() < 1e-3,
+        "main-pot rake reduction should be 15, got {}",
+        cfv_no_rake[0] - cfv[0]);
+
+    eprintln!("✓ 3p side-pot: trav-as-short-winner only claims main pot, raked correctly");
+}
+
+#[test]
+fn verify_rake_side_pot_deep_winner_main_raked_side_not() {
+    // Traverser = p1 (deep, c_t=100). Holding A (best). Wins BOTH pots:
+    //   main pot cash = (150 - 7.5)/1 = 142.5
+    //   side pot cash = 100/1 = 100 (UN-RAKED — this is the key
+    //                                discriminator for "main pot only" rule)
+    //   total cash = 242.5. net = 142.5.
+    //   Rake-free baseline: total cash = 250. net = 150.
+    // Valid (g_a, g_b) scenarios (g_a = p0's hand, g_b = p2's hand,
+    // both no conflict with h or each other):
+    //   (B, C): p0=B, p2=C — valid
+    //   (C, B): p0=C, p2=B — valid
+    // 2 scenarios. accum = 2 × 142.5 = 285. cfv[0] = 285.
+    // Rake-free: accum = 2 × 150 = 300.
+    let nh = 3usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8, 4u8, 5u8];
+    let pl_str = vec![50u16, 100u16, 200u16];
+    let pl_idx = vec![2u16, 1u16, 0u16];
+    let opp_str = pl_str.clone();
+    let opp_idx = pl_idx.clone();
+    let contributions = vec![50i32, 100i32, 100i32];
+    let fold_mask = 0u16;
+    let opp_reach = vec![vec![1.0f32; nh]; 2];
+    let opp_reach_views: Vec<&[f32]> = opp_reach.iter().map(|v| v.as_slice()).collect();
+
+    // traverser = 1
+    let cfv_no_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 1, 3, 0,
+        0.0, 0.0, true,
+    );
+    let cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 1, 3, 0,
+        0.05, 1000.0, true,
+    );
+    eprintln!("3p side-pot, trav=p1 deep winner:");
+    eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
+    eprintln!("  rake-5%  CFV: {:?}", cfv);
+
+    assert!((cfv_no_rake[0] - 300.0).abs() < 1e-3,
+        "rake-free cfv[0]={}, expected 300 (main pot 150 + side pot 100, × 2 scen − stake 100 = 150 × 2 = 300)",
+        cfv_no_rake[0]);
+    assert!((cfv[0] - 285.0).abs() < 1e-3,
+        "rake cfv[0]={}, expected 285 (main pot raked: (150−7.5)+100 − 100 = 142.5 × 2 = 285). \
+         Side pot UN-raked. Critical: if both pots were raked, diff would be larger.",
+        cfv[0]);
+
+    // The DISCRIMINATING check: difference is exactly main-pot rake × scenarios
+    // = 7.5 × 2 = 15. If side pot were also raked at 5%, the side-pot rake
+    // would add 5 × 2 = 10 more, giving cfv = 275 instead of 285.
+    let observed_rake_total = cfv_no_rake[0] - cfv[0];
+    assert!((observed_rake_total - 15.0).abs() < 1e-3,
+        "observed rake reduction = {}, expected 15 (main-only). \
+         If side pot were also raked, this would be 25.",
+        observed_rake_total);
+
+    eprintln!("✓ 3p side-pot: deep winner gets BOTH pots, ONLY main pot raked");
+}
+
+#[test]
+fn verify_rake_no_flop_no_drop_zeroes_rake() {
+    // Same setup as "trav=short winner" test, but flop_seen=false.
+    // Expected: cfv = rake-free baseline regardless of rake_rate.
+    let nh = 3usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8, 4u8, 5u8];
+    let pl_str = vec![50u16, 100u16, 200u16];
+    let pl_idx = vec![2u16, 1u16, 0u16];
+    let opp_str = pl_str.clone();
+    let opp_idx = pl_idx.clone();
+    let contributions = vec![50i32, 100i32, 100i32];
+    let fold_mask = 0u16;
+    let opp_reach = vec![vec![1.0f32; nh]; 2];
+    let opp_reach_views: Vec<&[f32]> = opp_reach.iter().map(|v| v.as_slice()).collect();
+
+    // flop_seen=true with rake → cfv[0] = 185
+    let cfv_flop = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 3, 0,
+        0.05, 1000.0, true,
+    );
+    // flop_seen=false (PREFLOP TERMINAL) with same rake → cfv[0] = 200 (no rake)
+    let cfv_preflop = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 3, 0,
+        0.05, 1000.0, false,
+    );
+    eprintln!("no-flop-no-drop test:");
+    eprintln!("  flop_seen=true  cfv: {:?}", cfv_flop);
+    eprintln!("  flop_seen=false cfv: {:?}", cfv_preflop);
+
+    assert!((cfv_flop[0] - 185.0).abs() < 1e-3, "flop_seen=true gives 185");
+    assert!((cfv_preflop[0] - 200.0).abs() < 1e-3,
+        "flop_seen=false should be rake-free (200), got {}",
+        cfv_preflop[0]);
+    // Across all hands, the flop_seen=false result must equal the rake-free
+    // result (rake gate to zero on every path).
+    for h in 0..nh {
+        let rake_free = if h == 0 { 200.0 } else { -100.0 };
+        assert!((cfv_preflop[h] - rake_free).abs() < 1e-3,
+            "no-flop cfv[{}] = {}, expected rake-free {}", h, cfv_preflop[h], rake_free);
+    }
+
+    eprintln!("✓ no flop, no drop: flop_seen=false zeroes rake across all paths");
 }
 
 #[test]
@@ -654,13 +827,13 @@ fn verify_rake_affects_terminal_payoffs() {
         &opp_reach_slices, &hand_cards, nh,
         &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
         &contributions, fold_mask, 0, 2, 0,
-        0.0, 0.0,
+        0.0, 0.0, true,
     );
     let cfv_with_rake = side_pot_showdown_cfv_with_rake(
         &opp_reach_slices, &hand_cards, nh,
         &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
         &contributions, fold_mask, 0, 2, 0,
-        0.05, 1000.0,
+        0.05, 1000.0, true,
     );
     assert!(
         cfv_no_rake.iter().zip(&cfv_with_rake).any(|(a, b)| (a - b).abs() > 1e-4),

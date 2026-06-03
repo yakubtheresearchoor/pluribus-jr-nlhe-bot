@@ -386,7 +386,7 @@ pub fn side_pot_showdown_cfv(
         sorted_opp_str, sorted_opp_idx,
         sorted_pl_str, sorted_pl_idx,
         contributions, fold_mask, traverser, num_players, starting_pot,
-        0.0, 0.0,
+        0.0, 0.0, true, // rake_rate, rake_cap, flop_seen (irrelevant when rate=0)
     )
 }
 
@@ -429,11 +429,28 @@ pub fn side_pot_showdown_cfv_with_rake(
     starting_pot: i32,
     rake_rate: f32,
     rake_cap: f32,
+    flop_seen: bool,
 ) -> Vec<f32> {
     let num_opp = opp_reach.len();
     let np = num_players as usize;
     let c_t = contributions[traverser];
     let mut cfv = vec![0.0f32; nh];
+
+    // Slice 1.5: the "no flop, no drop" rule. If the terminal occurred
+    // before a flop was dealt (e.g., HU preflop fold-to-open), no rake is
+    // taken — regardless of pot size. Gate the effective rate/cap to zero;
+    // every downstream path computes rake from these and gets 0.
+    //
+    // For flop-onward trees (current state of the solver), all terminals
+    // are at or after the flop by construction, so callers pass
+    // flop_seen=true and this gate is a no-op. The check exists so
+    // preflop integration (when it lands) can pass flop_seen=false at
+    // preflop-ending terminals without revisiting the showdown code.
+    let (eff_rake_rate, eff_rake_cap) = if flop_seen {
+        (rake_rate, rake_cap)
+    } else {
+        (0.0, 0.0)
+    };
 
     let mut num_active = 0usize;
     for p in 0..np {
@@ -471,7 +488,7 @@ pub fn side_pot_showdown_cfv_with_rake(
         // doesn't win → rake doesn't reduce their payoff (they lose
         // their investment regardless). Active-winner traverser claims
         // (total_pot − rake) instead of total_pot.
-        let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
+        let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
         let payoff = if fold_mask & (1u16 << traverser) != 0 {
             -traverser_investment
         } else {
@@ -593,7 +610,7 @@ pub fn side_pot_showdown_cfv_with_rake(
         // claim. cfv = half_pot × sweep_net − rake × (win_reach + tie_reach/2),
         // where rake = min(total_pot × rake_rate, rake_cap).clamp(0).
         let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
-        let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
+        let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
         for h in 0..nh {
             cfv[h] = half_pot * sweep_net[h] - rake * (win_reach[h] + 0.5 * tie_reach[h]);
         }
@@ -665,7 +682,7 @@ pub fn side_pot_showdown_cfv_with_rake(
             // Rake correction (Slice 1.3): see comment in the all-active-equal
             // sweep path above.
             let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
-            let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
+            let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
             for h in 0..nh {
                 cfv[h] = half_pot * sweep_net[h] - rake * (win_reach[h] + 0.5 * tie_reach[h]);
             }
@@ -709,7 +726,7 @@ pub fn side_pot_showdown_cfv_with_rake(
             // doesn't pay rake.
             let k = num_active_opp as f32;
             let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
-            let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
+            let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
             let rake_per_unit_stake = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
             for h in 0..nh {
                 let hc1 = hand_cards[h * 2] as usize;
@@ -784,7 +801,7 @@ pub fn side_pot_showdown_cfv_with_rake(
         // Slice 1.4 rake: thread rake_per_unit_stake through the recursive
         // evaluator. See the K=2 path comment above for the derivation.
         let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
-        let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
+        let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
         let rake_per_unit_stake = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
 
         #[allow(clippy::too_many_arguments)]
@@ -872,6 +889,24 @@ pub fn side_pot_showdown_cfv_with_rake(
     let mut levels: Vec<i32> = (0..np).map(|p| contributions[p]).collect();
     levels.sort();
     levels.dedup();
+
+    // Slice 1.5: site rake on MAIN POT ONLY (side pots un-raked).
+    // Main pot is level 0 of the per-level decomposition: every player who
+    // contributed at all (contribution >= levels[0]) put levels[0] into it,
+    // plus starting_pot. Side-pot levels (li >= 1) are uncapped and uncraked.
+    //
+    // Single per-hand cap applied here, once. Same min().max() form as
+    // other paths, gated by eff_rake_rate/eff_rake_cap (which are 0 if
+    // flop_seen=false, implementing "no flop, no drop").
+    let main_pot_amount: i32 = if levels.is_empty() {
+        starting_pot
+    } else {
+        let num_main_contributors = (0..np)
+            .filter(|&p| contributions[p] >= levels[0]).count();
+        levels[0] * num_main_contributors as i32 + starting_pot
+    };
+    let main_pot_rake: f32 = (main_pot_amount as f32 * eff_rake_rate)
+        .min(eff_rake_cap).max(0.0);
 
     // Per-level pot amount and eligible set.
     let mut level_pots: Vec<(i32, Vec<usize>, f32)> = Vec::new(); // (pot_at_level, eligible_active, per_player_stake_at_level)
@@ -1006,7 +1041,16 @@ pub fn side_pot_showdown_cfv_with_rake(
                         if b_elig && s_b == max_str { tied += 1; }
 
                         if h_str == max_str {
-                            cash += pot_l / tied as f32;
+                            // Slice 1.5: rake from main pot only (li == 0).
+                            // Side pots (li > 0) are un-raked per the site
+                            // convention. Single per-hand cap was applied
+                            // once when computing main_pot_rake above.
+                            let pot_after_rake = if li == 0 {
+                                pot_l - main_pot_rake
+                            } else {
+                                pot_l
+                            };
+                            cash += pot_after_rake / tied as f32;
                         }
                         prev_l = lev;
                     }
@@ -1071,15 +1115,21 @@ pub fn side_pot_showdown_cfv_with_rake(
                         prev_l = lev;
                         continue;
                     }
+                    // Slice 1.5: main-pot rake. Side pots un-raked.
+                    let pot_after_rake = if li == 0 {
+                        pot_l - main_pot_rake
+                    } else {
+                        pot_l
+                    };
                     if !a_elig {
-                        cash += pot_l;
+                        cash += pot_after_rake;
                     } else {
                         let max_str = h_str.max(s_a);
                         let mut tied: u32 = 0;
                         if h_str == max_str { tied += 1; }
                         if s_a == max_str { tied += 1; }
                         if h_str == max_str {
-                            cash += pot_l / tied as f32;
+                            cash += pot_after_rake / tied as f32;
                         }
                     }
                     prev_l = lev;
@@ -1221,7 +1271,13 @@ pub fn side_pot_showdown_cfv_with_rake(
                     }
 
                     if h_str == max_str {
-                        cash += pot_l / tied as f32;
+                        // Slice 1.5: main-pot rake. Side pots un-raked.
+                        let pot_after_rake = if li == 0 {
+                            pot_l - main_pot_rake
+                        } else {
+                            pot_l
+                        };
+                        cash += pot_after_rake / tied as f32;
                     }
                     prev_l = lev;
                 }
