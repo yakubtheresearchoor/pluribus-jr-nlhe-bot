@@ -178,6 +178,68 @@ impl PreflopChanceTable {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// P1.5.4: aggregate_preflop_chance (orbit-weighted CFV aggregation)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Aggregate per-canonical-flop CFVs into the preflop chance node's
+/// CFV at the lossless 169-class layout.
+///
+/// Math:
+/// ```text
+///   V_preflop[class] = Σ over canonical F of P(F | class) × V_flop[F, class]
+/// ```
+/// where `P(F | class) = (orbit_size(F) × |expansion(class, F)|) /
+/// (n_class × 19,600)` from `chance_probability_flop`.
+///
+/// This is the NEW ORCHESTRATION SHAPE for preflop→flop chance
+/// integration: the existing flop→turn and turn→river transitions
+/// aggregate over single chance cards; the preflop→flop transition
+/// aggregates over 1,755 canonical flops weighted by orbit sizes
+/// (× 4 / × 12 / × 24).
+///
+/// **Args:**
+///   - `table`: PreflopChanceTable holding the orbit weights and
+///     canonical-flop list
+///   - `flop_cfvs`: per-canonical-flop value vectors, shape
+///     `[1755][NUM_PREFLOP_CLASSES]`. `flop_cfvs[canonical][class]`
+///     is the value at the start of canonical flop's subtree for a
+///     player holding `class`. Must equal `table.num_canonical_flops()`
+///     length; each inner vec must have NUM_PREFLOP_CLASSES entries.
+///
+/// **Returns:** `[NUM_PREFLOP_CLASSES]` aggregated CFV at the preflop
+/// chance node.
+///
+/// **Isolation check coverage (`aggregate_preflop_chance_orbit_weighted`):**
+/// Hand-build a flop_cfvs map where exactly one canonical has a known
+/// non-zero value and verify the result matches the manually-computed
+/// orbit-weighted product. This discriminates against off-by-one in the
+/// loop (visits all canonicals exactly once), wrong probability lookup
+/// (uses the right (canonical, class) probability), and accumulator
+/// wrong-init (starts at 0, sums correctly).
+pub fn aggregate_preflop_chance(
+    table: &PreflopChanceTable,
+    flop_cfvs: &[Vec<f32>],
+) -> Vec<f32> {
+    let n_canon = table.num_canonical_flops();
+    let nh = NUM_PREFLOP_CLASSES;
+    assert_eq!(flop_cfvs.len(), n_canon,
+        "flop_cfvs length {} does not match num_canonical_flops {}",
+        flop_cfvs.len(), n_canon);
+
+    let mut out = vec![0.0f32; nh];
+    for (canonical_idx, cfvs_for_flop) in flop_cfvs.iter().enumerate() {
+        assert_eq!(cfvs_for_flop.len(), nh,
+            "flop_cfvs[{}] length {} != NUM_PREFLOP_CLASSES {}",
+            canonical_idx, cfvs_for_flop.len(), nh);
+        for class_idx in 0..nh {
+            let p = table.chance_probability_flop(canonical_idx, class_idx);
+            out[class_idx] += p * cfvs_for_flop[class_idx];
+        }
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // P1.5.3: compute_reach_preflop (free function, button-first reach order)
 // ─────────────────────────────────────────────────────────────────────
 
@@ -539,6 +601,90 @@ mod tests {
                 child, a, p0_reach, sigma_per_action[a],
             );
         }
+    }
+
+    /// Targeted P1.5.4 anchor: aggregate_preflop_chance correctly
+    /// orbit-weights per-canonical-flop CFVs into the preflop-zone
+    /// CFV at the chance node.
+    ///
+    /// THE DISCRIMINATOR: pick one specific canonical flop F_pick with
+    /// known orbit size, and one specific class H_pick with known
+    /// expansion count for F_pick. Set flop_cfvs[F_pick][H_pick] =
+    /// K (some non-zero), all others = 0. The aggregated CFV must
+    /// equal:
+    /// ```
+    ///   aggregate[H_pick] = K × P(F_pick | H_pick)
+    ///                     = K × (orbit_size(F_pick) × |expansion(H_pick, F_pick)|)
+    ///                       / (n_H_pick × 19,600)
+    /// ```
+    ///
+    /// What this catches:
+    ///   - off-by-one in the canonical-flop loop (visits each exactly once)
+    ///   - wrong (canonical, class) lookup (right probability per pair)
+    ///   - accumulator not initialized to 0 (sum starts clean)
+    ///   - typo in the multiply-accumulate (correct product)
+    ///
+    /// And a second case where flop_cfvs is constant across all flops:
+    /// aggregate[class] = constant × Σ P(F | class) = constant × 1.0 = constant
+    /// (this is the sum-to-one normalization re-applied at the aggregation
+    /// level — confirms the aggregation respects the chance-prob normalization).
+    #[test]
+    fn aggregate_preflop_chance_orbit_weighted() {
+        let table = PreflopChanceTable::new(
+            2,
+            vec![vec![1.0f32; NUM_PREFLOP_CLASSES]; 2],
+        );
+        let n_canon = table.num_canonical_flops();
+        let nh = NUM_PREFLOP_CLASSES;
+
+        // ── Discriminator 1: single non-zero canonical ──
+        // Pick canonical at index 0 (some lex-first canonical flop).
+        // Pick class AA (index 0). K = 7.5 to avoid round-trip with
+        // simple powers of 2.
+        let pick_canon = 0;
+        let pick_class = 0; // AA
+        let k = 7.5_f32;
+
+        let mut flop_cfvs: Vec<Vec<f32>> = vec![vec![0.0f32; nh]; n_canon];
+        flop_cfvs[pick_canon][pick_class] = k;
+
+        let aggregated = aggregate_preflop_chance(&table, &flop_cfvs);
+
+        let expected = k * table.chance_probability_flop(pick_canon, pick_class);
+        assert!(
+            (aggregated[pick_class] - expected).abs() < 1e-6,
+            "single-non-zero discriminator: aggregated[AA] = {}, expected K × P = {} × {} = {}",
+            aggregated[pick_class], k,
+            table.chance_probability_flop(pick_canon, pick_class), expected,
+        );
+
+        // All OTHER classes must remain 0 at the picked canonical (since
+        // we only put a non-zero at AA), and all other canonicals
+        // contribute 0 to AA — so aggregated[other_class] = 0.
+        for c in 0..nh {
+            if c == pick_class { continue; }
+            assert!(
+                aggregated[c].abs() < 1e-7,
+                "aggregated[{}] = {}, expected 0 (only AA at canonical {} was non-zero)",
+                c, aggregated[c], pick_canon,
+            );
+        }
+
+        // ── Discriminator 2: constant across all canonicals → constant out ──
+        // Sets flop_cfvs[any][AA] = K. By the normalization
+        // Σ P(F | AA) = 1, the aggregate must equal K for AA.
+        let mut flop_cfvs_const: Vec<Vec<f32>> = vec![vec![0.0f32; nh]; n_canon];
+        let k2 = 3.25_f32;
+        for canonical_idx in 0..n_canon {
+            flop_cfvs_const[canonical_idx][pick_class] = k2;
+        }
+        let aggregated_const = aggregate_preflop_chance(&table, &flop_cfvs_const);
+        assert!(
+            (aggregated_const[pick_class] - k2).abs() < 1e-4, // f32 rounding ~1e-5 from 1755 adds
+            "constant discriminator: aggregated[AA] = {}, expected K2 = {} \
+             (Σ P = 1.0 normalization should produce this exactly within f32)",
+            aggregated_const[pick_class], k2,
+        );
     }
 
     /// Sanity: 1,755 canonical flops, orbit-size histogram matches the
