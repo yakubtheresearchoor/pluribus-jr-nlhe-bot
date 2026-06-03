@@ -55,6 +55,8 @@ use crate::abstraction::preflop_class::{
 };
 use crate::card::Card;
 use crate::tree::flat::FlatTree;
+use crate::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
+use crate::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 
 /// C(50, 3) = number of distinct 3-card flops the dealer can deal
 /// conditional on a 2-card hand being held (52 - 2 = 50 cards left).
@@ -317,6 +319,147 @@ pub fn reduce_cfv_combo_to_class(
         // else: cfv_class[c] stays 0 (class fully blocked by F)
     }
     cfv_class
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P1.5.5b Slice 1: per-canonical real V_flop computation
+// ─────────────────────────────────────────────────────────────────────
+//
+// The "real" replacement for P2.5a's V_flop_stub. Given a canonical
+// flop, per-player combo-level initial weights, and a flop-rooted
+// FlatTree, runs the existing FlopStartVectorCfr for one CFR
+// iteration and returns the per-combo CFV at the flop root for a
+// specified traverser.
+//
+// Architectural choices made unilaterally (surface for reversal if wrong):
+//   - Fresh flop-rooted FlatTree built by the CALLER (not extracted
+//     from a preflop tree). Simpler, decouples the orchestrator from
+//     a specific preflop tree's pot context.
+//   - Uses existing FlopStartVectorCfr (anchored by its own tests).
+//     No new flop-solver code.
+//   - Iter-0 only (one call to .run with num_iterations=1). Validates
+//     the orchestration chance-integration math; full CFR convergence
+//     is a separate future piece.
+//
+// Memory note: instantiates one FlopStartVectorCfr per call. The
+// caller (orchestrator in Slice 2) will hold 1,755 of these at
+// validation scale (tractable at small nh). Production memory remains
+// the deferred #43 footprint work; see #44 task description for the
+// trail.
+
+/// Compute combo-level CFV at the flop root for a single canonical
+/// flop, at iter-0 with uniform strategy initialization.
+///
+/// **Args:**
+///   - `canonical_flop`: the 3-card flop board for this per-flop solve
+///   - `flop_tree`: a FlatTree rooted at BoardState::Flop with the
+///     desired action structure. Caller's responsibility to build.
+///   - `combo_ranges_per_player`: per-player initial reach at the
+///     combo level for this canonical, shape `[num_players][1326]`
+///     (NUM_POSSIBLE_HANDS), zero for combos blocked by the flop or
+///     outside the player's range.
+///   - `traverser`: player index 0..num_players whose CFV we return
+///
+/// **Returns:** `Vec<f32>` of length per-flop nh (= number of valid
+/// hands at this flop = combos not blocking the flop board), giving
+/// V_combo at the flop root for `traverser`. Plus the layout:
+/// `Vec<(Card, Card)>` of the corresponding combos (so the caller
+/// can match each V_combo[i] back to a specific combo).
+pub fn compute_v_flop_at_root_iter0(
+    canonical_flop: [Card; 3],
+    flop_tree: &FlatTree,
+    combo_ranges_per_player: &[Vec<f32>],
+    traverser: u8,
+) -> (Vec<f32>, Vec<(Card, Card)>) {
+    let num_players = combo_ranges_per_player.len() as u8;
+    assert!(num_players >= 2, "need at least 2 players");
+    for (p, r) in combo_ranges_per_player.iter().enumerate() {
+        assert_eq!(r.len(), crate::card::NUM_POSSIBLE_HANDS,
+            "combo_ranges_per_player[{}] length {} != NUM_POSSIBLE_HANDS {}",
+            p, r.len(), crate::card::NUM_POSSIBLE_HANDS);
+    }
+
+    // Build FlopChanceTable from the canonical flop board + the
+    // caller's per-player ranges. The table internally filters to
+    // valid hands (those not blocking the flop), giving the per-flop
+    // hand layout.
+    let board: Vec<Card> = canonical_flop.iter().copied().collect();
+    let table = FlopChanceTable::compute_flop_start(
+        &board, combo_ranges_per_player, num_players,
+    );
+    let nh = table.num_valid;
+    let layout: Vec<(Card, Card)> = (0..nh)
+        .map(|i| {
+            let c1 = table.hand_cards[i * 2];
+            let c2 = table.hand_cards[i * 2 + 1];
+            (c1, c2)
+        })
+        .collect();
+
+    let game = FlopStartGame::new(table);
+    let mut solver = FlopStartVectorCfr::new(flop_tree, game.table());
+
+    // Use vanilla CFR (alpha=beta=gamma=1) for iter-0 — the iter-0
+    // CFV doesn't depend on DCFR params (those weight regret
+    // accumulation, not the per-iter CFV computation), so vanilla
+    // keeps the math simple and deterministic.
+    solver.set_vanilla_mode(true);
+
+    // Run one iteration. Note: .run() averages CFV across traversers
+    // internally. For a per-traverser CFV at iter-0, we instead use
+    // the lower-level path (compute reach + bottom_up_zone) once for
+    // the specified traverser.
+    //
+    // At iter-0, compute_all_strategies initializes strategies to
+    // uniform, then compute_reach + bottom_up_zone gives the per-
+    // traverser CFV at the root.
+    solver.compute_all_strategies(flop_tree);
+    let reach = solver.compute_reach_flop(flop_tree, &game);
+
+    let nn = flop_tree.num_nodes();
+    let mut cfv = vec![0.0f32; nn * nh];
+    // DcfrParams at iteration 0 — params weight regret accumulation,
+    // not the per-iter CFV computation, so the specific values don't
+    // affect the CFV at root that we return. We use iteration=0 for
+    // determinism.
+    let params = crate::solver::flop_start_vector_cfr::DcfrParams::new(0);
+
+    // Bottom-up order matches the existing solver's pattern:
+    // River first, then Turn, then Flop. For each preceding zone,
+    // bottom_up_zone needs the relevant chance card indices; we run
+    // it across all chance card indices (the solver loops them
+    // internally via its tc/rc Option parameters).
+    let table_ref = game.table();
+    let turn_deck = table_ref.remaining_deck.clone();
+
+    use crate::solver::flop_start_vector_cfr::Zone;
+
+    // River: for each (turn, river) pair, run bottom_up_zone(River).
+    for (ti, &tc_card) in turn_deck.iter().enumerate() {
+        let river_deck = &table_ref.river_decks[tc_card as usize];
+        for ri in 0..river_deck.len() {
+            solver.bottom_up_zone(
+                flop_tree, table_ref, traverser, &reach, &mut cfv,
+                Zone::River, Some(ti), Some(ri), &params,
+            );
+        }
+    }
+    // Turn: for each turn card, run bottom_up_zone(Turn).
+    for ti in 0..turn_deck.len() {
+        solver.bottom_up_zone(
+            flop_tree, table_ref, traverser, &reach, &mut cfv,
+            Zone::Turn, Some(ti), None, &params,
+        );
+    }
+    // Flop: single pass.
+    solver.bottom_up_zone(
+        flop_tree, table_ref, traverser, &reach, &mut cfv,
+        Zone::Flop, None, None, &params,
+    );
+
+    // Root CFV is at cfv[0..nh].
+    let root_cfv = cfv[0..nh].to_vec();
+    (root_cfv, layout)
 }
 
 // ─────────────────────────────────────────────────────────────────────
