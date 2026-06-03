@@ -178,6 +178,148 @@ impl PreflopChanceTable {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// P1.5.5a: expand/reduce arithmetic at the preflop → flop boundary
+// ─────────────────────────────────────────────────────────────────────
+//
+// The lossless-169 architecture uses class-level representation at
+// preflop (nh = 169) and combo-level at flop (nh = per-canonical
+// surviving combos, ≈ 1,176 for a typical flop). The preflop → flop
+// chance transition needs two distinct boundary operations:
+//
+//   expand_reach_class_to_combo:
+//     reach_combo[h] = reach_class[class(h)] / |expansion(class(h), F)|
+//     for h ∈ expansion(class(h), F), else 0.
+//     The /|expansion| factor is probability mass conservation:
+//     uniformly distributing the class's reach across its surviving
+//     combos (the lossless-169 equiprobability property from P1.5-pre).
+//
+//   reduce_cfv_combo_to_class:
+//     CFV_class[c] = (1 / |expansion(c, F)|) ×
+//                    Σ over h ∈ expansion(c, F) of CFV_combo[h]
+//     CFV class-level = average of CFV combo-level over the surviving
+//     combos. The averaging weight comes from the same P(h | class, F)
+//     = 1/|expansion(class, F)| distribution.
+//
+// These are NOT inverses on the same data type (one is for probability
+// mass, the other for value averaging). They are well-defined separately
+// and each has a clean isolated check. The targeted anchors below verify
+// (a) expand preserves probability mass: Σ over expansion combos =
+// reach_class for the source class; (b) reduce of a uniform-per-class
+// combo array returns the original class values.
+
+/// Build the combo layout at a given canonical flop: all 2-card combos
+/// compatible with F (no shared card). Returns combos in deterministic
+/// order (low_card, high_card) ascending by low_card then high_card.
+///
+/// This is the natural per-flop combo indexing for the runtime: the
+/// flop subtree solver operates on this layout (per-flop nh =
+/// `flop_combo_layout(F).len()`, which equals 1326 - 150 = 1,176 for
+/// typical 3-card flops with distinct ranks/suits).
+pub fn flop_combo_layout(canonical_flop: [Card; 3]) -> Vec<(Card, Card)> {
+    let mut out = Vec::with_capacity(1_176);
+    for c1 in 0u8..52 {
+        if canonical_flop.contains(&c1) { continue; }
+        for c2 in (c1 + 1)..52 {
+            if canonical_flop.contains(&c2) { continue; }
+            out.push((c1, c2));
+        }
+    }
+    out
+}
+
+/// Per-class expansion sizes at a given canonical flop. Precomputed
+/// once to avoid repeated expansion() calls. Index 0..169.
+fn expansion_sizes_for_flop(canonical_flop: [Card; 3]) -> Vec<u32> {
+    (0..NUM_PREFLOP_CLASSES)
+        .map(|c| expansion(PreflopClass(c as u8), canonical_flop).len() as u32)
+        .collect()
+}
+
+/// Expand class-level reach to combo-level reach at a canonical flop.
+///
+/// ```text
+///   reach_combo[h] = reach_class[class(h)] / |expansion(class(h), F)|
+///                    for h ∈ combo_layout AND h ∈ expansion(class(h), F)
+///                  = 0  otherwise
+/// ```
+///
+/// `combo_layout` typically comes from `flop_combo_layout(F)`. The
+/// function is general — passing any layout works, but combos NOT in
+/// `expansion(class(h), F)` (i.e., conflicting with F) get reach 0.
+///
+/// **Probability mass conservation:** for any class C, Σ over combos
+/// h in combo_layout with class(h)==C of reach_combo[h] equals
+/// reach_class[C] (modulo numerical precision). Verified by the
+/// `expand_reach_preserves_class_mass` test.
+pub fn expand_reach_class_to_combo(
+    canonical_flop: [Card; 3],
+    reach_class: &[f32],
+    combo_layout: &[(Card, Card)],
+) -> Vec<f32> {
+    assert_eq!(reach_class.len(), NUM_PREFLOP_CLASSES,
+        "reach_class length {} != NUM_PREFLOP_CLASSES {}",
+        reach_class.len(), NUM_PREFLOP_CLASSES);
+    let exp_sizes = expansion_sizes_for_flop(canonical_flop);
+    let mut reach_combo = vec![0.0f32; combo_layout.len()];
+    for (idx, &(c1, c2)) in combo_layout.iter().enumerate() {
+        // Skip if combo conflicts with the flop (shouldn't happen if
+        // combo_layout was built from flop_combo_layout(F), but be
+        // defensive — preserves the 0-for-blocked semantic).
+        if canonical_flop.contains(&c1) || canonical_flop.contains(&c2) {
+            continue;
+        }
+        let class = PreflopClass::from_combo(c1, c2);
+        let n_exp = exp_sizes[class.index()];
+        if n_exp > 0 {
+            reach_combo[idx] = reach_class[class.index()] / (n_exp as f32);
+        }
+    }
+    reach_combo
+}
+
+/// Reduce per-combo CFV to per-class CFV at a canonical flop.
+///
+/// ```text
+///   CFV_class[c] = (1 / |expansion(c, F)|) ×
+///                  Σ over h in combo_layout with class(h)==c of CFV_combo[h]
+///              = 0 if |expansion(c, F)| == 0 (class fully blocked by F)
+/// ```
+///
+/// **Identity property under expand_value:** if CFV_combo was
+/// constructed as "uniform within class" (every combo h in
+/// expansion(c, F) has CFV_combo[h] = K_c for some per-class
+/// constant K_c), then reduce returns K_c per class (the averaging
+/// collapses to the constant). Verified by the
+/// `reduce_recovers_class_uniform_values` test.
+pub fn reduce_cfv_combo_to_class(
+    canonical_flop: [Card; 3],
+    cfv_combo: &[f32],
+    combo_layout: &[(Card, Card)],
+) -> Vec<f32> {
+    assert_eq!(cfv_combo.len(), combo_layout.len(),
+        "cfv_combo length {} != combo_layout length {}",
+        cfv_combo.len(), combo_layout.len());
+    let exp_sizes = expansion_sizes_for_flop(canonical_flop);
+    let mut cfv_class = vec![0.0f32; NUM_PREFLOP_CLASSES];
+    // Sum CFV per class
+    for (idx, &(c1, c2)) in combo_layout.iter().enumerate() {
+        if canonical_flop.contains(&c1) || canonical_flop.contains(&c2) {
+            continue;
+        }
+        let class = PreflopClass::from_combo(c1, c2);
+        cfv_class[class.index()] += cfv_combo[idx];
+    }
+    // Average by dividing by |expansion|
+    for c in 0..NUM_PREFLOP_CLASSES {
+        if exp_sizes[c] > 0 {
+            cfv_class[c] /= exp_sizes[c] as f32;
+        }
+        // else: cfv_class[c] stays 0 (class fully blocked by F)
+    }
+    cfv_class
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // P1.5.4: aggregate_preflop_chance (orbit-weighted CFV aggregation)
 // ─────────────────────────────────────────────────────────────────────
 
@@ -685,6 +827,142 @@ mod tests {
              (Σ P = 1.0 normalization should produce this exactly within f32)",
             aggregated_const[pick_class], k2,
         );
+    }
+
+    /// Targeted P1.5.5a anchor (1/2): expand_reach_class_to_combo
+    /// preserves probability mass per class.
+    ///
+    /// For any class C with reach R_C, the sum of reach_combo over
+    /// the combos in C's expansion must equal R_C. This is THE
+    /// probability mass conservation property that makes the expand
+    /// step a valid representation of the same probability across
+    /// the class → combo level change.
+    ///
+    /// Failure mode this catches: forgetting the /|expansion| factor
+    /// (sum would equal R_C × |expansion| instead of R_C), or applying
+    /// the wrong factor (sum would be off by some ratio).
+    #[test]
+    fn expand_reach_preserves_class_mass() {
+        // Use a typical 3-card flop (non-paired, non-suited) to exercise
+        // a generic expansion shape.
+        let flop: [Card; 3] = [
+            (12 << 2) | 3, // As
+            (11 << 2) | 2, // Kh
+            (10 << 2) | 1, // Qd
+        ];
+        let layout = flop_combo_layout(flop);
+        assert_eq!(layout.len(), 1_176,
+            "flop combo layout for non-blocking flop has 1326 - 150 = 1176 combos");
+
+        // Set reach uniformly to 1.0 for all classes — each class's
+        // surviving combos should sum to 1.0.
+        let reach_class: Vec<f32> = vec![1.0f32; NUM_PREFLOP_CLASSES];
+        let reach_combo = expand_reach_class_to_combo(flop, &reach_class, &layout);
+
+        // For each class with non-zero expansion, sum the reach_combo
+        // over its combos in layout. Must equal reach_class[c] = 1.0.
+        for c in 0..NUM_PREFLOP_CLASSES {
+            let class = PreflopClass(c as u8);
+            let exp = expansion(class, flop);
+            let exp_size = exp.len();
+            if exp_size == 0 { continue; }  // fully blocked, skip
+
+            let sum_in_class: f32 = layout.iter().enumerate()
+                .filter(|(_, &combo)| {
+                    PreflopClass::from_combo(combo.0, combo.1) == class
+                })
+                .map(|(idx, _)| reach_combo[idx])
+                .sum();
+
+            assert!(
+                (sum_in_class - 1.0).abs() < 1e-6,
+                "class {} (n_combos={}, expansion size={}): combo-level sum = {}, expected 1.0 \
+                 (probability mass conservation). If this is 1.0 × expansion_size = {}, \
+                 the /|expansion| factor was omitted (the expand-without-divide bug).",
+                c, class.num_combos(), exp_size, sum_in_class, exp_size as f32
+            );
+        }
+
+        // Also check a non-uniform class-level reach: only AA gets R = 5.
+        let mut reach_class2 = vec![0.0f32; NUM_PREFLOP_CLASSES];
+        let aa = 0;
+        reach_class2[aa] = 5.0;
+        let reach_combo2 = expand_reach_class_to_combo(flop, &reach_class2, &layout);
+
+        // Sum over AA-class combos in layout must equal 5.0.
+        let aa_class = PreflopClass(0);
+        let aa_sum: f32 = layout.iter().enumerate()
+            .filter(|(_, &combo)| PreflopClass::from_combo(combo.0, combo.1) == aa_class)
+            .map(|(idx, _)| reach_combo2[idx])
+            .sum();
+        assert!(
+            (aa_sum - 5.0).abs() < 1e-6,
+            "AA combo-level sum = {}, expected 5.0 (single-class non-uniform mass)",
+            aa_sum
+        );
+
+        // All non-AA-class combos must have reach_combo = 0.
+        for (idx, &combo) in layout.iter().enumerate() {
+            if PreflopClass::from_combo(combo.0, combo.1) != aa_class {
+                assert_eq!(reach_combo2[idx], 0.0,
+                    "non-AA combo {:?} got reach {} from AA-only class-level reach",
+                    combo, reach_combo2[idx]);
+            }
+        }
+    }
+
+    /// Targeted P1.5.5a anchor (2/2): reduce_cfv_combo_to_class
+    /// recovers per-class values when combo-level values are uniform
+    /// within class.
+    ///
+    /// Construct CFV_combo[h] = K_class for h in expansion(class, F),
+    /// for some per-class constants K_c. Then reduce(CFV_combo) must
+    /// return K_c per class (the averaging collapses to the constant
+    /// when the inputs are all equal within a class).
+    ///
+    /// Failure modes this catches: wrong averaging count (off by one in
+    /// |expansion|), wrong combo-to-class mapping (combos assigned to
+    /// wrong classes), forgetting to skip blocked combos (would change
+    /// the average).
+    #[test]
+    fn reduce_recovers_class_uniform_values() {
+        let flop: [Card; 3] = [
+            (12 << 2) | 3, // As
+            (11 << 2) | 2, // Kh
+            (10 << 2) | 1, // Qd
+        ];
+        let layout = flop_combo_layout(flop);
+
+        // Construct CFV_combo as "uniform within class" using class
+        // index as the constant (so class 0 has value 0.0, class 1
+        // has value 1.0, ..., class 168 has value 168.0).
+        let cfv_combo: Vec<f32> = layout.iter()
+            .map(|&(c1, c2)| {
+                let class = PreflopClass::from_combo(c1, c2);
+                class.index() as f32
+            })
+            .collect();
+
+        let cfv_class = reduce_cfv_combo_to_class(flop, &cfv_combo, &layout);
+
+        // For every non-blocked class, reduce must return the class index.
+        for c in 0..NUM_PREFLOP_CLASSES {
+            let class = PreflopClass(c as u8);
+            let exp_size = expansion(class, flop).len();
+            if exp_size == 0 {
+                // Blocked class: reduce returns 0.
+                assert_eq!(cfv_class[c], 0.0,
+                    "class {} fully blocked by flop {:?}, reduce should return 0",
+                    c, flop);
+            } else {
+                assert!(
+                    (cfv_class[c] - c as f32).abs() < 1e-5,
+                    "class {} (expansion size {}): reduce returned {}, expected {} \
+                     (uniform-within-class average must collapse to the constant)",
+                    c, exp_size, cfv_class[c], c
+                );
+            }
+        }
     }
 
     /// Sanity: 1,755 canonical flops, orbit-size histogram matches the
