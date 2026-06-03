@@ -510,6 +510,131 @@ fn verify_rake_sorted_sweep_payoffs_hu_realistic() {
     eprintln!("✓ Sorted-sweep HU rake: winner pays rake (-5), loser unchanged");
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Slice 1.4: brute-force per-(h, g_0, g_1) rake anchor (3-player)
+// ─────────────────────────────────────────────────────────────────────
+//
+// 3-player equal-contribution showdown path (num_active_opp == 2,
+// all_active_equal, fold_mask == 0). Per-scenario enumeration over
+// (g0, g1) opponent assignments with payoff in units of stake:
+//   strict win: K
+//   tie at top with T tied: (K+1 - T) / T
+//   strict loss: -1
+// With K = num_active_opp = 2, rake correction subtracts
+// rake_per_unit_stake / T from winning/tying payoffs.
+//
+// Hand-computed for 3p, contributions [50, 50, 50], starting_pot = 0:
+//   total_pot = 150, half_pot = stake = 50
+//   rake = min(150 × 0.05, 1000) = 7.5
+//   rake_per_unit_stake = 7.5 / 50 = 0.15
+//
+// Setup: nh = 3, combos A=(0,1) str=300, B=(2,3) str=200, C=(4,5) str=100.
+// Cards distinct so any two non-A combos can coexist as opp hands.
+
+#[test]
+fn verify_rake_brute_force_3p_strict_win_hand_computed() {
+    let nh = 3usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8, 4u8, 5u8];
+    // Sorted ascending by strength: C(100), B(200), A(300)
+    let pl_str = vec![100u16, 200u16, 300u16];
+    let pl_idx = vec![2u16, 1u16, 0u16];
+    let opp_str = pl_str.clone();
+    let opp_idx = pl_idx.clone();
+    let contributions = vec![50i32, 50i32, 50i32];
+    let fold_mask = 0u16;
+    let opp_reach = vec![vec![1.0f32; nh]; 2];
+    let opp_reach_views: Vec<&[f32]> = opp_reach.iter().map(|v| v.as_slice()).collect();
+
+    let cfv_no_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 3, 0,
+        0.0, 0.0,
+    );
+    let cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 3, 0,
+        0.05, 1000.0,
+    );
+    eprintln!("3p brute-force strict-win:");
+    eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
+    eprintln!("  rake-5%  CFV: {:?}", cfv);
+
+    // Hand-computed for h=0 (A, str=300, strict winner):
+    //   Valid (g0, g1) pairs: (B, C), (C, B) — both strict wins
+    //   payoff_unit = K - rake/stake = 2 - 0.15 = 1.85 each
+    //   accum = 2 × 1.85 = 3.7. cfv[0] = 50 × 3.7 = 185.
+    //   Rake-free: payoff_unit = 2. accum = 4. cfv[0] = 200.
+    assert!((cfv_no_rake[0] - 200.0).abs() < 1e-3,
+        "rake-free h=0: {} != 200 (= 2 valid (g0,g1) × payoff_unit=2 × half_pot=50)",
+        cfv_no_rake[0]);
+    assert!((cfv[0] - 185.0).abs() < 1e-3,
+        "rake h=0: {} != 185 (= 2 × (2 - 0.15) × 50, with rake reducing each strict win)",
+        cfv[0]);
+
+    // For h=1 (B, str=200, strict loser to A in every valid (g0, g1)):
+    //   Valid pairs: (A, C), (C, A) — both strict losses
+    //   payoff_unit = -1 each (rake-invariant for losses)
+    //   accum = -2. cfv[1] = 50 × -2 = -100, RAKE-FREE EQUALS RAKE.
+    assert!((cfv_no_rake[1] - (-100.0)).abs() < 1e-3,
+        "rake-free h=1: {} != -100", cfv_no_rake[1]);
+    assert!((cfv[1] - (-100.0)).abs() < 1e-3,
+        "rake h=1: {} != -100 (loser is rake-invariant)", cfv[1]);
+
+    // h=2 (C, str=100, strict loser): same as h=1 → -100 both with and without rake.
+    assert!((cfv_no_rake[2] - (-100.0)).abs() < 1e-3);
+    assert!((cfv[2] - (-100.0)).abs() < 1e-3);
+
+    eprintln!("✓ Brute-force 3p strict win: winner pays rake×K_scenarios; losers rake-invariant");
+}
+
+#[test]
+fn verify_rake_brute_force_3p_tie_at_top_hand_computed() {
+    // Tie scenario: player ties with one opp at top.
+    // Strengths: A=200, B=200, C=100. Player holds A; opp0=B (tie), opp1=C (loss to top).
+    let nh = 3usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8, 4u8, 5u8];
+    let pl_str = vec![100u16, 200u16, 200u16];  // sorted asc: C, A, B (or B, A — tie)
+    let pl_idx = vec![2u16, 0u16, 1u16];        // C at idx 2, A at idx 0, B at idx 1
+    let opp_str = pl_str.clone();
+    let opp_idx = pl_idx.clone();
+    let contributions = vec![50i32, 50i32, 50i32];
+    let fold_mask = 0u16;
+    let opp_reach = vec![vec![1.0f32; nh]; 2];
+    let opp_reach_views: Vec<&[f32]> = opp_reach.iter().map(|v| v.as_slice()).collect();
+
+    let cfv_no_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 3, 0,
+        0.0, 0.0,
+    );
+    let cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 3, 0,
+        0.05, 1000.0,
+    );
+    eprintln!("3p brute-force tie-at-top:");
+    eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
+    eprintln!("  rake-5%  CFV: {:?}", cfv);
+
+    // h=0 (A, str=200): valid (g0, g1) ∈ {(B,C), (C,B)}.
+    //   (B, C): max=200=h_str. T=2 (A, B tied). payoff_unit = (K+1-T)/T − rake/T
+    //          = (2+1-2)/2 − 0.15/2 = 0.5 − 0.075 = 0.425
+    //   (C, B): same. 0.425.
+    //   accum = 0.85. cfv[0] = 50 × 0.85 = 42.5.
+    //   Rake-free: 0.5 each → accum = 1.0 → cfv[0] = 50.
+    assert!((cfv_no_rake[0] - 50.0).abs() < 1e-3,
+        "rake-free h=0 tie: {} != 50 (= 2 × 0.5 × 50)", cfv_no_rake[0]);
+    assert!((cfv[0] - 42.5).abs() < 1e-3,
+        "rake h=0 tie: {} != 42.5 (= 2 × 0.425 × 50, T=2 reduces rake share by half)",
+        cfv[0]);
+
+    eprintln!("✓ Brute-force 3p tie-at-top T=2: rake shared 50/50 between winners");
+}
+
 #[test]
 fn verify_rake_affects_terminal_payoffs() {
     // The originally-#[ignore]'d test from the gap-discovery commit, now

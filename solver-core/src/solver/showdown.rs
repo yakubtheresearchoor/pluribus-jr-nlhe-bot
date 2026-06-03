@@ -697,7 +697,20 @@ pub fn side_pot_showdown_cfv_with_rake(
             //   tie at top with T tied (1..=K+1): (K+1 - T) / T
             // This is zero-sum exactly: for any (h0,h1,h2), sum over players of
             // their unit payoff is 0 (winner pool gets pot, others lose stake).
+            //
+            // Slice 1.4 rake: for winning / tying cases (player claims share of
+            // pot), subtract rake_per_unit_stake / T from payoff_unit.
+            // Derivation: with rake, the T winners split (pot - rake) instead
+            // of pot. Each winner's chip gain = (pot - rake)/T - stake =
+            // (K+1)stake/T - rake/T - stake = (K+1-T)stake/T - rake/T.
+            // In units of stake: (K+1-T)/T - rake/(T × stake).
+            // For strict win T=1; for tie at top T = number tied (2..=K+1).
+            // Loss case (max_opp > h_str): payoff = -stake unchanged; loser
+            // doesn't pay rake.
             let k = num_active_opp as f32;
+            let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+            let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
+            let rake_per_unit_stake = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
             for h in 0..nh {
                 let hc1 = hand_cards[h * 2] as usize;
                 let hc2 = hand_cards[h * 2 + 1] as usize;
@@ -726,15 +739,17 @@ pub fn side_pot_showdown_cfv_with_rake(
                         let max_opp = s0.max(s1);
 
                         let payoff_unit: f32 = if max_opp > h_str {
-                            -1.0
+                            -1.0  // loss: rake-invariant (loser doesn't pay rake)
                         } else if max_opp == h_str {
-                            // tie at top
+                            // tie at top with T total winners
                             let mut t: u32 = 1;
                             if s0 == h_str { t += 1; }
                             if s1 == h_str { t += 1; }
-                            (k + 1.0 - t as f32) / t as f32
+                            let t_f = t as f32;
+                            (k + 1.0 - t_f) / t_f - rake_per_unit_stake / t_f
                         } else {
-                            k
+                            // strict win, T=1
+                            k - rake_per_unit_stake
                         };
 
                         accum += r0 * r1 * payoff_unit;
@@ -766,7 +781,13 @@ pub fn side_pot_showdown_cfv_with_rake(
         }
         let k = num_active_opp as f32;
         let half_pot = starting_pot as f32 / np as f32 + c_t as f32;
+        // Slice 1.4 rake: thread rake_per_unit_stake through the recursive
+        // evaluator. See the K=2 path comment above for the derivation.
+        let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+        let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
+        let rake_per_unit_stake = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
 
+        #[allow(clippy::too_many_arguments)]
         fn recurse_eq(
             oi: usize, num_opp: usize, nh: usize,
             mask_so_far: u64, reach_so_far: f32, max_str_so_far: u16, tied_at_max_so_far: u32,
@@ -775,17 +796,20 @@ pub fn side_pot_showdown_cfv_with_rake(
             g_mask_arr: &[u64],
             hand_strength: &[u16],
             k: f32,
+            rake_per_unit_stake: f32,
             accum: &mut f32,
         ) {
             if oi == num_opp {
                 let net_unit: f32 = if max_str_so_far > h_str {
-                    -1.0
+                    -1.0  // loss, rake-invariant
                 } else if max_str_so_far == h_str {
                     // Traverser ties at top with (tied_at_max_so_far + 1) total tied.
                     let t = tied_at_max_so_far + 1;
-                    (k + 1.0 - t as f32) / t as f32
+                    let t_f = t as f32;
+                    (k + 1.0 - t_f) / t_f - rake_per_unit_stake / t_f
                 } else {
-                    k
+                    // strict win, T=1
+                    k - rake_per_unit_stake
                 };
                 *accum += reach_so_far * net_unit;
                 return;
@@ -806,7 +830,8 @@ pub fn side_pot_showdown_cfv_with_rake(
                     oi + 1, num_opp, nh,
                     mask_so_far | g_mask_arr[g], reach_so_far * r,
                     new_max, new_tied,
-                    h_str, opp_reach, g_mask_arr, hand_strength, k, accum,
+                    h_str, opp_reach, g_mask_arr, hand_strength, k,
+                    rake_per_unit_stake, accum,
                 );
             }
         }
@@ -817,7 +842,8 @@ pub fn side_pot_showdown_cfv_with_rake(
             let mut accum = 0.0f32;
             recurse_eq(
                 0, num_opp, nh, h_m, 1.0, 0u16, 0u32,
-                h_str, &filtered_views, &g_mask_arr, &hand_strength, k, &mut accum,
+                h_str, &filtered_views, &g_mask_arr, &hand_strength, k,
+                rake_per_unit_stake, &mut accum,
             );
             cfv[h] = half_pot * accum;
         }
