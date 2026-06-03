@@ -4,7 +4,7 @@ use crate::card::{index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use crate::hand::eval::Hand;
 use crate::solver::chance_table::ChanceTable;
 use crate::solver::game::GameSpec;
-use crate::solver::showdown::side_pot_showdown_cfv;
+use crate::solver::showdown::side_pot_showdown_cfv_with_rake;
 use crate::tree::flat::FlatTree;
 
 /// Game specification for flop-start games (2 chance transitions: turn + river).
@@ -502,36 +502,44 @@ impl GameSpec for FlopStartGame {
 
         let opp_reach: Vec<&[f32]> = filtered_opp_reach.iter().map(|v| v.as_slice()).collect();
 
-        // Select sorted arrays based on current turn + river cards
+        // Select sorted arrays based on current turn + river cards.
+        // Slice 1.6: rake threaded from FlatTree. flop_seen=true because
+        // this is a flop-start game (the flop has been dealt before this
+        // terminal can be reached, by tree construction).
+        let rake_rate = tree.rake_rate as f32;
+        let rake_cap = tree.rake_cap as f32;
         let cfv = match (self.current_turn_card.get(), self.current_river_card.get()) {
             (Some(tc), Some(rc)) => {
                 // Full board: use (turn, river) sorted arrays
                 let (os, oi, ps, pi) = self.table.river_sorted_arrays(tc, rc);
-                side_pot_showdown_cfv(
+                side_pot_showdown_cfv_with_rake(
                     &opp_reach, &self.table.hand_cards, nh,
                     os, oi, ps, pi,
                     &contributions, fold_mask, traverser as usize, self.table.num_players,
                     tree.starting_pot,
+                    rake_rate, rake_cap, true,
                 )
             }
             (Some(tc), None) => {
                 // Turn only (shouldn't happen at terminals, but handle gracefully)
                 let (os, oi, ps, pi) = self.table.turn_sorted_arrays(tc);
-                side_pot_showdown_cfv(
+                side_pot_showdown_cfv_with_rake(
                     &opp_reach, &self.table.hand_cards, nh,
                     os, oi, ps, pi,
                     &contributions, fold_mask, traverser as usize, self.table.num_players,
                     tree.starting_pot,
+                    rake_rate, rake_cap, true,
                 )
             }
             (None, _) => {
                 // No chance dealt yet (shouldn't happen at terminals)
-                side_pot_showdown_cfv(
+                side_pot_showdown_cfv_with_rake(
                     &opp_reach, &self.table.hand_cards, nh,
                     &self.base_sorted_opp_str, &self.base_sorted_opp_idx,
                     &self.base_sorted_pl_str, &self.base_sorted_pl_idx,
                     &contributions, fold_mask, traverser as usize, self.table.num_players,
                     tree.starting_pot,
+                    rake_rate, rake_cap, true,
                 )
             }
         };

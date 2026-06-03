@@ -20,7 +20,9 @@
 //!     wired to its intended effect
 
 use solver_core::card::card_from_str;
-use solver_core::solver::flop_start_game::FlopChanceTable;
+use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
+use solver_core::solver::flop_start_vector_cfr::{FlopStartVectorCfr, Zone, DcfrParams};
+use solver_core::solver::game::GameSpec;
 use solver_core::solver::showdown::{side_pot_showdown_cfv, side_pot_showdown_cfv_with_rake};
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
@@ -806,6 +808,278 @@ fn verify_rake_no_flop_no_drop_zeroes_rake() {
     }
 
     eprintln!("✓ no flop, no drop: flop_seen=false zeroes rake across all paths");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Slice 1.6: end-to-end — tree.rake_rate flows to SOLVED result
+// ─────────────────────────────────────────────────────────────────────
+//
+// The requirement closure for rake. After Slice 1.6 threads rake from
+// FlatTree through evaluate_terminal to side_pot_showdown_cfv_with_rake,
+// `tree.rake_rate` and `tree.rake_cap` actually reach the solved-result
+// CFV (not just storage). This test runs the flop-start solver iter-0
+// with rake=0 and rake=0.05 on the same tree+game setup, and confirms
+// the root CFV differs by an amount consistent with the rake.
+//
+// What this anchors:
+//   - The wiring from TreeConfig → FlatTree (Slice 1.6 storage path)
+//   - The wiring from FlatTree → FlopStartGame::evaluate_terminal (Slice 1.6
+//     evaluate_terminal change)
+//   - The wiring from evaluate_terminal → side_pot_showdown_cfv_with_rake
+//     (the rake math from Slices 1.1-1.5)
+//   - All composed end-to-end via a real solver run
+//
+// What this does NOT anchor (separate work):
+//   - GPU rake (Slice 2.x)
+//   - Ante / stack depth end-to-end (separate tests below)
+
+fn build_flop_start_game_with_rake(rake_rate: f64, rake_cap: f64)
+    -> (solver_core::tree::flat::FlatTree, FlopStartGame)
+{
+    use solver_core::card::NUM_POSSIBLE_HANDS;
+    let cfg = TreeConfig {
+        num_players: 2,
+        initial_state: BoardState::Flop,
+        starting_pot: 10,
+        starting_stacks: vec![100, 100],
+        initial_contributions: vec![0, 0],
+        rake_rate,
+        rake_cap,
+        bet_sizes: BetSizeOptions {
+            bet: vec![BetSize::PotRelative(1.0)],
+            raise: vec![],
+        },
+        add_allin_threshold: 1.0,
+        force_allin_threshold: 1.0,
+        merging_threshold: 0.0,
+    };
+    let tree = build_tree(&cfg).expect("tree builds");
+    let board = vec![
+        card_from_str("Ac").unwrap(),
+        card_from_str("Kd").unwrap(),
+        card_from_str("2h").unwrap(),
+    ];
+    let ranges = vec![vec![1.0f32; NUM_POSSIBLE_HANDS]; 2];
+    let table = FlopChanceTable::compute_flop_start(&board, &ranges, 2);
+    let game = FlopStartGame::new(table);
+    (tree, game)
+}
+
+fn run_iter0_root_cfv(
+    tree: &solver_core::tree::flat::FlatTree,
+    game: &FlopStartGame,
+    traverser: u8,
+) -> Vec<f32> {
+    let mut solver = FlopStartVectorCfr::new(tree, game.table());
+    solver.set_vanilla_mode(true);
+    solver.compute_all_strategies(tree);
+    let reach = solver.compute_reach_flop(tree, game);
+    let table_ref = game.table();
+    let nh = solver.num_hands();
+    let nn = tree.num_nodes();
+    let mut cfv = vec![0.0f32; nn * nh];
+    let params = DcfrParams::new(0);
+    // Bottom-up walk: River → Turn → Flop
+    let turn_deck = table_ref.remaining_deck.clone();
+    for (ti, &tc_card) in turn_deck.iter().enumerate() {
+        let river_deck = &table_ref.river_decks[tc_card as usize];
+        for ri in 0..river_deck.len() {
+            solver.bottom_up_zone(
+                tree, table_ref, traverser, &reach, &mut cfv,
+                Zone::River, Some(ti), Some(ri), &params,
+            );
+        }
+    }
+    for ti in 0..turn_deck.len() {
+        solver.bottom_up_zone(
+            tree, table_ref, traverser, &reach, &mut cfv,
+            Zone::Turn, Some(ti), None, &params,
+        );
+    }
+    solver.bottom_up_zone(
+        tree, table_ref, traverser, &reach, &mut cfv,
+        Zone::Flop, None, None, &params,
+    );
+    cfv[0..nh].to_vec()
+}
+
+#[test]
+fn verify_rake_reaches_solver_root_cfv_end_to_end() {
+    // SAME tree+game setup with two different rake configs. The only
+    // difference: rake_rate / rake_cap. Run iter-0 root CFV. The two
+    // results MUST differ (this confirms rake reaches the solver, not
+    // just storage).
+    let (tree_no_rake, game_no_rake) = build_flop_start_game_with_rake(0.0, 0.0);
+    let (tree_rake, game_rake) = build_flop_start_game_with_rake(0.05, 30.0);
+
+    // Storage round-trip first (already verified elsewhere, just confirm
+    // here so the test failure mode is clear).
+    assert_eq!(tree_no_rake.rake_rate, 0.0);
+    assert_eq!(tree_rake.rake_rate, 0.05);
+
+    let cfv_no_rake = run_iter0_root_cfv(&tree_no_rake, &game_no_rake, 0);
+    let cfv_rake = run_iter0_root_cfv(&tree_rake, &game_rake, 0);
+
+    let nh = cfv_no_rake.len();
+    let mut max_abs_diff = 0.0f32;
+    let mut argmax = 0usize;
+    for h in 0..nh {
+        let d = (cfv_no_rake[h] - cfv_rake[h]).abs();
+        if d > max_abs_diff { max_abs_diff = d; argmax = h; }
+    }
+    eprintln!("\nend-to-end rake reach test (HU flop-start, iter-0):");
+    eprintln!("  nh = {}", nh);
+    eprintln!("  cfv_no_rake[{}] = {}", argmax, cfv_no_rake[argmax]);
+    eprintln!("  cfv_rake[{}]    = {}", argmax, cfv_rake[argmax]);
+    eprintln!("  max abs diff   = {}", max_abs_diff);
+
+    // The two root CFVs MUST differ — rake reaches the solver output.
+    // The exact magnitude depends on the tree's terminal pot distribution
+    // and the solver's normalization (num_combinations), but any non-zero
+    // diff at f32 precision confirms wiring.
+    assert!(max_abs_diff > 1e-7,
+        "rake does NOT reach solver output: cfv unchanged between rake=0 and rake=0.05. \
+         The Slice 1.6 thread (evaluate_terminal → side_pot_showdown_cfv_with_rake) is \
+         not wired correctly.");
+
+    eprintln!("✓ tree.rake_rate flows end-to-end to solved-result CFV");
+}
+
+#[test]
+fn verify_stack_depth_reaches_solver_root_cfv_end_to_end() {
+    // SAME tree shape with different stack depths. Deep stack allows
+    // larger pots at terminals (because betting can go further), so root
+    // CFV magnitudes should differ.
+    use solver_core::card::NUM_POSSIBLE_HANDS;
+    fn build(stack: i32) -> (solver_core::tree::flat::FlatTree, FlopStartGame) {
+        // 2×pot bet config + small starting pot. With short stack 20
+        // (just bigger than the 2×pot bet of 20), the bet IS allin.
+        // With deep stack 1000, the same 2×pot bet is small relative
+        // to stack, allowing further action above it. Same shape as
+        // verify_stack_depth_bounds_max_betting which confirmed short
+        // vs deep produce different tree max-contributions.
+        let cfg = TreeConfig {
+            num_players: 2,
+            initial_state: BoardState::Flop,
+            starting_pot: 10,
+            starting_stacks: vec![stack, stack],
+            initial_contributions: vec![0, 0],
+            rake_rate: 0.0, rake_cap: 0.0,
+            bet_sizes: BetSizeOptions {
+                // Include raise options so the tree can grow deeper at
+                // deep stack (each raise compounds, exposing more of the
+                // stack via terminal contributions).
+                bet: vec![BetSize::PotRelative(1.0)],
+                raise: vec![BetSize::PotRelative(1.0), BetSize::AllIn],
+            },
+            add_allin_threshold: 0.0,
+            force_allin_threshold: 0.5,
+            merging_threshold: 0.0,
+        };
+        let tree = build_tree(&cfg).expect("tree builds");
+        let board = vec![
+            card_from_str("Ac").unwrap(),
+            card_from_str("Kd").unwrap(),
+            card_from_str("2h").unwrap(),
+        ];
+        let ranges = vec![vec![1.0f32; NUM_POSSIBLE_HANDS]; 2];
+        let table = FlopChanceTable::compute_flop_start(&board, &ranges, 2);
+        let game = FlopStartGame::new(table);
+        (tree, game)
+    }
+
+    let (tree_short, game_short) = build(20);
+    let (tree_deep, game_deep) = build(1000);
+
+    eprintln!("\nstack-depth end-to-end test: short stack vs deep stack");
+    eprintln!("  short tree: {} nodes", tree_short.num_nodes());
+    eprintln!("  deep tree:  {} nodes", tree_deep.num_nodes());
+    let short_max: i32 = (0..tree_short.num_nodes())
+        .map(|i| (0..2).map(|p| tree_short.get_contribution(i, p)).max().unwrap_or(0))
+        .max().unwrap_or(0);
+    let deep_max: i32 = (0..tree_deep.num_nodes())
+        .map(|i| (0..2).map(|p| tree_deep.get_contribution(i, p)).max().unwrap_or(0))
+        .max().unwrap_or(0);
+    eprintln!("  max terminal contribution: short={}, deep={}", short_max, deep_max);
+
+    let cfv_short = run_iter0_root_cfv(&tree_short, &game_short, 0);
+    let cfv_deep = run_iter0_root_cfv(&tree_deep, &game_deep, 0);
+
+    let nh = cfv_short.len();
+    let mut max_abs_diff = 0.0f32;
+    let mut argmax = 0usize;
+    for h in 0..nh {
+        let d = (cfv_short[h] - cfv_deep[h]).abs();
+        if d > max_abs_diff { max_abs_diff = d; argmax = h; }
+    }
+    eprintln!("  max abs diff = {} (h={})", max_abs_diff, argmax);
+    eprintln!("  cfv_short[{}] = {}", argmax, cfv_short[argmax]);
+    eprintln!("  cfv_deep[{}]  = {}", argmax, cfv_deep[argmax]);
+
+    assert!(max_abs_diff > 1e-7,
+        "stack depth does NOT reach solver output: cfv unchanged between 10 and 200 \
+         starting_stack. Stack must affect max-bet → terminal contributions → payoffs. \
+         Short tree: {} nodes, max contrib {}; deep tree: {} nodes, max contrib {}.",
+        tree_short.num_nodes(), short_max,
+        tree_deep.num_nodes(), deep_max);
+
+    eprintln!("✓ tree.starting_stacks flows end-to-end to solved-result CFV");
+}
+
+#[test]
+fn verify_ante_reaches_solver_root_cfv_end_to_end() {
+    // SAME tree shape with different initial_contributions (ante effect).
+    // Larger ante → larger initial pot → larger terminal payoffs.
+    use solver_core::card::NUM_POSSIBLE_HANDS;
+    fn build(ante: i32) -> (solver_core::tree::flat::FlatTree, FlopStartGame) {
+        let cfg = TreeConfig {
+            num_players: 2,
+            initial_state: BoardState::Flop,
+            starting_pot: 10,
+            starting_stacks: vec![100, 100],
+            initial_contributions: vec![ante, ante],
+            rake_rate: 0.0, rake_cap: 0.0,
+            bet_sizes: BetSizeOptions {
+                bet: vec![BetSize::PotRelative(1.0)],
+                raise: vec![],
+            },
+            add_allin_threshold: 1.0,
+            force_allin_threshold: 1.0,
+            merging_threshold: 0.0,
+        };
+        let tree = build_tree(&cfg).expect("tree builds");
+        let board = vec![
+            card_from_str("Ac").unwrap(),
+            card_from_str("Kd").unwrap(),
+            card_from_str("2h").unwrap(),
+        ];
+        let ranges = vec![vec![1.0f32; NUM_POSSIBLE_HANDS]; 2];
+        let table = FlopChanceTable::compute_flop_start(&board, &ranges, 2);
+        let game = FlopStartGame::new(table);
+        (tree, game)
+    }
+
+    let (tree_a0, game_a0) = build(0);
+    let (tree_a5, game_a5) = build(5);
+
+    let cfv_a0 = run_iter0_root_cfv(&tree_a0, &game_a0, 0);
+    let cfv_a5 = run_iter0_root_cfv(&tree_a5, &game_a5, 0);
+
+    let nh = cfv_a0.len();
+    let mut max_abs_diff = 0.0f32;
+    for h in 0..nh {
+        let d = (cfv_a0[h] - cfv_a5[h]).abs();
+        if d > max_abs_diff { max_abs_diff = d; }
+    }
+    eprintln!("\nante end-to-end test: ante=0 vs ante=5");
+    eprintln!("  max abs diff = {}", max_abs_diff);
+
+    assert!(max_abs_diff > 1e-7,
+        "ante (via initial_contributions) does NOT reach solver output. \
+         initial_contributions should affect root contributions → terminal \
+         contributions → payoffs.");
+
+    eprintln!("✓ initial_contributions (ante) flows end-to-end to solved-result CFV");
 }
 
 #[test]

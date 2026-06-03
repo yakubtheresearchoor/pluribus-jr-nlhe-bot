@@ -3,7 +3,7 @@ use std::cell::Cell;
 use crate::card::{index_to_card_pair, Card};
 use crate::solver::chance_table::ChanceTable;
 use crate::solver::game::GameSpec;
-use crate::solver::showdown::side_pot_showdown_cfv;
+use crate::solver::showdown::side_pot_showdown_cfv_with_rake;
 use crate::tree::flat::FlatTree;
 
 pub struct TurnStartGame {
@@ -69,6 +69,10 @@ impl GameSpec for TurnStartGame {
             .map(|p| cfreach[p].as_slice())
             .collect();
 
+        // Slice 1.6: rake threaded from FlatTree. flop_seen=true because
+        // this is a turn-start game (flop+turn both dealt by construction).
+        let rake_rate = tree.rake_rate as f32;
+        let rake_cap = tree.rake_cap as f32;
         let cfv = match self.current_river_card.get() {
             Some(_card) => {
                 let card = self.current_river_card.get().unwrap();
@@ -78,7 +82,7 @@ impl GameSpec for TurnStartGame {
                 let card_opp_str = &self.table.chance_sorted_strength[card_idx * stride..card_idx * stride + stride];
                 let card_opp_idx = &self.table.chance_sorted_indices[card_idx * stride..card_idx * stride + stride];
 
-                side_pot_showdown_cfv(
+                side_pot_showdown_cfv_with_rake(
                     &opp_reach,
                     &self.table.hand_cards,
                     nh,
@@ -91,10 +95,11 @@ impl GameSpec for TurnStartGame {
                     traverser as usize,
                     self.table.num_players,
                     tree.starting_pot,
+                    rake_rate, rake_cap, true,
                 )
             }
             None => {
-                side_pot_showdown_cfv(
+                side_pot_showdown_cfv_with_rake(
                     &opp_reach,
                     &self.table.hand_cards,
                     nh,
@@ -107,6 +112,7 @@ impl GameSpec for TurnStartGame {
                     traverser as usize,
                     self.table.num_players,
                     tree.starting_pot,
+                    rake_rate, rake_cap, true,
                 )
             }
         };

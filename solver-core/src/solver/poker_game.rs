@@ -240,7 +240,11 @@ impl GameSpec for RiverPokerGame {
             .map(|p| cfreach[p].as_slice())
             .collect();
 
-        let mut cfv = crate::solver::showdown::side_pot_showdown_cfv(
+        // Slice 1.6: rake threaded from FlatTree. flop_seen=true for the
+        // poker_game generic terminal evaluator (callers using this game
+        // spec are post-flop by convention; preflop integration uses a
+        // different GameSpec that passes flop_seen=false where appropriate).
+        let mut cfv = crate::solver::showdown::side_pot_showdown_cfv_with_rake(
             &opp_reach,
             &self.hand_cards,
             nh,
@@ -253,6 +257,7 @@ impl GameSpec for RiverPokerGame {
             traverser as usize,
             self.num_players,
             tree.starting_pot,
+            tree.rake_rate as f32, tree.rake_cap as f32, true,
         );
 
         // Normalize CFV by num_combinations (matching external solver convention)

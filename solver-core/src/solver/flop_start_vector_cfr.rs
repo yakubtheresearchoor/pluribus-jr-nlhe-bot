@@ -1,6 +1,6 @@
 use crate::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use crate::solver::game::GameSpec;
-use crate::solver::showdown::side_pot_showdown_cfv;
+use crate::solver::showdown::side_pot_showdown_cfv_with_rake;
 use crate::tree::flat::{FlatTree, MAX_NA, VCFR_NO_INFOSET};
 
 const UNUSED: usize = usize::MAX;
@@ -837,11 +837,14 @@ impl FlopStartVectorCfr {
                         }
                         Zone::Flop => {
                             let (os, oi, ps, pi, _) = table.sorted_opp_arrays_base();
-                            let cfv_out = side_pot_showdown_cfv(
+                            // Slice 1.6: rake threaded. flop_seen=true
+                            // (flop-start solver runs on flop-onward trees).
+                            let cfv_out = side_pot_showdown_cfv_with_rake(
                                 &opp_reach, &table.hand_cards, nh,
                                 &os, &oi, &ps, &pi,
                                 &contributions, fold_mask, traverser as usize, self.num_players,
                                 tree.starting_pot,
+                                tree.rake_rate as f32, tree.rake_cap as f32, true,
                             );
                             let nc = table.num_combinations as f32;
                             if nc > 0.0 {
@@ -857,11 +860,12 @@ impl FlopStartVectorCfr {
                         ),
                     };
 
-                    let cfv_out = side_pot_showdown_cfv(
+                    let cfv_out = side_pot_showdown_cfv_with_rake(
                         &opp_reach, &table.hand_cards, nh,
                         opp_str, opp_idx, pl_str, pl_idx,
                         &contributions, fold_mask, traverser as usize, self.num_players,
                         tree.starting_pot,
+                        tree.rake_rate as f32, tree.rake_cap as f32, true,
                     );
 
                     let nc = table.num_combinations as f32;
