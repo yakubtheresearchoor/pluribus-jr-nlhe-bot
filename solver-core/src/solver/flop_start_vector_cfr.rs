@@ -6,7 +6,7 @@ use crate::tree::flat::{FlatTree, MAX_NA, VCFR_NO_INFOSET};
 const UNUSED: usize = usize::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Zone { Flop, Turn, River }
+pub enum Zone { Flop, Turn, River, Preflop }
 
 pub struct DcfrParams {
     alpha_t: f32,
@@ -51,6 +51,13 @@ pub struct FlopStartVectorCfr {
     flop_zone_nodes: Vec<Vec<u32>>,            // per level
     turn_zone_nodes: Vec<Vec<u32>>,            // per level (template)
     river_zone_nodes: Vec<Vec<u32>>,           // per level (template)
+    /// P1.5.2: preflop zone nodes per level. Empty for flop-start trees
+    /// (no preflop nodes exist). Non-empty only when the tree's root is
+    /// at BoardState::Preflop. Consumed by `zone_nodes_per_level_with_preflop`
+    /// for the four-zone walk; the existing 3-tuple
+    /// `zone_nodes_per_level` accessor stays unchanged to keep the
+    /// blast radius of P1.5.2 to zero existing-consumer churn.
+    preflop_zone_nodes: Vec<Vec<u32>>,         // per level
 
     // ── Per-zone infoset bookkeeping ──
     // For each template decision node, its local infoset offset within its zone.
@@ -58,10 +65,14 @@ pub struct FlopStartVectorCfr {
     flop_local_offset: Vec<usize>,             // [nn]
     turn_local_offset: Vec<usize>,             // [nn]
     river_local_offset: Vec<usize>,            // [nn]
+    /// P1.5.2: preflop local offsets. UNUSED everywhere for flop-start trees.
+    preflop_local_offset: Vec<usize>,          // [nn]
 
     flop_infoset_count: usize,
     turn_infoset_count: usize,
     river_infoset_count: usize,
+    /// P1.5.2: preflop infoset count. 0 for flop-start trees.
+    preflop_infoset_count: usize,
 
     // ── Per-zone strides ──
     flop_stride: usize,    // flop_infoset_count × MAX_NA × nh
@@ -125,15 +136,25 @@ impl FlopStartVectorCfr {
         let max_depth = tree.max_depth as usize;
 
         // ── Classify zones ──
+        // P1.5.2: four-zone classification (Preflop / Flop / Turn / River).
+        // For flop-start trees (initial_state = Flop), no Preflop-to-Flop
+        // chance node exists, so below_flop stays all-false and the
+        // classification collapses to the original three-zone behavior
+        // (Preflop bucket stays empty). For preflop-start trees, below_flop
+        // is populated by marking descendants of the Preflop-to-Flop
+        // chance node (which has board_state == Flop == 0 by the destination
+        // convention).
         let mut below_river = vec![false; nn];
         let mut below_turn = vec![false; nn];
+        let mut below_flop = vec![false; nn];
         let mut river_cc = Vec::new();
         let mut turn_cc = Vec::new();
+        let mut flop_cc = Vec::new();
 
         for i in 0..nn {
             let n = &tree.nodes[i];
             if n.is_chance() && n.board_state == 2 {
-                // River chance node
+                // River chance node (destination = River)
                 for &c in tree.node_children(i) {
                     river_cc.push(c);
                     mark_descendants(tree, c as usize, &mut below_river);
@@ -143,18 +164,38 @@ impl FlopStartVectorCfr {
         for i in 0..nn {
             let n = &tree.nodes[i];
             if n.is_chance() && n.board_state == 1 {
-                // Turn chance node
+                // Turn chance node (destination = Turn)
                 for &c in tree.node_children(i) {
                     turn_cc.push(c);
                     mark_descendants(tree, c as usize, &mut below_turn);
                 }
             }
         }
+        // Preflop-to-Flop chance nodes have board_state == Flop == 0
+        // (destination convention). Only present in preflop-start trees.
+        // For flop-start trees this loop finds nothing.
+        for i in 0..nn {
+            let n = &tree.nodes[i];
+            if n.is_chance() && n.board_state == 0 {
+                for &c in tree.node_children(i) {
+                    flop_cc.push(c);
+                    mark_descendants(tree, c as usize, &mut below_flop);
+                }
+            }
+        }
+
+        // Root board_state determines the "else" zone: preflop-start trees
+        // default unclassified nodes to Preflop; flop-start trees default
+        // to Flop (preserving the original behavior). This is the dispatch
+        // that lets the same classification handle both tree shapes.
+        let root_is_preflop = tree.nodes[0].board_state == 3;
 
         let zones: Vec<Zone> = (0..nn)
             .map(|i| {
                 if below_river[i] { Zone::River }
                 else if below_turn[i] { Zone::Turn }
+                else if below_flop[i] { Zone::Flop }
+                else if root_is_preflop { Zone::Preflop }
                 else { Zone::Flop }
             })
             .collect();
@@ -163,6 +204,7 @@ impl FlopStartVectorCfr {
         let mut river_zn = vec![vec![]; max_depth + 1];
         let mut turn_zn = vec![vec![]; max_depth + 1];
         let mut flop_zn = vec![vec![]; max_depth + 1];
+        let mut preflop_zn = vec![vec![]; max_depth + 1];
 
         for level in 0..=max_depth {
             for &nid in tree.nodes_at_level(level as u32) {
@@ -170,6 +212,7 @@ impl FlopStartVectorCfr {
                     Zone::River => river_zn[level].push(nid),
                     Zone::Turn => turn_zn[level].push(nid),
                     Zone::Flop => flop_zn[level].push(nid),
+                    Zone::Preflop => preflop_zn[level].push(nid),
                 }
             }
         }
@@ -178,9 +221,11 @@ impl FlopStartVectorCfr {
         let mut flop_local_offset = vec![UNUSED; nn];
         let mut turn_local_offset = vec![UNUSED; nn];
         let mut river_local_offset = vec![UNUSED; nn];
+        let mut preflop_local_offset = vec![UNUSED; nn];
         let mut flop_count = 0usize;
         let mut turn_count = 0usize;
         let mut river_count = 0usize;
+        let mut preflop_count = 0usize;
 
         for &nid in &tree.decision_node_ids {
             let idx = nid as usize;
@@ -196,6 +241,10 @@ impl FlopStartVectorCfr {
                 Zone::River => {
                     river_local_offset[idx] = river_count;
                     river_count += 1;
+                }
+                Zone::Preflop => {
+                    preflop_local_offset[idx] = preflop_count;
+                    preflop_count += 1;
                 }
             }
         }
@@ -246,9 +295,12 @@ impl FlopStartVectorCfr {
             flop_local_offset,
             turn_local_offset,
             river_local_offset,
+            preflop_local_offset,
+            preflop_zone_nodes: preflop_zn,
             flop_infoset_count: flop_count,
             turn_infoset_count: turn_count,
             river_infoset_count: river_count,
+            preflop_infoset_count: preflop_count,
             flop_stride,
             turn_stride,
             river_stride,
@@ -700,6 +752,10 @@ impl FlopStartVectorCfr {
             Zone::Flop => self.flop_zone_nodes.clone(),
             Zone::Turn => self.turn_zone_nodes.clone(),
             Zone::River => self.river_zone_nodes.clone(),
+            Zone::Preflop => unreachable!(
+                "Zone::Preflop in flop-start bottom_up_zone; preflop processing \
+                 lives in P1.5.4 (#44), this code path handles flop-start trees only"
+            ),
         };
         let regret_floor = self.regret_floor;
 
@@ -728,6 +784,10 @@ impl FlopStartVectorCfr {
                             vec![table.remaining_deck[ti]]
                         }
                         Zone::Flop => vec![],
+                        Zone::Preflop => unreachable!(
+                            "Zone::Preflop in flop-start board_cards selection; \
+                             preflop processing lives in P1.5.4 (#44)"
+                        ),
                     };
 
                     // Filter opponent reach to exclude hands conflicting with turn/river cards
@@ -791,6 +851,10 @@ impl FlopStartVectorCfr {
                             }
                             continue;
                         }
+                        Zone::Preflop => unreachable!(
+                            "Zone::Preflop in flop-start sorted-array selection; \
+                             preflop processing lives in P1.5.4 (#44)"
+                        ),
                     };
 
                     let cfv_out = side_pot_showdown_cfv(
@@ -912,6 +976,10 @@ impl FlopStartVectorCfr {
                 let c = &mut self.cum_strategy_river[off..off + len];
                 (r, s, c)
             }
+            Zone::Preflop => unreachable!(
+                "Zone::Preflop in flop-start get_mut_slices; preflop \
+                 regret/strategy storage lives in P1.5.4 (#44)"
+            ),
         }
     }
 
@@ -960,6 +1028,11 @@ impl FlopStartVectorCfr {
 
     /// Return zone nodes organized by level for GPU dispatch.
     /// Returns (river, turn, flop) each as Vec<Vec<u32>> (one Vec per level).
+    ///
+    /// 3-zone accessor preserved unchanged for the P1.5.2 sub-step's
+    /// zero-blast-radius rule: 16 existing files consume this signature,
+    /// they continue to work. Preflop-zone consumers use the 4-zone
+    /// accessor below.
     pub fn zone_nodes_per_level(&self) -> (Vec<Vec<u32>>, Vec<Vec<u32>>, Vec<Vec<u32>>) {
         (
             self.river_zone_nodes.clone(),
@@ -967,6 +1040,55 @@ impl FlopStartVectorCfr {
             self.flop_zone_nodes.clone(),
         )
     }
+
+    /// P1.5.2: four-zone accessor for the preflop integration walk.
+    /// Returns (preflop, river, turn, flop), each Vec<Vec<u32>> per level.
+    /// Empty preflop vec for flop-start trees. Consumed by P1.5.4
+    /// (bottom_up_zone preflop extension) and by P2.5 (orchestration
+    /// oracle four-zone walk).
+    ///
+    /// Note the (preflop, river, turn, flop) ordering: the existing
+    /// 3-tuple kept its (river, turn, flop) bottom-up ordering, and
+    /// preflop slots at the front because in the bottom-up walk it
+    /// is the last zone visited (above flop). Pick whichever ordering
+    /// is clearer to consumers at the time; the data is the same.
+    pub fn zone_nodes_per_level_with_preflop(&self) -> (
+        Vec<Vec<u32>>,
+        Vec<Vec<u32>>,
+        Vec<Vec<u32>>,
+        Vec<Vec<u32>>,
+    ) {
+        (
+            self.preflop_zone_nodes.clone(),
+            self.river_zone_nodes.clone(),
+            self.turn_zone_nodes.clone(),
+            self.flop_zone_nodes.clone(),
+        )
+    }
+
+    /// P1.5.2: preflop-zone decision node IDs + local infoset offsets.
+    /// Empty for flop-start trees. Mirrors `per_zone_decision_nodes` for
+    /// the preflop zone only; that 3-zone function is preserved unchanged
+    /// to keep blast radius zero.
+    pub fn preflop_decision_nodes(&self, tree: &FlatTree) -> (Vec<u32>, Vec<u32>) {
+        let mut ids = Vec::new();
+        let mut offs = Vec::new();
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] == Zone::Preflop {
+                let off = self.preflop_local_offset[idx];
+                if off != UNUSED {
+                    ids.push(nid);
+                    offs.push(off as u32);
+                }
+            }
+        }
+        (ids, offs)
+    }
+
+    /// Number of preflop-zone decision (infoset) nodes. 0 for flop-start
+    /// trees.
+    pub fn preflop_infoset_count(&self) -> usize { self.preflop_infoset_count }
 
     /// Per-zone decision node IDs (for strategy computation on GPU).
     /// Returns (flop_decision_ids, flop_infoset_offsets, turn_decision_ids, turn_infoset_offsets,
@@ -1006,6 +1128,14 @@ impl FlopStartVectorCfr {
                         river_ids.push(nid);
                         river_offs.push(off as u32);
                     }
+                }
+                Zone::Preflop => {
+                    // 3-zone accessor signature is preserved (16 consumers).
+                    // Preflop decision nodes are surfaced via the separate
+                    // `preflop_decision_nodes()` accessor added in P1.5.2.
+                    // For flop-start trees this branch is unreachable; for
+                    // preflop-start trees, preflop nodes are emitted on the
+                    // dedicated accessor instead, not this 3-zone one.
                 }
             }
         }
@@ -1227,6 +1357,10 @@ impl FlopStartVectorCfr {
                 let off = (tc * self.max_n_river + rc) * self.river_stride + local * MAX_NA * nh;
                 self.cum_strategy_river[off..off + len].to_vec()
             }
+            Zone::Preflop => unreachable!(
+                "Zone::Preflop in flop-start get_strategy_for_outcome; \
+                 preflop cum-strategy storage lives in P1.5.4 (#44)"
+            ),
         };
         normalize_strategy(&mut strategy, na, nh);
         strategy

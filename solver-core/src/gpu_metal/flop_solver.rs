@@ -1575,6 +1575,10 @@ fn compute_infoset_offsets(tree: &FlatTree, solver: &FlopStartVectorCfr) -> Vec<
             crate::solver::flop_start_vector_cfr::Zone::Flop => solver.flop_local_offset()[idx],
             crate::solver::flop_start_vector_cfr::Zone::Turn => solver.turn_local_offset()[idx],
             crate::solver::flop_start_vector_cfr::Zone::River => solver.river_local_offset()[idx],
+            crate::solver::flop_start_vector_cfr::Zone::Preflop => unreachable!(
+                "Zone::Preflop in Metal flop-start offset table; preflop \
+                 processing lives in P1.5.4 (#44)"
+            ),
         };
         offsets[idx] = local as u32;
     }
