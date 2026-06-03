@@ -269,6 +269,27 @@ fn distinct_hand_cards_nh4() -> (Vec<u8>, Vec<u16>) {
     (hand_cards, hand_strength)
 }
 
+/// Tie-band layout: 4 distinct combos where TWO combos share a strength.
+/// Combos 0 and 1 tie at strength 200; combo 2 at 100; combo 3 at 300.
+/// All combos use distinct cards (no pairwise card overlap), so opp can
+/// hold combo 1 while player holds combo 0 (tie scenario, non-conflict).
+/// This exercises the showdown's tie code paths that
+/// `distinct_hand_cards_nh4`'s all-distinct strengths can never trigger
+/// (under all-distinct strengths, ties only occur at opp = h which is
+/// always blocked by card-conflict).
+///
+/// Coverage gap finding (from Slice 1.3 rake work): the closed validation
+/// arc never exercised non-conflicting ties. Pre-rake `sorted_sweep_showdown`
+/// was correct at ties by design (strict < and > comparisons → ties skipped
+/// → 0 contribution, matches expected 0 payoff for split pot at equal
+/// stakes) but the oracle didn't ANCHOR that correctness against
+/// formula-free enumeration. This layout closes the gap.
+fn tie_band_hand_cards_nh4() -> (Vec<u8>, Vec<u16>) {
+    let hand_cards = vec![46u8, 50, 38, 42, 30, 34, 18, 26]; // same 8 distinct cards
+    let hand_strength = vec![200u16, 200, 100, 300]; // combos 0 and 1 tie at 200
+    (hand_cards, hand_strength)
+}
+
 /// Larger hand-card layout for nh=12: 24 distinct cards, supports up to
 /// 6p meaningful joint enumerations (5 opp × 2 = 10 cards from 22
 /// non-traverser-cards). Strengths chosen distinct, descending order.
@@ -337,6 +358,40 @@ fn standing_showdown_oracle_battery() {
         opp_reach: vec![r_uniform.clone()],
         num_combinations: 16.0,
     });
+
+    // ---- Tie-band coverage (CLOSES THE GAP, see tie_band_hand_cards_nh4 doc) ----
+    // 4 combos with combos 0 and 1 sharing strength 200. Player holding
+    // combo 0 ties with opp holding combo 1 (no card conflict between
+    // combos 0 and 1). The independent reference's pair_outcome returns
+    // 0.5 for ties; scenario_payoff splits the pot among tied players.
+    // For HU equal contribs, tie payoff = pot/2 - investment = 0
+    // (player gets back their stake). The pre-Slice-1.3 sorted_sweep
+    // gives 0 contribution from ties (strict < and > skip them), which
+    // is correct — this case discriminatively anchors that the math
+    // matches truth, not just intuition.
+    {
+        let (tb_hc, tb_hs) = tie_band_hand_cards_nh4();
+        // HU showdown equal: tie band exists for combos {0,1}.
+        cases.push(ShowdownCase {
+            name: "HU showdown tie-band (combos 0&1 tie at str=200)",
+            np: 2, nh, traverser: 0, starting_pot: 10,
+            contributions: vec![5, 5], fold_mask: 0,
+            hand_cards: tb_hc.clone(), hand_strength: tb_hs.clone(),
+            opp_reach: vec![r_uniform.clone()],
+            num_combinations: 16.0,
+        });
+        // HU showdown tie-band with non-uniform opp_reach so the tie
+        // band's CFV depends on opp's reach distribution (more
+        // discriminating than uniform).
+        cases.push(ShowdownCase {
+            name: "HU showdown tie-band non-uniform reach",
+            np: 2, nh, traverser: 0, starting_pot: 10,
+            contributions: vec![5, 5], fold_mask: 0,
+            hand_cards: tb_hc.clone(), hand_strength: tb_hs.clone(),
+            opp_reach: vec![vec![0.3f32, 0.7, 0.5, 0.2]],
+            num_combinations: 16.0,
+        });
+    }
 
     // ---- 3p ----
     let r_quarter = vec![0.25f32; nh];
