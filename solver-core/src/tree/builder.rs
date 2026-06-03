@@ -44,12 +44,11 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
 
     let initial_contributions: Vec<i32> = config.initial_contributions.clone();
     let active_players: Vec<bool> = vec![true; num_players];
-    let stacks: Vec<i32> = config
-        .starting_stacks
-        .iter()
-        .zip(config.initial_contributions.iter())
-        .map(|(s, b)| s - b)
-        .collect();
+    // C1 convention: `committed[p]` = TOTAL chips player p has put in the pot
+    // from the start of the hand. Initialized to initial contributions
+    // (blinds/antes). Increases monotonically as the player calls or bets.
+    // Bounded above by `max_committable(p) = starting_stacks[p] + initial_contributions[p]`.
+    let stacks: Vec<i32> = config.initial_contributions.clone();
 
     let first_player = builder.first_postflop_player(&active_players);
 
@@ -62,12 +61,15 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
     }
 
     let info = BuildInfo {
+        // committed_at_round_start: on the first street (the initial state of
+        // the FlopStartGame, etc.), the round starts with the blinds/antes
+        // already in. Same value as initial_contributions = current stacks.
+        committed_at_round_start: stacks.clone(),
         stacks,
         active: active_players,
         folded: vec![false; num_players],
         has_acted_this_round: vec![false; num_players],
         round_starter: first_player as usize,
-        prev_action: Action::None,
         num_bets: 0,
         allin_flag: false,
         board_state: config.initial_state,
@@ -76,15 +78,42 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
 
     builder.build_recursive(root_idx, info);
 
-    // Fix up node_type for player nodes that were incorrectly set to TERMINAL
-    // This can happen when build_recursive reassigns player_id for inactive players
-    // and then the node gets children set. The node_type should be PLAYER, not TERMINAL.
-    for i in 0..builder.tree.nodes.len() {
-        let n = &builder.tree.nodes[i];
-        if n.node_type == NODE_TYPE_TERMINAL && n.num_children > 0 {
-            // This node has children but is marked as terminal.
-            // It should be a player node (chance nodes are created with FlatNode::chance()).
-            builder.tree.nodes[i].node_type = NODE_TYPE_PLAYER;
+    // Phase 3 fix: the Phase-2-era post-build TERMINAL→PLAYER fixup loop has
+    // been REMOVED. With the rewritten player-advancement (each child is
+    // allocated with the correct player_id directly, no in-place reassignment),
+    // a TERMINAL node should never end up with children. If it does, the
+    // rewrite has regressed — assert loud rather than silently relabel.
+    for (i, n) in builder.tree.nodes.iter().enumerate() {
+        debug_assert!(
+            !(n.node_type == NODE_TYPE_TERMINAL && n.num_children > 0),
+            "Tree-builder regression: TERMINAL node[{}] has {} children. The \
+             rewrite was supposed to allocate each child with the correct \
+             node_type up-front; if this fires, something is still doing \
+             in-place player_id reassignment that leaves a children-bearing \
+             TERMINAL behind.",
+            i, n.num_children
+        );
+    }
+
+    // Phase 5 build-time abstraction-cap assert: every PLAYER node's child
+    // count must fit within MAX_NA. GPU kernel strides are hard-coded to
+    // MAX_NA = {}; a config that legitimately exceeds it (e.g., multi-raise
+    // sizes pushing facing-bet beyond 4 actions) must force an explicit
+    // abstraction decision (cap actions, or raise MAX_NA + update strides),
+    // never silently corrupt GPU buffers by writing past the stride bound.
+    use crate::tree::flat::MAX_NA;
+    for (i, n) in builder.tree.nodes.iter().enumerate() {
+        if n.is_player() {
+            assert!(
+                (n.num_children as usize) <= MAX_NA,
+                "PLAYER node[{}] has {} children, exceeds MAX_NA={}. The \
+                 abstraction (bet_sizes config) produces a legal action set \
+                 wider than the GPU strides allow. Either cap the action set \
+                 (Option A) or raise MAX_NA and update strides in \
+                 flop_solver.rs / flop_start_vector_cfr.rs / vcfr.metal \
+                 (Option B). See Phase 5 of the rewrite plan.",
+                i, n.num_children, MAX_NA
+            );
         }
     }
 
@@ -99,16 +128,28 @@ struct TreeBuilder<'a> {
 }
 
 struct BuildInfo {
+    // Under the C1 convention from the prior tree-builder fix, `stacks[p]`
+    // tracks the TOTAL chips player p has put into the pot from the start of
+    // the hand (cumulative committed). Initialized to initial_contributions.
     stacks: Vec<i32>,
     active: Vec<bool>,
     folded: Vec<bool>,
     has_acted_this_round: Vec<bool>,
     round_starter: usize,
-    prev_action: Action,
     num_bets: i32,
     allin_flag: bool,
     board_state: BoardState,
     depth: usize,
+    // Per-street snapshot: cumulative committed at the start of the current
+    // betting round (i.e. the value `stacks` had just after the most recent
+    // street transition). On the first street, equals initial_contributions.
+    // Refreshed in `add_chance_child` after copying parent contribs to the
+    // chance node. Used by the per-street classifier to decide facing-bet
+    // vs not-facing-bet (a player is facing a bet iff their per-street
+    // commit is less than some other active player's per-street commit;
+    // cumulative comparison is incorrect across asymmetric blinds and
+    // street transitions).
+    committed_at_round_start: Vec<i32>,
 }
 
 impl BuildInfo {
@@ -129,11 +170,11 @@ impl BuildInfo {
             folded: self.folded.clone(),
             has_acted_this_round: self.has_acted_this_round.clone(),
             round_starter: self.round_starter,
-            prev_action: self.prev_action,
             num_bets: self.num_bets,
             allin_flag: self.allin_flag,
             board_state: self.board_state,
             depth: self.depth + 1,
+            committed_at_round_start: self.committed_at_round_start.clone(),
         }
     }
 
@@ -146,7 +187,97 @@ impl BuildInfo {
     }
 }
 
+/// Action-set classification for the player whose turn it is, derived from
+/// the rules of no-limit poker:
+///   - `AllInForcedCheck`: the acting player has no chips remaining
+///     (`max_committable - cumulative_committed == 0`). They cannot fold,
+///     call, bet, or raise. Their only "action" is a pass-through CHECK.
+///   - `FacingBet`: the acting player has put in fewer chips THIS STREET
+///     than at least one other still-eligible (active, not-yet-folded)
+///     player. To remain in the hand they must match the highest
+///     this-street commit; legal actions are FOLD, CALL (or all-in for
+///     less if their remaining chips don't cover the full call), and any
+///     RAISE the abstraction allows.
+///   - `NotFacingBet`: the acting player's this-street commit equals (or
+///     exceeds) every other active player's this-street commit. No one
+///     has bet yet, or everyone has matched. Legal actions are CHECK and
+///     any BET the abstraction allows. FOLD is NOT legal — there is
+///     nothing on the table that requires a fold or a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionClass {
+    AllInForcedCheck,
+    FacingBet,
+    NotFacingBet,
+}
+
 impl<'a> TreeBuilder<'a> {
+    /// Physical maximum chips this player can ever commit to the pot:
+    /// their starting stack plus any blinds/antes already posted.
+    /// Used to cap bet/raise amounts and call-matches at physical reality.
+    fn max_committable(&self, player: usize) -> i32 {
+        self.config.starting_stacks[player] + self.config.initial_contributions[player]
+    }
+
+    // ─── Per-street classifier helpers — INDEPENDENT from gate code ───
+    //
+    // These functions implement the action-class classifier derived directly
+    // from the poker rules documented above on `ActionClass`. They are NOT
+    // copied from `tests/tree_correctness_gate.rs` or
+    // `tests/tree_correctness_gate_hand_built.rs`. When the builder and the
+    // gate (each an independent derivation of the same rules) agree on a
+    // given tree, the agreement is real evidence; if either had been written
+    // by copying the other, agreement would be evidence of nothing.
+
+    /// Chips that player p has committed during the CURRENT betting round
+    /// (cumulative committed minus the snapshot taken at the start of the
+    /// round / most recent chance transition).
+    fn per_street_committed(info: &BuildInfo, p: usize) -> i32 {
+        info.stacks[p] - info.committed_at_round_start[p]
+    }
+
+    /// Largest per-street commit among all active players who are NOT the
+    /// `acting_player`. (Inactive/folded players are not counted — they no
+    /// longer affect what the acting player owes this street.)
+    fn max_other_per_street(info: &BuildInfo, acting_player: usize) -> i32 {
+        let np = info.stacks.len();
+        let mut m = 0i32;
+        for p in 0..np {
+            if p == acting_player || !info.active[p] {
+                continue;
+            }
+            let s = Self::per_street_committed(info, p);
+            if s > m {
+                m = s;
+            }
+        }
+        m
+    }
+
+    /// True iff the acting player has zero chips remaining (their cumulative
+    /// committed equals their physical maximum).
+    fn is_all_in(&self, info: &BuildInfo, player: usize) -> bool {
+        info.stacks[player] >= self.max_committable(player)
+    }
+
+    /// True iff the acting player has put in fewer chips this street than at
+    /// least one other active player. (Strict inequality — equal commits
+    /// mean no one has raised over you; you're not facing a bet.)
+    fn is_facing_bet(info: &BuildInfo, player: usize) -> bool {
+        Self::per_street_committed(info, player) < Self::max_other_per_street(info, player)
+    }
+
+    /// Classify the action set the acting player is legally entitled to,
+    /// per poker rules, given the current build state.
+    fn compute_legal_action_class(&self, info: &BuildInfo, player: usize) -> ActionClass {
+        if self.is_all_in(info, player) {
+            ActionClass::AllInForcedCheck
+        } else if Self::is_facing_bet(info, player) {
+            ActionClass::FacingBet
+        } else {
+            ActionClass::NotFacingBet
+        }
+    }
+
     fn first_postflop_player(&self, active: &[bool]) -> u8 {
         let num_players = self.config.num_players as usize;
         for i in 0..num_players {
@@ -169,6 +300,19 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn is_round_complete(&self, info: &BuildInfo) -> bool {
+        // Round is complete iff every active player has acted this round AND
+        // either (a) all active players have matched cumulative commits (the
+        // standard case — post-bet/post-call equalization), or (b) no betting
+        // has occurred this street (per-street commits all 0 for active
+        // players — handles the asymmetric-blind case where players check
+        // around but cumulative commits remain unequal because of the blinds).
+        //
+        // The cumulative-equal check is the conventional Model A semantics
+        // used by Call/Bet handlers; we keep it as the primary check.
+        // The no-betting-this-street special case fills the gap for
+        // asymmetric blinds: without it, on the flop with [10,5,5,5,5,5]
+        // initial contribs, no one can ever "end the round" by checking
+        // because cumulative stays unequal.
         let num_players = self.config.num_players as usize;
         for p in 0..num_players {
             if info.active[p] && !info.has_acted_this_round[p] {
@@ -176,15 +320,25 @@ impl<'a> TreeBuilder<'a> {
             }
         }
 
-        let active_stacks: Vec<i32> = (0..num_players)
+        let active: Vec<usize> = (0..num_players)
             .filter(|&p| info.active[p])
-            .map(|p| info.stacks[p])
             .collect();
-        if active_stacks.is_empty() {
+        if active.is_empty() {
             return true;
         }
-        let first = active_stacks[0];
-        active_stacks.iter().all(|&s| s == first)
+
+        // (a) All active have equal cumulative — standard Model A check.
+        let first = info.stacks[active[0]];
+        if active.iter().all(|&p| info.stacks[p] == first) {
+            return true;
+        }
+
+        // (b) No betting this street — all active have per-street commit 0.
+        if active.iter().all(|&p| Self::per_street_committed(info, p) == 0) {
+            return true;
+        }
+
+        false
     }
 
     fn only_one_active(&self, info: &BuildInfo) -> bool {
@@ -203,27 +357,53 @@ impl<'a> TreeBuilder<'a> {
             return;
         }
 
+        // EARLY RETURN: if this node was already constructed as TERMINAL or
+        // CHANCE by make_child_node (e.g., the FOLD action correctly sets
+        // child_type = TERMINAL), don't re-process it here. Re-processing
+        // adds spurious children and forces the post-build TERMINAL→PLAYER
+        // fixup, creating empty PLAYER nodes that the standing gate flags.
+        // This is a key Phase 3 structural fix.
+        let nt = self.tree.nodes[node_idx].node_type;
+        if nt == NODE_TYPE_TERMINAL {
+            // already terminal; nothing more to do
+            return;
+        }
+        if nt == crate::tree::flat::NODE_TYPE_CHANCE {
+            // chance nodes are constructed by add_chance_child which already
+            // handles the post-chance player recursion; don't re-process here.
+            return;
+        }
+
         if self.only_one_active(&info) {
             self.tree.nodes[node_idx].node_type = NODE_TYPE_TERMINAL;
             self.tree.set_folded_mask(node_idx, info.folded_mask());
             return;
         }
 
-        if info.allin_flag && info.board_state != BoardState::River {
+        if info.allin_flag {
+            // All-in check: every active player has reached their physical
+            // maximum (no chips remaining). Use max_committable per player,
+            // NOT cumulative-equal — with asymmetric blinds players have
+            // different max_committable values (e.g., big-blind=210,
+            // small-blind=205), so cumulative-equal fails even when all
+            // are genuinely all-in. The correct check is per-player
+            // physical-max comparison.
             let all_allin = (0..self.config.num_players as usize)
-                .all(|p| !info.active[p] || info.stacks[p] == info.stacks[info.active.iter().position(|&a| a).unwrap_or(0)]);
+                .all(|p| !info.active[p] || info.stacks[p] >= self.max_committable(p));
             if all_allin {
-                let mut child_info = info.clone_for_child();
                 match info.board_state {
                     BoardState::Flop => {
+                        let mut child_info = info.clone_for_child();
                         child_info.board_state = BoardState::Turn;
                         self.add_chance_child(node_idx, child_info);
                     }
                     BoardState::Turn => {
+                        let mut child_info = info.clone_for_child();
                         child_info.board_state = BoardState::River;
                         self.add_chance_child(node_idx, child_info);
                     }
                     BoardState::River => {
+                        // All all-in on river → showdown terminal.
                         self.tree.nodes[node_idx].node_type = NODE_TYPE_TERMINAL;
                         self.tree.set_folded_mask(node_idx, info.folded_mask());
                     }
@@ -232,7 +412,14 @@ impl<'a> TreeBuilder<'a> {
             }
         }
 
-        if info.prev_action == Action::Call || self.is_round_complete_after_action(&info) {
+        // PHASE 3 FIX: removed the `info.prev_action == Action::Call` shortcut.
+        // It was correct for heads-up (after a call, no one else can act) but
+        // wrong for 3+ players — after p1 calls p0's bet, p2 still needs to
+        // act. The shortcut was incorrectly advancing to the next street and
+        // leaving the intended p2-decision node as an empty PLAYER. Now rely
+        // solely on `is_round_complete_after_action` which checks that ALL
+        // active players have acted and all have equal stacks.
+        if self.is_round_complete_after_action(&info) {
             if info.board_state == BoardState::River {
                 self.tree.nodes[node_idx].node_type = NODE_TYPE_TERMINAL;
                 self.tree.set_folded_mask(node_idx, info.folded_mask());
@@ -253,6 +440,13 @@ impl<'a> TreeBuilder<'a> {
             if let Some(next) = self.next_active_player(player, &info.active) {
                 self.tree.nodes[node_idx].player_id = next as u8;
                 self.build_recursive(node_idx, info);
+            } else {
+                // No active player remaining — this should be a TERMINAL, not
+                // an empty PLAYER node. The only_one_active check above should
+                // already have caught num_active <= 1, but defending against
+                // any state where next_active_player returns None.
+                self.tree.nodes[node_idx].node_type = NODE_TYPE_TERMINAL;
+                self.tree.set_folded_mask(node_idx, info.folded_mask());
             }
             return;
         }
@@ -281,25 +475,46 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn is_round_complete_after_action(&self, info: &BuildInfo) -> bool {
-        if !self.is_round_complete(info) {
-            return false;
-        }
-        !matches!(info.prev_action, Action::None | Action::Chance(_))
+        // Phase 4 cleanup: the historical `prev_action != None/Chance` guard
+        // was redundant. `is_round_complete` itself requires every active
+        // player to have acted this round (`has_acted_this_round[p]`), which
+        // is `[false; np]` at both the root (init) and after any chance
+        // transition (reset in `add_chance_child`). So round-complete cannot
+        // fire at round-start regardless of `prev_action`. Function kept as
+        // a named alias for readability at the build_recursive callsite.
+        self.is_round_complete(info)
     }
 
     fn add_chance_child(&mut self, parent_idx: usize, mut info: BuildInfo) {
-        let chance_node = FlatNode::chance(info.board_state);
-        let chance_idx = self.tree.alloc_node(chance_node);
-        for p in 0..self.config.num_players as usize {
-            let contrib = self.tree.get_contribution(parent_idx, p as u8);
-            self.tree.set_contribution(chance_idx, p as u8, contrib);
-        }
+        // STRUCTURAL FIX: when this is called during build_recursive on a node
+        // that was originally allocated as a PLAYER (round-complete advance,
+        // all-allin advance), the PARENT NODE itself should become a CHANCE
+        // node — not stay a PLAYER node with a chance child. The previous
+        // behavior left a degenerate "PLAYER with single CHANCE child" that
+        // the gate (correctly) flags as having no legal player actions.
+        //
+        // Approach: mutate parent_idx into a CHANCE node directly, then
+        // allocate the post-chance player as its child. This consumes
+        // parent_idx as the chance node itself rather than adding an
+        // intermediate chance child below it.
+        self.tree.nodes[parent_idx].node_type =
+            crate::tree::flat::NODE_TYPE_CHANCE;
+        self.tree.nodes[parent_idx].board_state = info.board_state as u8;
+        // Note: the action_label on parent_idx is whatever brought us here
+        // (e.g., CALL, CHECK). The gate uses this when propagating folded_mask
+        // from the grandparent; CALL/CHECK don't trigger FOLD propagation, so
+        // that's correct.
 
         let child_node = {
             let first = self.first_postflop_player(&info.active);
             FlatNode::player(first, info.board_state, self.tree.nodes[parent_idx].amount)
         };
         let child_idx = self.tree.alloc_node(child_node);
+        // The post-chance player's incoming "action" from the chance node is
+        // CHANCE, not FOLD. Without this, gate's FOLD-propagation would treat
+        // the post-chance player as having been reached via a fold.
+        self.tree.nodes[child_idx].action_label =
+            crate::tree::flat::ACTION_LABEL_CHANCE;
         for p in 0..self.config.num_players as usize {
             let contrib = self.tree.get_contribution(parent_idx, p as u8);
             self.tree.set_contribution(child_idx, p as u8, contrib);
@@ -307,11 +522,14 @@ impl<'a> TreeBuilder<'a> {
 
         info.has_acted_this_round = vec![false; self.config.num_players as usize];
         info.num_bets = 0;
-        info.prev_action = Action::Chance(0);
         info.round_starter = self.first_postflop_player(&info.active) as usize;
+        // Refresh per-street commit snapshot at the chance boundary. The new
+        // round begins with all players' current cumulative committed values
+        // as their "starting" position for the next betting round.
+        info.committed_at_round_start = info.stacks.clone();
 
-        self.tree.set_children(chance_idx, vec![child_idx as u32]);
-        self.tree.set_children(parent_idx, vec![chance_idx as u32]);
+        // parent_idx IS the chance node now. Its child is the post-chance player.
+        self.tree.set_children(parent_idx, vec![child_idx as u32]);
 
         self.build_recursive(child_idx, info);
     }
@@ -325,30 +543,43 @@ impl<'a> TreeBuilder<'a> {
         let player = self.tree.nodes[node_idx].player_id as usize;
         let num_players = self.config.num_players as usize;
 
-        let mut max_other_stack = 0i32;
+        // C1: info.stacks[p] is now "total chips committed by p so far".
+        let mut max_other_committed = 0i32;
         for p in 0..num_players {
             if p != player && info.active[p] {
-                max_other_stack = max_other_stack.max(info.stacks[p]);
+                max_other_committed = max_other_committed.max(info.stacks[p]);
             }
         }
 
-        let player_stack = info.stacks[player];
-        let to_call = (max_other_stack - player_stack).max(0);
+        let player_committed = info.stacks[player];
+        let max_player_total = self.max_committable(player);
+        let player_remaining = (max_player_total - player_committed).max(0);
+        let to_call = (max_other_committed - player_committed).max(0);
         let pot = self.get_pot(node_idx);
-        let prev_amount = max_other_stack;
-        let max_amount = player_stack + prev_amount;
-        let min_amount = (prev_amount + to_call).clamp(1, max_amount);
+        // prev_amount: the highest commitment any other player has put in.
+        // Used by add_*_size_action and clamp_and_force_allin to translate
+        // a configured bet/raise delta into a TOTAL post-action commitment.
+        let prev_amount = max_other_committed;
+        // max_amount: the most this player can commit in TOTAL — capped at
+        // their physical chip total (starting_stack + initial_contribution).
+        let max_amount = max_player_total;
+        // min_amount: the minimum legal TOTAL commitment to participate.
+        // Must at least match the largest committer (but no more than this
+        // player can physically pay). A short-stack call is bounded above
+        // by max_player_total, which the clamp routine then forces all-in.
+        let min_amount = (player_committed + to_call.min(player_remaining))
+            .clamp(1, max_amount);
 
-        if player_stack <= 0 {
+        if player_remaining <= 0 {
             let mut child_info = info.clone_for_child();
             child_info.has_acted_this_round[player] = true;
-            child_info.prev_action = Action::Check;
             out.push((Action::Check, child_info));
             return;
         }
 
         let spr_after_call =
-            (player_stack - to_call) as f64 / (pot + to_call * (info.num_active() as i32)) as f64;
+            (player_remaining - to_call.min(player_remaining)) as f64
+                / (pot + to_call.min(player_remaining) * (info.num_active() as i32)) as f64;
 
         let num_remaining_streets = match info.board_state {
             BoardState::Flop => 3,
@@ -360,52 +591,71 @@ impl<'a> TreeBuilder<'a> {
 
         let mut actions = Vec::new();
 
-        if matches!(
-            info.prev_action,
-            Action::None | Action::Check | Action::Chance(_)
-        ) {
-            actions.push(Action::Check);
-
-            for &bet_size in &bet_options.bet {
-                self.add_bet_size_action(
-                    &bet_size,
-                    pot,
-                    0,
-                    max_amount,
-                    min_amount,
-                    num_remaining_streets,
-                    0,
-                    spr_after_call,
-                    &mut actions,
-                );
+        // PHASE 2 REWRITE: branch on per-street commit comparison (poker rules),
+        // not on prev_action (which is incorrect across asymmetric blinds and
+        // post-chance states with stale prev_action). The classifier helpers
+        // are independently derived from poker rules; see `compute_legal_action_class`.
+        //
+        // Note: the all-in-forced-check case is handled by the early return
+        // above at `player_remaining <= 0`. So here we only need to handle
+        // FacingBet and NotFacingBet.
+        let action_class = self.compute_legal_action_class(info, player);
+        match action_class {
+            ActionClass::AllInForcedCheck => {
+                // Unreachable in practice — handled by early-return above.
+                // Belt-and-suspenders: emit forced CHECK.
+                actions.push(Action::Check);
             }
+            ActionClass::NotFacingBet => {
+                // Open to act: legal = {CHECK, BET sizes, optional ALLIN if threshold}.
+                // FOLD is NOT legal (nothing to call).
+                actions.push(Action::Check);
 
-            if max_amount <= (pot as f64 * self.config.add_allin_threshold).round() as i32 {
-                actions.push(Action::AllIn(max_amount));
-            }
-        } else {
-            actions.push(Action::Fold);
-
-            actions.push(Action::Call);
-
-            if !info.allin_flag {
-                for &bet_size in &bet_options.raise {
-                    self.add_raise_size_action(
+                for &bet_size in &bet_options.bet {
+                    // Pass prev_amount (max other committed) so bet sizes produce
+                    // TOTAL post-action commitment (C1), not raw delta.
+                    self.add_bet_size_action(
                         &bet_size,
                         pot,
                         prev_amount,
                         max_amount,
                         min_amount,
                         num_remaining_streets,
-                        info.num_bets,
+                        0,
                         spr_after_call,
                         &mut actions,
                     );
                 }
 
-                let allin_threshold = pot as f64 * self.config.add_allin_threshold;
-                if max_amount <= prev_amount + allin_threshold.round() as i32 {
+                if max_amount <= (pot as f64 * self.config.add_allin_threshold).round() as i32 {
                     actions.push(Action::AllIn(max_amount));
+                }
+            }
+            ActionClass::FacingBet => {
+                // Owes chips this street: legal = {FOLD, CALL/ALLIN, raises if !allin_flag}.
+                // CHECK is NOT legal (cannot pass when owing).
+                actions.push(Action::Fold);
+                actions.push(Action::Call);
+
+                if !info.allin_flag {
+                    for &bet_size in &bet_options.raise {
+                        self.add_raise_size_action(
+                            &bet_size,
+                            pot,
+                            prev_amount,
+                            max_amount,
+                            min_amount,
+                            num_remaining_streets,
+                            info.num_bets,
+                            spr_after_call,
+                            &mut actions,
+                        );
+                    }
+
+                    let allin_threshold = pot as f64 * self.config.add_allin_threshold;
+                    if max_amount <= prev_amount + allin_threshold.round() as i32 {
+                        actions.push(Action::AllIn(max_amount));
+                    }
                 }
             }
         }
@@ -419,7 +669,6 @@ impl<'a> TreeBuilder<'a> {
 
         for action in actions {
             let mut child_info = info.clone_for_child();
-            child_info.prev_action = action;
 
             match action {
                 Action::Fold => {
@@ -431,10 +680,16 @@ impl<'a> TreeBuilder<'a> {
                     child_info.has_acted_this_round[player] = true;
                 }
                 Action::Call => {
-                    child_info.stacks[player] = max_other_stack;
+                    // C1: caller matches the largest committer, capped by
+                    // their own physical chip total (short-call all-in).
+                    child_info.stacks[player] = max_other_committed.min(max_player_total);
                     child_info.has_acted_this_round[player] = true;
                 }
                 Action::Bet(amount) | Action::Raise(amount) => {
+                    // C1: amount is the player's total commitment after the action.
+                    debug_assert!(amount <= max_player_total,
+                        "Bet/Raise amount {} exceeds player {}'s max committable {}",
+                        amount, player, max_player_total);
                     child_info.stacks[player] = amount;
                     child_info.num_bets += 1;
                     child_info.has_acted_this_round = vec![false; num_players];
@@ -442,6 +697,9 @@ impl<'a> TreeBuilder<'a> {
                     child_info.round_starter = player;
                 }
                 Action::AllIn(amount) => {
+                    debug_assert!(amount <= max_player_total,
+                        "AllIn amount {} exceeds player {}'s max committable {}",
+                        amount, player, max_player_total);
                     child_info.stacks[player] = amount;
                     child_info.allin_flag = true;
                     child_info.has_acted_this_round = vec![false; num_players];
@@ -459,7 +717,7 @@ impl<'a> TreeBuilder<'a> {
         &self,
         bet_size: &BetSize,
         pot: i32,
-        _prev_amount: i32,
+        prev_amount: i32,
         _max_amount: i32,
         _min_amount: i32,
         num_remaining_streets: i32,
@@ -467,6 +725,9 @@ impl<'a> TreeBuilder<'a> {
         spr_after_call: f64,
         actions: &mut Vec<Action>,
     ) {
+        // C1: action amount = TOTAL chips committed after the action
+        //   = prev_amount (max other committed = what we'd match by calling)
+        //   + delta (the additional chips this bet adds over the call amount)
         let compute_geometric = |n: i32, max_ratio: f64| -> i32 {
             let ratio =
                 ((2.0 * spr_after_call + 1.0).powf(1.0 / n as f64) - 1.0) / 2.0;
@@ -475,23 +736,27 @@ impl<'a> TreeBuilder<'a> {
 
         match bet_size {
             BetSize::PotRelative(ratio) => {
-                let amount = (pot as f64 * ratio).round() as i32;
-                actions.push(Action::Bet(amount));
+                let delta = (pot as f64 * ratio).round() as i32;
+                actions.push(Action::Bet(prev_amount + delta));
             }
             BetSize::PrevBetRelative(_) => {}
             BetSize::Additive(adder, _) => {
-                actions.push(Action::Bet(*adder));
+                actions.push(Action::Bet(prev_amount + *adder));
             }
             BetSize::Geometric(n, max_ratio) => {
                 let n = if *n == 0 { num_remaining_streets } else { *n };
-                let amount = compute_geometric(n, *max_ratio);
-                actions.push(Action::Bet(amount));
+                let delta = compute_geometric(n, *max_ratio);
+                actions.push(Action::Bet(prev_amount + delta));
             }
             BetSize::AllIn => {
-                actions.push(Action::AllIn(actions.iter().map(|a| match a {
-                    Action::Bet(v) | Action::Raise(v) | Action::AllIn(v) => *v,
-                    _ => 0,
-                }).max().unwrap_or(0)));
+                // amounts in actions[] are already C1 totals; max is the
+                // biggest existing total commitment (we want all-in to be at
+                // least as much as any other configured bet).
+                let max_total = actions.iter().filter_map(|a| match a {
+                    Action::Bet(v) | Action::Raise(v) | Action::AllIn(v) => Some(*v),
+                    _ => None,
+                }).max().unwrap_or(prev_amount);
+                actions.push(Action::AllIn(max_total));
             }
         }
     }
@@ -619,20 +884,27 @@ impl<'a> TreeBuilder<'a> {
 
         match action {
             Action::Bet(a) | Action::Raise(a) | Action::AllIn(a) => {
-                let prev_contrib = self.tree.get_contribution(parent_idx, player);
-                self.tree
-                    .set_contribution(child_idx, player, prev_contrib + (a - prev_contrib));
+                // C1: `a` is the total chips the player has committed after the
+                // action. With the physical-cap enforcement in compute_actions
+                // (max_amount = max_committable) and clamp_and_force_allin,
+                // `a` is already <= max_committable. Set directly.
+                let cap = self.max_committable(player as usize);
+                debug_assert!(*a <= cap,
+                    "post-action commitment {} exceeds player {}'s max {} (action {:?})",
+                    a, player, cap, action);
+                self.tree.set_contribution(child_idx, player, (*a).min(cap));
             }
             Action::Call => {
+                // C1: caller matches the largest committer, but capped by
+                // their own physical chip total (short-call all-in case).
                 let max_other = (0..self.config.num_players as usize)
                     .filter(|&p| p != player as usize && info.active[p])
                     .map(|p| info.stacks[p])
                     .max()
                     .unwrap_or(0);
-                let prev_contrib = self.tree.get_contribution(parent_idx, player);
-                let call_amount = max_other - info.stacks[player as usize];
+                let cap = self.max_committable(player as usize);
                 self.tree
-                    .set_contribution(child_idx, player, prev_contrib + call_amount.max(0));
+                    .set_contribution(child_idx, player, max_other.min(cap));
             }
             _ => {}
         }

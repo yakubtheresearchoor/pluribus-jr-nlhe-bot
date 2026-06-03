@@ -365,9 +365,13 @@ fn test_flop_metal_full_pipeline_parity() {
 
         // Iter 0: exact match — pipeline correctness gate
         if i == 0 {
-            assert!(flop_diff < 1e-3, "iter 0 flop regret diff {:.6} — pipeline bug", flop_diff);
-            assert!(turn_diff < 1e-3, "iter 0 turn regret diff {:.6} — pipeline bug", turn_diff);
-            assert!(river_diff < 1e-3, "iter 0 river regret diff {:.6} — pipeline bug", river_diff);
+            // #38 tightened from 1e-3 → 1e-5 after #37 fix anchored both CPU
+            // and GPU against the independent showdown oracle. Empirically
+            // diff = 0.0 at iter 0 (same arithmetic on both sides); 1e-5
+            // catches any future f32 ordering drift.
+            assert!(flop_diff < 1e-5, "iter 0 flop regret diff {:.6e} — pipeline bug", flop_diff);
+            assert!(turn_diff < 1e-5, "iter 0 turn regret diff {:.6e} — pipeline bug", turn_diff);
+            assert!(river_diff < 1e-5, "iter 0 river regret diff {:.6e} — pipeline bug", river_diff);
         }
 
         eprintln!("iter {:2}: regrets flop={:.6} turn={:.6} river={:.6}",

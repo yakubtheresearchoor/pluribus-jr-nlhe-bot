@@ -101,6 +101,21 @@ inline void sorted_sweep_showdown_vcfr_local(
 //   - hand_strength is computed inside (no caller dependency).
 //   - out[h] is filled for ALL h in [0, nh); caller is responsible for /nc.
 // ============================================================================
+
+// Forward declaration for the K >= 3 factored path (definition near end of
+// this file). Allows `multiway_brute_force_showdown` to call it before the
+// definition is reached in compilation order.
+inline float factored_share_for_level_thread(
+    int num_opp,
+    uint elig_opps,
+    uint tied_offset,
+    ulong h_m,
+    ushort h_str,
+    thread const float* reach,
+    const device uchar* hand_cards,
+    thread const ushort* hand_strength,
+    int nh);
+
 inline void multiway_brute_force_showdown(
     int nh, int np,
     int traverser,
@@ -417,8 +432,76 @@ inline void multiway_brute_force_showdown(
         return;
     }
 
-    // Fallback for np >= 4: leave at zero (not supported).
-    for (int h = 0; h < nh; h++) out[h] = 0.0f;
+    // ========================================================================
+    // K >= 3 (np >= 4): UNIFIED FACTORED CFV via the per-level recursive
+    // K-1 expansion with eligibility-restricted strength comparison.
+    //
+    // Replaces the previous K>=3 no-op. Same factored math validated at
+    // f32 noise floor across 18 gate tests including the 6-level side
+    // pot, three-way-shared-card configurations, and bug-class folded-
+    // high-contrib path. K=1 (HU) and K=2 (3-player) brute-force paths
+    // remain as-is in this commit (validated production); future cleanup
+    // unifies them.
+    // ========================================================================
+
+    for (int h = 0; h < nh; h++) {
+        ulong h_m = (1ul << hand_cards[h * 2]) | (1ul << hand_cards[h * 2 + 1]);
+        ushort h_str = hand_strength[h];
+
+        // TVRP(h) via factored share with all-ineligible (elig_opps=0, tied=0).
+        float tvrp = factored_share_for_level_thread(
+            num_opp, 0u, 0u, h_m, h_str,
+            opp_reach_local, hand_cards, hand_strength, nh);
+
+        // Walk levels: static cash + Case C shares.
+        float static_cash = 0.0f;
+        float case_c = 0.0f;
+        int prev_l = 0;
+        for (int li = 0; li < num_levels; li++) {
+            int lev = levels[li];
+            int pc = lev - prev_l;
+            if (pc == 0) { prev_l = lev; continue; }
+
+            int num_contrib = 0;
+            for (int p = 0; p < np; p++) {
+                if (contributions[p] >= lev) num_contrib++;
+            }
+            float pot_l = (float)(pc * num_contrib);
+            if (li == 0) pot_l += (float)starting_pot;
+
+            uint elig_opps = 0u;
+            int oi = 0;
+            for (int p = 0; p < np; p++) {
+                if (p == traverser) continue;
+                bool p_folded = (fold_mask & (uint16_t)(1u << p)) != 0;
+                bool p_elig = !p_folded && (contributions[p] >= lev);
+                if (p_elig) elig_opps |= (1u << oi);
+                oi++;
+            }
+            bool trav_elig = !traverser_folded && (c_t >= lev);
+            bool has_active_elig = (elig_opps != 0);
+
+            if (!has_active_elig && trav_elig) {
+                static_cash += pot_l;
+            } else if (!has_active_elig && !trav_elig) {
+                if (contributions[traverser] >= lev) {
+                    float trav_contrib = (float)pc;
+                    if (li == 0) trav_contrib += (float)starting_pot / (float)np;
+                    static_cash += trav_contrib;
+                }
+            } else if (!trav_elig) {
+                // Case D: traverser ineligible at contested level — no cash.
+            } else {
+                float share = factored_share_for_level_thread(
+                    num_opp, elig_opps, 0u, h_m, h_str,
+                    opp_reach_local, hand_cards, hand_strength, nh);
+                case_c += pot_l * share;
+            }
+            prev_l = lev;
+        }
+
+        out[h] = (static_cash - traverser_stake) * tvrp + case_c;
+    }
 }
 
 // ============================================================================
@@ -1299,6 +1382,12 @@ struct BatchedParams {
     float num_combinations;
     int32_t regret_outcome_stride;  // stride between outcomes in regrets buffer
     int32_t cum_outcome_stride;     // stride between outcomes in cum_strategy buffer
+    // ─── Negative-regret pruning (Phase 1.A, Option A) ───
+    int32_t pruning_enabled;        // 0 = off (default), nonzero = on
+    float pruning_threshold;        // regret < this & carve-outs ok → skip update
+    int32_t iteration;              // for stochastic re-enable
+    int32_t pruning_stride;         // re-enable every Kth iter (don't prune that iter)
+    int32_t board_state;            // 0=flop, 1=turn, 2=river (never prune river)
 };
 
 kernel void vcfr_bottom_up_batched(
@@ -1865,12 +1954,41 @@ kernel void vcfr_bottom_up_batched(
         int cum_base = outcome * params.cum_outcome_stride + int(infoset_id) * stride;
         for (int a = 0; a < na; a++) {
             uint child = children[node.children_start + a];
+
+            // ─── Negative-regret pruning carve-outs (Phase 1.A, per action) ───
+            // Apply skip only when ALL conditions hold:
+            //   1. pruning_enabled is on
+            //   2. NOT on a re-enable iteration (every Kth iter we traverse all)
+            //   3. NOT on the last street (river); we always update river regrets
+            //   4. action does NOT lead directly to a terminal node
+            // The per-hand skip on regret < threshold happens inside the inner
+            // loop so we get a fine-grained measurement of prunable fraction.
+            bool re_enable_iter = (params.pruning_stride > 0)
+                && (params.iteration % params.pruning_stride == 0);
+            bool action_leads_to_terminal = (nodes[child].node_type == NODE_TYPE_TERMINAL);
+            bool can_prune_this_action = (params.pruning_enabled != 0)
+                && !re_enable_iter
+                && (params.board_state != 2)
+                && !action_leads_to_terminal;
+
             for (int h = 0; h < nh; h++) {
                 float inst_regret = cfv_o[int(child) * nh + h] - cfv_avg[h];
                 int ridx = regret_base + a * nh + h;
 
                 // Inline DCFR discount (matches CPU bottom_up_zone)
                 float old_r = regrets[ridx];
+
+                // Per-(action, hand) pruning skip: leave regret unchanged.
+                // Note Option A skips only the regret-update arithmetic; the
+                // CFV computation (cfv_o reads above) already happened in the
+                // level below. Option B would skip subtree traversal entirely.
+                if (can_prune_this_action && old_r < params.pruning_threshold) {
+                    // Skip this regret update (per Pluribus negative-regret pruning).
+                    // Cumulative strategy update also skipped — under reset-on-recovery
+                    // semantics, the pruned-action strategy stays at last known value.
+                    continue;
+                }
+
                 float coef = (old_r >= 0.0f) ? params.alpha_t : params.beta_t;
                 float new_r = coef * old_r + inst_regret;
                 if (new_r < params.regret_floor) new_r = params.regret_floor;
@@ -2177,4 +2295,1082 @@ kernel void debug_brute_force_showdown(
     );
 
     for (int h = 0; h < nh; h++) output[h] = local_out[h];
+}
+
+// ============================================================================
+// K=5 brute-force showdown inner-loop MICROBENCHMARK
+//
+// Purpose: measure the achievable GPU throughput on the K=5 multiway
+// showdown inner loop, decoupled from the full CFR solver. The 17-year
+// projection in the bake-off rested on assuming the GPU stays at the
+// 287 MFLOPS measured on the 3p K=2 path, which is overhead-dominated
+// (tiny inner loop). The K=5 inner loop is two orders of magnitude
+// more compute-dense per memory access, so it should run closer to peak;
+// THIS BENCHMARK MEASURES THAT INSTEAD OF ASSUMING IT.
+//
+// Dispatch shape: total threads = (batches × nh). Each thread runs one
+// h_player slot's full nh^K brute-force enumeration (50^5 ≈ 312M traversals
+// per thread, of which ~217M are valid after card-conflict pruning).
+//
+// Card-mask uses ulong (64-bit) since 52 cards exceeds 32 bits.
+// ============================================================================
+kernel void k5_brute_force_microbench(
+    device const float*    reach           [[buffer(0)]],   // [num_opp * nh]
+    device const uchar*    hand_cards      [[buffer(1)]],   // [nh * 2]
+    device float*          per_thread_out  [[buffer(2)]],   // [batches * nh]
+    constant int&          nh              [[buffer(3)]],
+    constant int&          batches         [[buffer(4)]],
+    uint3                  tid             [[thread_position_in_grid]]
+) {
+    int batch_id = tid.x;
+    int h = tid.y;
+
+    if (batch_id >= batches || h >= nh) return;
+
+    ulong h_m = (1ul << hand_cards[h * 2]) | (1ul << hand_cards[h * 2 + 1]);
+
+    float accum = 0.0f;
+
+    // K=5 brute-force enumeration: 5 nested loops over opponent hands,
+    // each level rejecting conflicts via the running card mask.
+    int num_opp = 5;
+    int o0 = 0 * nh, o1 = 1 * nh, o2 = 2 * nh, o3 = 3 * nh, o4 = 4 * nh;
+
+    for (int g0 = 0; g0 < nh; g0++) {
+        ulong g0_m = (1ul << hand_cards[g0 * 2]) | (1ul << hand_cards[g0 * 2 + 1]);
+        if ((g0_m & h_m) != 0) continue;
+        float r0 = reach[o0 + g0];
+        if (r0 == 0.0f) continue;
+        ulong m01 = h_m | g0_m;
+
+        for (int g1 = 0; g1 < nh; g1++) {
+            ulong g1_m = (1ul << hand_cards[g1 * 2]) | (1ul << hand_cards[g1 * 2 + 1]);
+            if ((g1_m & m01) != 0) continue;
+            float r1 = reach[o1 + g1];
+            if (r1 == 0.0f) continue;
+            float p01 = r0 * r1;
+            ulong m12 = m01 | g1_m;
+
+            for (int g2 = 0; g2 < nh; g2++) {
+                ulong g2_m = (1ul << hand_cards[g2 * 2]) | (1ul << hand_cards[g2 * 2 + 1]);
+                if ((g2_m & m12) != 0) continue;
+                float r2 = reach[o2 + g2];
+                if (r2 == 0.0f) continue;
+                float p012 = p01 * r2;
+                ulong m23 = m12 | g2_m;
+
+                for (int g3 = 0; g3 < nh; g3++) {
+                    ulong g3_m = (1ul << hand_cards[g3 * 2]) | (1ul << hand_cards[g3 * 2 + 1]);
+                    if ((g3_m & m23) != 0) continue;
+                    float r3 = reach[o3 + g3];
+                    if (r3 == 0.0f) continue;
+                    float p0123 = p012 * r3;
+                    ulong m34 = m23 | g3_m;
+
+                    for (int g4 = 0; g4 < nh; g4++) {
+                        ulong g4_m = (1ul << hand_cards[g4 * 2]) | (1ul << hand_cards[g4 * 2 + 1]);
+                        if ((g4_m & m34) != 0) continue;
+                        float r4 = reach[o4 + g4];
+                        if (r4 == 0.0f) continue;
+                        accum += p0123 * r4;  // FMA: net for K=5 brute force scenario
+                    }
+                }
+            }
+        }
+    }
+
+    // Use batch_id to vary the write slot so the GPU can't dead-code-eliminate.
+    per_thread_out[batch_id * nh + h] = accum;
+    (void)num_opp;
+}
+
+// ============================================================================
+// K=5 factored CFV "share" inner-loop MICROBENCHMARK
+//
+// Implements the recursive K-1 expansion for K=5 share (the per-scenario
+// "1/(1+tied)" weighted reach product, weighted by validity-and-strength).
+// Recursion: 3 outer loops over g_0, g_1, g_2 with B/T category gating
+// (skip g where s > h_str), then K=2 PAIR-decomposition base case for
+// (g_3, g_4) using extended-mask masses recomputed on the fly.
+//
+// Per-thread output is the share (= the part of CFV inside `pot · share`,
+// pre-traverser-stake subtraction). Validated against CPU factored_share
+// at f32 precision for correctness, then dispatched at production nh=50
+// scale for throughput measurement against the 86 GFLOPS brute-force
+// baseline.
+//
+// Thread-local arrays (4 × 52 × float = 832 B per thread) — Metal will
+// place these in fast on-chip memory; per-batch grid sizing chosen to
+// keep total occupancy within budget.
+// ============================================================================
+kernel void k5_factored_share_microbench(
+    device const float*    reach           [[buffer(0)]],   // [5 * nh]
+    device const uchar*    hand_cards      [[buffer(1)]],   // [nh * 2]
+    device const ushort*   hand_strength   [[buffer(2)]],   // [nh]
+    device float*          share_out       [[buffer(3)]],   // [batches * nh]
+    constant int&          nh              [[buffer(4)]],
+    constant int&          batches         [[buffer(5)]],
+    uint3                  tid             [[thread_position_in_grid]]
+) {
+    int batch_id = tid.x;
+    int h = tid.y;
+    if (batch_id >= batches || h >= nh) return;
+
+    ulong h_m = (1ul << hand_cards[h * 2]) | (1ul << hand_cards[h * 2 + 1]);
+    ushort h_str = hand_strength[h];
+
+    int o0 = 0 * nh, o1 = 1 * nh, o2 = 2 * nh, o3 = 3 * nh, o4 = 4 * nh;
+
+    float share = 0.0f;
+
+    // Outer K-3 levels: enumerate g_0, g_1, g_2.
+    for (int g0 = 0; g0 < nh; g0++) {
+        ulong g0_m = (1ul << hand_cards[g0 * 2]) | (1ul << hand_cards[g0 * 2 + 1]);
+        if ((g0_m & h_m) != 0) continue;
+        float r0 = reach[o0 + g0];
+        if (r0 == 0.0f) continue;
+        ushort s0 = hand_strength[g0];
+        if (s0 > h_str) continue;
+        int t0 = (s0 == h_str) ? 1 : 0;
+        ulong m1 = h_m | g0_m;
+
+        for (int g1 = 0; g1 < nh; g1++) {
+            ulong g1_m = (1ul << hand_cards[g1 * 2]) | (1ul << hand_cards[g1 * 2 + 1]);
+            if ((g1_m & m1) != 0) continue;
+            float r1 = reach[o1 + g1];
+            if (r1 == 0.0f) continue;
+            ushort s1 = hand_strength[g1];
+            if (s1 > h_str) continue;
+            int t01 = t0 + ((s1 == h_str) ? 1 : 0);
+            float p01 = r0 * r1;
+            ulong m2 = m1 | g1_m;
+
+            for (int g2 = 0; g2 < nh; g2++) {
+                ulong g2_m = (1ul << hand_cards[g2 * 2]) | (1ul << hand_cards[g2 * 2 + 1]);
+                if ((g2_m & m2) != 0) continue;
+                float r2 = reach[o2 + g2];
+                if (r2 == 0.0f) continue;
+                ushort s2 = hand_strength[g2];
+                if (s2 > h_str) continue;
+                int t012 = t01 + ((s2 == h_str) ? 1 : 0);
+                float p012 = p01 * r2;
+                ulong m3 = m2 | g2_m;
+
+                // K=2 PAIR base case for (opp 3, opp 4) at extended mask m3.
+                // Recompute B/T totals + per-card + same-hand at extended mask.
+                float ba = 0.0f, ta = 0.0f, bb_tot = 0.0f, tb_tot = 0.0f;
+                float ba_pc[52]; float ta_pc[52];
+                float bb_pc[52]; float tb_pc[52];
+                for (int c = 0; c < 52; c++) {
+                    ba_pc[c] = 0.0f; ta_pc[c] = 0.0f;
+                    bb_pc[c] = 0.0f; tb_pc[c] = 0.0f;
+                }
+                float h_bb = 0.0f, h_tt = 0.0f;
+
+                for (int g = 0; g < nh; g++) {
+                    ulong g_m = (1ul << hand_cards[g * 2]) | (1ul << hand_cards[g * 2 + 1]);
+                    if ((g_m & m3) != 0) continue;
+                    float ra = reach[o3 + g];
+                    float rb = reach[o4 + g];
+                    if (ra == 0.0f && rb == 0.0f) continue;
+                    ushort s = hand_strength[g];
+                    int gc1 = hand_cards[g * 2];
+                    int gc2 = hand_cards[g * 2 + 1];
+                    if (s < h_str) {
+                        ba += ra; ba_pc[gc1] += ra; ba_pc[gc2] += ra;
+                        bb_tot += rb; bb_pc[gc1] += rb; bb_pc[gc2] += rb;
+                        h_bb += ra * rb;
+                    } else if (s == h_str) {
+                        ta += ra; ta_pc[gc1] += ra; ta_pc[gc2] += ra;
+                        tb_tot += rb; tb_pc[gc1] += rb; tb_pc[gc2] += rb;
+                        h_tt += ra * rb;
+                    }
+                }
+
+                // Edge sums over c ∉ extended dead mask.
+                float bb_edge = 0.0f, bt_edge = 0.0f, tb_edge = 0.0f, tt_edge = 0.0f;
+                for (int c = 0; c < 52; c++) {
+                    if ((m3 & (1ul << c)) != 0) continue;
+                    bb_edge += ba_pc[c] * bb_pc[c];
+                    bt_edge += ba_pc[c] * tb_pc[c];
+                    tb_edge += ta_pc[c] * bb_pc[c];
+                    tt_edge += ta_pc[c] * tb_pc[c];
+                }
+
+                // PAIR with same-hand corrections only for BB and TT.
+                float pair_bb = ba * bb_tot - bb_edge + h_bb;
+                float pair_bt = ba * tb_tot - bt_edge;
+                float pair_tb = ta * bb_tot - tb_edge;
+                float pair_tt = ta * tb_tot - tt_edge + h_tt;
+
+                float tf = (float)t012;
+                float pair_share =
+                    pair_bb / (1.0f + tf) +
+                    pair_bt / (2.0f + tf) +
+                    pair_tb / (2.0f + tf) +
+                    pair_tt / (3.0f + tf);
+
+                share += p012 * pair_share;
+            }
+        }
+    }
+
+    share_out[batch_id * nh + h] = share;
+}
+
+// ============================================================================
+// K=3 per-level factored share kernel — for one Case C level with given
+// eligibility bitmask. Mirrors CPU `factored_share_at_level` at K=3 with
+// the K=2 PAIR-decomposition base case handling all four eligibility
+// sub-cases (E,E), (E,I), (I,E), (I,I).
+//
+// Eligibility: bit `oi` in `elig_opps` set → opp at slot `oi` is eligible
+// at this level (use B/T strength filter, skip S). Cleared → ineligible
+// (any strength, contribute to reach product only).
+// ============================================================================
+kernel void k3_per_level_share_microbench(
+    device const float*    reach          [[buffer(0)]],   // [3 * nh]
+    device const uchar*    hand_cards     [[buffer(1)]],   // [nh * 2]
+    device const ushort*   hand_strength  [[buffer(2)]],   // [nh]
+    device float*          share_out      [[buffer(3)]],   // [batches * nh]
+    constant int&          nh             [[buffer(4)]],
+    constant int&          batches        [[buffer(5)]],
+    constant uint&         elig_opps      [[buffer(6)]],   // 3 bits
+    constant uint&         tied_offset_in [[buffer(7)]],   // 0 at recursion start
+    uint3                  tid            [[thread_position_in_grid]]
+) {
+    int batch_id = tid.x;
+    int h = tid.y;
+    if (batch_id >= batches || h >= nh) return;
+
+    ulong h_m = (1ul << hand_cards[h * 2]) | (1ul << hand_cards[h * 2 + 1]);
+    ushort h_str = hand_strength[h];
+
+    bool e0 = (elig_opps >> 0) & 1u;
+    bool e1 = (elig_opps >> 1) & 1u;
+    bool e2 = (elig_opps >> 2) & 1u;
+
+    int o0 = 0 * nh, o1 = 1 * nh, o2 = 2 * nh;
+    float share = 0.0f;
+
+    // Outer loop over g_0.
+    for (int g0 = 0; g0 < nh; g0++) {
+        ulong g0_m = (1ul << hand_cards[g0 * 2]) | (1ul << hand_cards[g0 * 2 + 1]);
+        if ((g0_m & h_m) != 0) continue;
+        float r0 = reach[o0 + g0];
+        if (r0 == 0.0f) continue;
+        ushort s0 = hand_strength[g0];
+
+        uint t0;
+        if (e0) {
+            if (s0 > h_str) continue;
+            t0 = (s0 == h_str) ? (tied_offset_in + 1) : tied_offset_in;
+        } else {
+            t0 = tied_offset_in;
+        }
+
+        ulong m1 = h_m | g0_m;
+
+        // K=2 base case: compute B/T/S masses for opps 1, 2 at extended mask m1.
+        float b1 = 0.0f, t1 = 0.0f, ss1 = 0.0f;
+        float b2 = 0.0f, t2 = 0.0f, ss2 = 0.0f;
+        float b1_pc[52], t1_pc[52], s1_pc[52];
+        float b2_pc[52], t2_pc[52], s2_pc[52];
+        for (int c = 0; c < 52; c++) {
+            b1_pc[c] = 0.0f; t1_pc[c] = 0.0f; s1_pc[c] = 0.0f;
+            b2_pc[c] = 0.0f; t2_pc[c] = 0.0f; s2_pc[c] = 0.0f;
+        }
+        float h_bb = 0.0f, h_tt = 0.0f, h_ss = 0.0f;
+
+        for (int g = 0; g < nh; g++) {
+            ulong g_m = (1ul << hand_cards[g * 2]) | (1ul << hand_cards[g * 2 + 1]);
+            if ((g_m & m1) != 0) continue;
+            float r1 = reach[o1 + g];
+            float r2 = reach[o2 + g];
+            if (r1 == 0.0f && r2 == 0.0f) continue;
+            ushort s = hand_strength[g];
+            int gc1 = hand_cards[g * 2];
+            int gc2 = hand_cards[g * 2 + 1];
+            if (s < h_str) {
+                b1 += r1; b1_pc[gc1] += r1; b1_pc[gc2] += r1;
+                b2 += r2; b2_pc[gc1] += r2; b2_pc[gc2] += r2;
+                h_bb += r1 * r2;
+            } else if (s == h_str) {
+                t1 += r1; t1_pc[gc1] += r1; t1_pc[gc2] += r1;
+                t2 += r2; t2_pc[gc1] += r2; t2_pc[gc2] += r2;
+                h_tt += r1 * r2;
+            } else {
+                ss1 += r1; s1_pc[gc1] += r1; s1_pc[gc2] += r1;
+                ss2 += r2; s2_pc[gc1] += r2; s2_pc[gc2] += r2;
+                h_ss += r1 * r2;
+            }
+        }
+        float r1_tot = b1 + t1 + ss1;
+        float r2_tot = b2 + t2 + ss2;
+        float h_tot = h_bb + h_tt + h_ss;
+
+        // Edge sums over c ∉ extended mask.
+        float ebb = 0.0f, ebt = 0.0f, etb = 0.0f, ett = 0.0f;
+        float ebe = 0.0f, ete = 0.0f, eeb = 0.0f, eet = 0.0f, eee = 0.0f;
+        for (int c = 0; c < 52; c++) {
+            if ((m1 & (1ul << c)) != 0) continue;
+            float b1c = b1_pc[c], t1c = t1_pc[c], s1c = s1_pc[c];
+            float b2c = b2_pc[c], t2c = t2_pc[c], s2c = s2_pc[c];
+            float r1c = b1c + t1c + s1c;
+            float r2c = b2c + t2c + s2c;
+            ebb += b1c * b2c;
+            ebt += b1c * t2c;
+            etb += t1c * b2c;
+            ett += t1c * t2c;
+            ebe += b1c * r2c;
+            ete += t1c * r2c;
+            eeb += r1c * b2c;
+            eet += r1c * t2c;
+            eee += r1c * r2c;
+        }
+
+        // PAIR formulas with eligibility-determined same-hand corrections.
+        float pair_bb = b1 * b2 - ebb + h_bb;
+        float pair_bt = b1 * t2 - ebt;
+        float pair_tb = t1 * b2 - etb;
+        float pair_tt = t1 * t2 - ett + h_tt;
+        float pair_be = b1 * r2_tot - ebe + h_bb;
+        float pair_te = t1 * r2_tot - ete + h_tt;
+        float pair_eb = r1_tot * b2 - eeb + h_bb;
+        float pair_et = r1_tot * t2 - eet + h_tt;
+        float pair_ee = r1_tot * r2_tot - eee + h_tot;
+
+        float tf = (float)t0;
+        float inner;
+        if (e1 && e2) {
+            inner = pair_bb / (1.0f + tf)
+                  + pair_bt / (2.0f + tf)
+                  + pair_tb / (2.0f + tf)
+                  + pair_tt / (3.0f + tf);
+        } else if (e1 && !e2) {
+            inner = pair_be / (1.0f + tf) + pair_te / (2.0f + tf);
+        } else if (!e1 && e2) {
+            inner = pair_eb / (1.0f + tf) + pair_et / (2.0f + tf);
+        } else {
+            inner = pair_ee / (1.0f + tf);
+        }
+
+        share += r0 * inner;
+    }
+
+    share_out[batch_id * nh + h] = share;
+}
+
+// ============================================================================
+// K=5 per-level factored share kernel — extends the K=3 version with 2
+// more outer loops (g_1, g_2) and per-opp eligibility flags from bits 0..4.
+// Same K=2 base case as K=3 for opps 3, 4.
+//
+// elig_opps bitmask: bit i set ↔ opp at slot i is eligible at this level.
+// ============================================================================
+kernel void k5_per_level_share_microbench(
+    device const float*    reach          [[buffer(0)]],   // [5 * nh]
+    device const uchar*    hand_cards     [[buffer(1)]],
+    device const ushort*   hand_strength  [[buffer(2)]],
+    device float*          share_out      [[buffer(3)]],
+    constant int&          nh             [[buffer(4)]],
+    constant int&          batches        [[buffer(5)]],
+    constant uint&         elig_opps      [[buffer(6)]],   // bits 0..4
+    constant uint&         tied_offset_in [[buffer(7)]],
+    uint3                  tid            [[thread_position_in_grid]]
+) {
+    int batch_id = tid.x;
+    int h = tid.y;
+    if (batch_id >= batches || h >= nh) return;
+
+    ulong h_m = (1ul << hand_cards[h * 2]) | (1ul << hand_cards[h * 2 + 1]);
+    ushort h_str = hand_strength[h];
+
+    bool e0 = (elig_opps >> 0) & 1u;
+    bool e1 = (elig_opps >> 1) & 1u;
+    bool e2 = (elig_opps >> 2) & 1u;
+    bool e3 = (elig_opps >> 3) & 1u;
+    bool e4 = (elig_opps >> 4) & 1u;
+
+    int o0 = 0 * nh, o1 = 1 * nh, o2 = 2 * nh, o3 = 3 * nh, o4 = 4 * nh;
+    float share = 0.0f;
+
+    for (int g0 = 0; g0 < nh; g0++) {
+        ulong g0_m = (1ul << hand_cards[g0 * 2]) | (1ul << hand_cards[g0 * 2 + 1]);
+        if ((g0_m & h_m) != 0) continue;
+        float r0 = reach[o0 + g0];
+        if (r0 == 0.0f) continue;
+        ushort s0 = hand_strength[g0];
+        uint t0;
+        if (e0) {
+            if (s0 > h_str) continue;
+            t0 = (s0 == h_str) ? (tied_offset_in + 1) : tied_offset_in;
+        } else {
+            t0 = tied_offset_in;
+        }
+        ulong m1 = h_m | g0_m;
+
+        for (int g1 = 0; g1 < nh; g1++) {
+            ulong g1_m = (1ul << hand_cards[g1 * 2]) | (1ul << hand_cards[g1 * 2 + 1]);
+            if ((g1_m & m1) != 0) continue;
+            float r1 = reach[o1 + g1];
+            if (r1 == 0.0f) continue;
+            ushort s1 = hand_strength[g1];
+            uint t01;
+            if (e1) {
+                if (s1 > h_str) continue;
+                t01 = (s1 == h_str) ? (t0 + 1) : t0;
+            } else {
+                t01 = t0;
+            }
+            float p01 = r0 * r1;
+            ulong m2 = m1 | g1_m;
+
+            for (int g2 = 0; g2 < nh; g2++) {
+                ulong g2_m = (1ul << hand_cards[g2 * 2]) | (1ul << hand_cards[g2 * 2 + 1]);
+                if ((g2_m & m2) != 0) continue;
+                float r2 = reach[o2 + g2];
+                if (r2 == 0.0f) continue;
+                ushort s2 = hand_strength[g2];
+                uint t012;
+                if (e2) {
+                    if (s2 > h_str) continue;
+                    t012 = (s2 == h_str) ? (t01 + 1) : t01;
+                } else {
+                    t012 = t01;
+                }
+                float p012 = p01 * r2;
+                ulong m3 = m2 | g2_m;
+
+                // K=2 base case for opps 3, 4 at extended mask m3.
+                float b1 = 0.0f, t1 = 0.0f, ss1 = 0.0f;
+                float b2 = 0.0f, t2 = 0.0f, ss2 = 0.0f;
+                float b1_pc[52], t1_pc[52], s1_pc[52];
+                float b2_pc[52], t2_pc[52], s2_pc[52];
+                for (int c = 0; c < 52; c++) {
+                    b1_pc[c]=0.0f; t1_pc[c]=0.0f; s1_pc[c]=0.0f;
+                    b2_pc[c]=0.0f; t2_pc[c]=0.0f; s2_pc[c]=0.0f;
+                }
+                float h_bb=0.0f, h_tt=0.0f, h_ss=0.0f;
+
+                for (int g = 0; g < nh; g++) {
+                    ulong g_m = (1ul << hand_cards[g * 2]) | (1ul << hand_cards[g * 2 + 1]);
+                    if ((g_m & m3) != 0) continue;
+                    float rA = reach[o3 + g];
+                    float rB = reach[o4 + g];
+                    if (rA == 0.0f && rB == 0.0f) continue;
+                    ushort s = hand_strength[g];
+                    int gc1 = hand_cards[g * 2];
+                    int gc2 = hand_cards[g * 2 + 1];
+                    if (s < h_str) {
+                        b1 += rA; b1_pc[gc1] += rA; b1_pc[gc2] += rA;
+                        b2 += rB; b2_pc[gc1] += rB; b2_pc[gc2] += rB;
+                        h_bb += rA * rB;
+                    } else if (s == h_str) {
+                        t1 += rA; t1_pc[gc1] += rA; t1_pc[gc2] += rA;
+                        t2 += rB; t2_pc[gc1] += rB; t2_pc[gc2] += rB;
+                        h_tt += rA * rB;
+                    } else {
+                        ss1 += rA; s1_pc[gc1] += rA; s1_pc[gc2] += rA;
+                        ss2 += rB; s2_pc[gc1] += rB; s2_pc[gc2] += rB;
+                        h_ss += rA * rB;
+                    }
+                }
+                float r1_tot = b1 + t1 + ss1;
+                float r2_tot = b2 + t2 + ss2;
+                float h_tot = h_bb + h_tt + h_ss;
+
+                float ebb=0.0f, ebt=0.0f, etb=0.0f, ett=0.0f;
+                float ebe=0.0f, ete=0.0f, eeb=0.0f, eet=0.0f, eee=0.0f;
+                for (int c = 0; c < 52; c++) {
+                    if ((m3 & (1ul << c)) != 0) continue;
+                    float b1c=b1_pc[c], t1c=t1_pc[c], s1c=s1_pc[c];
+                    float b2c=b2_pc[c], t2c=t2_pc[c], s2c=s2_pc[c];
+                    float r1c = b1c + t1c + s1c;
+                    float r2c = b2c + t2c + s2c;
+                    ebb += b1c * b2c;
+                    ebt += b1c * t2c;
+                    etb += t1c * b2c;
+                    ett += t1c * t2c;
+                    ebe += b1c * r2c;
+                    ete += t1c * r2c;
+                    eeb += r1c * b2c;
+                    eet += r1c * t2c;
+                    eee += r1c * r2c;
+                }
+
+                float pair_bb = b1 * b2 - ebb + h_bb;
+                float pair_bt = b1 * t2 - ebt;
+                float pair_tb = t1 * b2 - etb;
+                float pair_tt = t1 * t2 - ett + h_tt;
+                float pair_be = b1 * r2_tot - ebe + h_bb;
+                float pair_te = t1 * r2_tot - ete + h_tt;
+                float pair_eb = r1_tot * b2 - eeb + h_bb;
+                float pair_et = r1_tot * t2 - eet + h_tt;
+                float pair_ee = r1_tot * r2_tot - eee + h_tot;
+
+                float tf = (float)t012;
+                float inner;
+                if (e3 && e4) {
+                    inner = pair_bb / (1.0f + tf)
+                          + pair_bt / (2.0f + tf)
+                          + pair_tb / (2.0f + tf)
+                          + pair_tt / (3.0f + tf);
+                } else if (e3 && !e4) {
+                    inner = pair_be / (1.0f + tf) + pair_te / (2.0f + tf);
+                } else if (!e3 && e4) {
+                    inner = pair_eb / (1.0f + tf) + pair_et / (2.0f + tf);
+                } else {
+                    inner = pair_ee / (1.0f + tf);
+                }
+                share += p012 * inner;
+            }
+        }
+    }
+
+    share_out[batch_id * nh + h] = share;
+}
+
+// ============================================================================
+// UNIFIED N-player factored showdown kernel (N = 2 to 6).
+//
+// One generic Metal kernel for any opponent count K = num_opp ∈ {1, 2, 3, 4, 5},
+// replacing the fragmented per-K kernels. Internal structure:
+//
+//   1. Walk levels of the terminal. For each level:
+//      - Case A (no eligible active, traverser eligible OR contributed):
+//        add static cash (the slice returned).
+//      - Case D (active opps eligible, traverser ineligible): skip.
+//      - Case C (active eligible AND traverser eligible): compute factored
+//        share via the per-level recursive K-1 expansion with eligibility-
+//        determined strength filtering.
+//   2. Compose: cfv = (static_cash − stake) × TVRP + Σ_C pot_l × share_l
+//      where TVRP = factored share with elig_opps = 0.
+//
+// Recursion: up to 3 outer loops (max K = 5 → outer over g_0, g_1, g_2) +
+// K=2 PAIR-decomposition base case for opps (K-2, K-1). For K = 1, use
+// K=1 base directly. For K = 2, use K=2 base directly.
+//
+// Eligibility-aware: bit i of elig_opps = 1 → opp at slot i eligible at
+// this level (B/T strength filter, skip S). Bit cleared → ineligible
+// (any strength, contribute to reach product only).
+//
+// Numerical discipline: f32 throughout for now. f64 inner combiner is
+// out-of-scope for the first cut. Same operation order as CPU factored:
+// inner accumulators ordered (b_a, t_a, s_a) and edge sums computed in
+// (bb, bt, tb, tt, be, te, eb, et, ee) order. CPU and GPU must walk in
+// the same order so accumulator round-off matches; pinned here:
+//   - Outer loop order: g_0, g_1, g_2 ascending (matches CPU `opp_indices`)
+//   - K=2 base: scan hands ascending, compute pc edge sums (c ascending),
+//     then PAIR formulas in (BB, BT, TB, TT, BE, TE, EB, ET, EE) order,
+//     and share dispatch by (ea, eb).
+// ============================================================================
+
+struct LevelInfoMetal {
+    float pot_l;
+    uint  elig_opps;
+    uint  trav_elig;
+    float trav_contrib_at_lev;
+};
+
+// K=1 base case: enumerate one opponent.
+inline float factored_share_k1(
+    int oi,
+    bool elig,
+    ulong dead_mask,
+    ushort h_str,
+    uint tied_offset,
+    device const float* reach,
+    device const uchar* hand_cards,
+    device const ushort* hand_strength,
+    int nh
+) {
+    float share = 0.0f;
+    int o_off = oi * nh;
+    for (int g = 0; g < nh; g++) {
+        ulong g_m = (1ul << hand_cards[g * 2]) | (1ul << hand_cards[g * 2 + 1]);
+        if ((g_m & dead_mask) != 0) continue;
+        float r = reach[o_off + g];
+        if (r == 0.0f) continue;
+        ushort s = hand_strength[g];
+        if (elig) {
+            if (s > h_str) continue;
+            uint t = (s == h_str) ? (tied_offset + 1) : tied_offset;
+            share += r / (1.0f + (float)t);
+        } else {
+            share += r / (1.0f + (float)tied_offset);
+        }
+    }
+    return share;
+}
+
+// K=2 base case: 4 PAIR formulas dispatched by (ea, eb) eligibility.
+inline float factored_share_k2(
+    int oa, int ob,
+    bool ea, bool eb,
+    ulong dead_mask,
+    ushort h_str,
+    uint tied_offset,
+    device const float* reach,
+    device const uchar* hand_cards,
+    device const ushort* hand_strength,
+    int nh
+) {
+    int oa_off = oa * nh;
+    int ob_off = ob * nh;
+
+    float b_a = 0.0f, t_a = 0.0f, s_a = 0.0f;
+    float b_b = 0.0f, t_b = 0.0f, s_b = 0.0f;
+    float b_a_pc[52], t_a_pc[52], s_a_pc[52];
+    float b_b_pc[52], t_b_pc[52], s_b_pc[52];
+    for (int c = 0; c < 52; c++) {
+        b_a_pc[c] = 0.0f; t_a_pc[c] = 0.0f; s_a_pc[c] = 0.0f;
+        b_b_pc[c] = 0.0f; t_b_pc[c] = 0.0f; s_b_pc[c] = 0.0f;
+    }
+    float h_bb = 0.0f, h_tt = 0.0f, h_ss = 0.0f;
+
+    for (int g = 0; g < nh; g++) {
+        ulong g_m = (1ul << hand_cards[g * 2]) | (1ul << hand_cards[g * 2 + 1]);
+        if ((g_m & dead_mask) != 0) continue;
+        float r_a = reach[oa_off + g];
+        float r_b = reach[ob_off + g];
+        if (r_a == 0.0f && r_b == 0.0f) continue;
+        ushort s = hand_strength[g];
+        int gc1 = hand_cards[g * 2];
+        int gc2 = hand_cards[g * 2 + 1];
+        if (s < h_str) {
+            b_a += r_a; b_a_pc[gc1] += r_a; b_a_pc[gc2] += r_a;
+            b_b += r_b; b_b_pc[gc1] += r_b; b_b_pc[gc2] += r_b;
+            h_bb += r_a * r_b;
+        } else if (s == h_str) {
+            t_a += r_a; t_a_pc[gc1] += r_a; t_a_pc[gc2] += r_a;
+            t_b += r_b; t_b_pc[gc1] += r_b; t_b_pc[gc2] += r_b;
+            h_tt += r_a * r_b;
+        } else {
+            s_a += r_a; s_a_pc[gc1] += r_a; s_a_pc[gc2] += r_a;
+            s_b += r_b; s_b_pc[gc1] += r_b; s_b_pc[gc2] += r_b;
+            h_ss += r_a * r_b;
+        }
+    }
+    float r_a_tot = b_a + t_a + s_a;
+    float r_b_tot = b_b + t_b + s_b;
+    float h_tot = h_bb + h_tt + h_ss;
+
+    float edge_bb = 0.0f, edge_bt = 0.0f, edge_tb = 0.0f, edge_tt = 0.0f;
+    float edge_be = 0.0f, edge_te = 0.0f, edge_eb = 0.0f, edge_et = 0.0f;
+    float edge_ee = 0.0f;
+    for (int c = 0; c < 52; c++) {
+        if ((dead_mask & (1ul << c)) != 0) continue;
+        float bac = b_a_pc[c], tac = t_a_pc[c], sac = s_a_pc[c];
+        float bbc = b_b_pc[c], tbc = t_b_pc[c], sbc = s_b_pc[c];
+        float rac = bac + tac + sac;
+        float rbc = bbc + tbc + sbc;
+        edge_bb += bac * bbc;
+        edge_bt += bac * tbc;
+        edge_tb += tac * bbc;
+        edge_tt += tac * tbc;
+        edge_be += bac * rbc;
+        edge_te += tac * rbc;
+        edge_eb += rac * bbc;
+        edge_et += rac * tbc;
+        edge_ee += rac * rbc;
+    }
+
+    float pair_bb = b_a * b_b - edge_bb + h_bb;
+    float pair_bt = b_a * t_b - edge_bt;
+    float pair_tb = t_a * b_b - edge_tb;
+    float pair_tt = t_a * t_b - edge_tt + h_tt;
+    float pair_be = b_a * r_b_tot - edge_be + h_bb;
+    float pair_te = t_a * r_b_tot - edge_te + h_tt;
+    float pair_eb = r_a_tot * b_b - edge_eb + h_bb;
+    float pair_et = r_a_tot * t_b - edge_et + h_tt;
+    float pair_ee = r_a_tot * r_b_tot - edge_ee + h_tot;
+
+    float tf = (float)tied_offset;
+    if (ea && eb) {
+        return pair_bb / (1.0f + tf)
+             + pair_bt / (2.0f + tf)
+             + pair_tb / (2.0f + tf)
+             + pair_tt / (3.0f + tf);
+    } else if (ea && !eb) {
+        return pair_be / (1.0f + tf) + pair_te / (2.0f + tf);
+    } else if (!ea && eb) {
+        return pair_eb / (1.0f + tf) + pair_et / (2.0f + tf);
+    } else {
+        return pair_ee / (1.0f + tf);
+    }
+}
+
+// Factored share for one level with given eligibility mask & tied_offset.
+// Generic over K=1..5 via outer-loop depth determined by num_opp.
+inline float factored_share_for_level(
+    int num_opp,
+    uint elig_opps,
+    uint tied_offset,
+    ulong h_m,
+    ushort h_str,
+    device const float* reach,
+    device const uchar* hand_cards,
+    device const ushort* hand_strength,
+    int nh
+) {
+    if (num_opp == 1) {
+        bool e0 = (elig_opps >> 0) & 1u;
+        return factored_share_k1(0, e0, h_m, h_str, tied_offset,
+                                  reach, hand_cards, hand_strength, nh);
+    }
+    if (num_opp == 2) {
+        bool e0 = (elig_opps >> 0) & 1u;
+        bool e1 = (elig_opps >> 1) & 1u;
+        return factored_share_k2(0, 1, e0, e1, h_m, h_str, tied_offset,
+                                  reach, hand_cards, hand_strength, nh);
+    }
+
+    // num_opp >= 3: outer loops to K=2 base.
+    int k2a = num_opp - 2;
+    int k2b = num_opp - 1;
+    bool ek2a = (elig_opps >> k2a) & 1u;
+    bool ek2b = (elig_opps >> k2b) & 1u;
+    bool e0 = (elig_opps >> 0) & 1u;
+
+    float share = 0.0f;
+
+    for (int g0 = 0; g0 < nh; g0++) {
+        ulong g0_m = (1ul << hand_cards[g0 * 2]) | (1ul << hand_cards[g0 * 2 + 1]);
+        if ((g0_m & h_m) != 0) continue;
+        float r0 = reach[0 * nh + g0];
+        if (r0 == 0.0f) continue;
+        ushort s0 = hand_strength[g0];
+        uint t0;
+        if (e0) {
+            if (s0 > h_str) continue;
+            t0 = (s0 == h_str) ? (tied_offset + 1) : tied_offset;
+        } else {
+            t0 = tied_offset;
+        }
+        ulong m1 = h_m | g0_m;
+
+        if (num_opp == 3) {
+            share += r0 * factored_share_k2(k2a, k2b, ek2a, ek2b,
+                                              m1, h_str, t0,
+                                              reach, hand_cards, hand_strength, nh);
+            continue;
+        }
+
+        bool e1 = (elig_opps >> 1) & 1u;
+        for (int g1 = 0; g1 < nh; g1++) {
+            ulong g1_m = (1ul << hand_cards[g1 * 2]) | (1ul << hand_cards[g1 * 2 + 1]);
+            if ((g1_m & m1) != 0) continue;
+            float r1 = reach[1 * nh + g1];
+            if (r1 == 0.0f) continue;
+            ushort s1 = hand_strength[g1];
+            uint t01;
+            if (e1) {
+                if (s1 > h_str) continue;
+                t01 = (s1 == h_str) ? (t0 + 1) : t0;
+            } else {
+                t01 = t0;
+            }
+            ulong m2 = m1 | g1_m;
+            float p01 = r0 * r1;
+
+            if (num_opp == 4) {
+                share += p01 * factored_share_k2(k2a, k2b, ek2a, ek2b,
+                                                  m2, h_str, t01,
+                                                  reach, hand_cards, hand_strength, nh);
+                continue;
+            }
+
+            // num_opp == 5
+            bool e2 = (elig_opps >> 2) & 1u;
+            for (int g2 = 0; g2 < nh; g2++) {
+                ulong g2_m = (1ul << hand_cards[g2 * 2]) | (1ul << hand_cards[g2 * 2 + 1]);
+                if ((g2_m & m2) != 0) continue;
+                float r2 = reach[2 * nh + g2];
+                if (r2 == 0.0f) continue;
+                ushort s2 = hand_strength[g2];
+                uint t012;
+                if (e2) {
+                    if (s2 > h_str) continue;
+                    t012 = (s2 == h_str) ? (t01 + 1) : t01;
+                } else {
+                    t012 = t01;
+                }
+                ulong m3 = m2 | g2_m;
+                float p012 = p01 * r2;
+
+                share += p012 * factored_share_k2(k2a, k2b, ek2a, ek2b,
+                                                   m3, h_str, t012,
+                                                   reach, hand_cards, hand_strength, nh);
+            }
+        }
+    }
+
+    return share;
+}
+
+// The unified kernel.
+kernel void factored_showdown_unified(
+    device const float*           reach           [[buffer(0)]],
+    device const uchar*           hand_cards      [[buffer(1)]],
+    device const ushort*          hand_strength   [[buffer(2)]],
+    constant LevelInfoMetal*      levels          [[buffer(3)]],
+    constant int&                 num_levels      [[buffer(4)]],
+    constant int&                 num_opp         [[buffer(5)]],
+    constant float&               traverser_stake [[buffer(6)]],
+    device float*                 cfv_out         [[buffer(7)]],
+    constant int&                 nh              [[buffer(8)]],
+    constant int&                 batches         [[buffer(9)]],
+    uint3                         tid             [[thread_position_in_grid]]
+) {
+    int batch_id = tid.x;
+    int h = tid.y;
+    if (batch_id >= batches || h >= nh) return;
+
+    ulong h_m = (1ul << hand_cards[h * 2]) | (1ul << hand_cards[h * 2 + 1]);
+    ushort h_str = hand_strength[h];
+
+    // 1. TVRP(h) = factored share with all-ineligible (elig_opps = 0, tied = 0).
+    float tvrp = factored_share_for_level(
+        num_opp, 0u, 0u, h_m, h_str,
+        reach, hand_cards, hand_strength, nh);
+
+    // 2. Walk levels, accumulate static cash + Case C shares.
+    float static_cash = 0.0f;
+    float case_c = 0.0f;
+    for (int li = 0; li < num_levels; li++) {
+        LevelInfoMetal lev = levels[li];
+        bool has_active_elig = (lev.elig_opps != 0);
+        bool trav_elig = (lev.trav_elig != 0);
+        if (!has_active_elig && trav_elig) {
+            static_cash += lev.pot_l;
+        } else if (!has_active_elig && !trav_elig) {
+            if (lev.trav_contrib_at_lev > 0.0f) {
+                static_cash += lev.trav_contrib_at_lev;
+            }
+        } else if (!trav_elig) {
+            // Case D: skip
+        } else {
+            float share = factored_share_for_level(
+                num_opp, lev.elig_opps, 0u, h_m, h_str,
+                reach, hand_cards, hand_strength, nh);
+            case_c += lev.pot_l * share;
+        }
+    }
+
+    cfv_out[batch_id * nh + h] = (static_cash - traverser_stake) * tvrp + case_c;
+}
+
+// ============================================================================
+// THREAD-LOCAL variants of the factored helpers, for use inside
+// `multiway_brute_force_showdown` which keeps opp_reach in thread-local
+// memory for cache locality. Same logic as the device-pointer versions
+// above, just with `thread const float*` for reach (and thread ushort*
+// for hand_strength which is reconstructed locally per-thread).
+// ============================================================================
+
+inline float factored_share_k1_thread(
+    int oi,
+    bool elig,
+    ulong dead_mask,
+    ushort h_str,
+    uint tied_offset,
+    thread const float* reach,
+    const device uchar* hand_cards,
+    thread const ushort* hand_strength,
+    int nh
+) {
+    float share = 0.0f;
+    int o_off = oi * nh;
+    for (int g = 0; g < nh; g++) {
+        ulong g_m = (1ul << hand_cards[g * 2]) | (1ul << hand_cards[g * 2 + 1]);
+        if ((g_m & dead_mask) != 0) continue;
+        float r = reach[o_off + g];
+        if (r == 0.0f) continue;
+        ushort s = hand_strength[g];
+        if (elig) {
+            if (s > h_str) continue;
+            uint t = (s == h_str) ? (tied_offset + 1) : tied_offset;
+            share += r / (1.0f + (float)t);
+        } else {
+            share += r / (1.0f + (float)tied_offset);
+        }
+    }
+    return share;
+}
+
+inline float factored_share_k2_thread(
+    int oa, int ob,
+    bool ea, bool eb,
+    ulong dead_mask,
+    ushort h_str,
+    uint tied_offset,
+    thread const float* reach,
+    const device uchar* hand_cards,
+    thread const ushort* hand_strength,
+    int nh
+) {
+    int oa_off = oa * nh;
+    int ob_off = ob * nh;
+    float b_a = 0.0f, t_a = 0.0f, s_a = 0.0f;
+    float b_b = 0.0f, t_b = 0.0f, s_b = 0.0f;
+    float b_a_pc[52], t_a_pc[52], s_a_pc[52];
+    float b_b_pc[52], t_b_pc[52], s_b_pc[52];
+    for (int c = 0; c < 52; c++) {
+        b_a_pc[c] = 0.0f; t_a_pc[c] = 0.0f; s_a_pc[c] = 0.0f;
+        b_b_pc[c] = 0.0f; t_b_pc[c] = 0.0f; s_b_pc[c] = 0.0f;
+    }
+    float h_bb = 0.0f, h_tt = 0.0f, h_ss = 0.0f;
+    for (int g = 0; g < nh; g++) {
+        ulong g_m = (1ul << hand_cards[g * 2]) | (1ul << hand_cards[g * 2 + 1]);
+        if ((g_m & dead_mask) != 0) continue;
+        float r_a = reach[oa_off + g];
+        float r_b = reach[ob_off + g];
+        if (r_a == 0.0f && r_b == 0.0f) continue;
+        ushort s = hand_strength[g];
+        int gc1 = hand_cards[g * 2];
+        int gc2 = hand_cards[g * 2 + 1];
+        if (s < h_str) {
+            b_a += r_a; b_a_pc[gc1] += r_a; b_a_pc[gc2] += r_a;
+            b_b += r_b; b_b_pc[gc1] += r_b; b_b_pc[gc2] += r_b;
+            h_bb += r_a * r_b;
+        } else if (s == h_str) {
+            t_a += r_a; t_a_pc[gc1] += r_a; t_a_pc[gc2] += r_a;
+            t_b += r_b; t_b_pc[gc1] += r_b; t_b_pc[gc2] += r_b;
+            h_tt += r_a * r_b;
+        } else {
+            s_a += r_a; s_a_pc[gc1] += r_a; s_a_pc[gc2] += r_a;
+            s_b += r_b; s_b_pc[gc1] += r_b; s_b_pc[gc2] += r_b;
+            h_ss += r_a * r_b;
+        }
+    }
+    float r_a_tot = b_a + t_a + s_a;
+    float r_b_tot = b_b + t_b + s_b;
+    float h_tot = h_bb + h_tt + h_ss;
+    float edge_bb = 0.0f, edge_bt = 0.0f, edge_tb = 0.0f, edge_tt = 0.0f;
+    float edge_be = 0.0f, edge_te = 0.0f, edge_eb = 0.0f, edge_et = 0.0f;
+    float edge_ee = 0.0f;
+    for (int c = 0; c < 52; c++) {
+        if ((dead_mask & (1ul << c)) != 0) continue;
+        float bac = b_a_pc[c], tac = t_a_pc[c], sac = s_a_pc[c];
+        float bbc = b_b_pc[c], tbc = t_b_pc[c], sbc = s_b_pc[c];
+        float rac = bac + tac + sac;
+        float rbc = bbc + tbc + sbc;
+        edge_bb += bac * bbc; edge_bt += bac * tbc;
+        edge_tb += tac * bbc; edge_tt += tac * tbc;
+        edge_be += bac * rbc; edge_te += tac * rbc;
+        edge_eb += rac * bbc; edge_et += rac * tbc;
+        edge_ee += rac * rbc;
+    }
+    float pair_bb = b_a * b_b - edge_bb + h_bb;
+    float pair_bt = b_a * t_b - edge_bt;
+    float pair_tb = t_a * b_b - edge_tb;
+    float pair_tt = t_a * t_b - edge_tt + h_tt;
+    float pair_be = b_a * r_b_tot - edge_be + h_bb;
+    float pair_te = t_a * r_b_tot - edge_te + h_tt;
+    float pair_eb = r_a_tot * b_b - edge_eb + h_bb;
+    float pair_et = r_a_tot * t_b - edge_et + h_tt;
+    float pair_ee = r_a_tot * r_b_tot - edge_ee + h_tot;
+    float tf = (float)tied_offset;
+    if (ea && eb) {
+        return pair_bb / (1.0f + tf) + pair_bt / (2.0f + tf) + pair_tb / (2.0f + tf) + pair_tt / (3.0f + tf);
+    } else if (ea && !eb) {
+        return pair_be / (1.0f + tf) + pair_te / (2.0f + tf);
+    } else if (!ea && eb) {
+        return pair_eb / (1.0f + tf) + pair_et / (2.0f + tf);
+    } else {
+        return pair_ee / (1.0f + tf);
+    }
+}
+
+inline float factored_share_for_level_thread(
+    int num_opp,
+    uint elig_opps,
+    uint tied_offset,
+    ulong h_m,
+    ushort h_str,
+    thread const float* reach,
+    const device uchar* hand_cards,
+    thread const ushort* hand_strength,
+    int nh
+) {
+    if (num_opp == 1) {
+        bool e0 = (elig_opps >> 0) & 1u;
+        return factored_share_k1_thread(0, e0, h_m, h_str, tied_offset,
+                                         reach, hand_cards, hand_strength, nh);
+    }
+    if (num_opp == 2) {
+        bool e0 = (elig_opps >> 0) & 1u;
+        bool e1 = (elig_opps >> 1) & 1u;
+        return factored_share_k2_thread(0, 1, e0, e1, h_m, h_str, tied_offset,
+                                         reach, hand_cards, hand_strength, nh);
+    }
+    int k2a = num_opp - 2;
+    int k2b = num_opp - 1;
+    bool ek2a = (elig_opps >> k2a) & 1u;
+    bool ek2b = (elig_opps >> k2b) & 1u;
+    bool e0 = (elig_opps >> 0) & 1u;
+    float share = 0.0f;
+    for (int g0 = 0; g0 < nh; g0++) {
+        ulong g0_m = (1ul << hand_cards[g0 * 2]) | (1ul << hand_cards[g0 * 2 + 1]);
+        if ((g0_m & h_m) != 0) continue;
+        float r0 = reach[0 * nh + g0];
+        if (r0 == 0.0f) continue;
+        ushort s0 = hand_strength[g0];
+        uint t0;
+        if (e0) {
+            if (s0 > h_str) continue;
+            t0 = (s0 == h_str) ? (tied_offset + 1) : tied_offset;
+        } else {
+            t0 = tied_offset;
+        }
+        ulong m1 = h_m | g0_m;
+        if (num_opp == 3) {
+            share += r0 * factored_share_k2_thread(k2a, k2b, ek2a, ek2b, m1, h_str, t0,
+                                                    reach, hand_cards, hand_strength, nh);
+            continue;
+        }
+        bool e1 = (elig_opps >> 1) & 1u;
+        for (int g1 = 0; g1 < nh; g1++) {
+            ulong g1_m = (1ul << hand_cards[g1 * 2]) | (1ul << hand_cards[g1 * 2 + 1]);
+            if ((g1_m & m1) != 0) continue;
+            float r1 = reach[1 * nh + g1];
+            if (r1 == 0.0f) continue;
+            ushort s1 = hand_strength[g1];
+            uint t01;
+            if (e1) {
+                if (s1 > h_str) continue;
+                t01 = (s1 == h_str) ? (t0 + 1) : t0;
+            } else {
+                t01 = t0;
+            }
+            ulong m2 = m1 | g1_m;
+            float p01 = r0 * r1;
+            if (num_opp == 4) {
+                share += p01 * factored_share_k2_thread(k2a, k2b, ek2a, ek2b, m2, h_str, t01,
+                                                         reach, hand_cards, hand_strength, nh);
+                continue;
+            }
+            bool e2 = (elig_opps >> 2) & 1u;
+            for (int g2 = 0; g2 < nh; g2++) {
+                ulong g2_m = (1ul << hand_cards[g2 * 2]) | (1ul << hand_cards[g2 * 2 + 1]);
+                if ((g2_m & m2) != 0) continue;
+                float r2 = reach[2 * nh + g2];
+                if (r2 == 0.0f) continue;
+                ushort s2 = hand_strength[g2];
+                uint t012;
+                if (e2) {
+                    if (s2 > h_str) continue;
+                    t012 = (s2 == h_str) ? (t01 + 1) : t01;
+                } else {
+                    t012 = t01;
+                }
+                ulong m3 = m2 | g2_m;
+                float p012 = p01 * r2;
+                share += p012 * factored_share_k2_thread(k2a, k2b, ek2a, ek2b, m3, h_str, t012,
+                                                          reach, hand_cards, hand_strength, nh);
+            }
+        }
+    }
+    return share;
 }

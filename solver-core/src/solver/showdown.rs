@@ -298,9 +298,16 @@ pub fn side_pot_showdown_cfv(
                 }
             }
             for h in 0..nh {
+                // Inclusion-exclusion: |opp hands NOT using c1 NOR c2|
+                //   = total - (uses c1) - (uses c2) + (uses BOTH c1 and c2)
+                // In 2-card holdem with unique (c1,c2) pair indexing, the only opp
+                // hand using BOTH of h's cards is h itself. Without the `+ opp_reach[h]`
+                // correction, h's reach is double-subtracted (once for c1, once for c2)
+                // → cfreach off by `-opp_reach[h]`. Audit-fix from #37.
                 let cfreach = opp_reach_sum
                     - opp_reach_minus[hand_cards[h * 2] as usize]
-                    - opp_reach_minus[hand_cards[h * 2 + 1] as usize];
+                    - opp_reach_minus[hand_cards[h * 2 + 1] as usize]
+                    + opp_reach[0][h];
                 cfv[h] = payoff * cfreach;
             }
         } else {
@@ -422,9 +429,18 @@ pub fn side_pot_showdown_cfv(
             }
             if opp_reach_sum > 0.0 {
                 for h in 0..nh {
+                    // Inclusion-exclusion correction: see comment at line 290's fix
+                    // (#37 audit). For multi-opp case, sum the self-hand reach across
+                    // all opponents to recover the term double-subtracted by
+                    // minus[c1] + minus[c2].
+                    let mut uses_both = 0.0f32;
+                    for oi in 0..num_opp {
+                        uses_both += opp_reach[oi][h];
+                    }
                     let cfreach = opp_reach_sum
                         - opp_reach_minus[hand_cards[h * 2] as usize]
-                        - opp_reach_minus[hand_cards[h * 2 + 1] as usize];
+                        - opp_reach_minus[hand_cards[h * 2 + 1] as usize]
+                        + uses_both;
                     cfv[h] = payoff * cfreach;
                 }
             }
@@ -1284,6 +1300,152 @@ fn tvrp_brute(
 ///     comment on [`tvrp_brute`] for the structural reason the obvious
 ///     "matching enumeration" expansion does not suffice).
 ///   - K ≥ 6: panics (max table size is 6 players → K ≤ 5).
+/// Factored K=3 `TotalValidReachProduct(h)` via recursive K=2 expansion.
+///
+/// ```text
+/// TVRP_K=3(h, dead)
+///   = Σ over g_0 valid (not conflicting h, not in dead) of
+///       r_0[g_0] · TVRP_K=2(opps {1,2}, h, dead ∪ {g_0's two cards})
+/// ```
+///
+/// The inner K=2 TVRP with the EXTENDED dead mask is expressed via I-E on
+/// the BASE masses (already precomputed for the base `h_dead_mask`):
+///
+/// ```text
+///   M_i_ext           = M_i      − M_i^(g0_c1)      − M_i^(g0_c2)      + r_i[g_0]
+///   M_i_ext^(c)       = M_i^(c)  − r_i[h_{g0_c1,c}] − r_i[h_{g0_c2,c}]    (for c ∉ ext)
+///   H_{12}_ext        = H_{12}   − H_{12}^(g0_c1)   − H_{12}^(g0_c2)   + r_1[g_0]·r_2[g_0]
+///
+///   K=2_TVRP_ext      = M_1_ext · M_2_ext
+///                     − Σ over c ∉ ext_mask of M_1_ext^(c) · M_2_ext^(c)
+///                     + H_{12}_ext
+/// ```
+///
+/// `H_{12}` and `H_{12}^(c)` are not in `OppMasses` (they'd be K-quadratic
+/// in storage if we materialized them across all opp pairs); we compute
+/// them on the fly once per `h_player` at O(nh + 52) cost. This is the
+/// per-`h` setup that the per-`g_0` inner loop then uses.
+///
+/// Cost: O(nh · 52) per `h_player`. At nh=50: 2,600 ops per `h` × 50
+/// hands = 130k per terminal. Compared with brute-force at O(nh^3) =
+/// 125k per `h` × 50 = 6.25M per terminal, the factored formula is
+/// ~50× faster at K=3.
+///
+/// CORRECTNESS PROPERTY: matches brute-force `tvrp_brute` on the
+/// triangle-conflict configuration `{h={0,1}, h={0,2}, h={1,2}}` where
+/// the matching-based formula (without the higher-order shared-card
+/// terms) gave 41 vs the true 18. The recursive K=2 expansion handles
+/// the shared-card cases by CONSTRUCTION through the growing dead mask
+/// rather than by enumerating conflict patterns it cannot fully
+/// represent — which is the structural reason this formulation is
+/// preferred over the matching enumeration the original plan called
+/// for. See the `ie_k3_tvrp_matches_bruteforce` test.
+///
+/// SIGN CARE: subtracted terms like `M_i_ext = M_i − M_i^(c1) − M_i^(c2) + r_i[g_0]`
+/// can be ≤ 0 in f32 if the base mass is small and the subtracted
+/// per-card term equals it. The downstream multiplication
+/// `M_1_ext · M_2_ext` propagates this; the formula remains
+/// mathematically correct (it's I-E with cancellation), but
+/// floating-point accumulators must be f64 for the per-h sums to keep
+/// catastrophic-cancellation drift below the 1e-5 threshold the test
+/// asserts. All accumulators here are f64.
+fn tvrp_k3_factored(
+    masses: &OppMasses,
+    opp_reach: &[&[f32]],
+    h: usize,
+    h_dead_mask: u64,    // already includes h_player's cards + base dead mask
+) -> f64 {
+    let nh = masses.nh;
+    let hand_cards = &masses.hand_cards;
+
+    // Base K=2 quantities for opps 1, 2 at THIS h_player.
+    // M_i = total reach over valid g for opp i (already precomputed).
+    let m1 = masses.r(1, h) as f64;
+    let m2 = masses.r(2, h) as f64;
+
+    // H_{12} and H_{12}^(c) — sum-of-products of (r_1[g], r_2[g]) over
+    // valid g, optionally restricted to those containing card c. NOT in
+    // OppMasses (K-quadratic in opp pairs), computed on the fly here.
+    let mut h12 = 0.0f64;
+    let mut h12_pc = [0.0f64; 52];
+    for g in 0..nh {
+        let gc1 = hand_cards[g * 2] as usize;
+        let gc2 = hand_cards[g * 2 + 1] as usize;
+        let g_m = (1u64 << gc1) | (1u64 << gc2);
+        if g_m & h_dead_mask != 0 { continue; }
+        let r1 = opp_reach[1][g] as f64;
+        let r2 = opp_reach[2][g] as f64;
+        let prod = r1 * r2;
+        if prod == 0.0 { continue; }
+        h12 += prod;
+        h12_pc[gc1] += prod;
+        h12_pc[gc2] += prod;
+    }
+
+    // Per-g_0 inner loop.
+    let mut total = 0.0f64;
+    for g0 in 0..nh {
+        let g0c1 = hand_cards[g0 * 2] as usize;
+        let g0c2 = hand_cards[g0 * 2 + 1] as usize;
+        let g0_m = (1u64 << g0c1) | (1u64 << g0c2);
+        if g0_m & h_dead_mask != 0 { continue; }
+        let r0_g0 = opp_reach[0][g0] as f64;
+        if r0_g0 == 0.0 { continue; }
+
+        let r1_g0 = opp_reach[1][g0] as f64;
+        let r2_g0 = opp_reach[2][g0] as f64;
+
+        // Extended-mask totals (constant per g_0).
+        let m1_g0c1 = masses.r_per_card(1, h, g0c1) as f64;
+        let m1_g0c2 = masses.r_per_card(1, h, g0c2) as f64;
+        let m2_g0c1 = masses.r_per_card(2, h, g0c1) as f64;
+        let m2_g0c2 = masses.r_per_card(2, h, g0c2) as f64;
+        let m1_ext = m1 - m1_g0c1 - m1_g0c2 + r1_g0;
+        let m2_ext = m2 - m2_g0c1 - m2_g0c2 + r2_g0;
+
+        // Σ over c ∉ extended dead of M_1_ext^(c) · M_2_ext^(c).
+        let ext_mask = h_dead_mask | g0_m;
+        let mut edge_sum = 0.0f64;
+        for c in 0..52usize {
+            if (1u64 << c) & ext_mask != 0 { continue; }
+            // M_i_ext^(c) = M_i^(c) − r_i[h_{g0c1, c}] − r_i[h_{g0c2, c}]
+            let r1_h_g0c1_c = lookup_pair_reach(opp_reach[1], &masses.hand_index, g0c1, c);
+            let r1_h_g0c2_c = lookup_pair_reach(opp_reach[1], &masses.hand_index, g0c2, c);
+            let r2_h_g0c1_c = lookup_pair_reach(opp_reach[2], &masses.hand_index, g0c1, c);
+            let r2_h_g0c2_c = lookup_pair_reach(opp_reach[2], &masses.hand_index, g0c2, c);
+            let m1_ext_c = masses.r_per_card(1, h, c) as f64 - r1_h_g0c1_c - r1_h_g0c2_c;
+            let m2_ext_c = masses.r_per_card(2, h, c) as f64 - r2_h_g0c1_c - r2_h_g0c2_c;
+            edge_sum += m1_ext_c * m2_ext_c;
+        }
+
+        // H_{12}_ext = H_{12} − H_{12}^(g0c1) − H_{12}^(g0c2) + r_1[g_0]·r_2[g_0]
+        let h12_ext = h12 - h12_pc[g0c1] - h12_pc[g0c2] + r1_g0 * r2_g0;
+
+        let k2_tvrp_ext = m1_ext * m2_ext - edge_sum + h12_ext;
+        total += r0_g0 * k2_tvrp_ext;
+    }
+
+    total
+}
+
+/// Look up `r_i[h_{c1, c2}]` — the opp-`i` reach at the unique sampled hand
+/// `{c1, c2}` if it exists in the sample, else 0.
+///
+/// Filtering note: this returns the raw `opp_reach[idx]`. Caller is
+/// responsible for the validity invariant that `opp_reach` is already
+/// zeroed for hands conflicting with the dead mask / `h_player`. For the
+/// `tvrp_k3_factored` call sites, the cards `c1, c2` are guaranteed not in
+/// `h_player` or in the original dead mask (by the construction of the
+/// extended mask filter), and any hand not in the sample returns -1 via
+/// `hand_index` and is handled here.
+#[inline]
+fn lookup_pair_reach(opp_reach: &[f32], hand_index: &[i32], c1: usize, c2: usize) -> f64 {
+    if c1 == c2 { return 0.0; }
+    let idx = hand_index[c1 * 52 + c2];
+    if idx < 0 { return 0.0; }
+    opp_reach[idx as usize] as f64
+}
+
 pub fn total_valid_reach_product(
     masses: &OppMasses,
     opp_reach: &[&[f32]],
@@ -1343,7 +1505,8 @@ pub fn total_valid_reach_product(
 
                 prod - edge_sum + same_hand_sum
             }
-            3 | 4 | 5 => tvrp_brute(masses, opp_reach, h, h_dead_mask),
+            3 => tvrp_k3_factored(masses, opp_reach, h, h_dead_mask),
+            4 | 5 => tvrp_brute(masses, opp_reach, h, h_dead_mask),
             _ => unimplemented!("K >= 6 not supported (max table size is 6 players)"),
         };
     }
@@ -1544,10 +1707,15 @@ mod tests {
                 label, max_abs_diff, worst_h, max_rel_diff
             );
 
+            // Mixed absolute/relative threshold: f64 cancellation noise
+            // around bf=0 (e.g., when h_player itself is invalidated by
+            // the dead mask and brute-force returns exactly 0) blows up
+            // a pure relative comparison. Accept either max_abs < 1e-5
+            // (f32-precision floor) OR max_rel < 1e-5 (per-h rel parity).
             assert!(
-                max_rel_diff < 1e-5,
-                "[{}] K=3 I-E does not match brute-force: max_rel={:.3e} at h={}",
-                label, max_rel_diff, worst_h
+                max_abs_diff < 1e-5 || max_rel_diff < 1e-5,
+                "[{}] K=3 factored does not match brute-force: max_abs={:.3e}, max_rel={:.3e} at h={}",
+                label, max_abs_diff, max_rel_diff, worst_h
             );
         }
     }

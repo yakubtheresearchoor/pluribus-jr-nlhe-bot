@@ -137,6 +137,13 @@ pub struct MetalFlopStartSolver {
     num_combinations: f32,
     regret_floor: f32,
     iteration: u32,
+    // ─── Phase 1.A negative-regret pruning (Option A) ───
+    // Default off — when enabled, kernel skips per-(action, hand) regret
+    // updates where the regret is below pruning_threshold, with Pluribus
+    // carve-outs (never river, never terminal-leading, every Kth iter all).
+    pruning_enabled: bool,
+    pruning_threshold: f32,
+    pruning_stride: u32,
     n_turn: usize,
     max_river: usize,
     max_depth: usize,
@@ -410,6 +417,10 @@ impl MetalFlopStartSolver {
             num_combinations: table.num_combinations as f32,
             regret_floor: -1e30,
             iteration: 0,
+            // Phase 1.A pruning: default OFF. Existing tests unchanged.
+            pruning_enabled: false,
+            pruning_threshold: -1e30,  // never trips when disabled
+            pruning_stride: 20,        // Pluribus's "every 5%" → 1/20
             n_turn,
             max_river,
             max_depth,
@@ -862,6 +873,9 @@ impl MetalFlopStartSolver {
                 traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
                 regret_floor: f32, starting_pot: i32, num_combinations: f32,
                 regret_outcome_stride: i32, cum_outcome_stride: i32,
+                // ─── Phase 1.A pruning (Option A) ───
+                pruning_enabled: i32, pruning_threshold: f32,
+                iteration: i32, pruning_stride: i32, board_state: i32,
             }
             let bp = BParams {
                 level_count: count as i32,
@@ -879,6 +893,12 @@ impl MetalFlopStartSolver {
                 num_combinations: self.num_combinations,
                 regret_outcome_stride: self.river_stride as i32,
                 cum_outcome_stride: self.river_stride as i32,
+                // Phase 1.A pruning (river: board_state=2 → kernel never prunes river anyway)
+                pruning_enabled: if self.pruning_enabled { 1 } else { 0 },
+                pruning_threshold: self.pruning_threshold,
+                iteration: self.iteration as i32,
+                pruning_stride: self.pruning_stride as i32,
+                board_state: 2,  // RIVER
             };
             self.upload_params(&bp);
             let params_buf = unsafe { (*self.d_params_buf.get()).as_ref() };
@@ -948,6 +968,9 @@ impl MetalFlopStartSolver {
                 traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
                 regret_floor: f32, starting_pot: i32, num_combinations: f32,
                 regret_outcome_stride: i32, cum_outcome_stride: i32,
+                // ─── Phase 1.A pruning (Option A) ───
+                pruning_enabled: i32, pruning_threshold: f32,
+                iteration: i32, pruning_stride: i32, board_state: i32,
             }
             let bp = BParams {
                 level_count: count as i32,
@@ -965,6 +988,12 @@ impl MetalFlopStartSolver {
                 num_combinations: self.num_combinations,
                 regret_outcome_stride: self.turn_stride as i32,
                 cum_outcome_stride: self.turn_stride as i32,
+                // Phase 1.A pruning (turn: board_state=1)
+                pruning_enabled: if self.pruning_enabled { 1 } else { 0 },
+                pruning_threshold: self.pruning_threshold,
+                iteration: self.iteration as i32,
+                pruning_stride: self.pruning_stride as i32,
+                board_state: 1,  // TURN
             };
             self.upload_params(&bp);
             let params_buf = unsafe { (*self.d_params_buf.get()).as_ref() };
@@ -1385,6 +1414,16 @@ impl MetalFlopStartSolver {
 
     pub fn iteration(&self) -> u32 { self.iteration }
     pub fn set_iteration(&mut self, i: u32) { self.iteration = i; }
+
+    // ─── Phase 1.A pruning accessors ───
+    pub fn pruning_enabled(&self) -> bool { self.pruning_enabled }
+    pub fn set_pruning(&mut self, enabled: bool, threshold: f32, stride: u32) {
+        self.pruning_enabled = enabled;
+        self.pruning_threshold = threshold;
+        self.pruning_stride = stride.max(1);
+    }
+    pub fn pruning_threshold(&self) -> f32 { self.pruning_threshold }
+    pub fn pruning_stride(&self) -> u32 { self.pruning_stride }
     pub fn debug_params(&self, ctx: &MetalContext) -> Vec<f32> {
         let device = ctx.device();
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
