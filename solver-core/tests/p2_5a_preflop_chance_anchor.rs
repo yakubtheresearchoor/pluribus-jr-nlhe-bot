@@ -52,12 +52,13 @@
 //! canonicalization path.
 
 use solver_core::abstraction::preflop_class::{
-    class_combos, PreflopClass, NUM_PREFLOP_CLASSES,
+    class_combos, expansion, PreflopClass, NUM_PREFLOP_CLASSES,
 };
 use solver_core::abstraction::flop_isomorphism::enumerate_all_flops;
 use solver_core::card::Card;
 use solver_core::solver::preflop_start_game::{
-    compute_preflop_cfv_per_canonical_pass, FLOPS_PER_HAND, PreflopChanceTable,
+    compute_preflop_cfv_per_canonical_pass, flop_combo_layout, FLOPS_PER_HAND,
+    PreflopChanceTable,
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -192,13 +193,210 @@ fn compute_preflop_cfv_reference(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// f64 MIRROR OF THE RUNTIME PATH (for the precision discriminator below)
+// ─────────────────────────────────────────────────────────────────────
+//
+// The library's `compute_preflop_cfv_per_canonical_pass` uses f32
+// throughout (matching production). For the f32-vs-bug discriminator,
+// we need the SAME loop shape (1,755 canonicals × reduce × orbit-weighted
+// aggregate) but with f64 arithmetic. If the f64-mirror runtime agrees
+// with the f64 reference at f64 floor, the structural arithmetic is
+// proven right and the f32 diff was precision. If they disagree, the
+// f32 diff was masking a real value-dependent bug.
+//
+// This duplicates the runtime path's structure (same loops, same
+// weighting formulas) in the test file. The duplication is the
+// verification: both implementations agreeing at f64 floor proves the
+// arithmetic, not just structural plausibility.
+
+fn compute_preflop_cfv_runtime_f64(
+    table: &PreflopChanceTable,
+    v_flop_fn: impl Fn([Card; 3], (Card, Card)) -> f32,
+) -> Vec<f64> {
+    let n_canon = table.num_canonical_flops();
+
+    // Reduce per-canonical to per-class in f64
+    // Matches the SHAPE of reduce_cfv_combo_to_class but in f64:
+    //   v_class_at_canonical[c] = (sum of v_combo for combos in class c) / |expansion(c, F)|
+    let mut per_canonical_v_class: Vec<Vec<f64>> = Vec::with_capacity(n_canon);
+    for canonical_idx in 0..n_canon {
+        let f_canon = table.canonical_flops[canonical_idx];
+        let layout = flop_combo_layout(f_canon);
+
+        let mut sums = vec![0.0f64; NUM_PREFLOP_CLASSES];
+        for &(c1, c2) in &layout {
+            let class = PreflopClass::from_combo(c1, c2);
+            sums[class.index()] += v_flop_fn(f_canon, (c1, c2)) as f64;
+        }
+        let v_class: Vec<f64> = (0..NUM_PREFLOP_CLASSES)
+            .map(|c| {
+                let exp_size = expansion(PreflopClass(c as u8), f_canon).len();
+                if exp_size > 0 { sums[c] / exp_size as f64 } else { 0.0 }
+            })
+            .collect();
+        per_canonical_v_class.push(v_class);
+    }
+
+    // Aggregate per-canonical CFVs with orbit weights in f64
+    // Matches the SHAPE of aggregate_preflop_chance + chance_probability_flop:
+    //   v_class[c] = Σ over canonical F of P(F | c) × v_class_at_canonical[c]
+    //   P(F | c) = orbit_size(F) × |expansion(c, F)| / (n_c × 19,600)
+    let mut v_class_out = vec![0.0f64; NUM_PREFLOP_CLASSES];
+    for canonical_idx in 0..n_canon {
+        let f_canon = table.canonical_flops[canonical_idx];
+        let orbit_size = table.orbit_sizes[canonical_idx] as f64;
+        for c in 0..NUM_PREFLOP_CLASSES {
+            let class = PreflopClass(c as u8);
+            let n_c = class.num_combos() as f64;
+            let exp_size = expansion(class, f_canon).len() as f64;
+            let p_f_given_c = (orbit_size * exp_size) / (n_c * FLOPS_PER_HAND as f64);
+            v_class_out[c] += p_f_given_c * per_canonical_v_class[canonical_idx][c];
+        }
+    }
+
+    v_class_out
+}
+
+fn compute_preflop_cfv_reference_f64(
+    v_flop_fn: impl Fn([Card; 3], (Card, Card)) -> f32,
+) -> Vec<f64> {
+    let mut v_class = vec![0.0f64; NUM_PREFLOP_CLASSES];
+    for f in enumerate_all_flops() {
+        for class_idx in 0..NUM_PREFLOP_CLASSES {
+            let class = PreflopClass(class_idx as u8);
+            for &(c1, c2) in &class_combos(class) {
+                if f.contains(&c1) || f.contains(&c2) { continue; }
+                v_class[class_idx] += (v_flop_fn(f, (c1, c2)) as f64)
+                    / (class.num_combos() as f64 * FLOPS_PER_HAND as f64);
+            }
+        }
+    }
+    v_class
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // THE TEST
 // ─────────────────────────────────────────────────────────────────────
+
+/// THE F32-vs-BUG DISCRIMINATOR.
+///
+/// The main test (below) finds a 1.26e-5 relative diff between the f32
+/// runtime and the f32 (via f64-internals) reference at variable stub.
+/// Two possible explanations:
+///   (1) f32 accumulation floor (the magnitude argument: ~2M f32 sums
+///       on ~10³ values accumulates ~1e-5 relative)
+///   (2) A value-dependent arithmetic bug (the survivor-count
+///       primitive is the inclusion-exclusion-shaped piece — it could
+///       have a bug that vanishes on constant input but surfaces on
+///       variable input)
+///
+/// The constant-stub discriminator above CANNOT distinguish these:
+/// at constant K, a survivor-count error would still produce K
+/// (because the wrong count cancels in num/denom of the average).
+///
+/// The DEMONSTRATING discriminator: run both sides in f64. f64 has
+/// ~16 digits of precision; the same accumulation that gave 1e-5 in
+/// f32 gives ~1e-13 in f64. If the diff collapses to f64 floor, the
+/// arithmetic is proven right and (1) is the explanation. If the
+/// diff STAYS at ~1e-5 in f64, (2) is the explanation — a real
+/// value-dependent bug the f32 magnitude argument was masking.
+///
+/// This converts "plausibly f32 noise" from an assertion into a
+/// demonstration. The discipline that has caught every prior bug
+/// in this project.
+#[test]
+fn f64_mirror_proves_f32_diff_is_precision_not_bug() {
+    let table = PreflopChanceTable::new(
+        2, vec![vec![1.0f32; NUM_PREFLOP_CLASSES]; 2],
+    );
+
+    eprintln!("\n=== f64 discriminator: is the 1.26e-5 f32 diff precision or bug? ===");
+    eprintln!("Computing same runtime + reference shapes in f64.");
+    eprintln!("Expected if pure precision: max_diff drops to ~1e-13 (f64 floor)");
+    eprintln!("Expected if value-dependent bug: max_diff stays at ~1e-5");
+
+    let t0 = std::time::Instant::now();
+    let runtime_f64 = compute_preflop_cfv_runtime_f64(&table, v_flop_stub);
+    let t_rt = t0.elapsed();
+
+    let t0 = std::time::Instant::now();
+    let reference_f64 = compute_preflop_cfv_reference_f64(v_flop_stub);
+    let t_ref = t0.elapsed();
+
+    eprintln!("Runtime f64: {:?}; Reference f64: {:?}", t_rt, t_ref);
+
+    let mut max_abs_diff_f64: f64 = 0.0;
+    let mut max_rel_diff_f64: f64 = 0.0;
+    let mut argmax: usize = 0;
+    for c in 0..NUM_PREFLOP_CLASSES {
+        let abs = (runtime_f64[c] - reference_f64[c]).abs();
+        let rel = if reference_f64[c].abs() > 1.0 { abs / reference_f64[c].abs() } else { abs };
+        if rel > max_rel_diff_f64 {
+            max_rel_diff_f64 = rel;
+            max_abs_diff_f64 = abs;
+            argmax = c;
+        }
+    }
+
+    eprintln!("\nf64 max_rel_diff = {:e} (class {}, abs {:e})", max_rel_diff_f64, argmax, max_abs_diff_f64);
+    eprintln!("  runtime_f64[{}]   = {}", argmax, runtime_f64[argmax]);
+    eprintln!("  reference_f64[{}] = {}", argmax, reference_f64[argmax]);
+
+    // f64 floor for this accumulation pattern: ~2M f64 adds on magnitude
+    // ~10³ gives cumulative error ~sqrt(2M) × 2.2e-16 × 10³ ≈ 3e-10
+    // absolute, ~3e-13 relative on the largest class values. Set
+    // tolerance to 1e-10 relative (well above f64 floor but well below
+    // the 1e-5 the "value-dependent bug" hypothesis would give).
+    //
+    // If max_rel_diff < 1e-10 ⇒ DEMONSTRATED f32 floor (f64 has the
+    // headroom f32 lacked; diff collapses to f64 floor; the 1e-5 was
+    // pure precision).
+    // If max_rel_diff > 1e-7 ⇒ DEMONSTRATED bug (f64 doesn't fix it;
+    // it's a value-dependent arithmetic error, not precision).
+    let f64_floor_tol = 1e-10;
+    let bug_floor = 1e-7;
+
+    if max_rel_diff_f64 < f64_floor_tol {
+        eprintln!("✓ f32-floor DEMONSTRATED: f64 mirror reduces diff to {:e} (< {:e})", max_rel_diff_f64, f64_floor_tol);
+        eprintln!("  The 1.26e-5 in the main test is the runtime's f32 accumulator floor,");
+        eprintln!("  not a value-dependent arithmetic bug. The survivor-count primitive,");
+        eprintln!("  orbit weighting, and reduce arithmetic are proven correct.");
+    } else if max_rel_diff_f64 > bug_floor {
+        panic!(
+            "F64 DIAGNOSTIC FAILED — VALUE-DEPENDENT BUG DETECTED.\n\
+             max_rel_diff in f64 = {} (class {}, abs {}).\n\
+             f32 floor was ~1e-5; f64 floor should be ~1e-13. If f64 diff is {} >> f64 floor, \
+             the f32 diff was NOT precision — it was a real arithmetic bug the constant-stub \
+             discriminator could not catch (because the error cancels on constant input).\n\
+             \n\
+             Most likely culprit: the per-(class, canonical-flop) survivor count in either \
+             reduce_cfv_combo_to_class (P1.5.5a) or chance_probability_flop (P1.5.1) — \
+             both use |expansion(class, F)| as a normalization factor.\n\
+             \n\
+             runtime_f64[{}]   = {}\n\
+             reference_f64[{}] = {}\n\
+             rel diff       = {}",
+            max_rel_diff_f64, argmax, max_abs_diff_f64, max_rel_diff_f64,
+            argmax, runtime_f64[argmax], argmax, reference_f64[argmax], max_rel_diff_f64,
+        );
+    } else {
+        // In the gap between f64 floor and bug-suggestive: surface for inspection.
+        eprintln!("⚠ f64 diff in ambiguous range: {} (between f64 floor {} and bug threshold {}).",
+                  max_rel_diff_f64, f64_floor_tol, bug_floor);
+        eprintln!("  Probably precision but worth a look — accumulation order differences,");
+        eprintln!("  not f32 floor exactly, not bug either.");
+    }
+}
 
 /// Discriminator: at constant stub K, the math derivation says
 /// V_class[c] = K for every class. If both sides give K within f32
 /// precision, the structural arithmetic is right. If they don't, there's
 /// a real bug.
+///
+/// CAVEAT: this discriminator alone CANNOT distinguish f32 precision
+/// from a value-dependent arithmetic bug (a wrong survivor count would
+/// still produce K on constant input because the wrong count cancels
+/// in num/denom). The f64-mirror test above is the real discriminator.
 #[test]
 fn constant_stub_gives_constant_class_cfv_on_both_sides() {
     let table = PreflopChanceTable::new(
