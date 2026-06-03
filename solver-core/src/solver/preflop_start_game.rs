@@ -322,6 +322,129 @@ pub fn reduce_cfv_combo_to_class(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// P1.5.5b Slice 2: stratified canonical subset + subset aggregation
+// ─────────────────────────────────────────────────────────────────────
+//
+// Per the wall-clock observation in Slice 1 (~1s per per-flop solve at
+// nh=1176, ×1755 ≈ 30 min full-scale), CI tests sub-sample canonicals.
+// Sub-sampling is stratified, not random: the user-emphasized rule is
+// that "subset passes" must imply "full passes" by COVERAGE rather than
+// LUCK, because the highest-risk primitive (the per-(class, F)
+// survivor count) is exactly the one most exercised in the cases a
+// random subset would under-sample.
+//
+// Stratification axes:
+//   - Orbit size (×4 / ×12 / ×24): catches bugs sensitive to orbit
+//     multiplicity. Each stratum has different orbit counts:
+//     299 / 1170 / 286 canonicals respectively (from P0).
+//   - Flop rank structure (trip / paired / rainbow): catches
+//     survivor-count edge cases. Trip flops drive class survivor count
+//     to 0 for the trip-rank class (most stress on blocked-class
+//     handling in expand/reduce). Paired flops are intermediate.
+//
+// The subset selector below picks samples from each stratum + each
+// rank structure, giving a small (~50-100) but representative
+// subset that exercises the survivor-count arithmetic across its
+// stressful corners.
+
+/// Categorize a 3-card flop's rank structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FlopRankShape {
+    /// All three cards have the same rank (e.g., KcKdKh).
+    Trip,
+    /// Exactly two cards share a rank (e.g., KcKd7s).
+    Paired,
+    /// All three cards have distinct ranks (e.g., Kc7d2s).
+    Rainbow,
+}
+
+pub fn flop_rank_shape(flop: [Card; 3]) -> FlopRankShape {
+    let r0 = flop[0] >> 2;
+    let r1 = flop[1] >> 2;
+    let r2 = flop[2] >> 2;
+    if r0 == r1 && r1 == r2 { FlopRankShape::Trip }
+    else if r0 == r1 || r1 == r2 || r0 == r2 { FlopRankShape::Paired }
+    else { FlopRankShape::Rainbow }
+}
+
+/// Build a stratified subset of canonical-flop indices covering all
+/// (orbit_size, rank_shape) cells. For each (orbit_size, rank_shape)
+/// cell, picks up to `n_per_cell` indices in deterministic order
+/// (lex order on canonical_flops, which is the order
+/// `enumerate_canonical_flops` returns).
+///
+/// Cells:
+///   3 orbit sizes (4, 12, 24) × 3 rank shapes (Trip, Paired, Rainbow)
+///   = 9 cells maximum. Some cells may be empty (e.g., Trip + orbit 12)
+///   and are silently skipped.
+///
+/// Returns sorted, deduplicated subset of canonical indices.
+pub fn stratified_canonical_subset(
+    table: &PreflopChanceTable,
+    n_per_cell: usize,
+) -> Vec<usize> {
+    use std::collections::BTreeMap;
+    // Group indices by (orbit_size, rank_shape) cell
+    let mut by_cell: BTreeMap<(u32, FlopRankShape), Vec<usize>> = BTreeMap::new();
+    for (idx, &flop) in table.canonical_flops.iter().enumerate() {
+        let orbit = table.orbit_sizes[idx];
+        let shape = flop_rank_shape(flop);
+        by_cell.entry((orbit, shape)).or_default().push(idx);
+    }
+    let mut subset = Vec::new();
+    for (_, indices) in by_cell {
+        subset.extend(indices.into_iter().take(n_per_cell));
+    }
+    subset.sort();
+    subset.dedup();
+    subset
+}
+
+/// Subset variant of `aggregate_preflop_chance`. Sums orbit-weighted
+/// chance-probability × per-canonical V_class_at_F over a subset of
+/// canonical-flop indices.
+///
+/// Use case: validation tests that run per-flop solves only on a
+/// stratified subset of canonicals. The per-class CFV produced is the
+/// PARTIAL sum (over the subset, weighted by orbit), not the full
+/// preflop CFV. Both the runtime side (this function) and the
+/// reference side (in tests) sum over the same subset; their agreement
+/// validates the orchestration arithmetic.
+///
+/// **Args:**
+///   - `table`: PreflopChanceTable (the full 1,755-canonical context;
+///     orbit weights are read from here)
+///   - `subset_indices`: canonical indices to aggregate over (subset
+///     of 0..1755). Same indices the per-flop solves were run on.
+///   - `flop_cfvs_subset`: `[subset_indices.len()][NUM_PREFLOP_CLASSES]`,
+///     V_class_at_F for each canonical in the subset
+///
+/// **Returns:** `[NUM_PREFLOP_CLASSES]` partial preflop CFV.
+pub fn aggregate_preflop_chance_subset(
+    table: &PreflopChanceTable,
+    subset_indices: &[usize],
+    flop_cfvs_subset: &[Vec<f32>],
+) -> Vec<f32> {
+    let nh = NUM_PREFLOP_CLASSES;
+    assert_eq!(subset_indices.len(), flop_cfvs_subset.len(),
+        "subset_indices length {} != flop_cfvs_subset length {}",
+        subset_indices.len(), flop_cfvs_subset.len());
+
+    let mut out = vec![0.0f32; nh];
+    for (i, &canonical_idx) in subset_indices.iter().enumerate() {
+        let cfvs_for_flop = &flop_cfvs_subset[i];
+        assert_eq!(cfvs_for_flop.len(), nh,
+            "flop_cfvs_subset[{}] length {} != NUM_PREFLOP_CLASSES {}",
+            i, cfvs_for_flop.len(), nh);
+        for class_idx in 0..nh {
+            let p = table.chance_probability_flop(canonical_idx, class_idx);
+            out[class_idx] += p * cfvs_for_flop[class_idx];
+        }
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // P1.5.5b Slice 1: per-canonical real V_flop computation
 // ─────────────────────────────────────────────────────────────────────
 //
