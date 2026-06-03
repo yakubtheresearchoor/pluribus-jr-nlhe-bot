@@ -375,6 +375,141 @@ fn verify_rake_does_not_apply_to_folded_traverser() {
     eprintln!("✓ Folded traverser payoff is rake-invariant (rake comes out of winner's claim)");
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Slice 1.3: sorted-sweep rake hand-computed anchor
+// ─────────────────────────────────────────────────────────────────────
+//
+// Sorted-sweep path triggered by "all_active_equal && fold_mask == 0
+// && num_active_opp == 1" (line ~640 in showdown.rs). HU showdown,
+// both players in for the same amount, no folds.
+//
+// Case 1: pure-win-no-tie scenario. Player has higher strength for ALL
+// nh combos, opp has lower strength for ALL. With ties=0:
+//   sweep_net[h] = win_reach[h] (no loss component)
+//   tie_reach[h] = 0
+//   cfv[h] = half_pot × sweep_net[h] − rake × win_reach[h]
+//          = (half_pot − rake) × sweep_net[h]   (since sweep_net = win_reach here)
+//
+// Case 2: pure-tie scenario. Player and opp have identical strengths
+// at every combo. With wins=0, losses=0:
+//   sweep_net[h] = 0
+//   tie_reach[h] = some positive amount
+//   cfv[h] = 0 − rake × (tie_reach/2) = −rake × tie_reach / 2
+//   This validates that ties produce a NEGATIVE CFV (player pays half-rake
+//   on ties — both players split the post-rake pot, losing half-rake each).
+
+use solver_core::solver::showdown::sorted_sweep_with_rake_components;
+
+// Realistic HU showdown: opp_str = pl_str (same hand-strength evaluation
+// on shared board). Player and opp have the SAME nh combos with the SAME
+// per-combo strengths. Player's win/tie/loss depends on which combo they
+// hold vs which combo opp holds.
+//
+// Setup: 2 combos with different strengths, no card overlap between
+// combos.
+//   combo 0: cards (0, 1), strength = 100 (low)
+//   combo 1: cards (2, 3), strength = 200 (high)
+// Sorted ascending: opp_str = pl_str = [100, 200], opp_idx = pl_idx = [0, 1].
+//
+// For player holding combo 0 (low):
+//   vs opp combo 0 (self-conflict — same cards, can't both hold): tie band
+//      includes opp idx 0, BUT card-blocking removes it; the self-correction
+//      adds reach[0] back. Net tie contribution from opp combo 0 = reach[0].
+//      But the inclusion-exclusion math (after self-correction) gives:
+//      tie_reach[0] = tie_sum − tie_minus[0] − tie_minus[1] + reach[0]
+//                   = reach[0] − reach[0] − reach[0] + reach[0] = 0.
+//   vs opp combo 1: opp_str=200 > pl_str=100 → loss. opp's cards (2,3)
+//      don't conflict with h's (0,1). Loss contribution = reach[1] = 1.
+//   So for h=0: win_reach=0, tie_reach=0, sweep_net = −1.
+//
+// For player holding combo 1 (high):
+//   vs opp combo 0: opp_str=100 < pl_str=200 → win. opp's cards (0,1)
+//      don't conflict with h's (2,3). Win contribution = reach[0] = 1.
+//   vs opp combo 1 (self): tie band, after self-correction = 0.
+//   So for h=1: win_reach=1, tie_reach=0, sweep_net = 1.
+
+#[test]
+fn verify_rake_sorted_sweep_components_hu_realistic() {
+    let nh = 2usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8];
+    let opp_reach_data = vec![1.0f32; nh];
+    let opp_reach_slices: Vec<&[f32]> = vec![&opp_reach_data];
+    let pl_str = vec![100u16, 200u16];
+    let pl_idx = vec![0u16, 1u16];
+    let opp_str = vec![100u16, 200u16]; // HU: same evaluation
+    let opp_idx = vec![0u16, 1u16];
+
+    let (sweep_net, win_reach, tie_reach) = sorted_sweep_with_rake_components(
+        &opp_reach_slices, &hand_cards, nh, &opp_str, &opp_idx, &pl_str, &pl_idx,
+    );
+    eprintln!("HU-realistic sorted-sweep components:");
+    eprintln!("  sweep_net = {:?}", sweep_net);
+    eprintln!("  win_reach = {:?}", win_reach);
+    eprintln!("  tie_reach = {:?}", tie_reach);
+
+    // Hand-computed expected:
+    //   h=0: win=0, tie=0 (self-corrected), sweep_net=-1
+    //   h=1: win=1, tie=0 (self-corrected), sweep_net=+1
+    assert!((win_reach[0] - 0.0).abs() < 1e-6, "win_reach[0] = {}, expected 0", win_reach[0]);
+    assert!((tie_reach[0] - 0.0).abs() < 1e-6, "tie_reach[0] = {}, expected 0", tie_reach[0]);
+    assert!((sweep_net[0] - (-1.0)).abs() < 1e-6, "sweep_net[0] = {}, expected -1", sweep_net[0]);
+    assert!((win_reach[1] - 1.0).abs() < 1e-6, "win_reach[1] = {}, expected 1", win_reach[1]);
+    assert!((tie_reach[1] - 0.0).abs() < 1e-6, "tie_reach[1] = {}, expected 0", tie_reach[1]);
+    assert!((sweep_net[1] - 1.0).abs() < 1e-6, "sweep_net[1] = {}, expected 1", sweep_net[1]);
+
+    eprintln!("✓ Sorted-sweep components match hand-computed HU values \
+        (self-correction applied to tie band)");
+}
+
+#[test]
+fn verify_rake_sorted_sweep_payoffs_hu_realistic() {
+    // Same HU setup as above, now applying rake to the full showdown.
+    // Contributions [50, 50], starting_pot = 0, total_pot = 100.
+    // half_pot = 0/2 + 50 = 50. rake = min(100 × 0.05, 1000) = 5.
+    //
+    // Hand-computed CFV:
+    //   h=0 (loser): half_pot × sweep_net[0] − rake × (win_reach[0] + tie_reach[0]/2)
+    //              = 50 × (−1) − 5 × (0 + 0) = −50  (no rake — loser doesn't pay)
+    //   h=1 (winner): 50 × 1 − 5 × (1 + 0) = 50 − 5 = 45
+    let nh = 2usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8];
+    let opp_reach_data = vec![1.0f32; nh];
+    let opp_reach_slices: Vec<&[f32]> = vec![&opp_reach_data];
+    let pl_str = vec![100u16, 200u16];
+    let pl_idx = vec![0u16, 1u16];
+    let opp_str = vec![100u16, 200u16];
+    let opp_idx = vec![0u16, 1u16];
+    let contributions = vec![50i32, 50i32];
+    let fold_mask = 0u16;
+
+    let cfv_no_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 2, 0,
+        0.0, 0.0,
+    );
+    let cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &opp_str, &opp_idx, &pl_str, &pl_idx,
+        &contributions, fold_mask, 0, 2, 0,
+        0.05, 1000.0,
+    );
+    eprintln!("HU-realistic showdown:");
+    eprintln!("  rake-free CFV: {:?}", cfv_no_rake);
+    eprintln!("  rake-5%  CFV: {:?}", cfv);
+
+    let expected_no_rake = [-50.0f32, 50.0f32];
+    let expected_with_rake = [-50.0f32, 45.0f32];
+    for h in 0..nh {
+        assert!((cfv_no_rake[h] - expected_no_rake[h]).abs() < 1e-4,
+            "rake-free CFV[{}] = {}, expected {}", h, cfv_no_rake[h], expected_no_rake[h]);
+        assert!((cfv[h] - expected_with_rake[h]).abs() < 1e-4,
+            "rake CFV[{}] = {}, expected {} (loser unchanged, winner -rake)",
+            h, cfv[h], expected_with_rake[h]);
+    }
+    eprintln!("✓ Sorted-sweep HU rake: winner pays rake (-5), loser unchanged");
+}
+
 #[test]
 fn verify_rake_affects_terminal_payoffs() {
     // The originally-#[ignore]'d test from the gap-discovery commit, now

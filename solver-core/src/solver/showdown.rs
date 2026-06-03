@@ -152,6 +152,135 @@ impl ShowdownTable {
 /// to get the actual counterfactual value: `cfv[h] = c_t * result[h]`.
 ///
 /// For each opponent, two passes (ascending wins, descending losses) compute
+/// Extended sorted-sweep: returns (sweep_net, win_reach, tie_reach) per
+/// hand, where:
+///   - `sweep_net[h]` = Σ over opp of (win_reach − loss_reach) with
+///     card-blocking inclusion-exclusion. Matches what
+///     `sorted_sweep_showdown` returns.
+///   - `win_reach[h]` = Σ over opp of reach where opp_str < pl_str[h]
+///     (the opps h beats), card-blocked.
+///   - `tie_reach[h]` = Σ over opp of reach where opp_str == pl_str[h]
+///     (the opps h ties), card-blocked.
+///
+/// The tie component is needed for the rake correction in showdown
+/// payoffs: the winner's claim is (pot − rake), and ties split the
+/// (pot − rake) pot, so player's expected rake cost is
+/// `rake × (win_reach + tie_reach/2)` per hand. See
+/// `side_pot_showdown_cfv_with_rake` for how this composes.
+///
+/// Complexity: O(num_opp × nh) for the win + loss passes (same as the
+/// non-extended function), plus O(nh × 52) per tie band for the tie
+/// component allocation (per-si reset of a 52-card minus vector).
+#[allow(clippy::too_many_arguments)]
+pub fn sorted_sweep_with_rake_components(
+    opp_reach: &[&[f32]],
+    hand_cards: &[u8],
+    nh: usize,
+    opp_str: &[u16],
+    opp_idx: &[u16],
+    pl_str: &[u16],
+    pl_idx: &[u16],
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let num_opp = opp_reach.len();
+    let mut sweep_net = vec![0.0f32; nh];
+    let mut win_reach = vec![0.0f32; nh];
+    let mut tie_reach = vec![0.0f32; nh];
+
+    for oi in 0..num_opp {
+        let reach = opp_reach[oi];
+        let mut cfreach_sum = 0.0f32;
+        let mut cfreach_minus = vec![0.0f32; 52];
+
+        // FORWARD PASS: accumulate opponents h beats (opp_str < pl_str)
+        // and look-ahead for ties (opp_str == pl_str). Same `i` pointer
+        // as the original sorted_sweep_showdown for the win side; the
+        // tie look-ahead uses a separate j cursor that doesn't advance i.
+        let mut i = 0;
+        for si in 0..nh {
+            let str_h = pl_str[si];
+            let h = pl_idx[si] as usize;
+            // Win accumulation: opp_str < str_h
+            while i < nh && opp_str[oi * nh + i] < str_h {
+                let ho = opp_idx[oi * nh + i] as usize;
+                let r = reach[ho];
+                if r != 0.0 {
+                    cfreach_sum += r;
+                    cfreach_minus[hand_cards[ho * 2] as usize] += r;
+                    cfreach_minus[hand_cards[ho * 2 + 1] as usize] += r;
+                }
+                i += 1;
+            }
+            let win = cfreach_sum
+                - cfreach_minus[hand_cards[h * 2] as usize]
+                - cfreach_minus[hand_cards[h * 2 + 1] as usize];
+            sweep_net[h] += win;
+            win_reach[h] += win;
+
+            // Tie look-ahead: opp_str == str_h, scanning from i (which
+            // points at the first opp with opp_str >= str_h). The tie
+            // contribution doesn't advance i, so subsequent hands at
+            // the same strength see the same tie band.
+            //
+            // Inclusion-exclusion correction: the only opp using BOTH
+            // of h's cards is opp = h itself. In HU showdown opp_str =
+            // pl_str (same hand-strength evaluation), so opp = h IS at
+            // the tie boundary (same strength) and IS in the tie band.
+            // Without `+ reach[h]` correction, h's reach is
+            // double-subtracted (once for each of h's cards). Same
+            // shape as the audit-fix #37 correction in the fast path.
+            let mut tie_sum = 0.0f32;
+            let mut tie_minus = [0.0f32; 52];
+            let mut j = i;
+            let mut tie_includes_self = false;
+            while j < nh && opp_str[oi * nh + j] == str_h {
+                let ho = opp_idx[oi * nh + j] as usize;
+                let r = reach[ho];
+                if r != 0.0 {
+                    tie_sum += r;
+                    tie_minus[hand_cards[ho * 2] as usize] += r;
+                    tie_minus[hand_cards[ho * 2 + 1] as usize] += r;
+                    if ho == h { tie_includes_self = true; }
+                }
+                j += 1;
+            }
+            let self_correction = if tie_includes_self { reach[h] } else { 0.0 };
+            let tie = tie_sum
+                - tie_minus[hand_cards[h * 2] as usize]
+                - tie_minus[hand_cards[h * 2 + 1] as usize]
+                + self_correction;
+            tie_reach[h] += tie;
+        }
+
+        // BACKWARD PASS: accumulate opponents h loses to (opp_str > pl_str).
+        // Subtract from sweep_net (loss reduces net). Same as the original
+        // sorted_sweep_showdown's second pass.
+        cfreach_sum = 0.0;
+        for c in 0..52 { cfreach_minus[c] = 0.0; }
+
+        let mut i = nh;
+        for si in (0..nh).rev() {
+            let str_h = pl_str[si];
+            let h = pl_idx[si] as usize;
+            while i > 0 && opp_str[oi * nh + i - 1] > str_h {
+                i -= 1;
+                let ho = opp_idx[oi * nh + i] as usize;
+                let r = reach[ho];
+                if r != 0.0 {
+                    cfreach_sum += r;
+                    cfreach_minus[hand_cards[ho * 2] as usize] += r;
+                    cfreach_minus[hand_cards[ho * 2 + 1] as usize] += r;
+                }
+            }
+            let loss = cfreach_sum
+                - cfreach_minus[hand_cards[h * 2] as usize]
+                - cfreach_minus[hand_cards[h * 2 + 1] as usize];
+            sweep_net[h] -= loss;
+        }
+    }
+
+    (sweep_net, win_reach, tie_reach)
+}
+
 /// per-hand counterfactual reach via inclusion-exclusion card blocking.
 /// Total complexity: O(num_opp * NH).
 #[allow(clippy::too_many_arguments)]
@@ -453,15 +582,20 @@ pub fn side_pot_showdown_cfv_with_rake(
         }
 
         let filtered_views: Vec<&[f32]> = filtered_opp.iter().map(|v| v.as_slice()).collect();
-        let sweep = sorted_sweep_showdown(
+        let (sweep_net, win_reach, tie_reach) = sorted_sweep_with_rake_components(
             &filtered_views, hand_cards, nh,
             sorted_opp_str, sorted_opp_idx,
             sorted_pl_str, sorted_pl_idx,
         );
 
         let half_pot = starting_pot as f32 / np as f32 + min_active_contrib as f32;
+        // Rake correction (Slice 1.3): rake is taken from the winner's pot
+        // claim. cfv = half_pot × sweep_net − rake × (win_reach + tie_reach/2),
+        // where rake = min(total_pot × rake_rate, rake_cap).clamp(0).
+        let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+        let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
         for h in 0..nh {
-            cfv[h] = half_pot * sweep[h];
+            cfv[h] = half_pot * sweep_net[h] - rake * (win_reach[h] + 0.5 * tie_reach[h]);
         }
         return cfv;
     }
@@ -522,13 +656,18 @@ pub fn side_pot_showdown_cfv_with_rake(
 
         if num_active_opp == 1 {
             let filtered_views: Vec<&[f32]> = filtered_opp.iter().map(|v| v.as_slice()).collect();
-            let sweep = sorted_sweep_showdown(
+            let (sweep_net, win_reach, tie_reach) = sorted_sweep_with_rake_components(
                 &filtered_views, hand_cards, nh,
                 sorted_opp_str, sorted_opp_idx,
                 sorted_pl_str, sorted_pl_idx,
             );
+            let half_pot = starting_pot as f32 / np as f32 + c_t as f32;
+            // Rake correction (Slice 1.3): see comment in the all-active-equal
+            // sweep path above.
+            let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+            let rake = (total_pot as f32 * rake_rate).min(rake_cap).max(0.0);
             for h in 0..nh {
-                cfv[h] = (starting_pot as f32 / np as f32 + c_t as f32) * sweep[h];
+                cfv[h] = half_pot * sweep_net[h] - rake * (win_reach[h] + 0.5 * tie_reach[h]);
             }
             return cfv;
         }
