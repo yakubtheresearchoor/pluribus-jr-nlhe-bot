@@ -54,6 +54,7 @@ use crate::abstraction::preflop_class::{
     expansion, PreflopClass, NUM_PREFLOP_CLASSES,
 };
 use crate::card::Card;
+use crate::tree::flat::FlatTree;
 
 /// C(50, 3) = number of distinct 3-card flops the dealer can deal
 /// conditional on a 2-card hand being held (52 - 2 = 50 cards left).
@@ -174,6 +175,124 @@ impl PreflopChanceTable {
 
     /// Number of preflop classes (always 169 for the lossless layout).
     pub fn num_classes(&self) -> usize { NUM_PREFLOP_CLASSES }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P1.5.3: compute_reach_preflop (free function, button-first reach order)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Top-down reach propagation through the preflop zone at the lossless
+/// 169-class layout.
+///
+/// Returns a Vec<f32> of shape `[nn * num_players * NUM_PREFLOP_CLASSES]`,
+/// where `reach[nid * np * nh + p * nh + h]` is the probability that
+/// player `p`, holding class `h`, reaches node `nid` along the chosen
+/// strategy profile.
+///
+/// **Button-first action order:** the function reads `node.player_id`
+/// for the acting player, which the tree builder set to the
+/// button-first convention for preflop nodes (P1 in HU = SB = button,
+/// validated by P2.1's `preflop_action_order` tests). This function
+/// therefore inherits button-first ordering automatically — provided
+/// it correctly dispatches on `node.player_id` and does NOT hardcode
+/// any player index. That is the property `compute_reach_preflop_uses_
+/// button_player_at_root` in `tests` discriminates: a hand-built
+/// strategy that scales player 1's reach by σ at the root must produce
+/// a child whose player-1 reach equals σ × initial weight, while
+/// player 0's reach is unchanged — failure of this property would
+/// catch the bug of hardcoding player 0 (the postflop-first-actor
+/// assumption leaking into the preflop reach path).
+///
+/// **Stops at preflop chance:** at the preflop → flop chance node,
+/// reach is propagated unchanged to the chance child (which is in
+/// the Flop zone). The chance-probability weighting enters the CFV
+/// pass downstream (P1.5.4's bottom_up_zone), not the reach pass.
+///
+/// **Args:**
+///   - `tree`: the preflop-start FlatTree (root must be at
+///     `BoardState::Preflop`)
+///   - `num_players`: player count (matches `tree.num_players` for
+///     real trees; explicit for testability)
+///   - `zones`: zone classification from FlopStartVectorCfr::new (so
+///     we filter to Preflop-zone nodes). Pass `&[]` to skip filtering
+///     and walk all nodes (useful for isolated tests; the production
+///     path should pass the real zones).
+///   - `initial_class_weights`: `[num_players][NUM_PREFLOP_CLASSES]`
+///   - `preflop_strategies`: one optional `Vec<f32>` per tree node;
+///     `Some(sigma)` at preflop decision nodes (sigma layout
+///     `[num_actions * NUM_PREFLOP_CLASSES]`), `None` elsewhere.
+///     Decoupled from FlopStartVectorCfr's `self.strategy_*` storage
+///     because preflop strategy storage doesn't exist yet (P1.5.4 wires it).
+pub fn compute_reach_preflop(
+    tree: &FlatTree,
+    num_players: u8,
+    zones: &[crate::solver::flop_start_vector_cfr::Zone],
+    initial_class_weights: &[Vec<f32>],
+    preflop_strategies: &[Option<Vec<f32>>],
+) -> Vec<f32> {
+    use crate::solver::flop_start_vector_cfr::Zone;
+    let nn = tree.num_nodes();
+    let np = num_players as usize;
+    let nh = NUM_PREFLOP_CLASSES;
+    let mut reach = vec![0.0f32; nn * np * nh];
+
+    assert_eq!(initial_class_weights.len(), np);
+    for p in 0..np {
+        assert_eq!(initial_class_weights[p].len(), nh);
+        for h in 0..nh { reach[p * nh + h] = initial_class_weights[p][h]; }
+    }
+    assert_eq!(preflop_strategies.len(), nn);
+
+    let use_zone_filter = !zones.is_empty();
+
+    for level in 0..=tree.max_depth {
+        for &nid in tree.nodes_at_level(level as u32) {
+            let idx = nid as usize;
+            if use_zone_filter && zones[idx] != Zone::Preflop { continue; }
+            let node = &tree.nodes[idx];
+
+            if node.is_player() {
+                let player = node.player_id as usize;
+                let na = node.num_children as usize;
+                let sigma = match &preflop_strategies[idx] {
+                    Some(s) => s,
+                    None => continue, // no strategy: leave children with zero reach
+                };
+                assert_eq!(sigma.len(), na * nh,
+                    "strategy at node {} has length {}, expected {} ({} actions × {} classes)",
+                    idx, sigma.len(), na * nh, na, nh);
+
+                for (a, &child) in tree.node_children(idx).iter().enumerate() {
+                    let src = idx * np * nh;
+                    let dst = child as usize * np * nh;
+                    // Inherit reach from parent for every (player, class).
+                    for p in 0..np {
+                        for h in 0..nh { reach[dst + p * nh + h] = reach[src + p * nh + h]; }
+                    }
+                    // Multiply the ACTING player's reach by their strategy
+                    // for this action. The acting player is `node.player_id`
+                    // — the button-first preflop convention is baked into
+                    // the tree builder (P2.1 anchor), not redundantly here.
+                    for h in 0..nh {
+                        reach[dst + player * nh + h] *= sigma[a * nh + h];
+                    }
+                }
+            } else if node.is_chance() {
+                // Preflop → Flop chance: propagate reach unchanged to the
+                // chance child (which is in Flop zone). Chance-prob
+                // weighting enters CFV pass, not reach pass.
+                for &child in tree.node_children(idx) {
+                    let src = idx * np * nh;
+                    let dst = child as usize * np * nh;
+                    for p in 0..np {
+                        for h in 0..nh { reach[dst + p * nh + h] = reach[src + p * nh + h]; }
+                    }
+                }
+            }
+        }
+    }
+
+    reach
 }
 
 #[cfg(test)]
@@ -301,6 +420,124 @@ mod tests {
                 assert!(p >= 0.0, "P({} | class {}) = {} < 0", c, k, p);
                 assert!(p <= 1.0, "P({} | class {}) = {} > 1", c, k, p);
             }
+        }
+    }
+
+    /// Targeted P1.5.3 anchor: compute_reach_preflop applies the acting
+    /// player's strategy to the acting player's reach slot, where the
+    /// acting player is `node.player_id` (button-first at preflop root
+    /// per P2.1's tree-side anchor).
+    ///
+    /// THE DISCRIMINATOR: build a preflop tree, set a non-uniform
+    /// strategy at the root. The root acts player_id = 1 (button = SB in
+    /// HU). After reach propagation:
+    ///   - child[0]: player 1's reach scaled by σ[0] (≈ 0.7); player 0's
+    ///     reach unchanged (still = initial = 1.0)
+    ///   - child[1]: player 1's reach scaled by σ[1] (≈ 0.3); player 0
+    ///     unchanged
+    ///
+    /// If the function bug hardcoded player 0 (the postflop-first-actor
+    /// assumption leaking in), player 0's reach at the child would be
+    /// 0.7 / 0.3 instead of 1.0. That's the failure this catches.
+    #[test]
+    fn compute_reach_preflop_uses_button_player_at_root() {
+        use crate::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
+        use crate::tree::builder::build_tree;
+
+        // HU preflop, simple action set (matches preflop_tree_smoke).
+        let cfg = TreeConfig {
+            num_players: 2,
+            initial_state: BoardState::Preflop,
+            starting_pot: 3,
+            starting_stacks: vec![100, 100],
+            initial_contributions: vec![2, 1],
+            rake_rate: 0.0, rake_cap: 0.0,
+            bet_sizes: BetSizeOptions {
+                bet: vec![BetSize::PotRelative(1.0)],
+                raise: vec![],
+            },
+            add_allin_threshold: 1.0,
+            force_allin_threshold: 1.0,
+            merging_threshold: 0.0,
+        };
+        let tree = build_tree(&cfg).expect("preflop tree builds");
+
+        let np = cfg.num_players as usize;
+        let nh = NUM_PREFLOP_CLASSES;
+        let nn = tree.num_nodes();
+
+        // Sanity: root acts player 1 (button, validated by
+        // preflop_action_order tests).
+        assert_eq!(tree.nodes[0].player_id, 1,
+            "preflop root must act player 1 (button); if this changed, \
+             the P2.1 anchor regressed and this test's discriminator \
+             premise breaks");
+        let root_na = tree.nodes[0].num_children as usize;
+
+        // Non-uniform strategy at the root only, uniform per class.
+        // σ[a, h] is action `a`'s probability for class `h`. To make
+        // the discriminator unambiguous, use σ[0] = 0.7, σ[1] = 0.3 for
+        // every class (or split evenly if root has more children — but
+        // for HU preflop with our cfg, root has 2 children).
+        let mut preflop_strategies: Vec<Option<Vec<f32>>> = vec![None; nn];
+        let mut root_sigma = vec![0.0f32; root_na * nh];
+        let sigma_per_action: Vec<f32> = match root_na {
+            2 => vec![0.7, 0.3],
+            3 => vec![0.5, 0.3, 0.2],
+            4 => vec![0.4, 0.3, 0.2, 0.1],
+            _ => panic!("unexpected root_na = {}", root_na),
+        };
+        for a in 0..root_na {
+            for h in 0..nh {
+                root_sigma[a * nh + h] = sigma_per_action[a];
+            }
+        }
+        preflop_strategies[0] = Some(root_sigma);
+
+        // Initial class weights: uniform 1.0 for both players. (The
+        // probability function doesn't care about normalization for
+        // this discriminator; we just need a known starting value.)
+        let initial_class_weights = vec![vec![1.0f32; nh]; np];
+
+        // Run reach propagation with no zone filter (walk all nodes,
+        // strategies at non-preflop nodes are None so they'd be skipped
+        // anyway). The zones-arg-empty mode is documented for testability.
+        let reach = compute_reach_preflop(
+            &tree,
+            cfg.num_players,
+            &[],
+            &initial_class_weights,
+            &preflop_strategies,
+        );
+
+        // Identify the first chance descendant's TWO PARENT player-children
+        // — root has root_na = 2 children, indices read from the tree.
+        let root_children: Vec<u32> = tree.node_children(0).to_vec();
+        assert_eq!(root_children.len(), 2, "HU preflop root has 2 children");
+
+        // For each child of root, verify:
+        //   reach[child][player=1][h] == sigma_per_action[a]  (button scaled)
+        //   reach[child][player=0][h] == 1.0                  (BB unchanged)
+        for (a, &child) in root_children.iter().enumerate() {
+            let base = child as usize * np * nh;
+            let p1_reach = reach[base + 1 * nh + 0];
+            let p0_reach = reach[base + 0 * nh + 0];
+            assert!(
+                (p1_reach - sigma_per_action[a]).abs() < 1e-7,
+                "child {} (action {}): player 1 (button) reach = {}, expected {} \
+                 (strategy applied to acting player's slot)",
+                child, a, p1_reach, sigma_per_action[a],
+            );
+            assert!(
+                (p0_reach - 1.0).abs() < 1e-7,
+                "child {} (action {}): player 0 (BB) reach = {}, expected 1.0 \
+                 (non-acting player's reach should pass through unchanged). \
+                 If this is {}, the function hardcoded player 0 as the actor \
+                 instead of reading node.player_id — the postflop-first-actor \
+                 bug leaking into preflop, exactly the failure mode P1.5.3 \
+                 anchors against.",
+                child, a, p0_reach, sigma_per_action[a],
+            );
         }
     }
 
