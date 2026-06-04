@@ -1724,7 +1724,28 @@ kernel void vcfr_bottom_up_batched(
         return;
     }
 
-    // (Legacy showdown evaluation code removed; replaced by brute-force above.)
+    // ═════════════════════════════════════════════════════════════════
+    // DEAD CODE WARNING (Slice 2 Phase B finding): the `if (false)`
+    // block below is legacy showdown evaluation, replaced by the
+    // multiway_brute_force_showdown call above. This block is GATED
+    // OUT and does NOT execute in any production code path. Edits
+    // inside it (including Slice 2 Phase B rake-mirror attempts at
+    // lines ~1772/1820/1872/1932/1959/1995/etc.) have NO RUNTIME
+    // EFFECT.
+    //
+    // Discovered when Phase B Site (d) part 2 sorted_sweep edits
+    // failed to move the HU gate (residual stayed at exactly
+    // 0.09375006). The standing question applied: "does this code
+    // actually execute?" — Answer: NO, it's gated behind if(false).
+    //
+    // FIFTH inventory iteration failure: even the exhaustive output-
+    // write enumeration the user explicitly directed was blind to this
+    // gate. The output-write pattern is necessary but not sufficient;
+    // each site also has to be verified REACHABLE in production code
+    // paths. The standing question applies to enumeration itself.
+    //
+    // Recommended cleanup (deferred): delete this dead block entirely.
+    // ═════════════════════════════════════════════════════════════════
     if (false) {
         int32_t c_t = contributions[int(node_id) * np + int(params.traverser)];
         uint16_t fold_mask = folded_masks[int(node_id)];
@@ -1741,11 +1762,20 @@ kernel void vcfr_bottom_up_batched(
             int32_t total_pot = params.starting_pot;
             for (int p = 0; p < np; p++) total_pot += contributions[int(node_id) * np + p];
             float traverser_investment = float(params.starting_pot) / float(np) + float(c_t);
+            // ── Slice 2 Phase B Site F1: fold-win rake (inline batched) ──
+            // Mirror CPU `side_pot_showdown_cfv_with_rake` fast path
+            // (showdown.rs ~484-548). Active lone-survivor traverser
+            // claims (total_pot − rake); folded traverser loses
+            // investment regardless of rake (no win).
+            bool flop_seen = (node.board_state != 3);
+            float eff_rake_rate = flop_seen ? params.rake_rate : 0.0f;
+            float eff_rake_cap  = flop_seen ? params.rake_cap  : 0.0f;
+            float rake = fmax(0.0f, fmin((float)total_pot * eff_rake_rate, eff_rake_cap));
             float payoff;
             if (fold_mask & (1 << params.traverser)) {
                 payoff = -traverser_investment;
             } else {
-                payoff = float(total_pot) - traverser_investment;
+                payoff = (float(total_pot) - rake) - traverser_investment;
             }
 
             float opp_reach_sum = 0.0f;

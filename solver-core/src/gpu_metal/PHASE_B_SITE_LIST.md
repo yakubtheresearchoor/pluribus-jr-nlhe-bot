@@ -1,5 +1,58 @@
 # Phase B: exhaustive output-write site list (production kernels only)
 
+> ## ⚠️ FIFTH-ITERATION INVENTORY FAILURE — this document is INCORRECT
+>
+> The site list below was constructed by exhaustive output-write
+> enumeration in vcfr_bottom_up_batched. After applying rake at F1 and
+> observing the HU gate did NOT move (residual stayed at exactly
+> 0.09375006), the standing question applied: "does this code actually
+> execute?" Answer: NO.
+>
+> All inline payoff sites F1–G4 (and the sorted_sweep_with_components
+> sites 10/13 from Site (d) part 2) are inside an `if (false)` gate at
+> vcfr.metal line 1728. Comment at line 1727 says "Legacy showdown
+> evaluation code removed; replaced by brute-force above" — but the
+> code wasn't deleted, just gated.
+>
+> **PRODUCTION ROUTING IN vcfr_bottom_up_batched**: every terminal
+> goes through the unconditional `multiway_brute_force_showdown` call
+> at line 1719, then `return;` at 1725. The entire 600-line block
+> below 1728 is DEAD.
+>
+> **Lesson for the standing method**: output-write enumeration is
+> NECESSARY BUT NOT SUFFICIENT. Each enumerated site must ALSO be
+> verified REACHABLE in production code paths (the standing question
+> applied to enumeration). The simplest verification: insert a deliberate
+> compile-break (or NaN write) at the site and confirm tests detect it.
+> A site whose disturbance changes nothing is dead.
+>
+> **What's actually rake-correct in production** (verified by unit tests
+> against multiway_brute_force_showdown's 5 branches):
+>   - Sites (a) K=2 all-equal brute: unit test 0.0
+>   - Sites (b) K=2 fold-win fast: unit test 0.0
+>   - Sites (c) K=2 unequal/side-pot: unit test 0.0
+>   - Site (d) K=1 HU per-level: unit test 0.0 (incl tie-band)
+>   - Site (e) K≥3 factored: STILL OPEN (rake-free)
+>
+> **Phase B remaining work**: site (e) only (K≥3 factored in
+> multiway_brute_force_showdown), plus production-solve instrumentation
+> as the standing completeness check. The "5+ inline sites" finding
+> dissolved on the standing-question check.
+>
+> **HU gate residual (0.09375006) still unexplained**: the multiway
+> helper is fully rake-correct for K=1, so the residual is NOT a rake
+> bug in the K=1 path. Possible sources: site (e) doesn't affect HU
+> (K=1 not K≥3); chance integration; CFR propagation through decision
+> nodes; numerical artifact. Needs investigation as a separate finding,
+> NOT bundled with rake.
+>
+> The site list below is preserved for reference but should be read
+> understanding that everything except line 1719 (multiway helper call)
+> is dead code.
+>
+> ---
+
+
 Per the lead's directive: per-site rake-mirror keeping the inline fast-path
 optimizations, with output-write enumeration as the standing method and
 production-solve instrumentation as the permanent CI completeness check.
