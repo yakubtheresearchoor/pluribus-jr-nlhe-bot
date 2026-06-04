@@ -120,40 +120,70 @@ residual says something is still rake-free, chase the tension) caught
 the miscounted line ranges. The gate residual caught what TWO rounds
 of source-reading inventory missed.
 
-## The hierarchy of trust (generalizes beyond rake)
-
-This generalizes beyond the rake arc, beyond this session, beyond
-Phase B. It is the deepest version of the project's recurring theme.
+## The hierarchy-of-trust principle (sharpened)
 
 The project's running theme has been: **"agreement between
 implementations is not correctness, anchor against truth."** The
-inventory finding adds the orthogonal axis:
+inventory finding adds an orthogonal axis, but stated precisely
+this time — the first version was too absolute.
 
-  **"A reading of the code is not the code, anchor against what
-   the code actually does."**
+WRONG (too absolute): "execution-grounded signals over source-reading
+inventories, when they disagree execution wins."
 
-The original showdown inventory, the re-survey, both were readings of
-source. Both had gaps. The gate residual is grounded in execution.
-The hierarchy of trust:
+This formulation would mislead later, because this very project is
+full of execution-grounded signals that were ALSO wrong:
+  - rake=0 parity gates pass while telling you nothing about rake
+  - constant-stub test passes while not exercising the value-dependent
+    path
+  - the loose 0.5 parity gate passed while hiding the inclusion-
+    exclusion bug
+  - zero-assertion "trace" tests pass while validating nothing
+  - the cap-binding site (b) regret-level gate "passes" while not
+    actually measuring site (b)
 
-  1. **Execution-grounded signals** (authoritative)
-     - gate residual reaching f32 floor (no rake-free location remains
-       in the paths the gate exercises)
-     - unit test routed to a specific branch reaching 0.0 (that branch's
-       math matches CPU truth)
-     - instrumented assertions in the running solve (proposed below)
+So execution-grounded signals are not automatically authoritative.
+The reason the gate residual WON over the inventory in this case is
+not that execution always beats reading — it's that the gate residual
+was actually exercising production payoff paths while the inventory
+wasn't grounded in execution at all.
 
-  2. **Source-reading inventories** (hypotheses)
-     - explore agent's enumeration of code locations
-     - grep-based call-site mapping
-     - any human or LLM reading of the source
+PRECISE (the deeper principle):
 
-Source readings can be wrong; execution signals cannot. So when they
-disagree, the execution signal wins — and "the inventory says all
-locations are mirrored but the gate isn't at f32 floor" means the
-inventory is wrong, not the gate. The agent's instinct to chase
-that tension was correct; trusting the re-survey would have been the
-mistake.
+  **A signal that actually exercises the path under test beats one
+   that doesn't. Execution-grounded signals earn their authority by
+   exercising the thing, not by being execution-grounded per se.**
+
+The failure mode to guard against, in either direction:
+  - **The reading not grounded in execution** (inventory says a
+    location is covered; it isn't, because the reading miscounted)
+  - **The execution-grounded signal not exercising the thing**
+    (gate passes; it isn't validating what it appears to, because
+    the scenario doesn't reach the relevant code path with the
+    relevant input)
+
+Both have happened in this project. The principle covers both:
+ask "does this signal actually exercise the path in question?" If
+yes, trust it; if no, it's green-but-useless regardless of whether
+it's a reading or an execution.
+
+In this arc specifically:
+  - The original inventory: reading, not grounded in execution → wrong
+  - The re-survey: reading, not grounded in execution → wrong
+  - The site (b) gate at rake=0: execution-grounded, not exercising
+    rake → useless for rake (the Slice 2 gate was added because of this)
+  - The site (b) cap-binding gate: execution-grounded, exercising rake
+    but not site (b) specifically → false discriminator (vindicated by
+    the kernel unit test)
+  - The site (b) kernel unit test: execution-grounded, routed to
+    site (b)'s branch via fold_mask → actually exercises site (b),
+    authoritative
+  - The HU gate residual after site (d) part 1: execution-grounded,
+    exercising HU production paths → authoritative, and revealed the
+    second unmapped location that two inventories missed
+
+So the right question at every step: "does this signal actually
+exercise what I claim it validates?" The gate residual at HU passed
+that test. The two inventories did not.
 
 ## Consequence for Phase B completion criterion
 
@@ -207,13 +237,39 @@ scenarios should be chosen to be representative of production play;
 the inventory becomes an implementation detail rather than a
 coverage criterion.
 
-## Recommendation
+## Recommendation (revised per sharpened principle)
 
-Apply Option 2 minimally (audit gate scenarios for production-terminal-
-type coverage) as part of declaring Phase B done. Consider Option 1
-(production-solve rake-assertion instrumentation) as future hardening
-if the inventory keeps proving unreliable beyond Phase B. Both
-options are execution-grounded; the difference is rigor vs cost.
+The first version of this recommendation said "apply Option 2
+minimally, consider Option 1 as future hardening." That under-applied
+the sharpened principle.
+
+The sharpened principle says: a signal earns authority by ACTUALLY
+exercising the thing. Option 2 (gate-scenario representativeness of
+production play) is coverage-by-reasoning — you have to reason about
+which terminal types production produces, then verify the gate
+scenarios collectively exercise them. That reasoning is the same
+class of activity as the inventory: a reading-based hypothesis about
+what production does. The inventory has been wrong twice. Coverage-
+by-reasoning could be wrong the same way.
+
+Option 1 (production-solve instrumented assertion that rake was
+applied at every terminal it touches) is coverage-by-execution: the
+running solve answers "did every terminal I evaluated apply rake?"
+directly. No reasoning step that could fail; the live code reports.
+
+Given the inventory has been wrong twice, that's the evidence that
+coverage-by-reasoning is the approach that fails on THIS codebase.
+Option 1 is the version that doesn't depend on getting coverage right
+by reasoning.
+
+**Revised recommendation**: For Phase B done-declaration, lean toward
+Option 1 (production-solve instrumentation). It's more work, but the
+inventory being wrong twice is exactly the evidence that the cheaper
+coverage-by-reasoning approach is the one that fails. Option 2 as
+fallback only if instrumentation is genuinely too expensive for the
+done-declaration timeframe — and even then, it should be paired with
+extra paranoia (audit by multiple methods, accept the residual risk
+explicitly).
 
 ## Principle to carry beyond Phase B
 
@@ -227,16 +283,71 @@ to empirical detection. This applies to:
   - Bucketing / postflop abstraction (new code shapes)
   - Any future cross-implementation parity work
 
-The standing method for catching unmapped locations:
-  1. Gate scenarios chosen to represent production play
-  2. f32-floor-everywhere as the declarative completion criterion
+The standing method for catching unmapped locations (revised):
+  1. Choose signals that actually exercise the path under test
+     (not signals that are merely execution-grounded)
+  2. f32-floor-everywhere as the declarative completion criterion,
+     but only on gate scenarios that exercise production paths
   3. Unit test routed to a specific location as the discriminator
-     when a gate doesn't reach floor
-  4. Treat the gate residual as authoritative; the inventory is a
-     hypothesis to be falsified by execution
+     when a gate doesn't reach floor (kernel-math-wrong vs
+     location-missing)
+  4. Prefer instrumented assertions in the running solve over
+     coverage-by-reasoning, when achievable
+  5. For both readings AND execution signals: ask "does this
+     actually exercise what I claim it validates?" Skepticism
+     applies to both directions.
 
 This is the deepest lesson the rake arc produced and it is bigger than
 rake.
+
+## Altitude: where the rake arc sits in the larger plan
+
+The rake arc started as "implement rake, ~1-2 hours" and has become a
+multi-session investigation. So far it has produced:
+
+  - CPU: rake was stored-but-unimplemented (the original gap)
+  - CPU: rake implemented across all 5 showdown paths with the
+    sorted-sweep tie-band subtlety (audit-fix #37 lineage)
+  - Validation arc: tie-band oracle coverage gap closed
+  - Build hygiene: 3 stale/zero-assertion tests removed; CUDA legacy
+    deleted (49 files, 14,811 lines)
+  - GPU: showdown-site inventory demonstrated incomplete TWICE
+  - GPU: K=2 cluster fully closed (3 unit tests at 0.0)
+  - GPU: site (d) part 1 closed; sorted_sweep second location found
+  - Sharpened the project's recurring principle (this file)
+
+Every one was a real correctness issue that would have produced
+wrong blueprint output or false-confidence validation. The arc has
+justified itself many times over in caught bugs.
+
+That said: the question "is the remaining rake work worth the
+marginal correctness" is legitimate. Site (d) part 2 and site (e)
+are real (a rake-free showdown path produces wrong payoffs, and
+rake is strategy-determining), so they SHOULD be finished — this
+isn't a place to stop short.
+
+But a meta-point worth keeping visible: **the blueprint is NOT
+gated on the remaining GPU rake.** The blueprint is computed on CPU
+(via FlopStartVectorCfr); CPU rake is done and validated. The GPU
+rake is for the real-time search path (which uses the GPU and must
+be rake-correct). So:
+
+  - Blueprint computation: can proceed RIGHT NOW on CPU, rake-correct
+  - Real-time search: requires the remaining GPU rake work
+  - The two are independent and can run in parallel
+
+The remaining Phase B work (site (d) part 2, site (e), instrumented
+coverage check for the done-declaration) is well-scoped and should
+be finished while context and detection method are fresh. But if it
+extends further (site (e) being more complex and possibly multi-
+location like site (d) turned out to be), the blueprint can proceed
+in parallel rather than waiting. This is not a redirect; it's a
+sequencing option to keep visible.
+
+The sharpening of the principle to "actually exercises the thing"
+applies broadly. The remaining sites should be finished, validated
+under the sharpened principle, and the blueprint can be computed in
+parallel on the rake-correct CPU path whenever convenient.
 
 ## Carry for site (e)
 
