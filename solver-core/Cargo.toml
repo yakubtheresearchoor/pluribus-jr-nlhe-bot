@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cudarc = { version = "0.19", optional = true, features = ["cuda-13020"] }
 metal = { version = "0.33", optional = true }
 objc = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -15,7 +14,6 @@ rand = "0.8"
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
 metal = ["dep:metal", "dep:objc"]
 
 [dev-dependencies]

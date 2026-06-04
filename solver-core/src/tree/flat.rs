@@ -1,8 +1,5 @@
 use crate::tree::action::BoardState;
 
-#[cfg(feature = "cuda")]
-use cudarc::driver::DeviceRepr;
-
 pub const NODE_TYPE_TERMINAL: u8 = 0;
 pub const NODE_TYPE_CHANCE: u8 = 1;
 pub const NODE_TYPE_PLAYER: u8 = 2;
@@ -18,9 +15,6 @@ pub struct FlatNode {
     pub amount: i32,
     pub action_label: u8,
 }
-
-#[cfg(feature = "cuda")]
-unsafe impl DeviceRepr for FlatNode {}
 
 impl FlatNode {
     pub fn terminal() -> Self {

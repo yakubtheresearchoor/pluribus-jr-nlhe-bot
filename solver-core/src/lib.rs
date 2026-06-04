@@ -4,7 +4,5 @@ pub mod range;
 pub mod card;
 pub mod solver;
 pub mod abstraction;
-#[cfg(feature = "cuda")]
-pub mod gpu;
 #[cfg(feature = "metal")]
 pub mod gpu_metal;
