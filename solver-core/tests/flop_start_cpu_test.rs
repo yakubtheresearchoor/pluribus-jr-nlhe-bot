@@ -102,12 +102,14 @@ fn flop_start_solver_initializes() {
     println!("  flop_infosets = {}", solver.flop_infosets());
     println!("  turn_infosets = {}", solver.turn_infosets());
     println!("  river_infosets = {}", solver.river_infosets());
-    println!("  memory = {:.1} MB", solver.memory_usage() as f64 / 1e6);
+    // (memory_usage diagnostic removed: method no longer exists on
+    // FlopStartVectorCfr after a refactor. The accompanying assert
+    // was a sanity "allocated something" check; the infoset assertions
+    // below cover the same intent.)
 
     assert!(solver.flop_infosets() > 0, "Should have flop zone infosets");
     assert!(solver.turn_infosets() > 0, "Should have turn zone infosets");
     assert!(solver.river_infosets() > 0, "Should have river zone infosets");
-    assert!(solver.memory_usage() > 0, "Should have nonzero memory");
 }
 
 #[test]
