@@ -134,6 +134,15 @@ pub struct MetalFlopStartSolver {
     nh: usize,
     nn: usize,
     starting_pot: i32,
+    // ─── Slice 2: rake plumbing (CPU↔Metal parity) ───
+    // Mirror CPU `tree.rake_rate, tree.rake_cap` as f32 for kernel scalars.
+    // Apply gates: `eff_rake = flop_seen ? rake : 0.0` (no-flop-no-drop),
+    // then `rake_amount = (pot * eff_rate).min(eff_cap).max(0.0)`.
+    // Today flop_seen is always true (no preflop terminals); the gating is
+    // wired now so it's correct when preflop integration brings preflop-end
+    // terminals — not a later gap.
+    rake_rate: f32,
+    rake_cap: f32,
     num_combinations: f32,
     regret_floor: f32,
     iteration: u32,
@@ -414,6 +423,9 @@ impl MetalFlopStartSolver {
             nh,
             nn,
             starting_pot: tree.starting_pot,
+            // Slice 2 rake: stash the f64 tree fields as f32 scalars for kernel use.
+            rake_rate: tree.rake_rate as f32,
+            rake_cap: tree.rake_cap as f32,
             num_combinations: table.num_combinations as f32,
             regret_floor: -1e30,
             iteration: 0,
@@ -876,6 +888,8 @@ impl MetalFlopStartSolver {
                 // ─── Phase 1.A pruning (Option A) ───
                 pruning_enabled: i32, pruning_threshold: f32,
                 iteration: i32, pruning_stride: i32, board_state: i32,
+                // ─── Slice 2 rake (CPU↔Metal parity) ───
+                rake_rate: f32, rake_cap: f32,
             }
             let bp = BParams {
                 level_count: count as i32,
@@ -899,6 +913,8 @@ impl MetalFlopStartSolver {
                 iteration: self.iteration as i32,
                 pruning_stride: self.pruning_stride as i32,
                 board_state: 2,  // RIVER
+                rake_rate: self.rake_rate,
+                rake_cap: self.rake_cap,
             };
             self.upload_params(&bp);
             let params_buf = unsafe { (*self.d_params_buf.get()).as_ref() };
@@ -971,6 +987,8 @@ impl MetalFlopStartSolver {
                 // ─── Phase 1.A pruning (Option A) ───
                 pruning_enabled: i32, pruning_threshold: f32,
                 iteration: i32, pruning_stride: i32, board_state: i32,
+                // ─── Slice 2 rake (CPU↔Metal parity) ───
+                rake_rate: f32, rake_cap: f32,
             }
             let bp = BParams {
                 level_count: count as i32,
@@ -994,6 +1012,8 @@ impl MetalFlopStartSolver {
                 iteration: self.iteration as i32,
                 pruning_stride: self.pruning_stride as i32,
                 board_state: 1,  // TURN
+                rake_rate: self.rake_rate,
+                rake_cap: self.rake_cap,
             };
             self.upload_params(&bp);
             let params_buf = unsafe { (*self.d_params_buf.get()).as_ref() };
@@ -1048,6 +1068,8 @@ impl MetalFlopStartSolver {
                 level_count: i32, num_players: i32, nh: i32,
                 traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
                 regret_floor: f32, starting_pot: i32, num_combinations: f32,
+                // ─── Slice 2 rake (CPU↔Metal parity) ───
+                rake_rate: f32, rake_cap: f32,
             }
             let bp = BuParams {
                 level_count: count as i32,
@@ -1060,6 +1082,8 @@ impl MetalFlopStartSolver {
                 regret_floor: self.regret_floor,
                 starting_pot: self.starting_pot,
                 num_combinations: self.num_combinations,
+                rake_rate: self.rake_rate,
+                rake_cap: self.rake_cap,
             };
             self.upload_params(&bp);
 

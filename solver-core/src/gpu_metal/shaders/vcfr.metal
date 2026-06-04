@@ -684,6 +684,11 @@ struct BottomUpParams {
     float regret_floor;
     int32_t starting_pot;
     float num_combinations;
+    // ─── Slice 2 rake (CPU↔Metal parity) ───
+    // Mirror CPU `tree.rake_rate, tree.rake_cap`. Per-terminal gating is
+    // applied at evaluation site as: `eff_rate/eff_cap = flop_seen ? rake : 0`.
+    float rake_rate;
+    float rake_cap;
 };
 
 kernel void vcfr_bottom_up(
@@ -1388,6 +1393,9 @@ struct BatchedParams {
     int32_t iteration;              // for stochastic re-enable
     int32_t pruning_stride;         // re-enable every Kth iter (don't prune that iter)
     int32_t board_state;            // 0=flop, 1=turn, 2=river (never prune river)
+    // ─── Slice 2 rake (CPU↔Metal parity) ───
+    float rake_rate;
+    float rake_cap;
 };
 
 kernel void vcfr_bottom_up_batched(
