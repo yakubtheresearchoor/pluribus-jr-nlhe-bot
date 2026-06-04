@@ -79,6 +79,131 @@ inline void sorted_sweep_showdown_vcfr_local(
 }
 
 // ============================================================================
+// Slice 2 Phase B Site (d) part 2: sorted-sweep with rake components.
+//
+// Mirrors CPU `sorted_sweep_with_rake_components` (showdown.rs ~170-260).
+// Returns THREE thread-local arrays:
+//   sweep_net[h]  — wins − losses, identical to sorted_sweep_showdown_vcfr_local
+//   win_reach[h]  — cumulative opp reach where h strictly wins (opp_str < pl_str)
+//   tie_reach[h]  — cumulative opp reach where h ties at top (opp_str == pl_str),
+//                   WITH the +reach[h] inclusion-exclusion correction (audit-fix #37):
+//                   when opp = h is in the tie band (which happens because
+//                   opp_str == pl_str for opp = h), its reach is double-subtracted
+//                   by the two-card minus vector without the self-correction.
+//
+// Caller then applies:
+//   cfv[h] = half_pot * sweep_net[h] - rake * (win_reach[h] + 0.5 * tie_reach[h])
+// where rake = min(total_pot * eff_rake_rate, eff_rake_cap).max(0).
+//
+// The tie-band test (site_d_tie_band_isolated_kernel_unit_test) is the
+// targeted defense for this function's tie_reach correctness.
+// ============================================================================
+inline void sorted_sweep_showdown_vcfr_local_with_components(
+    thread const float* opp_reach_all, int num_opp, int nh,
+    const device uint16_t* opp_strength, const device uint16_t* opp_indices,
+    const device uint16_t* player_strength, const device uint16_t* player_indices,
+    const device uint8_t* hand_cards,
+    thread float* sweep_net,
+    thread float* win_reach,
+    thread float* tie_reach
+) {
+    for (int h = 0; h < nh; h++) {
+        sweep_net[h] = 0.0f;
+        win_reach[h] = 0.0f;
+        tie_reach[h] = 0.0f;
+    }
+
+    // FORWARD PASS: wins (opp_str < pl_str) and tie look-ahead.
+    for (int oi = 0; oi < num_opp; oi++) {
+        float cfreach_sum = 0.0f;
+        float cfreach_minus[52];
+        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+
+        int i = 0;
+        for (int si = 0; si < nh; si++) {
+            uint16_t str_h = player_strength[si];
+            uint16_t h = player_indices[si];
+            // Wins: opp_str < str_h
+            while (i < nh && opp_strength[oi * nh + i] < str_h) {
+                uint16_t ho = opp_indices[oi * nh + i];
+                float r = opp_reach_all[oi * nh + ho];
+                if (r != 0.0f) {
+                    cfreach_sum += r;
+                    cfreach_minus[hand_cards[ho * 2]] += r;
+                    cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                }
+                i++;
+            }
+            float win = cfreach_sum
+                - cfreach_minus[hand_cards[h * 2]]
+                - cfreach_minus[hand_cards[h * 2 + 1]];
+            sweep_net[h] += win;
+            win_reach[h] += win;
+
+            // Tie look-ahead: opp_str == str_h, scanning from i (which
+            // points at the first opp with opp_str >= str_h). The tie
+            // contribution does NOT advance i, so subsequent hands at
+            // the same strength see the same tie band.
+            //
+            // +reach[h] self-correction: when opp = h is in the tie band
+            // (always true in HU because opp_str == pl_str = same hand
+            // evaluation), h's reach is double-subtracted by the two-card
+            // minus vector. Self-correct by adding it back. CPU audit-fix
+            // #37 lineage — see showdown.rs comment at line ~226.
+            float tie_sum = 0.0f;
+            float tie_minus[52];
+            for (int c = 0; c < 52; c++) tie_minus[c] = 0.0f;
+            int j = i;
+            bool tie_includes_self = false;
+            while (j < nh && opp_strength[oi * nh + j] == str_h) {
+                uint16_t ho = opp_indices[oi * nh + j];
+                float r = opp_reach_all[oi * nh + ho];
+                if (r != 0.0f) {
+                    tie_sum += r;
+                    tie_minus[hand_cards[ho * 2]] += r;
+                    tie_minus[hand_cards[ho * 2 + 1]] += r;
+                    if (ho == h) tie_includes_self = true;
+                }
+                j++;
+            }
+            float self_correction = tie_includes_self ? opp_reach_all[oi * nh + h] : 0.0f;
+            float tie = tie_sum
+                - tie_minus[hand_cards[h * 2]]
+                - tie_minus[hand_cards[h * 2 + 1]]
+                + self_correction;
+            tie_reach[h] += tie;
+        }
+    }
+
+    // BACKWARD PASS: losses (opp_str > pl_str). Subtract from sweep_net.
+    for (int oi = 0; oi < num_opp; oi++) {
+        float cfreach_sum = 0.0f;
+        float cfreach_minus[52];
+        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+
+        int i = nh - 1;
+        for (int si = nh - 1; si >= 0; si--) {
+            uint16_t str_h = player_strength[si];
+            uint16_t h = player_indices[si];
+            while (i >= 0 && opp_strength[oi * nh + i] > str_h) {
+                uint16_t ho = opp_indices[oi * nh + i];
+                float r = opp_reach_all[oi * nh + ho];
+                if (r != 0.0f) {
+                    cfreach_sum += r;
+                    cfreach_minus[hand_cards[ho * 2]] += r;
+                    cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                }
+                i--;
+            }
+            float loss = cfreach_sum
+                - cfreach_minus[hand_cards[h * 2]]
+                - cfreach_minus[hand_cards[h * 2 + 1]];
+            sweep_net[h] -= loss;
+        }
+    }
+}
+
+// ============================================================================
 // Helper: per-scenario brute-force showdown for 3-player (K=2 opponents) games.
 //
 // Mirrors CPU side_pot_showdown_cfv exactly. For each ordered (g_a, g_b)
@@ -1259,6 +1384,12 @@ kernel void vcfr_streaming_level(
                 }
 
                 if (num_active_opp == 1) {
+                    // NOTE: this call site is INSIDE vcfr_streaming_level
+                    // (DEAD CODE — not called from production Rust). Leaving
+                    // rake-free here; rake support would require extending
+                    // StreamingParams, which is not warranted for unused
+                    // code. Re-introducing this kernel would require adding
+                    // rake fields to StreamingParams and routing here.
                     float local_cfv[1326];
                     sorted_sweep_showdown_vcfr_local(
                         opp_reach_local, num_opp, nh,
@@ -1712,14 +1843,35 @@ kernel void vcfr_bottom_up_batched(
             }
 
             if (num_active_opp == 1) {
-                float local_cfv[1326];
-                sorted_sweep_showdown_vcfr_local(
+                // ── Slice 2 Phase B Site (d) part 2: sorted-sweep rake ──
+                // Mirror CPU showdown.rs ~595-617 (the all_active_equal HU-
+                // after-folds sweep path). cfv = half_pot * sweep_net -
+                // rake * (win_reach + 0.5 * tie_reach), with the tie-band
+                // +reach correction in tie_reach (audit-fix #37 lineage,
+                // defended by site_d_tie_band_isolated_kernel_unit_test).
+                // flop_seen: per-terminal no-flop-no-drop gate. node is in
+                // scope here from the enclosing kernel.
+                bool flop_seen = (node.board_state != 3);
+                float eff_rake_rate = flop_seen ? params.rake_rate : 0.0f;
+                float eff_rake_cap  = flop_seen ? params.rake_cap  : 0.0f;
+                float sweep_net[1326];
+                float win_reach[1326];
+                float tie_reach[1326];
+                sorted_sweep_showdown_vcfr_local_with_components(
                     opp_reach_local, num_opp, nh,
                     opp_str, opp_idx, pl_str, pl_idx,
-                    hand_cards, local_cfv
+                    hand_cards, sweep_net, win_reach, tie_reach
                 );
                 float pot_size = float(params.starting_pot) / float(np) + float(c_t);
-                for (int h = 0; h < nh; h++) out[h] = local_cfv[h] * pot_size;
+                int32_t total_pot_int = (int)params.starting_pot;
+                for (int p = 0; p < np; p++) {
+                    total_pot_int += (int)contributions[int(node_id) * np + p];
+                }
+                float rake = fmax(0.0f, fmin((float)total_pot_int * eff_rake_rate, eff_rake_cap));
+                for (int h = 0; h < nh; h++) {
+                    out[h] = pot_size * sweep_net[h]
+                           - rake * (win_reach[h] + 0.5f * tie_reach[h]);
+                }
             } else {
                 // Multiway probabilistic
                 float cum_weaker[5 * 1326];
@@ -1818,14 +1970,31 @@ kernel void vcfr_bottom_up_batched(
                             }
                         }
                     }
-                    float local_cfv[1326];
-                    sorted_sweep_showdown_vcfr_local(
+                    // ── Slice 2 Phase B Site (d) part 2: sorted-sweep rake (HU all-equal) ──
+                    // Mirror CPU showdown.rs ~670-690 (the num_active_opp==1 HU
+                    // sweep path). Same formula as above:
+                    //   cfv = half_pot * sweep_net - rake * (win_reach + 0.5 * tie_reach)
+                    bool flop_seen = (node.board_state != 3);
+                    float eff_rake_rate = flop_seen ? params.rake_rate : 0.0f;
+                    float eff_rake_cap  = flop_seen ? params.rake_cap  : 0.0f;
+                    float sweep_net[1326];
+                    float win_reach[1326];
+                    float tie_reach[1326];
+                    sorted_sweep_showdown_vcfr_local_with_components(
                         opp_reach_local, num_opp, nh,
                         opp_str, opp_idx,
                         pl_str, pl_idx,
-                        hand_cards, local_cfv
+                        hand_cards, sweep_net, win_reach, tie_reach
                     );
-                    for (int h = 0; h < nh; h++) out[h] = half_pot * local_cfv[h];
+                    int32_t total_pot_int = (int)params.starting_pot;
+                    for (int p = 0; p < np; p++) {
+                        total_pot_int += (int)contributions[int(node_id) * np + p];
+                    }
+                    float rake = fmax(0.0f, fmin((float)total_pot_int * eff_rake_rate, eff_rake_cap));
+                    for (int h = 0; h < nh; h++) {
+                        out[h] = half_pot * sweep_net[h]
+                               - rake * (win_reach[h] + 0.5f * tie_reach[h]);
+                    }
                 }
             } else {
             // Multiway side pot handling (3+ players)

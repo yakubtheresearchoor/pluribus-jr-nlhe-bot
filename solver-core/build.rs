@@ -227,7 +227,15 @@ fn build_metal_shaders() {
             }
         }
 
-        println!("cargo:rerun-if-changed=src/gpu/metal/shaders/{}", metal_file);
+        // Note: path corrected from "src/gpu/metal/shaders/" (wrong, never
+        // matched any file) to "src/gpu_metal/shaders/" (actual location).
+        // Discovered during Slice 2 Phase B Site (d) part 2: kernel edits
+        // were not triggering rebuilds — the build script was watching a
+        // non-existent path. Earlier Phase B edits happened to recompile
+        // because adjacent Rust struct changes invalidated other build
+        // artifacts; standalone .metal edits would NOT have triggered
+        // rebuild before this fix.
+        println!("cargo:rerun-if-changed=src/gpu_metal/shaders/{}", metal_file);
     }
 
     // Link all .air files into a single .metallib
