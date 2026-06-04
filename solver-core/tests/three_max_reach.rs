@@ -316,12 +316,12 @@ fn test_3player_flop_reach() {
             }
             if parent.is_some() { break; }
         }
-        let zone_str = match cpu.zones()[cc] { Zone::Flop => "Flop", Zone::Turn => "Turn", Zone::River => "River" };
+        let zone_str = match cpu.zones()[cc] { Zone::Flop => "Flop", Zone::Turn => "Turn", Zone::River => "River", Zone::Preflop => "Preflop" };
         eprintln!("  Turn CC[{}] = node {}: zone={}, parent={}, CPU P0 reach = {:?}, GPU P0 reach = {:?}", 
                   i, cc, zone_str, parent.unwrap_or(999), 
                   &flop_p0[..nh.min(3)], &gpu_p0[..nh.min(3)]);
         if let Some(p) = parent {
-            let parent_zone_str = match cpu.zones()[p] { Zone::Flop => "Flop", Zone::Turn => "Turn", Zone::River => "River" };
+            let parent_zone_str = match cpu.zones()[p] { Zone::Flop => "Flop", Zone::Turn => "Turn", Zone::River => "River", Zone::Preflop => "Preflop" };
             let parent_p0: Vec<f32> = (0..nh).map(|h| cpu_reach[p * np * nh + 0 * nh + h]).collect();
             let gpu_parent_p0: Vec<f32> = (0..nh).map(|h| gpu_reach[p * np * nh + 0 * nh + h]).collect();
             eprintln!("    parent node {} zone={} CPU P0 reach = {:?} GPU P0 reach = {:?}", p, parent_zone_str, &parent_p0[..nh.min(3)], &gpu_parent_p0[..nh.min(3)]);
@@ -336,7 +336,7 @@ fn test_3player_flop_reach() {
                 if gp.is_some() { break; }
             }
             if let Some(g) = gp {
-                let gp_zone_str = match cpu.zones()[g] { Zone::Flop => "Flop", Zone::Turn => "Turn", Zone::River => "River" };
+                let gp_zone_str = match cpu.zones()[g] { Zone::Flop => "Flop", Zone::Turn => "Turn", Zone::River => "River", Zone::Preflop => "Preflop" };
                 let gp_p0: Vec<f32> = (0..nh).map(|h| cpu_reach[g * np * nh + 0 * nh + h]).collect();
                 eprintln!("    grandparent node {} zone={} CPU P0 reach = {:?}", g, gp_zone_str, &gp_p0[..nh.min(3)]);
             }
@@ -364,136 +364,47 @@ fn test_3player_flop_reach() {
         }
     }
     eprintln!("River reach: {} nodes differ, max_diff={:.6}", river_diff_count, river_max_diff);
-    
-    // How many nodes have node_type=0 but num_children > 0?
-    let mut bad_count = 0;
-    for i in 0..nn {
-        let n = &tree.nodes[i];
-        if n.node_type == 0 && n.num_children > 0 {
-            bad_count += 1;
-            if bad_count <= 5 {
-                eprintln!("Bad node {}: node_type=0, num_children={}, player_id={}, zone={}",
-                          i, n.num_children, n.player_id, 
-                          match cpu.zones()[i] { Zone::Flop => "Flop", Zone::Turn => "Turn", Zone::River => "River" });
-            }
-        }
-    }
-    eprintln!("Total bad nodes (node_type=0 with children): {}", bad_count);
-    
-    // Also check: how many nodes are in each zone?
-    let mut zone_counts = [0usize; 3];
-    for i in 0..nn { zone_counts[cpu.zones()[i] as usize] += 1; }
-    eprintln!("Zone counts: Flop={}, Turn={}, River={}", zone_counts[0], zone_counts[1], zone_counts[2]);
-    
-    // Check node 1241's node_type before GPU solver creation
-    eprintln!("Node 1241 node_type BEFORE GPU: {}", tree.nodes[1241].node_type);
-    
-    // Check after GPU solver creation
-    let ctx = MetalContext::new().expect("Metal context");
-    let mut gpu = MetalFlopStartSolver::new(&ctx, &tree, &game, &cpu);
-    
-    // Download the GPU's node data
-    // Actually, the GPU copies the tree's FlatNode data. Let me check if the GPU
-    // modifies node_type somehow.
-    eprintln!("Node 1241 node_type AFTER GPU: {}", tree.nodes[1241].node_type);
-    
-    assert!(max_diff_overall < 0.01, "Flop reach diff = {:.6} (expected < 0.01)", max_diff_overall);
-    // Also check: does the GPU's flop level nodes include node 1245 (grandparent of CC[1])?
-    // The GPU's d_flop_level_nodes is constructed with Zone::Flop filter.
-    // If node 1245 IS in the flop zone, both should process it.
-    // The issue is that the GPU's d_reach at node 1247 is non-zero but CPU's is zero.
-    // Let me check: does the GPU's d_flop_level_nodes include turn zone chance nodes?
-    // Actually, the GPU uses d_flop_level_nodes for compute_reach_flop,
-    // but d_flop_zone_nodes for the bottom-up. They might differ.
-    
-    // Let me check what nodes are in d_flop_zone_nodes vs d_flop_level_nodes
-    // The d_flop_zone_nodes is constructed from flop_zn which has Zone::Flop filter.
-    // The d_flop_level_nodes now also uses Zone::Flop filter.
-    // So they should be the same.
-    
-    // But wait - the compute_reach_flop method uses d_flop_level_nodes.
-    // And the init_reach pipeline sets reach at ALL nodes (not just root).
-    // The init sets reach[0..np_nh] = initial_weight, rest = 0.
-    // But then the top-down pass OVERWRITES reach at children of flop zone nodes.
-    // The issue: the top-down writes reach at node 1247 (a chance child),
-    // but the CPU doesn't process node 1245's parent (which would lead to 1245 → 1247).
-    
-    // The root cause: node 1245's CPU reach is zero. This means the CPU's
-    // top-down didn't propagate reach to node 1245. But the GPU's top-down DID.
-    // This can only happen if the GPU processes a node that the CPU doesn't.
-    
-    // Actually wait - the test uses the CPU's compute_reach_flop, which starts from
-    // the CPU's own strategy. But the GPU uses its own strategy buffer.
-    // If the strategies differ, the reach values will differ.
-    // At iter 0 with zero regrets, strategies should be uniform.
-    // But we verified that the GPU strategy at the root is [0, 1] after run(),
-    // not [0.5, 0.5]. This is because run() updates regrets during bottom-up.
-    // But for compute_reach_flop, we call it BEFORE run(). So strategies should
-    // be from zero regrets = uniform.
-    // 
-    // But in this test, I call compute_all_strategies first, then compute_reach_flop.
-    // The compute_all_strategies computes from current regrets (all zero) = uniform.
-    // So strategies should be uniform.
-    
-    // Let me verify by downloading the GPU strategy AFTER compute_all_strategies
-    // but BEFORE compute_reach_flop.
-    let gpu_strat = gpu.download_strategy();
-    eprintln!("GPU strategy check: root action 0 = {:?}, action 1 = {:?}",
-              &gpu_strat[0..3], &gpu_strat[nh..nh+3]);
-    
-    // Also check: what are the regrets at the root?
-    let gpu_reg = gpu.download_regrets();
-    eprintln!("GPU regrets at root: action 0 = {:?}, action 1 = {:?}",
-              &gpu_reg[0..3], &gpu_reg[nh..nh+3]);
-    
-    // Trace the path from root to node 1247
-    // Find the chain: root → ... → node 1245 → node 1247
-    // Node 1245 is a player node. Node 1247 is a chance node (turn chance).
-    eprintln!("\n--- Tracing path to node 1247 ---");
-    // Node 1245: what type is it? What are its children?
-    if tree.nodes[1245].is_player() {
-        let n = &tree.nodes[1245];
-        eprintln!("Node 1245: player_id={}, num_children={}, children_start={}", 
-                  n.player_id, n.num_children, n.children_start);
-        for a in 0..n.num_children as usize {
-            let ch = tree.children[n.children_start as usize + a] as usize;
-            let ch_zone = cpu.zones()[ch];
-            let ch_zone_str = match ch_zone { Zone::Flop => "Flop", Zone::Turn => "Turn", Zone::River => "River" };
-            eprintln!("  child[{}] = node {} zone={}", a, ch, ch_zone_str);
-        }
-    } else {
-        eprintln!("Node 1245: is_chance={}, is_terminal={}", tree.nodes[1245].is_chance(), tree.nodes[1245].is_terminal());
-    }
-    // Check reach at node 1245 for all players
-    for p in 0..np {
-        let cpu_p: Vec<f32> = (0..nh).map(|h| cpu_reach[1245 * np * nh + p * nh + h]).collect();
-        let gpu_p: Vec<f32> = (0..nh).map(|h| gpu_reach[1245 * np * nh + p * nh + h]).collect();
-        eprintln!("  Node 1245 P{} CPU reach = {:?} GPU reach = {:?}", p, &cpu_p[..3], &gpu_p[..3]);
-    }
-    // Find node 1245's parent
-    let mut p1245_parent = None;
-    for nid in 0..nn {
-        for &ch in tree.node_children(nid) {
-            if ch as usize == 1245 { p1245_parent = Some(nid); break; }
-        }
-        if p1245_parent.is_some() { break; }
-    }
-    eprintln!("  Node 1245 parent = {:?}", p1245_parent);
-    if let Some(pp) = p1245_parent {
-        // Check node 1241's type and local offset
-        let n = &tree.nodes[pp];
-        let flop_lo = cpu.flop_local_offset()[pp];
-        let turn_lo = cpu.turn_local_offset()[pp];
-        eprintln!("    Parent {} type: node_type={}, player_id={}, num_children={}, is_player={}, is_chance={}, flop_lo={}, turn_lo={}", 
-                  pp, n.node_type, n.player_id, n.num_children, n.is_player(), n.is_chance(), flop_lo, turn_lo);
-        for p in 0..np {
-            let cpu_p: Vec<f32> = (0..nh).map(|h| cpu_reach[pp * np * nh + p * nh + h]).collect();
-            eprintln!("    Parent {} P{} CPU reach = {:?}", pp, p, &cpu_p[..3]);
-        }
-        // What are node 1241's children?
-        for a in 0..n.num_children as usize {
-            let ch = tree.children[n.children_start as usize + a] as usize;
-            eprintln!("    Parent {} child[{}] = node {}", pp, a, ch);
-        }
-    }
+
+    // CPU↔Metal reach parity assertions on all three zones.
+    //
+    // Prior version of this test had ~130 lines of debug instrumentation
+    // (hardcoded tree.nodes[1241] etc.) after this point that was stale
+    // from when the tree was larger; the test was broken by my Zone::Preflop
+    // addition exposing non-exhaustive match arms in those debug prints,
+    // and the hardcoded node indices then panicked on the smaller current
+    // tree. The actual test logic (the three reach comparisons above) was
+    // never reaching the assertion. Replaced with proper assertions on all
+    // three reach diffs (flop / turn / river) at the f32 floor tolerance
+    // appropriate for iter-0 reach (~uniform-strategy product propagation).
+    //
+    // Tolerance rationale: max_diff_overall threshold was 0.01 in the
+    // original assertion. Reach values at iter-0 are products of uniform
+    // strategy probs × initial weight 1.0, so per-node reach is bounded
+    // by 1.0; a diff > 0.01 would represent a 1% reach divergence which
+    // is far above f32 floor for the small number of multiplications
+    // involved. Keeping the 0.01 tolerance for flop, and applying the
+    // same tolerance to turn/river.
+    let flop_tol = 0.01_f32;
+    let turn_tol = 0.01_f32;
+    let river_tol = 0.01_f32;
+    assert!(max_diff_overall < flop_tol,
+        "CPU↔Metal FLOP reach diff = {:.6} > {} tolerance. \
+         3-player flop-reach computation diverges between CPU and Metal — \
+         likely a bug in compute_reach_flop on either side, or a tree-builder \
+         issue causing different reach propagation. This sits in an anchored \
+         multiway layer next to active rake/preflop work, so investigate \
+         before assuming benign.",
+        max_diff_overall, flop_tol);
+    assert!(turn_max_diff < turn_tol,
+        "CPU↔Metal TURN reach diff = {:.6} > {} tolerance (ti=0). Similar \
+         risk profile to the flop assertion above.",
+        turn_max_diff, turn_tol);
+    assert!(river_max_diff < river_tol,
+        "CPU↔Metal RIVER reach diff = {:.6} > {} tolerance (ti=0, ri=0). \
+         Similar risk profile to the flop assertion above.",
+        river_max_diff, river_tol);
+
+    eprintln!("✓ 3p CPU↔Metal reach parity: flop {:.6} | turn {:.6} | river {:.6} \
+        (all < 0.01)",
+        max_diff_overall, turn_max_diff, river_max_diff);
 }
