@@ -2908,6 +2908,24 @@ kernel void factored_showdown_unified(
         }
     }
 
+    // PRODUCTION-DEAD (confirmed by disturbance test 2026-06-04):
+    // No production create_pipeline binding; NaN write at this output
+    // was invisible to ALL production tests (gpu_rake_parity_gate,
+    // three_max_parity, three_max_reach, six_player_iter0_parity,
+    // flop_start_cpu_test, iter_divergence — all PASS with NaN write).
+    //
+    // Test-only kernel — used by:
+    //   - unified_kernel_gates.rs (K≥3 factored math validation)
+    //   - precision_attribution_check.rs (f32 precision analysis)
+    //
+    // SEPARATE FINDING (recorded for follow-up): the disturbance test
+    // ALSO revealed that unified_kernel_gates and precision_attribution_
+    // check have WEAK ASSERTIONS that don't catch NaN — those tests print
+    // `gpu=NaN diff=NaN` but still report test result OK. This is the
+    // seventh false-green pattern surfaced in the rake arc (test that
+    // uses a kernel but doesn't validate its CFV values). Not blocking
+    // Phase B, but the test infrastructure should be hardened to detect
+    // NaN as failures in a separate cleanup.
     cfv_out[batch_id * nh + h] = (static_cash - traverser_stake) * tvrp + case_c;
 }
 
