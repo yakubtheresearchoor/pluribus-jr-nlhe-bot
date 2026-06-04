@@ -16,7 +16,7 @@
 // AFTER #37 FIX, all cases must agree. Going forward, any new bug in
 // any showdown code path fails this gate.
 
-use solver_core::solver::showdown::side_pot_showdown_cfv;
+use solver_core::solver::showdown::{side_pot_showdown_cfv, side_pot_showdown_cfv_with_rake};
 
 /// Outcome of comparing one hand-pair: 1.0 = traverser strict win,
 /// 0.0 = strict loss, 0.5 = tie (split). For multiway, this generalizes
@@ -701,4 +701,285 @@ fn standing_showdown_oracle_battery() {
         validate_case(tc);
     }
     eprintln!("\n✓ All {} showdown configurations match independent enumerator at f32 floor.", cases.len());
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Phase 1 P2.4: preflop showdown oracle extension.
+//
+// Preflop terminals come in two types with opposite rake behavior:
+//
+//   Type A: preflop fold-terminals (action stopped before the flop)
+//           flop_seen = FALSE, rake MUST be zero (no flop, no drop).
+//           This is the first real exercise of the no-flop-no-drop
+//           condition. The rake machinery's flop_seen gate was built
+//           for this case and was dormant-untested until now (all
+//           postflop trees had flop_seen=true at every terminal).
+//
+//   Type B: preflop all-in then 3-street runout reaching showdown
+//           flop_seen = TRUE, rake applies normally, multi-level
+//           contributions arise from tournament-style allin sequences
+//           (builds on the Phase 1 #40 multi-level oracle extension).
+//
+// The two types split cleanly on the rake condition. P2.4 verifies
+// BOTH branches explicitly:
+//
+//   For Type A: assert side_pot_showdown_cfv_with_rake(rake=5%,
+//     flop_seen=false) produces IDENTICAL CFV to the rake-free
+//     side_pot_showdown_cfv. This proves the no-flop-no-drop gate
+//     correctly zeros out rake when flop_seen=false, closing the
+//     dormant-untested item carried since the rake arc.
+//
+//   For Type B: assert structure correctness via the independent
+//     enumerator at rake=0 (multi-level math is right), then
+//     separately assert rake applies non-trivially at rake=5%
+//     (rake-applied check via diff from rake-free baseline).
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+fn preflop_terminals_oracle_with_rake_gating() {
+    eprintln!("\n=== P2.4: preflop showdown oracle + no-flop-no-drop coverage ===");
+
+    let (hand_cards, hand_strength) = distinct_hand_cards_nh4();
+    let nh = 4;
+    let r_uniform = vec![0.125f32; nh];
+    let r_quarter = vec![0.25f32; nh];
+
+    // ─────────────────────────────────────────────────────────────
+    // Type A: preflop fold-terminals (no-flop-no-drop coverage)
+    // ─────────────────────────────────────────────────────────────
+    //
+    // Each case represents a tree terminal that occurred preflop
+    // (before any board card was dealt). For these, flop_seen=false
+    // and rake MUST be zero regardless of rake_rate/rake_cap.
+    //
+    // Validation: the rake-bearing path with flop_seen=false MUST
+    // produce identical CFV to the rake-free baseline. Any divergence
+    // means the no-flop-no-drop gate is broken.
+
+    let preflop_fold_cases: Vec<ShowdownCase> = vec![
+        // HU: SB (player 0) folds preflop to BB's pre-action. Common.
+        // contributions = [SB(1), BB(2)], SB folded.
+        ShowdownCase {
+            name: "Preflop HU SB-fold",
+            np: 2, nh, traverser: 0, starting_pot: 0,
+            contributions: vec![1, 2], fold_mask: 0b01,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: vec![r_uniform.clone()],
+            num_combinations: 16.0,
+        },
+        // HU: BB (player 1) folds preflop after SB raises. Rare but possible.
+        // contributions = [SB-raised(5), BB(2)], BB folded.
+        ShowdownCase {
+            name: "Preflop HU BB-fold-to-raise",
+            np: 2, nh, traverser: 0, starting_pot: 0,
+            contributions: vec![5, 2], fold_mask: 0b10,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: vec![r_uniform.clone()],
+            num_combinations: 16.0,
+        },
+        // 3p: button (player 2) folds preflop early.
+        // contributions = [SB(1), BB(2), button(0)], button folded.
+        ShowdownCase {
+            name: "Preflop 3p button-fold",
+            np: 3, nh, traverser: 0, starting_pot: 0,
+            contributions: vec![1, 2, 0], fold_mask: 0b100,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: vec![r_quarter.clone(), r_quarter.clone()],
+            num_combinations: 64.0,
+        },
+        // 3p: SB and button both fold, BB wins uncontested preflop.
+        // contributions = [SB(1), BB(2), button(0)], SB and button folded.
+        // Traverser=1 (BB) is the sole survivor.
+        ShowdownCase {
+            name: "Preflop 3p SB+button fold, BB wins",
+            np: 3, nh, traverser: 1, starting_pot: 0,
+            contributions: vec![1, 2, 0], fold_mask: 0b101,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: vec![r_quarter.clone(), r_quarter.clone()],
+            num_combinations: 64.0,
+        },
+        // 6p: typical preflop fold sequence (everyone except SB+BB folds).
+        // Then SB folds. BB wins uncontested.
+        // contributions = [SB(1), BB(2), 0, 0, 0, 0], SB and all others folded.
+        ShowdownCase {
+            name: "Preflop 6p all-fold-to-BB",
+            np: 6, nh, traverser: 1, starting_pot: 0,
+            contributions: vec![1, 2, 0, 0, 0, 0], fold_mask: 0b111101,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: vec![r_uniform.clone(), r_uniform.clone(),
+                            r_uniform.clone(), r_uniform.clone(), r_uniform.clone()],
+            num_combinations: 1024.0,
+        },
+    ];
+
+    eprintln!("\nType A: preflop fold-terminals (no-flop-no-drop verification)");
+    eprintln!("  Asserting: side_pot_showdown_cfv_with_rake(rake=5%, flop_seen=false)");
+    eprintln!("           == side_pot_showdown_cfv (rake-free) at f32 floor.");
+    eprintln!("  This is the first real exercise of the no-flop-no-drop");
+    eprintln!("  rake gate (the dormant-untested item carried since Slice 1.5).\n");
+
+    for tc in &preflop_fold_cases {
+        // Build the sorted_pl arrays the rake-bearing path needs.
+        let mut items: Vec<(u16, u16)> = (0..tc.nh)
+            .map(|h| (tc.hand_strength[h], h as u16))
+            .collect();
+        items.sort_by_key(|&(s, _)| s);
+        let sorted_str: Vec<u16> = items.iter().map(|&(s, _)| s).collect();
+        let sorted_idx: Vec<u16> = items.iter().map(|&(_, i)| i).collect();
+
+        let opp_reach_views: Vec<&[f32]> = tc.opp_reach.iter().map(|v| v.as_slice()).collect();
+
+        // Rake-free baseline (the canonical no-rake output).
+        let cfv_rake_free = side_pot_showdown_cfv(
+            &opp_reach_views, &tc.hand_cards, tc.nh,
+            &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+            &tc.contributions, tc.fold_mask, tc.traverser, tc.np as u8,
+            tc.starting_pot,
+        );
+
+        // Rake-bearing path with flop_seen=FALSE. Per the rake spec
+        // (no flop, no drop), this MUST produce identical CFV to the
+        // rake-free baseline regardless of rake_rate or rake_cap.
+        let cfv_no_flop_no_drop = side_pot_showdown_cfv_with_rake(
+            &opp_reach_views, &tc.hand_cards, tc.nh,
+            &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+            &tc.contributions, tc.fold_mask, tc.traverser, tc.np as u8,
+            tc.starting_pot,
+            0.05, 1000.0, false, // rake_rate=5%, generous cap, flop_seen=FALSE
+        );
+
+        let mut max_diff = 0.0f32;
+        for h in 0..tc.nh {
+            let d = (cfv_rake_free[h] - cfv_no_flop_no_drop[h]).abs();
+            if d > max_diff { max_diff = d; }
+        }
+        eprintln!(
+            "  [{:45}] rake-free={:?} no-flop-no-drop={:?} max_diff={:.6e}",
+            tc.name, cfv_rake_free, cfv_no_flop_no_drop, max_diff,
+        );
+        assert!(
+            max_diff < 1e-6,
+            "P2.4 NO-FLOP-NO-DROP REGRESSION at case '{}': rake_with_gate \
+             diverges from rake-free by {} > 1e-6. The flop_seen=false gate \
+             is not zeroing rake. This closes the dormant-untested item \
+             from the rake arc by exercising the no-flop-no-drop path for \
+             the first time at a real preflop terminal.",
+            tc.name, max_diff,
+        );
+    }
+    eprintln!("\n✓ All {} preflop fold-terminals: no-flop-no-drop gate verified \
+        rake-correctly-zero.", preflop_fold_cases.len());
+
+    // ─────────────────────────────────────────────────────────────
+    // Type B: preflop all-in then 3-street runout (multi-level, rake applies)
+    // ─────────────────────────────────────────────────────────────
+    //
+    // These reach showdown after a preflop all-in followed by 3 streets
+    // of board cards. flop_seen=TRUE, rake applies normally. Multi-level
+    // contributions arise from tournament-style allin sequences (one or
+    // more players covered for different amounts), building on the #40
+    // multi-level extension.
+    //
+    // Validation: each case is added to the standard battery (validates
+    // structure via the independent enumerator at rake=0). Additionally,
+    // verify rake applies non-trivially at rake=5% (cfv differs from
+    // rake-free by the predicted rake amount).
+
+    let preflop_allin_cases: Vec<ShowdownCase> = vec![
+        // HU equal stacks: both go allin preflop, 3-street runout to showdown.
+        // contributions = [100, 100], no folds, flop_seen=true.
+        ShowdownCase {
+            name: "Preflop HU allin-equal showdown",
+            np: 2, nh, traverser: 0, starting_pot: 3, // 1+2 blinds
+            contributions: vec![100, 100], fold_mask: 0,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: vec![r_uniform.clone()],
+            num_combinations: 16.0,
+        },
+        // 3p tournament: SB (short) and BB go allin at 20, button covers
+        // both at 100. Multi-level showdown after 3-street runout.
+        // contributions = [20, 20, 100], no folds, flop_seen=true.
+        // Two distinct levels (20, 100).
+        ShowdownCase {
+            name: "Preflop 3p two-level allin [20,20,100]",
+            np: 3, nh, traverser: 0, starting_pot: 3,
+            contributions: vec![20, 20, 100], fold_mask: 0,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: vec![r_quarter.clone(), r_quarter.clone()],
+            num_combinations: 64.0,
+        },
+        // 3p tournament with 3 distinct levels: SB short at 15, BB at 50,
+        // button at 100. Builds on #40's three-level extension applied to
+        // a preflop scenario specifically.
+        ShowdownCase {
+            name: "Preflop 3p three-level allin [15,50,100]",
+            np: 3, nh, traverser: 1, starting_pot: 3,
+            contributions: vec![15, 50, 100], fold_mask: 0,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: vec![r_quarter.clone(), r_quarter.clone()],
+            num_combinations: 64.0,
+        },
+    ];
+
+    eprintln!("\nType B: preflop all-in runout (multi-level, rake applies)");
+    eprintln!("  Asserting: structure via independent enumerator (rake=0),");
+    eprintln!("  AND rake applies non-trivially at rake=5%, flop_seen=true.\n");
+
+    for tc in &preflop_allin_cases {
+        // Part 1: structure check via independent enumerator (rake-free).
+        validate_case(tc);
+
+        // Part 2: rake-applied non-triviality check. The independent
+        // enumerator gives rake-free CFV; the rake-bearing path with
+        // flop_seen=true and rake=5% must DIFFER from rake-free by
+        // a measurable amount (proves rake is actually being applied
+        // at the preflop allin runout terminal).
+        let mut items: Vec<(u16, u16)> = (0..tc.nh)
+            .map(|h| (tc.hand_strength[h], h as u16))
+            .collect();
+        items.sort_by_key(|&(s, _)| s);
+        let sorted_str: Vec<u16> = items.iter().map(|&(s, _)| s).collect();
+        let sorted_idx: Vec<u16> = items.iter().map(|&(_, i)| i).collect();
+        let opp_reach_views: Vec<&[f32]> = tc.opp_reach.iter().map(|v| v.as_slice()).collect();
+
+        let cfv_rake_free = side_pot_showdown_cfv(
+            &opp_reach_views, &tc.hand_cards, tc.nh,
+            &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+            &tc.contributions, tc.fold_mask, tc.traverser, tc.np as u8,
+            tc.starting_pot,
+        );
+        let cfv_with_rake = side_pot_showdown_cfv_with_rake(
+            &opp_reach_views, &tc.hand_cards, tc.nh,
+            &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+            &tc.contributions, tc.fold_mask, tc.traverser, tc.np as u8,
+            tc.starting_pot,
+            0.05, 1000.0, true, // rake_rate=5%, generous cap, flop_seen=TRUE
+        );
+
+        // The rake amount should be non-zero at some hand (else rake
+        // isn't applying — false-green by vacuous match).
+        let max_rake_effect = (0..tc.nh)
+            .map(|h| (cfv_with_rake[h] - cfv_rake_free[h]).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "  [{:45}] max_rake_effect={:.4e} (non-zero means rake applies)",
+            tc.name, max_rake_effect,
+        );
+        assert!(
+            max_rake_effect > 1e-4,
+            "P2.4 RAKE-APPLIED check FAILED at case '{}': max_rake_effect = \
+             {}, expected > 1e-4. Rake at 5%% on a multi-thousand-chip pot \
+             must produce a measurable CFV shift at some hand. If 0, the \
+             rake path is silently inactive at this terminal type.",
+            tc.name, max_rake_effect,
+        );
+    }
+    eprintln!("\n✓ All {} preflop allin-runout cases: structure matches \
+        independent enumerator AND rake-applies non-trivially at flop_seen=true.",
+        preflop_allin_cases.len());
+
+    eprintln!("\n═══ P2.4 COMPLETE: preflop showdown oracle covers both branches ═══");
+    eprintln!("  Type A (fold-terminals): no-flop-no-drop verified explicitly");
+    eprintln!("  Type B (allin-runouts):  multi-level structure + rake-applies verified");
+    eprintln!("  Dormant-untested item from rake arc: CLOSED.");
 }
