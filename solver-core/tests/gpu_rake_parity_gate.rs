@@ -801,6 +801,117 @@ fn site_d_isolated_kernel_unit_test() {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// Site (d) TIE-BAND ISOLATION TEST — catches the +reach correction
+//
+// Per user direction for Phase B Site (d) part 2: "include a tie-band
+// scenario in the site (d) unit test, because the tie correction is
+// the part most likely to be subtly wrong and the part that the
+// non-tie cases would not catch."
+//
+// The +reach inclusion-exclusion correction (audit-fix #37) only
+// fires when there are TIES in opp_str == pl_str. The distinct-
+// strengths unit test above will NEVER exercise it. A tie-band test
+// is therefore the targeted defense for the sorted-sweep rake mirror
+// (Phase B Site (d) part 2), since that's the location where the
+// 3-component decomposition (sweep_net, win_reach, tie_reach) carries
+// the +reach correction in tie_reach.
+//
+// This test is needed BEFORE site (d) part 2 lands. Today it runs
+// against the multiway K=1 branch (which doesn't have the tie-band
+// subtlety in the same form — it does brute-force per-(g_a)
+// enumeration), so it's also a useful coverage extension for the
+// multiway K=1 site's tie handling.
+//
+// SCENARIO: nh=3 with TWO hands tied at top strength. Strengths
+// [10, 30, 30] mean h=1 and h=2 are tied for top. Site (d) lone-
+// survivor path runs (no fold variance in HU showdown), so the test
+// validates the (currently-correct, but-with-this-new-scenario)
+// tie handling at the multiway K=1 branch. After site (d) part 2,
+// it ALSO validates the sorted_sweep tie-band rake correction.
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "Slice 2 Phase B Site (d) TIE-BAND ISOLATION: validates HU tie-band \
+            arithmetic at multiway K=1 (currently passes, but extends coverage \
+            beyond distinct-strengths case). Also serves as the targeted defense \
+            for site (d) part 2 (sorted_sweep rake mirror) where the +reach \
+            inclusion-exclusion correction lives — that correction only fires \
+            in tie bands and the non-tie unit test would not catch errors in it. \
+            Run: cargo test --release --features metal --test \
+            gpu_rake_parity_gate site_d_tie -- --ignored"]
+fn site_d_tie_band_isolated_kernel_unit_test() {
+    use solver_core::solver::showdown::side_pot_showdown_cfv_with_rake;
+
+    let nh = 3;
+    let np = 2;
+    let num_opp = 1;
+    let hand_cards: Vec<u8> = vec![0, 1, 2, 3, 4, 5];
+    // TIE BAND: h=1 and h=2 share strength 30 (top). h=0 has strength 10.
+    // This exercises the tied-at-top accounting that the distinct-
+    // strengths unit test never reaches.
+    let strengths: Vec<u16> = vec![10, 30, 30];
+    let (pl_str, pl_idx) = debug_kernel::make_sorted(&strengths);
+
+    let opp_reach: Vec<f32> = vec![1.0; num_opp * nh];
+    let contributions: Vec<i32> = vec![5, 5];
+    let starting_pot: i32 = 10;
+    let fold_mask: u16 = 0;
+    let traverser = 0;
+
+    let rake_rate = 0.05_f32;
+    let rake_cap = 1.0_f32;
+    let flop_seen = true;
+
+    let opp_reach_per_opp: Vec<Vec<f32>> = (0..num_opp)
+        .map(|oi| opp_reach[oi * nh..(oi + 1) * nh].to_vec())
+        .collect();
+    let opp_reach_views: Vec<&[f32]> = opp_reach_per_opp.iter().map(|v| v.as_slice()).collect();
+    let mut sorted_opp_str = Vec::with_capacity(num_opp * nh);
+    let mut sorted_opp_idx = Vec::with_capacity(num_opp * nh);
+    for _ in 0..num_opp {
+        sorted_opp_str.extend_from_slice(&pl_str);
+        sorted_opp_idx.extend_from_slice(&pl_idx);
+    }
+    let cpu_cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &sorted_opp_str, &sorted_opp_idx,
+        &pl_str, &pl_idx,
+        &contributions, fold_mask, traverser, np as u8, starting_pot,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    let ctx = MetalContext::new().expect("Metal context");
+    let gpu_cfv = debug_kernel::gpu_brute_force_with_rake(
+        &ctx, nh, np, traverser, starting_pot, fold_mask,
+        &opp_reach, &contributions, &hand_cards, &pl_str, &pl_idx,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    eprintln!("Site (d) HU TIE-BAND isolated kernel unit test:");
+    eprintln!("  CPU (with rake):    {:?}", cpu_cfv);
+    eprintln!("  Metal (with rake):  {:?}", gpu_cfv);
+
+    let mut max_diff = 0.0_f32;
+    let mut max_h = 0;
+    for h in 0..nh {
+        let d = (cpu_cfv[h] - gpu_cfv[h]).abs();
+        if d > max_diff { max_diff = d; max_h = h; }
+    }
+    eprintln!("  max_diff = {} at h={}", max_diff, max_h);
+
+    assert!(max_diff < 1e-4,
+        "Site (d) HU tie-band isolated unit test FAILED: max_diff = {} \
+         at h={}. With tied strengths at top (h=1, h=2 both at strength \
+         30), this scenario exercises the +reach inclusion-exclusion \
+         correction in the tie band — the most likely place for sorted-\
+         sweep rake arithmetic to be subtly wrong. CPU formula uses \
+         self_correction = if tie_includes_self {{ reach[h] }} else {{ 0 }}; \
+         Metal mirror must produce the same.",
+        max_diff, max_h);
+    eprintln!("✓ Site (d) HU tie-band isolated unit test PASSED");
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // Site (b) PRIMARY ISOLATION TEST — direct CPU↔Metal kernel unit check
 //
 // Per user direction after Phase A.6: "The divergence-assertion fallback

@@ -104,7 +104,7 @@ DoD per site (d):
   2. site (d) unit test (multiway K=1 isolation) stays at 0.0
   3. All other gates unchanged (empirical isolation check)
 
-## The standing discipline now codified
+## The standing discipline now codified (the deepest version)
 
 The user's framing, validated twice in succession:
   - Site (d) part 1: gate residual 0.094 → unit test discriminator
@@ -112,11 +112,131 @@ The user's framing, validated twice in succession:
   - Re-survey itself: agent miscounted line ranges, claimed inventory
     complete when it wasn't
 
-Both iterations of "verify the inventory" had gaps. The only reliable
-detector is the empirical signal: gate-not-reaching-f32-floor MUST be
-treated as the standing trigger for an unmapped location, until proven
-otherwise. The unit test (routed to a specific code location) is the
-discriminator: kernel-math-wrong vs location-missing.
+The verification step that was supposed to catch the inventory gap
+INTRODUCED its own error. If the agent had trusted the re-survey, the
+two production sorted-sweep call sites would have shipped rake-free.
+Only the agent's independent check (re-survey says complete, gate
+residual says something is still rake-free, chase the tension) caught
+the miscounted line ranges. The gate residual caught what TWO rounds
+of source-reading inventory missed.
+
+## The hierarchy of trust (generalizes beyond rake)
+
+This generalizes beyond the rake arc, beyond this session, beyond
+Phase B. It is the deepest version of the project's recurring theme.
+
+The project's running theme has been: **"agreement between
+implementations is not correctness, anchor against truth."** The
+inventory finding adds the orthogonal axis:
+
+  **"A reading of the code is not the code, anchor against what
+   the code actually does."**
+
+The original showdown inventory, the re-survey, both were readings of
+source. Both had gaps. The gate residual is grounded in execution.
+The hierarchy of trust:
+
+  1. **Execution-grounded signals** (authoritative)
+     - gate residual reaching f32 floor (no rake-free location remains
+       in the paths the gate exercises)
+     - unit test routed to a specific branch reaching 0.0 (that branch's
+       math matches CPU truth)
+     - instrumented assertions in the running solve (proposed below)
+
+  2. **Source-reading inventories** (hypotheses)
+     - explore agent's enumeration of code locations
+     - grep-based call-site mapping
+     - any human or LLM reading of the source
+
+Source readings can be wrong; execution signals cannot. So when they
+disagree, the execution signal wins — and "the inventory says all
+locations are mirrored but the gate isn't at f32 floor" means the
+inventory is wrong, not the gate. The agent's instinct to chase
+that tension was correct; trusting the re-survey would have been the
+mistake.
+
+## Consequence for Phase B completion criterion
+
+You cannot declare Phase B complete by checking inventory items off,
+because the inventory is demonstrably incomplete and re-surveys are
+unreliable. The only declarative criterion is:
+
+  **Every production payoff path is exercised by some gate scenario,
+   AND every such gate reaches f32 floor.**
+
+  - The f32-floor-everywhere half is the execution-grounded detector
+    (a still-rake-free location holds its gate above floor).
+  - The coverage half (every production path exercised by some gate)
+    is what the inventory was supposed to ensure and CANNOT be
+    trusted to ensure.
+
+So the coverage question must be answered without relying on the
+inventory. Two ways:
+
+### Option 1 (logically airtight, more instrumentation)
+
+Instrument the production solve to assert, at each terminal it
+evaluates, that the rake path was taken (or correctly skipped per
+no-flop-no-drop). Run a representative solve; if every terminal
+asserts rake-applied, coverage is proven by execution, not by
+enumeration.
+
+This converts coverage from "did I enumerate all locations" (which
+keeps being wrong) to "did every terminal the solve actually hit
+apply rake" (which the running code can attest to directly).
+
+### Option 2 (less rigorous but cheaper, audited)
+
+Audit that the gate scenarios collectively exercise the terminal
+types a production solve produces:
+  - HU showdowns at flop / turn / river zones
+  - 3p showdowns (all-equal, fold terminals at various depths)
+  - 3p side-pot terminals (after allin)
+  - 4p+ showdowns (factored path)
+  - Rake gating: flop_seen=true terminals (current) and false
+    (preflop, dormant)
+
+If the gate scenarios are representative of production play AND every
+one reaches f32 floor, the inferred conclusion is "rake correct on
+all paths a real solve traverses." A code location no production
+solve ever reaches is harmless even if rake-free — it never executes.
+
+So **the coverage that matters is "every path a production solve
+traverses," not "every code location in vcfr.metal."** The gate
+scenarios should be chosen to be representative of production play;
+the inventory becomes an implementation detail rather than a
+coverage criterion.
+
+## Recommendation
+
+Apply Option 2 minimally (audit gate scenarios for production-terminal-
+type coverage) as part of declaring Phase B done. Consider Option 1
+(production-solve rake-assertion instrumentation) as future hardening
+if the inventory keeps proving unreliable beyond Phase B. Both
+options are execution-grounded; the difference is rigor vs cost.
+
+## Principle to carry beyond Phase B
+
+The inventory is not a finished artifact, it's a hypothesis subject
+to empirical detection. This applies to:
+
+  - Future Metal/GPU work (kernel code locations evolve; an inventory
+    drawn today is stale tomorrow)
+  - Preflop integration (new terminal types → new payoff paths,
+    inventory will be partial)
+  - Bucketing / postflop abstraction (new code shapes)
+  - Any future cross-implementation parity work
+
+The standing method for catching unmapped locations:
+  1. Gate scenarios chosen to represent production play
+  2. f32-floor-everywhere as the declarative completion criterion
+  3. Unit test routed to a specific location as the discriminator
+     when a gate doesn't reach floor
+  4. Treat the gate residual as authoritative; the inventory is a
+     hypothesis to be falsified by execution
+
+This is the deepest lesson the rake arc produced and it is bigger than
+rake.
 
 ## Carry for site (e)
 
