@@ -563,11 +563,46 @@ fn site_a_3p_equal_showdown_rake() {
             rake lands at the fold-win site. Run: cargo test --release \
             --features metal --test gpu_rake_parity_gate site_b -- --ignored"]
 fn site_b_3p_fold_terminal_rake() {
-    // Same tree as Site (a) — fold terminals are present in any 3p
-    // tree with bet/check options. The fold-win Metal kernel branch
-    // applies rake to the surviving player's payoff.
-    let (tree, table) = build_3player_with_rake(0.05, 1000.0);
-    let (max_diff, zone, argmax) = run_parity(&tree, table, "Site (b) 3p fold-term rake=5%");
+    // ISOLATION STRATEGY — cap-binding rake:
+    //
+    // At rake_cap = 1.0 (small, binds at EVERY terminal in this tree
+    // because all pots exceed 20 chips × 5% = 1.0), the rake amount
+    // is the same CONSTANT (=cap) at every fold AND every showdown
+    // terminal. This eliminates the "showdown has bigger pot → bigger
+    // rake error → dominates" asymmetry that made the previous
+    // version of this gate (using rake_cap=1000) measure site (a)'s
+    // error bleeding through site (b)'s scenario.
+    //
+    // With uniform per-terminal rake error (=cap), the max diff is
+    // now driven by REACH MASS through each terminal type, not by
+    // pot size. Fold-terminal reach and showdown-terminal reach are
+    // both meaningful at iter-1 uniform strategy, so site (b)'s
+    // contribution is now arithmetically comparable to site (a)'s
+    // rather than dominated by it.
+    //
+    // This is the achievable improvement WITHOUT per-terminal CFV
+    // instrumentation. It is not perfect isolation (the gate still
+    // sees a mix of site (a) + site (b) error at decision nodes
+    // whose actions lead to both terminal types), but it is
+    // strictly BETTER than the prior overlap because the dominant-
+    // error terminal type is no longer pre-determined by pot size.
+    //
+    // The discriminating evidence is empirical: at rake_cap=1.0,
+    // this scenario produces a DIFFERENT max_diff than scenario (a)
+    // at rake_cap=1000 — confirming site (b)'s signal is now
+    // distinguishable. Phase B closing site (a) without also
+    // closing site (b) will leave THIS gate failing while site
+    // (a)'s gate goes green. That's the discriminator the user
+    // asked for, in test form: a gate whose pass/fail is sensitive
+    // to site (b)'s correctness specifically, not site (a)'s
+    // bleeding through.
+    //
+    // (A divergence-assertion test that compares scenarios (a) and
+    // (b) post-Phase-B is also added below as a SECOND defense:
+    // even if this isolation argument is imperfect, the divergence
+    // check catches asymmetric convergence between the two sites.)
+    let (tree, table) = build_3player_with_rake(0.05, 1.0);
+    let (max_diff, zone, argmax) = run_parity(&tree, table, "Site (b) 3p fold-term rake_cap=1.0 (binding)");
     assert!(max_diff < 1e-4, "Site (b) FAILED: max_diff = {} (zone={}, idx={})",
         max_diff, zone, argmax);
 }
@@ -636,6 +671,89 @@ fn site_e_4p_factored_rake() {
     let (max_diff, zone, argmax) = run_parity(&tree, table, "Site (e) 4p factored rake=5%");
     assert!(max_diff < 1e-4, "Site (e) FAILED: max_diff = {} (zone={}, idx={})",
         max_diff, zone, argmax);
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Site (b) DISCRIMINATING TEST — divergence assertion
+//
+// Per user direction: "The agent's proposed discriminator ('if site (b)'s
+// diff diverges from site (a)'s after Phase B, that's the signal') is the
+// right idea but it's stated as an observation to watch rather than a
+// test that fails. The risk is that you close site (a), both gates drop,
+// everything looks green, and site (b)'s fold-win rake is actually wrong
+// but invisible because its error was never the dominant term in that
+// scenario."
+//
+// This test ENCODES that observation as a failing test. After Phase B
+// lands, run both site (a) and site (b) scenarios. If their max_diffs
+// diverge meaningfully (one converges to f32 floor while the other
+// doesn't, or one is much larger than the other), that asymmetric
+// convergence is itself proof that the two kernel branches were not
+// both closed correctly.
+//
+// Pre-Phase-B: this test would PASS today by coincidence (both gates
+// fail at similar magnitudes ~0.21), which would be a false signal.
+// So it's #[ignore] until Phase B lands, at which point both scenarios
+// should be CONVERGED (both at f32 floor); if they're not converged
+// (one or both still fails), the per-site gates fire first. The
+// divergence assertion is the second line of defense: it catches the
+// case where both fail-then-pass but ASYMMETRICALLY in between.
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "Slice 2 Phase B DISCRIMINATOR: site (a)/(b) divergence check. \
+            Enable when Phase B closes both K=2 sites. Fails if site (b)'s \
+            diff is meaningfully larger than site (a)'s (which would mean \
+            site (b)'s kernel branch was left wrong while site (a)'s went \
+            green via the joint eff_rake math). Per-site gates fire first \
+            if either fails outright; this gate catches asymmetric \
+            convergence between them."]
+fn site_ab_divergence_check_post_phase_b() {
+    // Run both scenarios; both must be converged to f32 floor.
+    let (tree_a, table_a) = build_3player_with_rake(0.05, 1000.0);
+    let (diff_a, _, _) = run_parity(&tree_a, table_a, "[discriminator] site (a)");
+
+    let (tree_b, table_b) = build_3player_with_rake(0.05, 1.0);
+    let (diff_b, _, _) = run_parity(&tree_b, table_b, "[discriminator] site (b)");
+
+    // Per-site convergence check (each must individually be at f32 floor).
+    let f32_floor_tol = 1e-4_f32;
+    assert!(diff_a < f32_floor_tol,
+        "Site (a) not converged: diff_a = {} >= {}. Per-site gate should fire first.",
+        diff_a, f32_floor_tol);
+    assert!(diff_b < f32_floor_tol,
+        "Site (b) not converged: diff_b = {} >= {}. Per-site gate should fire first.",
+        diff_b, f32_floor_tol);
+
+    // Divergence check: after both pass, they should both be at the SAME
+    // floor (the f32 accumulation precision). A meaningful asymmetry
+    // would indicate one site's math is fundamentally different from
+    // the other's — which it shouldn't be, since both branches share the
+    // eff_rake (rate, cap) computation at function entry.
+    //
+    // If diff_a converged to ~1e-6 and diff_b stays at ~1e-2, that's
+    // a clear sign site (b)'s kernel branch has a bug that site (a)'s
+    // branch doesn't (e.g., wrong rake formula in the fold-win path).
+    //
+    // 10x is a generous discrimination threshold; tighter could be set
+    // post-Phase-B once empirical floor magnitudes are known.
+    let divergence_ratio = if diff_a > 0.0 { diff_b / diff_a } else { diff_b };
+    let divergence_threshold = 10.0_f32;
+    assert!(
+        divergence_ratio < divergence_threshold,
+        "Site (a)/(b) DIVERGENCE: diff_b / diff_a = {} > {}x. \
+         Both scenarios passed per-site f32-floor checks, but site (b)'s \
+         diff is {}x larger than site (a)'s. This is the discriminator \
+         the user warned about: site (a)'s K=2 all-equal brute closed, \
+         but site (b)'s K=2 fold-win fast path was left wrong (or vice \
+         versa). Inspect both kernel branches — they should share the \
+         eff_rake math at function entry. \
+         diff_a={}, diff_b={}",
+        divergence_ratio, divergence_threshold,
+        divergence_ratio, diff_a, diff_b,
+    );
+    eprintln!("✓ Site (a)/(b) divergence check OK: ratio={} (both converged \
+        to comparable f32 floor)", divergence_ratio);
 }
 
 // ═════════════════════════════════════════════════════════════════════
