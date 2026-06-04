@@ -967,6 +967,218 @@ fn site_b_isolated_kernel_unit_test() {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// Site (a) PRIMARY ISOLATION TEST — direct CPU↔Metal kernel unit check
+//
+// Per user direction after Phase B Site (b): "Closing (b) didn't move
+// other gates" proves (b) wasn't contaminating them, but does NOT prove
+// (a) and (c) are self-isolated, because (a) and (c) are both still
+// open and could be contaminating each other's gates. The gate-level
+// signal was proven unreliable for the K=2 cluster (b's gate didn't
+// measure b), so (a) and (c) get the same debug-kernel unit test that
+// worked for (b) — not gate-reliance.
+//
+// Routing to site (a)'s K=2 all-equal brute (vcfr.metal line ~187):
+//   - np = 3 (num_opp = 2 → K=2 paths)
+//   - fold_mask = 0 (no folds → fails (b)'s num_active≤1 check)
+//   - contributions all equal → passes (a)'s all_active_equal check
+//   - → kernel routes to site (a)'s branch exclusively
+//
+// CPU reference: side_pot_showdown_cfv_with_rake. With all-equal
+// contribs and no folds, CPU takes the K≥2 equal-contributions path
+// (showdown.rs ~699-779) which uses rake_per_unit_stake:
+//   rake = min(total_pot * eff_rake_rate, eff_rake_cap)
+//   rake_per_unit_stake = rake / half_pot
+//   payoff_unit = K - rake_per_unit_stake [for wins]
+//                = (K+1-T)/T - rake_per_unit_stake/T [for ties]
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "Slice 2 Phase B Site (a) ISOLATION (primary): direct CPU↔Metal \
+            kernel-level check of site (a)'s K=2 all-equal brute rake math. \
+            Catches asymmetric AND correlated K=2-cluster failures (sibling \
+            of site b's unit test, same pattern). Run: cargo test --release \
+            --features metal --test gpu_rake_parity_gate site_a_isolated \
+            -- --ignored"]
+fn site_a_isolated_kernel_unit_test() {
+    use solver_core::solver::showdown::side_pot_showdown_cfv_with_rake;
+
+    let nh = 3;
+    let np = 3;
+    let num_opp = 2;
+    let hand_cards: Vec<u8> = vec![0, 1, 2, 3, 4, 5];
+    let strengths: Vec<u16> = vec![10, 20, 30];
+    let (pl_str, pl_idx) = debug_kernel::make_sorted(&strengths);
+
+    let opp_reach: Vec<f32> = vec![1.0; num_opp * nh];
+    let contributions: Vec<i32> = vec![5, 5, 5];  // all equal → site (a)
+    let starting_pot: i32 = 15;
+    let fold_mask: u16 = 0;  // no folds → site (a)
+    let traverser = 0;
+
+    let rake_rate = 0.05_f32;
+    let rake_cap = 1.0_f32;
+    let flop_seen = true;
+
+    let opp_reach_per_opp: Vec<Vec<f32>> = (0..num_opp)
+        .map(|oi| opp_reach[oi * nh..(oi + 1) * nh].to_vec())
+        .collect();
+    let opp_reach_views: Vec<&[f32]> = opp_reach_per_opp.iter().map(|v| v.as_slice()).collect();
+    let mut sorted_opp_str = Vec::with_capacity(num_opp * nh);
+    let mut sorted_opp_idx = Vec::with_capacity(num_opp * nh);
+    for _ in 0..num_opp {
+        sorted_opp_str.extend_from_slice(&pl_str);
+        sorted_opp_idx.extend_from_slice(&pl_idx);
+    }
+    let cpu_cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &sorted_opp_str, &sorted_opp_idx,
+        &pl_str, &pl_idx,
+        &contributions, fold_mask, traverser, np as u8, starting_pot,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    let ctx = MetalContext::new().expect("Metal context");
+    let gpu_cfv = debug_kernel::gpu_brute_force_with_rake(
+        &ctx, nh, np, traverser, starting_pot, fold_mask,
+        &opp_reach, &contributions, &hand_cards, &pl_str, &pl_idx,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    eprintln!("Site (a) isolated kernel unit test:");
+    eprintln!("  CPU (with rake): {:?}", cpu_cfv);
+    eprintln!("  Metal (with rake? — today: NO, pre-Phase-B-site-a): {:?}", gpu_cfv);
+
+    let mut max_diff = 0.0_f32;
+    let mut max_h = 0;
+    for h in 0..nh {
+        let d = (cpu_cfv[h] - gpu_cfv[h]).abs();
+        if d > max_diff { max_diff = d; max_h = h; }
+    }
+    eprintln!("  max_diff = {} at h={} (predicted today: ≈ rake_per_unit_stake × reach)",
+        max_diff, max_h);
+
+    assert!(max_diff < 1e-4,
+        "Site (a) isolated unit test FAILED: max_diff = {} at h={}. \
+         CPU computes site (a) K=2 all-equal brute with rake; Metal \
+         computes it without. Phase B must add rake math at vcfr.metal \
+         line ~187 mirroring CPU showdown.rs lines 699-779: \
+         rake_per_unit_stake = rake / half_pot; payoff_unit adjustments \
+         for win/tie cases.",
+        max_diff, max_h);
+    eprintln!("✓ Site (a) isolated unit test PASSED");
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Site (c) PRIMARY ISOLATION TEST — direct CPU↔Metal kernel unit check
+//
+// Per user direction (same Phase A.7 lesson applied to site (c)):
+// (c) is the K=2 path most sensitive to rake-formula errors because
+// the main-pot-only and cap-once rules interact with per-level cash
+// accumulation. A per-level-rake or per-level-cap error would be
+// invisible at the gate level (correlated K=2 errors) but caught
+// immediately by a direct CPU-truth comparison at the (c) branch.
+//
+// Routing to site (c)'s K=2 general path (vcfr.metal line ~281):
+//   - np = 3 (num_opp = 2)
+//   - contributions UNEQUAL (e.g., [10, 5, 5]) → fails (a)'s
+//     all_active_equal check
+//   - fold_mask = 0 (no folds) → fails (b)'s num_active≤1 check
+//   - → kernel falls through to (c)'s per-level brute-force loop
+//
+// CPU reference: side_pot_showdown_cfv_with_rake at the unequal-
+// contributions path (showdown.rs ~870-910 the main-pot-only Slice 1.5
+// implementation). Site (c) is the trickiest mirror because of the
+// per-level cash logic + main-pot-only-rake spec.
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "Slice 2 Phase B Site (c) ISOLATION (primary): direct CPU↔Metal \
+            kernel-level check of site (c)'s K=2 unequal-contributions / \
+            side-pot rake math. The main-pot-only and cap-once rules make \
+            this the most rake-formula-sensitive site; isolated unit test \
+            catches per-level-rake or per-level-cap errors that would be \
+            invisible at the gate level. Run: cargo test --release \
+            --features metal --test gpu_rake_parity_gate site_c_isolated \
+            -- --ignored"]
+fn site_c_isolated_kernel_unit_test() {
+    use solver_core::solver::showdown::side_pot_showdown_cfv_with_rake;
+
+    let nh = 3;
+    let np = 3;
+    let num_opp = 2;
+    let hand_cards: Vec<u8> = vec![0, 1, 2, 3, 4, 5];
+    let strengths: Vec<u16> = vec![10, 20, 30];
+    let (pl_str, pl_idx) = debug_kernel::make_sorted(&strengths);
+
+    let opp_reach: Vec<f32> = vec![1.0; num_opp * nh];
+
+    // Unequal contributions to route to (c)'s side-pot branch. Player
+    // 0 has 10, others have 5. This creates a 2-level pot structure:
+    //   - Level 1 (li=0, main pot): all 3 contributed 5 each → 15 + starting_pot
+    //   - Level 2 (li=1, side pot): only player 0 contributed extra 5 → 5
+    // Per the rake spec (Slice 1.5): rake applies to MAIN POT ONLY,
+    // side-pot level un-raked, cap applied ONCE.
+    let contributions: Vec<i32> = vec![10, 5, 5];
+    let starting_pot: i32 = 15;
+    let fold_mask: u16 = 0;
+    let traverser = 0;
+
+    let rake_rate = 0.05_f32;
+    let rake_cap = 1.0_f32;
+    let flop_seen = true;
+
+    let opp_reach_per_opp: Vec<Vec<f32>> = (0..num_opp)
+        .map(|oi| opp_reach[oi * nh..(oi + 1) * nh].to_vec())
+        .collect();
+    let opp_reach_views: Vec<&[f32]> = opp_reach_per_opp.iter().map(|v| v.as_slice()).collect();
+    let mut sorted_opp_str = Vec::with_capacity(num_opp * nh);
+    let mut sorted_opp_idx = Vec::with_capacity(num_opp * nh);
+    for _ in 0..num_opp {
+        sorted_opp_str.extend_from_slice(&pl_str);
+        sorted_opp_idx.extend_from_slice(&pl_idx);
+    }
+    let cpu_cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &sorted_opp_str, &sorted_opp_idx,
+        &pl_str, &pl_idx,
+        &contributions, fold_mask, traverser, np as u8, starting_pot,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    let ctx = MetalContext::new().expect("Metal context");
+    let gpu_cfv = debug_kernel::gpu_brute_force_with_rake(
+        &ctx, nh, np, traverser, starting_pot, fold_mask,
+        &opp_reach, &contributions, &hand_cards, &pl_str, &pl_idx,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    eprintln!("Site (c) isolated kernel unit test:");
+    eprintln!("  CPU (with rake, main-pot-only): {:?}", cpu_cfv);
+    eprintln!("  Metal (today, no rake): {:?}", gpu_cfv);
+
+    let mut max_diff = 0.0_f32;
+    let mut max_h = 0;
+    for h in 0..nh {
+        let d = (cpu_cfv[h] - gpu_cfv[h]).abs();
+        if d > max_diff { max_diff = d; max_h = h; }
+    }
+    eprintln!("  max_diff = {} at h={} (today: ≈ main-pot rake × reach)",
+        max_diff, max_h);
+
+    assert!(max_diff < 1e-4,
+        "Site (c) isolated unit test FAILED: max_diff = {} at h={}. \
+         CPU computes site (c) K=2 unequal-contributions with main-pot-\
+         only rake; Metal computes it without. Phase B must add rake \
+         math at vcfr.metal line ~281 mirroring CPU showdown.rs \
+         ~870-910: rake applies ONLY at li==0 (main pot), side-pot \
+         levels (li≥1) un-raked, cap applied ONCE per hand. The most \
+         rake-formula-sensitive site; isolated test catches per-level \
+         errors invisible at gate level.",
+        max_diff, max_h);
+    eprintln!("✓ Site (c) isolated unit test PASSED");
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // Site (b) SECONDARY DEFENSE — divergence assertion
 //
 // (Kept as a secondary line of defense. After the primary isolation
