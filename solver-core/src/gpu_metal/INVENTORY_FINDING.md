@@ -632,6 +632,66 @@ standing guard, especially with the real-time-search kernel work
 coming. It should be in place before that work can reintroduce a
 bypass."
 
+## Precision-anchor discipline: scale-discrimination as the proof
+
+Added during Phase 1 P5a (preflop chance integration anchor, 2026-06-04).
+
+The standing trap: a precision diff that's "well under tolerance" can
+be either the expected f32-accumulation floor (correct anchor) OR a
+quiet loosening of an f64 path that should have collapsed to ~1e-13
+(broken anchor that the loose tolerance papers over).
+
+The P5a observation: 4.657e-7 diff against an f64 reference. Six
+orders looser than P2.5a's ~1e-13 precedent. Was it the expected
+f32-accumulation floor or a regression?
+
+The discriminating method that resolved it: SCALE-VARIATION. Run the
+same anchor at input scales spanning many orders of magnitude and
+measure diff/scale. Three cases:
+
+  - Diff is f32 accumulation floor: diff scales linearly with input,
+    diff/scale stays roughly constant.
+  - Diff is fixed-magnitude bug: diff stays similar regardless of
+    scale, diff/scale ratio diverges with scale.
+  - Diff is f64 non-exactness: diff would already be far below f32
+    ULP times scale and would NOT scale with input.
+
+P5a's empirical result: diff/scale ratio 1.56 across nine orders
+(1e-6 to 1e3). Linearity confirmed. The 4.657e-7 IS the expected
+f32 accumulation floor for that input scale, NOT a fixed-magnitude
+offset or f64 path non-exactness.
+
+The bonus finding: my original tolerance was 1e-4, loose enough to
+pass an order-of-magnitude regression. Tightened to 1e-5 (50x the
+empirical floor) so the anchor catches regressions while still
+having headroom for cancellation-pattern variation.
+
+THE PATTERN, as standing discipline for future precision anchors:
+
+  1. Define an f64 reference for the production f32 computation.
+  2. Anchor the production at f32 floor against the reference.
+  3. Validate the floor by scale variation: run the same anchor at
+     scales spanning many orders, assert diff/scale stays within
+     a small ratio (e.g., 100x range).
+  4. Tighten the tolerance to within ~10x to ~50x of the empirical
+     floor so the anchor is sensitive to regressions, not just to
+     orders-of-magnitude blowups.
+
+The P2.5a "~1e-13" was the STUB anchor where the entire computation
+could be in f64. The P5a "~5e-4 per unit scale" is the RUNNING
+orchestrator with f32 accumulators by production design. Both are
+correctly anchored; they measure different things. Don't compare
+absolute magnitudes across anchors without checking what each is
+measuring.
+
+CARRY for the full-scale CPU run (Phase 1 slice 7): aggregation
+accumulates at the linear-N×ULP bound, not the sqrt-statistical
+bound. For 1755 canonical flops at production scale, this is
+probably fine but worth remembering when measuring f32 sufficiency
+over a long convergence run: the per-iter f32 drift from aggregation
+is bounded by the linear bound, not the sqrt one, so accumulated
+drift over iterations follows the linear×iters scaling.
+
 ## Altitude: where the rake arc sits in the larger plan
 
 The rake arc started as "implement rake, ~1-2 hours" and has become a
