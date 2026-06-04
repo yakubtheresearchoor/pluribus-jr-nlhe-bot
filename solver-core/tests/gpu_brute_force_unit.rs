@@ -18,6 +18,16 @@ struct DebugBruteForceParams {
     starting_pot: i32,
     fold_mask: u16,
     _pad: u16,
+    // ─── Slice 2 rake forwarding (mirrors vcfr.metal struct) ───
+    // Existing tests in this file pre-date Slice 2 and validate the
+    // rake-FREE helper output, so they default rake_rate=0, rake_cap=0,
+    // flop_seen=0 — every gate in this file checks against
+    // side_pot_showdown_cfv (rake-free CPU reference). Slice 2 site
+    // isolation tests in gpu_rake_parity_gate.rs use the rake-bearing
+    // variant with nonzero values.
+    rake_rate: f32,
+    rake_cap: f32,
+    flop_seen: i32,
 }
 
 fn gpu_brute_force(
@@ -50,6 +60,12 @@ fn gpu_brute_force(
         starting_pot,
         fold_mask,
         _pad: 0,
+        // Existing tests in this file use the rake-FREE CPU reference
+        // (side_pot_showdown_cfv), so we MUST pass rake=0 / flop_seen=0
+        // to make the kernel skip the rake math.
+        rake_rate: 0.0,
+        rake_cap: 0.0,
+        flop_seen: 0,
     };
     let d_params = MetalBuffer::from_slice(device, &[params]);
 

@@ -587,20 +587,38 @@ fn site_b_3p_fold_terminal_rake() {
     // strictly BETTER than the prior overlap because the dominant-
     // error terminal type is no longer pre-determined by pot size.
     //
-    // The discriminating evidence is empirical: at rake_cap=1.0,
-    // this scenario produces a DIFFERENT max_diff than scenario (a)
-    // at rake_cap=1000 — confirming site (b)'s signal is now
-    // distinguishable. Phase B closing site (a) without also
-    // closing site (b) will leave THIS gate failing while site
-    // (a)'s gate goes green. That's the discriminator the user
-    // asked for, in test form: a gate whose pass/fail is sensitive
-    // to site (b)'s correctness specifically, not site (a)'s
-    // bleeding through.
+    // EMPIRICAL FINDING (after Phase B site (b) closure):
     //
-    // (A divergence-assertion test that compares scenarios (a) and
-    // (b) post-Phase-B is also added below as a SECOND defense:
-    // even if this isolation argument is imperfect, the divergence
-    // check catches asymmetric convergence between the two sites.)
+    // This gate did NOT drop when site (b)'s kernel math landed and
+    // the unit test went to f32 floor. The diff stayed at 0.20833 at
+    // flop idx=96 even with site (b) demonstrably correct (unit
+    // test = 0.0).
+    //
+    // Interpretation: this gate's max-diff position (idx 96) is
+    // dominated by sites (a) and (c) errors (rake-free showdowns and
+    // 1-folded terminals), NOT by site (b)'s lone-survivor
+    // contribution. Even with cap binding shifting per-terminal rake
+    // magnitudes to uniform, the dominant error term is from
+    // terminal types that don't route to site (b)'s branch.
+    //
+    // So this gate is NOT actually measuring site (b)'s correctness.
+    // It measures the OVERALL CFR-regret rake error across all
+    // K=2-cluster terminals (sites a + b + c collectively). It will
+    // converge to f32 floor only after ALL of sites (a), (b), (c)
+    // are closed — making it a JOINT-K=2 convergence gate, not a
+    // site-(b)-specific one.
+    //
+    // The REAL site (b) validation is `site_b_isolated_kernel_unit_test`
+    // (defined below), which directly invokes site (b)'s branch via
+    // the debug kernel and compares against CPU truth. That test
+    // went from max_diff=2.0 (today, before Phase B) to max_diff=0.0
+    // (after Phase B Site (b) closure) with the kernel rake math.
+    //
+    // This gate is kept under the "site (b)" name because (i) it
+    // sits in the K=2-cluster joint signal and (ii) when Phase B
+    // closes sites (a) and (c) too, this gate becomes the f32-floor
+    // gate for the K=2 cluster as a whole. But the per-SITE site (b)
+    // DoD is the unit test, not this regret-level gate.
     let (tree, table) = build_3player_with_rake(0.05, 1.0);
     let (max_diff, zone, argmax) = run_parity(&tree, table, "Site (b) 3p fold-term rake_cap=1.0 (binding)");
     assert!(max_diff < 1e-4, "Site (b) FAILED: max_diff = {} (zone={}, idx={})",
@@ -744,9 +762,16 @@ mod debug_kernel {
         starting_pot: i32,
         fold_mask: u16,
         _pad: u16,
+        rake_rate: f32,
+        rake_cap: f32,
+        flop_seen: i32,
     }
 
-    pub fn gpu_brute_force(
+    /// Invoke Metal's `multiway_brute_force_showdown` via the debug
+    /// kernel, with explicit rake params for Slice 2 site isolation
+    /// tests. Pass `rake_rate=0.0, rake_cap=0.0, flop_seen=false` for
+    /// rake-free invocation (matches pre-Slice-2 behavior).
+    pub fn gpu_brute_force_with_rake(
         ctx: &MetalContext,
         nh: usize,
         np: usize,
@@ -758,6 +783,9 @@ mod debug_kernel {
         hand_cards: &[u8],
         pl_str: &[u16],
         pl_idx: &[u16],
+        rake_rate: f32,
+        rake_cap: f32,
+        flop_seen: bool,
     ) -> Vec<f32> {
         let device = ctx.device();
         let pipeline = ctx.create_pipeline("debug_brute_force_showdown").expect("pipeline");
@@ -776,6 +804,9 @@ mod debug_kernel {
             starting_pot,
             fold_mask,
             _pad: 0,
+            rake_rate,
+            rake_cap,
+            flop_seen: if flop_seen { 1 } else { 0 },
         };
         let d_params = MetalBuffer::from_slice(device, &[params]);
 
@@ -896,9 +927,10 @@ fn site_b_isolated_kernel_unit_test() {
     // extends DebugBruteForceParams + the debug kernel to forward
     // rake params, Metal will apply the same rake math as CPU.
     let ctx = MetalContext::new().expect("Metal context");
-    let gpu_cfv = debug_kernel::gpu_brute_force(
+    let gpu_cfv = debug_kernel::gpu_brute_force_with_rake(
         &ctx, nh, np, traverser, starting_pot, fold_mask,
         &opp_reach, &contributions, &hand_cards, &pl_str, &pl_idx,
+        rake_rate, rake_cap, flop_seen,
     );
 
     eprintln!("Site (b) isolated kernel unit test:");

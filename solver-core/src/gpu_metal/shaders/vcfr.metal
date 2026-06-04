@@ -126,10 +126,29 @@ inline void multiway_brute_force_showdown(
     const device uint8_t* hand_cards,              // [nh*2]
     const device uint16_t* sorted_pl_strength,     // [nh]
     const device uint16_t* sorted_pl_indices,      // [nh]
+    // ─── Slice 2 rake (CPU↔Metal parity) ───
+    // Mirror CPU `side_pot_showdown_cfv_with_rake` interface. The
+    // no-flop-no-drop gate is computed once at function entry; per
+    // the rake spec, rake is taken from the MAIN POT ONLY (side
+    // pots un-raked) with a SINGLE per-hand cap applied once.
+    // flop_seen is the no-flop-no-drop gate: when false (preflop-
+    // ending terminal), eff_rake_rate and eff_rake_cap are 0 so
+    // every downstream path computes rake = 0.
+    float rake_rate,
+    float rake_cap,
+    bool flop_seen,
     thread float* out                              // [nh]
 ) {
     int num_opp = np - 1;
     int32_t c_t = contributions[traverser];
+
+    // Slice 2 rake gating: no-flop-no-drop. For flop-onward trees
+    // (current state), flop_seen is always true and this is a no-op.
+    // When preflop integration brings preflop-end terminals, callers
+    // pass flop_seen=false at those terminals and rake collapses
+    // to zero without revisiting the showdown code.
+    float eff_rake_rate = flop_seen ? rake_rate : 0.0f;
+    float eff_rake_cap  = flop_seen ? rake_cap  : 0.0f;
 
     // Build hand_strength array from sorted_pl. CPU equivalent:
     //   for si in 0..nh: hand_strength[sorted_pl_indices[si]] = sorted_pl_strength[si];
@@ -243,11 +262,18 @@ inline void multiway_brute_force_showdown(
     if (num_opp == 2 && (num_active <= 1 || traverser_folded)) {
         int total_pot = (int)starting_pot;
         for (int p = 0; p < np; p++) total_pot += (int)contributions[p];
+        // ── Slice 2 Phase B site (b): rake on winner's pot claim ──
+        // Mirror CPU `side_pot_showdown_cfv_with_rake` lines 484-548.
+        // Folded traverser loses their investment regardless of rake
+        // (they don't win the pot, so rake doesn't reduce their payoff).
+        // Active traverser as lone survivor claims (total_pot − rake)
+        // instead of total_pot.
+        float rake = fmax(0.0f, fmin((float)total_pot * eff_rake_rate, eff_rake_cap));
         float payoff;
         if (traverser_folded) {
             payoff = -traverser_stake;
         } else {
-            payoff = (float)total_pot - traverser_stake;
+            payoff = ((float)total_pot - rake) - traverser_stake;
         }
 
         thread const float* reach_0 = opp_reach_local + 0 * nh;
@@ -746,14 +772,24 @@ kernel void vcfr_bottom_up(
         }
 
         // Per-scenario brute-force showdown evaluation (matches CPU
-        // side_pot_showdown_cfv). Returns raw CFV; we apply /num_combinations
-        // below as the caller normalization.
+        // side_pot_showdown_cfv_with_rake). Returns raw CFV with rake
+        // applied per CPU spec; we apply /num_combinations below as
+        // the caller normalization.
+        // flop_seen: per-terminal no-flop-no-drop gate. Today
+        // node.board_state ∈ {0=Flop, 1=Turn, 2=River} for all
+        // flop-onward terminals → flop_seen=true. When preflop
+        // integration brings preflop-end terminals, those have
+        // board_state=3 (Preflop) → flop_seen=false → rake collapses.
+        // Static-anchored in gpu_rake_parity_gate.rs against the
+        // BoardState::Preflop repr.
+        bool flop_seen = (node.board_state != 3);
         float local_out[1326];
         multiway_brute_force_showdown(
             nh, np, int(params.traverser),
             params.starting_pot, fold_mask,
             contribs_local, opp_reach_local,
             hand_cards, sorted_pl_strength, sorted_pl_indices,
+            params.rake_rate, params.rake_cap, flop_seen,
             local_out
         );
         for (int h = 0; h < nh; h++) out[h] = local_out[h];
@@ -1468,13 +1504,18 @@ kernel void vcfr_bottom_up_batched(
             }
         }
 
-        // Run the brute-force showdown helper.
+        // Run the brute-force showdown helper. Slice 2: pass rake
+        // params + flop_seen (board_state != 3=Preflop) for the
+        // no-flop-no-drop gate. See comment at the bottom_up caller
+        // for the dormant-but-correct Preflop handling.
+        bool flop_seen = (node.board_state != 3);
         float local_out[1326];
         multiway_brute_force_showdown(
             nh, np, int(params.traverser),
             params.starting_pot, fold_mask,
             contribs_local, opp_reach_local,
             hand_cards, pl_str, pl_idx,
+            params.rake_rate, params.rake_cap, flop_seen,
             local_out
         );
         for (int h = 0; h < nh; h++) out[h] = local_out[h];
@@ -2269,6 +2310,16 @@ struct DebugBruteForceParams {
     int traverser;
     int32_t starting_pot;
     uint16_t fold_mask;
+    uint16_t _pad;          // align rake floats to 4-byte boundary
+    // ─── Slice 2 rake forwarding for site (b) isolation unit test ───
+    // Per user direction: "The debug-kernel rake-param forwarding is
+    // as load-bearing as the kernel math, so both land together and
+    // the DoD is the unit test reaching f32 floor (which confirms
+    // both the helper applies rake and the test exercises it), not
+    // merely changing."
+    float rake_rate;
+    float rake_cap;
+    int32_t flop_seen;      // bool as i32 (Metal struct alignment)
 };
 
 kernel void debug_brute_force_showdown(
@@ -2299,6 +2350,7 @@ kernel void debug_brute_force_showdown(
         params.starting_pot, params.fold_mask,
         contribs_local, opp_reach_local,
         hand_cards_dev, pl_str_dev, pl_idx_dev,
+        params.rake_rate, params.rake_cap, params.flop_seen != 0,
         local_out
     );
 
