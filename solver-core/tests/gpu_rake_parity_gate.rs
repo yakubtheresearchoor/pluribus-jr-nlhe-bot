@@ -674,30 +674,274 @@ fn site_e_4p_factored_rake() {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Site (b) DISCRIMINATING TEST — divergence assertion
+// Site (b) PRIMARY ISOLATION TEST — direct CPU↔Metal kernel unit check
 //
-// Per user direction: "The agent's proposed discriminator ('if site (b)'s
-// diff diverges from site (a)'s after Phase B, that's the signal') is the
-// right idea but it's stated as an observation to watch rather than a
-// test that fails. The risk is that you close site (a), both gates drop,
-// everything looks green, and site (b)'s fold-win rake is actually wrong
-// but invisible because its error was never the dominant term in that
-// scenario."
+// Per user direction after Phase A.6: "The divergence-assertion fallback
+// catches the case where site b is wrong and site a is right, but it
+// does not catch the case where site a and site b are wrong in the same
+// way (both have the same rake-formula error, say the cap applied wrong
+// in a way common to both K=2 paths), because then they converge
+// together, their ratio stays ~1, and the divergence assertion never
+// fires while both are wrong. So the trade isn't 'perfect vs
+// good-enough,' it's 'catches the less-likely failure, misses the
+// more-likely one.' Make site (b) measure site (b) against truth, then
+// Phase B proceeds with all five sites genuinely covered."
 //
-// This test ENCODES that observation as a failing test. After Phase B
-// lands, run both site (a) and site (b) scenarios. If their max_diffs
-// diverge meaningfully (one converges to f32 floor while the other
-// doesn't, or one is much larger than the other), that asymmetric
-// convergence is itself proof that the two kernel branches were not
-// both closed correctly.
+// This test directly invokes the Metal `multiway_brute_force_showdown`
+// helper via the `debug_brute_force_showdown` kernel (existing
+// infrastructure, used by gpu_brute_force_unit.rs) with inputs that
+// route the kernel EXCLUSIVELY through site (b)'s lone-survivor branch:
 //
-// Pre-Phase-B: this test would PASS today by coincidence (both gates
-// fail at similar magnitudes ~0.21), which would be a false signal.
-// So it's #[ignore] until Phase B lands, at which point both scenarios
-// should be CONVERGED (both at f32 floor); if they're not converged
-// (one or both still fails), the per-site gates fire first. The
-// divergence assertion is the second line of defense: it catches the
-// case where both fail-then-pass but ASYMMETRICALLY in between.
+//   - np = 3 (num_opp = 2 → K=2 paths)
+//   - fold_mask = 0b110 (players 1, 2 folded)
+//   - traverser = 0 (the lone survivor; NOT folded)
+//   - → kernel checks num_opp==2 && (num_active<=1) → site (b) fast path
+//
+// CPU reference: `side_pot_showdown_cfv_with_rake` with the same inputs,
+// rake_rate=0.05, rake_cap=1.0, flop_seen=true. Returns rake-applied
+// per-hand CFV.
+//
+// Today (pre-Phase B): Metal's debug kernel calls the helper WITHOUT
+// rake params (the helper signature hasn't been extended yet), so
+// Metal's output is rake-free. Diff = rake amount per surviving hand.
+// Test FAILS today.
+//
+// After Phase B closes site (b) AND extends DebugBruteForceParams +
+// the debug kernel to forward rake params to the helper: Metal's site
+// (b) computes the same rake math as CPU. Diff → f32 floor. Test PASSES.
+//
+// THIS TEST IS THE PRIMARY DEFENSE because:
+//   - It validates site (b)'s arithmetic against CPU GROUND TRUTH, not
+//     against site (a)'s convergence. Correlated failure (both K=2
+//     paths sharing a wrong eff_rake helper) is caught: even if site
+//     (a)'s gate also fails the same way, this test independently
+//     catches site (b) being wrong against the CPU rake reference.
+//   - It directly invokes site (b)'s code path via fold_mask routing,
+//     so the measured diff IS site (b)'s error (zero contribution
+//     from any other kernel branch).
+//
+// The cap-binding scenario (site_b_3p_fold_terminal_rake) and the
+// divergence-assertion test (site_ab_divergence_check_post_phase_b)
+// remain as SECOND and THIRD lines of defense respectively. But this
+// kernel unit test is the primary site-(b)-against-truth validation
+// the user asked for.
+// ═════════════════════════════════════════════════════════════════════
+
+// Local copy of the debug-kernel calling pattern from
+// gpu_brute_force_unit.rs (cross-test-file imports aren't supported
+// in Rust integration tests; minor duplication is the path).
+mod debug_kernel {
+    use metal::MTLSize;
+    use solver_core::gpu_metal::buffer::MetalBuffer;
+    use solver_core::gpu_metal::context::MetalContext;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DebugBruteForceParams {
+        nh: i32,
+        np: i32,
+        traverser: i32,
+        starting_pot: i32,
+        fold_mask: u16,
+        _pad: u16,
+    }
+
+    pub fn gpu_brute_force(
+        ctx: &MetalContext,
+        nh: usize,
+        np: usize,
+        traverser: usize,
+        starting_pot: i32,
+        fold_mask: u16,
+        opp_reach: &[f32],
+        contributions: &[i32],
+        hand_cards: &[u8],
+        pl_str: &[u16],
+        pl_idx: &[u16],
+    ) -> Vec<f32> {
+        let device = ctx.device();
+        let pipeline = ctx.create_pipeline("debug_brute_force_showdown").expect("pipeline");
+
+        let d_output = MetalBuffer::<f32>::zeros(device, nh);
+        let d_opp_reach = MetalBuffer::from_slice(device, opp_reach);
+        let d_contributions = MetalBuffer::from_slice(device, contributions);
+        let d_hand_cards = MetalBuffer::from_slice(device, hand_cards);
+        let d_pl_str = MetalBuffer::from_slice(device, pl_str);
+        let d_pl_idx = MetalBuffer::from_slice(device, pl_idx);
+
+        let params = DebugBruteForceParams {
+            nh: nh as i32,
+            np: np as i32,
+            traverser: traverser as i32,
+            starting_pot,
+            fold_mask,
+            _pad: 0,
+        };
+        let d_params = MetalBuffer::from_slice(device, &[params]);
+
+        let cmd = ctx.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(d_output.as_ref()), 0);
+        enc.set_buffer(1, Some(d_opp_reach.as_ref()), 0);
+        enc.set_buffer(2, Some(d_contributions.as_ref()), 0);
+        enc.set_buffer(3, Some(d_hand_cards.as_ref()), 0);
+        enc.set_buffer(4, Some(d_pl_str.as_ref()), 0);
+        enc.set_buffer(5, Some(d_pl_idx.as_ref()), 0);
+        enc.set_buffer(6, Some(d_params.as_ref()), 0);
+
+        let grid = MTLSize { width: 1, height: 1, depth: 1 };
+        let tg = MTLSize { width: 1, height: 1, depth: 1 };
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        d_output.to_vec()
+    }
+
+    pub fn make_sorted(strengths: &[u16]) -> (Vec<u16>, Vec<u16>) {
+        let nh = strengths.len();
+        let mut items: Vec<(u16, u16)> = (0..nh).map(|h| (strengths[h], h as u16)).collect();
+        items.sort_by_key(|&(s, _)| s);
+        let mut s_str = vec![0u16; nh];
+        let mut s_idx = vec![0u16; nh];
+        for i in 0..nh {
+            s_str[i] = items[i].0;
+            s_idx[i] = items[i].1;
+        }
+        (s_str, s_idx)
+    }
+}
+
+#[test]
+#[ignore = "Slice 2 Phase B Site (b) ISOLATION (primary): direct CPU↔Metal \
+            kernel-level check of site (b)'s lone-survivor rake math. \
+            Catches BOTH asymmetric (site b wrong, a right) AND correlated \
+            (both K=2 sites wrong via shared helper) failures because it \
+            validates site (b)'s output against CPU GROUND TRUTH at the \
+            kernel-helper level, not against another site's convergence. \
+            Enable when Phase B (i) closes site (b)'s rake math in \
+            multiway_brute_force_showdown AND (ii) extends \
+            DebugBruteForceParams + debug_brute_force_showdown kernel to \
+            forward rake_rate/rake_cap/flop_seen to the helper. Run: \
+            cargo test --release --features metal --test \
+            gpu_rake_parity_gate site_b_isolated -- --ignored"]
+fn site_b_isolated_kernel_unit_test() {
+    use solver_core::solver::showdown::side_pot_showdown_cfv_with_rake;
+
+    // 3p (num_opp=2) — K=2 paths.
+    let nh = 3;
+    let np = 3;
+    let num_opp = 2;
+    let hand_cards: Vec<u8> = vec![0, 1, 2, 3, 4, 5];
+    let strengths: Vec<u16> = vec![10, 20, 30];
+    let (pl_str, pl_idx) = debug_kernel::make_sorted(&strengths);
+
+    // Reach: uniform 1.0 for both opponents. Site (b) lone-survivor
+    // formula is independent of opp_reach distribution (the survivor
+    // wins regardless of opp hands), but we need a nonzero value so
+    // the kernel's reach-weighted accumulator produces a measurable
+    // CFV. With uniform reach=1.0, the per-hand CFV =
+    //   (num_opp_hand_combos_compatible_with_h) * payoff(h)
+    // and payoff(h) is constant per h (= total_pot - rake -
+    // traverser_stake for the surviving traverser), so CFV scales by
+    // the compatible-pair count.
+    let opp_reach: Vec<f32> = vec![1.0; num_opp * nh];
+
+    // Equal contributions; total_pot = starting_pot + sum(contribs) = 30.
+    let contributions: Vec<i32> = vec![5, 5, 5];
+    let starting_pot: i32 = 15;
+
+    // fold_mask = 0b110: players 1 and 2 folded. traverser=0 is the
+    // sole active player. The kernel's check
+    //   `num_opp == 2 && (num_active <= 1 || traverser_folded)`
+    // triggers site (b)'s fast path. num_active = 1 ≤ 1 → enters
+    // this branch with traverser as the lone survivor.
+    let fold_mask: u16 = 0b110;
+    let traverser = 0;
+
+    // Rake params: rake_rate=0.05 (5%), rake_cap=1.0 (binds at this
+    // pot since total_pot * 0.05 = 1.5 > 1.0). flop_seen=true (current
+    // flop-onward tree, no preflop terminals).
+    let rake_rate = 0.05_f32;
+    let rake_cap = 1.0_f32;
+    let flop_seen = true;
+
+    // CPU reference: side_pot_showdown_cfv_with_rake. This is the
+    // proven-against-hand-computation reference; per Slice 1.x it
+    // has been anchored at every path including the lone-survivor
+    // fast path (showdown.rs ~484-548).
+    let opp_reach_per_opp: Vec<Vec<f32>> = (0..num_opp)
+        .map(|oi| opp_reach[oi * nh..(oi + 1) * nh].to_vec())
+        .collect();
+    let opp_reach_views: Vec<&[f32]> = opp_reach_per_opp.iter().map(|v| v.as_slice()).collect();
+    let mut sorted_opp_str = Vec::with_capacity(num_opp * nh);
+    let mut sorted_opp_idx = Vec::with_capacity(num_opp * nh);
+    for _ in 0..num_opp {
+        sorted_opp_str.extend_from_slice(&pl_str);
+        sorted_opp_idx.extend_from_slice(&pl_idx);
+    }
+    let cpu_cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &sorted_opp_str, &sorted_opp_idx,
+        &pl_str, &pl_idx,
+        &contributions, fold_mask, traverser, np as u8, starting_pot,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    // Metal helper: invoke via debug kernel. TODAY (pre-Phase B):
+    // the debug kernel does not pass rake params to the helper, so
+    // Metal computes the rake-FREE site (b) CFV. After Phase B
+    // extends DebugBruteForceParams + the debug kernel to forward
+    // rake params, Metal will apply the same rake math as CPU.
+    let ctx = MetalContext::new().expect("Metal context");
+    let gpu_cfv = debug_kernel::gpu_brute_force(
+        &ctx, nh, np, traverser, starting_pot, fold_mask,
+        &opp_reach, &contributions, &hand_cards, &pl_str, &pl_idx,
+    );
+
+    eprintln!("Site (b) isolated kernel unit test:");
+    eprintln!("  CPU (with rake): {:?}", cpu_cfv);
+    eprintln!("  Metal (today, no rake): {:?}", gpu_cfv);
+
+    let mut max_diff = 0.0_f32;
+    let mut max_h = 0;
+    for h in 0..nh {
+        let d = (cpu_cfv[h] - gpu_cfv[h]).abs();
+        if d > max_diff { max_diff = d; max_h = h; }
+    }
+    eprintln!("  max_diff = {} at h={} (today: ≈ rake amount per surviving hand)",
+        max_diff, max_h);
+
+    // After Phase B (kernel + debug-params updated to forward rake):
+    // diff at f32 floor. CPU reference for this scenario is hand-
+    // anchored and small (3-hand uniform), so f64 confirmation of the
+    // CPU reference is trivial (the formula is `(total_pot * rate)
+    // .min(cap)` = min(30 * 0.05, 1.0) = 1.0 per surviving hand
+    // exactly, no accumulation drift).
+    assert!(max_diff < 1e-4,
+        "Site (b) isolated unit test FAILED: max_diff = {} at h={}. \
+         CPU computes site (b) lone-survivor with rake; Metal computes \
+         it without. Phase B must (i) add rake math at the lone-survivor \
+         branch in multiway_brute_force_showdown (vcfr.metal line ~243) \
+         AND (ii) extend DebugBruteForceParams + debug kernel to forward \
+         rake_rate/rake_cap/flop_seen. Until BOTH land, this test fails. \
+         This test is the PRIMARY site (b) defense: it catches correlated \
+         K=2 failures the divergence assertion misses, because it \
+         compares against CPU GROUND TRUTH not against site (a).",
+        max_diff, max_h);
+    eprintln!("✓ Site (b) isolated unit test PASSED: Metal site (b) matches CPU rake reference");
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Site (b) SECONDARY DEFENSE — divergence assertion
+//
+// (Kept as a secondary line of defense. After the primary isolation
+// test passes, the divergence assertion catches the remaining failure
+// mode: site (a) closed, site (b) closed but with a math bug that
+// happens to converge to f32 floor in the isolation test but diverges
+// from site (a) in the gate scenario. Unlikely, but cheap to keep.)
 // ═════════════════════════════════════════════════════════════════════
 
 #[test]
