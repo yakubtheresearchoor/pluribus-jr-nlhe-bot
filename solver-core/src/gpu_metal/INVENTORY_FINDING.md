@@ -300,6 +300,114 @@ The standing method for catching unmapped locations (revised):
 This is the deepest lesson the rake arc produced and it is bigger than
 rake.
 
+## Fifth iteration: inline payoff sites were dead code, then consolidated
+
+The fourth-iteration finding (inline sites in vcfr_bottom_up_batched
+bypass the helper) was itself WRONG. Phase B Site (d) part 2 surgery
+mirrored rake into the inline sites; the HU gate stayed at EXACTLY
+0.09375006 — unchanged byte-for-byte. The standing question applied
+to the surgery itself: "did this code actually execute?" Answer: NO.
+
+The entire ~600-line inline-sites block in vcfr_bottom_up_batched
+was inside an `if (false) { ... }` gate at line 1749. Comment at
+line 1727 said "Legacy showdown evaluation code removed; replaced by
+brute-force above" — the code wasn't removed, just gated. Phase B
+Site (d) part 2 edits, F1 edit, and the "5+ inline sites" framing
+were ALL on dead code.
+
+The fifth-iteration refinement to the standing method:
+
+  **DISTURBANCE-TEST REACHABILITY BEFORE TRUSTING ANY SITE IS LIVE
+  OR DEAD.** Output-write enumeration is necessary but not sufficient
+  — each enumerated site must also be verified REACHABLE in
+  production code paths. The standing question applies to enumeration
+  itself, in both directions:
+    - Reading says site is live: insert a deliberate disturbance
+      (NaN write, deliberately wrong value). Run production tests.
+      If nothing detects it, the site is dead despite the reading.
+    - Reading says site is dead: same disturbance test. If anything
+      detects it, the site is live despite the reading.
+
+  Both directions of the dead-or-alive claim require execution-
+  grounded confirmation, not source-reading.
+
+## Consolidation: per-site-with-scatter collapsed to single-helper chokepoint
+
+the lead's decision after the fifth-iteration finding: "the dead inline
+fast paths are abandoned. Clear them out and consolidate on the single
+helper. The if(false) finding means production already routes through
+multiway_brute_force_showdown, so this is formalizing what's already
+true, not changing the live path."
+
+Executed via the lead's deliberate order:
+
+  Step 1 — disturbance-test the if(false) block to PROVE dead before
+    deleting (5 NaN writes at different points, including all prior
+    surgery sites). Full test suite ran with disturbances in place;
+    zero detection, byte-identical results. Reachability proven dead
+    by execution.
+
+  Step 2 — delete the dead block as isolated commit (commit 2fc543e):
+    627 lines removed (legacy if(false) block + unused
+    `sorted_sweep_showdown_vcfr_local_with_components` helper whose
+    only callers were inside the deleted block). Forced clean rebuild,
+    full test suite confirmed only dead code removed.
+
+  Step 3 — confirm helper is sole production payoff chokepoint
+    (this commit). Post-deletion enumeration:
+      vcfr_bottom_up: line 863 `out[h] = local_out[h]` (multiway
+        helper result), plus chance-integration aggregation writes.
+      vcfr_bottom_up_batched: line 1595 `out[h] = local_out[h]`
+        (multiway helper result), plus chance-integration writes.
+    The chance writes aggregate already-rake-applied terminal CFVs;
+    they preserve rake without applying it themselves. So
+    `multiway_brute_force_showdown` is the unambiguous payoff
+    chokepoint.
+
+    Helper reachability is already proven historically: every
+    successful K=2/K=1 rake closure was an edit to the helper that
+    DID change test results (positive-form disturbance test), while
+    the if(false) block deletion changed NOTHING.
+
+  Step 4 — finish site (e) K≥3 factored (the only remaining
+    rake-free branch in the helper). Next session.
+
+  Step 5 — production-solve instrumentation as permanent CI
+    completeness check. Next session.
+
+## What the consolidation buys
+
+The per-site-with-scattered-instrumentation plan from before the
+fifth-iteration finding collapses to single-helper-chokepoint, which
+is simpler and structurally robust:
+
+  - Completeness story: one path to verify (the helper), not N
+    scattered sites to police.
+  - Future-divergence risk: any future change that adds a payoff
+    path bypassing the helper would be caught by the production-solve
+    instrumentation (Step 5). The chokepoint structure makes this
+    instrumentation cheap and decisive.
+  - Maintenance: no scattered rake math to keep in sync across
+    inline fast paths.
+
+## Five iterations of inventory/reading failure, all caught by execution
+
+  1. Original inventory missed sorted_sweep call sites entirely
+  2. Re-survey (explore agent) miscounted line ranges
+  3. My own re-count placed a dead-code call in production
+  4. Helper-call search missed inline payoff sites that bypass helpers
+  5. Output-write enumeration missed `if (false)` gates → all inline
+     sites were dead, surgery on dead code
+
+Plus the build-system bug: the rerun-if-changed path was wrong, so
+Metal-only edits weren't reliably recompiled. Validation history had
+to be re-verified against a fresh build (it held).
+
+Six false-greens / reading failures in the arc. Each caught by the
+same operational question: "does this signal actually exercise what
+I claim it validates?" applied to both readings AND execution
+signals AND build-system state AND code reachability.
+
 ## Fourth iteration: inline payoff sites bypass the helper
 
 Phase B Site (d) part 2 attempted to mirror rake into the production
