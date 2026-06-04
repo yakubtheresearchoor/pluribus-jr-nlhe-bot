@@ -484,11 +484,32 @@ pub fn side_pot_showdown_cfv_with_rake(
     if (num_active <= 1 || fold_mask & (1u16 << traverser) != 0) && num_opp <= 2 {
         let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
         let traverser_investment = starting_pot as f32 / np as f32 + c_t as f32;
-        // Rake applies only to the winner's pot claim. Folded traverser
-        // doesn't win → rake doesn't reduce their payoff (they lose
-        // their investment regardless). Active-winner traverser claims
-        // (total_pot − rake) instead of total_pot.
-        let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
+        // Slice 2 HU residual fix (the lead spec confirmation 2026-06-04):
+        // Rake applies to the MAIN POT ONLY (contested/called portion).
+        // Uncalled bets are returned to the bettor un-raked per the site
+        // spec. The lone-survivor winner receives total_pot - main_pot_rake
+        // (i.e., they get back their uncalled overage at face value plus
+        // the rake-reduced contested pot).
+        //
+        // Previous version used `(total_pot * rake_rate).min(cap)` which
+        // over-raked uncalled bets — a real arithmetic bug that surfaced
+        // as the HU gate 0.09375 residual in Phase B Site (d) closure.
+        // Fix mirrors Metal K=1 per-level's already-spec-correct
+        // computation: main_pot = min_contrib × num_contributors +
+        // starting_pot. At equal contributions main_pot == total_pot
+        // so this is a no-op at the unit-tested cases; the change only
+        // affects fold-win-after-bet (unequal contributions) terminals.
+        //
+        // Folded traverser doesn't win → rake doesn't reduce their
+        // payoff (they lose their investment regardless).
+        let main_pot_amount: i32 = {
+            let min_contrib = contributions.iter().min().copied().unwrap_or(0);
+            let num_main_contributors = contributions
+                .iter().filter(|&&c| c >= min_contrib).count();
+            min_contrib * num_main_contributors as i32 + starting_pot
+        };
+        let rake = (main_pot_amount as f32 * eff_rake_rate)
+            .min(eff_rake_cap).max(0.0);
         let payoff = if fold_mask & (1u16 << traverser) != 0 {
             -traverser_investment
         } else {

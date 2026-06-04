@@ -378,6 +378,120 @@ fn verify_rake_does_not_apply_to_folded_traverser() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Slice 2 HU residual fix: fold-win-after-bet (uncalled-bet returned un-raked)
+// ─────────────────────────────────────────────────────────────────────
+//
+// COVERAGE GAP CORRECTION (the lead spec confirmation 2026-06-04): the
+// Slice 1.x anchors only covered fold-win with EQUAL contributions
+// (e.g., the verify_rake_fast_path_matches_hand_computed_reference
+// test uses contributions=[50, 50] where main_pot == total_pot, so
+// the rake-on-total-pot vs rake-on-main-pot distinction is invisible).
+//
+// The UNEQUAL-contributions case (fold-after-bet: the bettor's bet
+// went uncalled because the opponent folded) was not anchored. CPU
+// happened to use `rake_on_total_pot` which over-raked the uncalled
+// portion — a real arithmetic bug that surfaced as the HU gate
+// 0.09375 residual after Phase B Site (d) closure.
+//
+// Per the rake spec: uncalled bets are returned un-raked. Rake is
+// applied to the MAIN POT (contested portion) only. The lone-survivor
+// winner receives:
+//   total_pot - main_pot_rake - traverser_investment
+// where main_pot = min_contribution × num_contributors + starting_pot
+// (the "called" portion that was contested).
+//
+// Hand-computed example (the lead's): HU, starting_pot=0, P0 bets 15,
+// P1 has 5 then folds. contributions=[15, 5].
+//   total_pot = 0 + 15 + 5 = 20
+//   main_pot = min(15, 5) × 2 + 0 = 10 (contested portion: P1's 5
+//     matched by 5 of P0's 15)
+//   rake = min(10 × 0.05, 1000) = 0.5  (rake on main pot only)
+//   uncalled excess (returned to P0 un-raked) = 15 - 5 = 10
+//   traverser_investment = 0/2 + 15 = 15
+//   payoff to P0 = (20 - 0.5) - 15 = 4.5
+//     [= uncalled_returned(10) + main_pot_after_rake(9.5) - investment(15)
+//      = 10 + 9.5 - 15 = 4.5 ✓ confirms uncalled excess returned un-raked]
+
+#[test]
+fn verify_rake_fold_win_after_bet_uncalled_returned_unraked() {
+    let nh = 2usize;
+    let hand_cards = vec![0u8, 1u8, 2u8, 3u8];
+    let opp_reach_data = vec![1.0f32; nh];
+    let opp_reach_slices: Vec<&[f32]> = vec![&opp_reach_data];
+    let sorted_str = vec![100u16, 200u16];
+    let sorted_idx = vec![0u16, 1u16];
+
+    // P0 bets 15, P1 had 5 then folded. UNEQUAL contributions.
+    // starting_pot = 0 (simplifies hand computation).
+    let contributions = vec![15i32, 5i32];
+    let fold_mask: u16 = 1u16 << 1; // P1 folded
+    let starting_pot: i32 = 0;
+
+    let rake_rate = 0.05_f32;
+    let rake_cap = 1000.0_f32;
+
+    // With rake_rate=0.05, rake_cap=1000:
+    //   main_pot = 5 × 2 + 0 = 10
+    //   main_pot_rake = 10 × 0.05 = 0.5
+    //   total_pot = 20
+    //   traverser_investment = 0/2 + 15 = 15
+    //   payoff = (total_pot - main_pot_rake) - traverser_investment
+    //          = (20 - 0.5) - 15 = 4.5
+    //   CFV per hand = payoff × cfreach (cfreach=1 for non-conflict 2-hand case)
+    //                = 4.5
+    let cfv_with_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+        &contributions, fold_mask, 0, 2, starting_pot,
+        rake_rate, rake_cap, true,
+    );
+
+    eprintln!("HU fold-win-after-bet (uncalled excess returned un-raked):");
+    eprintln!("  Setup: starting_pot=0, contributions=[15,5], P1 folded, traverser=P0");
+    eprintln!("  Hand-computed: main_pot=10, rake=0.5, uncalled=10 (returned),");
+    eprintln!("                 payoff = (20-0.5) - 15 = 4.5");
+    eprintln!("  Actual CFV: {:?}", cfv_with_rake);
+
+    let expected = [4.5_f32, 4.5_f32];
+    for h in 0..nh {
+        assert!((cfv_with_rake[h] - expected[h]).abs() < 1e-4,
+            "fold-win-after-bet CFV[{}] = {}, expected {} \
+             (hand-computed: main_pot_only rake, uncalled returned un-raked)",
+            h, cfv_with_rake[h], expected[h]);
+    }
+
+    // Sanity check: also verify with rake=0 the diff is 5 (the full uncalled-included
+    // payoff minus rake-free payoff would be ... actually at rake=0 it should just
+    // be the rake-free fold-win, payoff = 20 - 15 = 5).
+    let cfv_no_rake = side_pot_showdown_cfv_with_rake(
+        &opp_reach_slices, &hand_cards, nh,
+        &sorted_str, &sorted_idx, &sorted_str, &sorted_idx,
+        &contributions, fold_mask, 0, 2, starting_pot,
+        0.0, 0.0, true,
+    );
+    let expected_no_rake = [5.0_f32, 5.0_f32];
+    for h in 0..nh {
+        assert!((cfv_no_rake[h] - expected_no_rake[h]).abs() < 1e-4,
+            "rake=0 fold-win CFV[{}] = {}, expected {}",
+            h, cfv_no_rake[h], expected_no_rake[h]);
+    }
+    eprintln!("✓ Fold-win-after-bet correctly applies main-pot-only rake; \
+        uncalled bet returned un-raked per the rake spec");
+
+    // OVER-RAKE DEMONSTRATION (documents the bug that was fixed):
+    // The previous (buggy) total_pot rake would have given:
+    //   rake_buggy = 20 × 0.05 = 1.0
+    //   payoff_buggy = (20 - 1.0) - 15 = 4.0  ← over-raked by 0.5
+    // The 0.5 per-terminal discrepancy is exactly what surfaced as
+    // the HU gate 0.09375 residual after Phase B Site (d) closure.
+    let buggy_value = 4.0_f32;
+    assert!((cfv_with_rake[0] - buggy_value).abs() > 0.1,
+        "Sanity: the buggy total_pot rake would give CFV={}; \
+         actual CFV={} confirms the main-pot-only fix is in effect.",
+        buggy_value, cfv_with_rake[0]);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Slice 1.3: sorted-sweep rake hand-computed anchor
 // ─────────────────────────────────────────────────────────────────────
 //

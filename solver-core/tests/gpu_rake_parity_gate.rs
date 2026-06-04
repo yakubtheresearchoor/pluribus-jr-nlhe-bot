@@ -1048,12 +1048,25 @@ fn site_d_tie_band_isolated_kernel_unit_test() {
 // ═════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "HU RESIDUAL DIAGNOSTIC: demonstrates CPU vs Metal disagree on \
-            HU fold-win-after-bet (unequal contribs). The K=1 vs K=2 \
-            lone-survivor formulas differ. This explains the 0.09375 HU \
-            gate residual. Run: cargo test --release --features metal \
-            --test gpu_rake_parity_gate hu_residual_fold_after_bet -- --ignored"]
 fn hu_residual_fold_after_bet_diagnostic() {
+    // POST-FIX (2026-06-04): the divergence is now GONE. This test was
+    // originally written to DEMONSTRATE the bug exists (asserting
+    // max_diff > 0.1). After the lead confirmed main-pot-only is the
+    // correct spec, both CPU fast path and Metal K=2 fast path were
+    // fixed to use main_pot_amount instead of total_pot for rake. The
+    // diff is now at f32 floor.
+    //
+    // Test repurposed as a PERMANENT REGRESSION GATE: if either CPU or
+    // Metal regresses to total-pot rake for fold-win-after-bet (which
+    // would over-rake the uncalled bet), this test fails immediately.
+    //
+    // Setup: HU, P0 bet 15, P1 had 5 then folded. P0 is lone survivor.
+    //   Per the rake spec (main-pot-only):
+    //     main_pot = min(15,5) × 2 + starting_pot(10) = 20
+    //     main_pot_rake = 20 × 0.05 = 1.0
+    //     payoff = (total_pot=30 - 1.0) - traverser_investment(20) = 9.0
+    //     CFV per hand = 9.0 × reach(2) = 18.0
+    //   Buggy total-pot version would have given CFV = 17.0 (diff 1.0).
     use solver_core::solver::showdown::side_pot_showdown_cfv_with_rake;
 
     let nh = 3;
@@ -1111,29 +1124,23 @@ fn hu_residual_fold_after_bet_diagnostic() {
         let d = (cpu_cfv[h] - gpu_cfv[h]).abs();
         if d > max_diff { max_diff = d; }
     }
-    eprintln!("  max_diff = {} (predicted: 0.5 × reach if hypothesis correct)", max_diff);
+    eprintln!("  max_diff = {} (post-fix: should be ≤ f32 floor)", max_diff);
 
-    // This test asserts the divergence EXISTS at the predicted magnitude.
-    // It's a diagnostic test, not a parity gate; if max_diff is non-zero
-    // and near the predicted 0.5×reach, the hypothesis is confirmed.
-    //
-    // Marked #[ignore] because it's diagnostic — running unconditionally
-    // would fail CI until the lead decides which formula is correct.
+    // POST-FIX assertion: CPU and Metal now both use main_pot_only rake.
+    // The diff at this scenario should be at f32 floor (effectively 0).
+    // If it's not, either CPU or Metal regressed to total-pot rake.
     assert!(
-        max_diff > 0.1,
-        "Diagnostic FAILED: expected divergence ≈ 0.5×reach, got {}. \
-         If max_diff is near 0, the hypothesis is wrong and the HU gate \
-         residual has a different cause.",
+        max_diff < 1e-4,
+        "Regression: HU fold-win-after-bet shows max_diff = {} > 1e-4. \
+         Expected: CPU and Metal both apply main_pot_only rake (uncalled \
+         bets returned un-raked per the rake spec). If CPU returns ≈17.0 \
+         and Metal returns ≈18.0, CPU regressed to total_pot rake (the \
+         buggy version from before 2026-06-04). If both return ≈17.0, \
+         both regressed.",
         max_diff,
     );
-    eprintln!("✓ HU residual hypothesis CONFIRMED: CPU fast path uses total_pot rake, \
-        Metal K=1 per-level uses main_pot_only rake. They disagree on lone-survivor \
-        unequal-contribs case. This is the source of the 0.09375 HU gate residual.");
-    eprintln!("\nResolution required (for the lead): which formula matches the rake spec?");
-    eprintln!("  Option A: CPU fast path is correct, change Metal K=1 per-level to use total_pot");
-    eprintln!("  Option B: Metal K=1 is correct, change CPU fast path to use main_pot_only");
-    eprintln!("  (Note: Metal K=2 lone-survivor uses CPU fast path's formula, so it would need");
-    eprintln!("   the same fix as CPU if Option B. Currently Metal K=1 ≠ Metal K=2 internally.)");
+    eprintln!("✓ HU fold-win-after-bet: CPU and Metal agree on main_pot_only rake \
+        (uncalled bet returned un-raked).");
 }
 
 // ═════════════════════════════════════════════════════════════════════

@@ -279,13 +279,38 @@ inline void multiway_brute_force_showdown(
     if (num_opp == 2 && (num_active <= 1 || traverser_folded)) {
         int total_pot = (int)starting_pot;
         for (int p = 0; p < np; p++) total_pot += (int)contributions[p];
-        // ── Slice 2 Phase B site (b): rake on winner's pot claim ──
-        // Mirror CPU `side_pot_showdown_cfv_with_rake` lines 484-548.
-        // Folded traverser loses their investment regardless of rake
-        // (they don't win the pot, so rake doesn't reduce their payoff).
-        // Active traverser as lone survivor claims (total_pot − rake)
-        // instead of total_pot.
-        float rake = fmax(0.0f, fmin((float)total_pot * eff_rake_rate, eff_rake_cap));
+        // ── Slice 2 Phase B site (b) — HU residual fix (2026-06-04) ──
+        // Mirror CORRECTED CPU `side_pot_showdown_cfv_with_rake` fast
+        // path. Per the rake spec: rake applies to
+        // MAIN POT ONLY (called portion). Uncalled bets returned to the
+        // bettor un-raked.
+        //
+        // The previous version of this site (and the corresponding CPU
+        // fast path) used `total_pot * rake_rate` which over-raked
+        // uncalled bets — a real arithmetic bug that surfaced as the
+        // HU gate 0.09375 residual once Metal K=1 (already main-pot-only
+        // correct) was closed in Phase B Site (d) part 1. The K=1 vs
+        // K=2 internal inconsistency was the discriminator.
+        //
+        // Now consistent across K=1 (per-level, main-pot-only) and
+        // K=2 (this fast path, main-pot-only): both formulas give
+        // identical results to the per-level computation at equal
+        // contributions (main_pot == total_pot), and both correctly
+        // refund uncalled bets at unequal contributions.
+        //
+        // Folded traverser loses their investment regardless of rake.
+        // Active lone-survivor claims (total_pot − main_pot_rake), i.e.,
+        // gets uncalled excess at face value plus rake-reduced main pot.
+        int min_contrib = contributions[0];
+        for (int p = 1; p < np; p++) {
+            if (contributions[p] < min_contrib) min_contrib = contributions[p];
+        }
+        int num_main_contributors = 0;
+        for (int p = 0; p < np; p++) {
+            if (contributions[p] >= min_contrib) num_main_contributors++;
+        }
+        int main_pot_amount = min_contrib * num_main_contributors + (int)starting_pot;
+        float rake = fmax(0.0f, fmin((float)main_pot_amount * eff_rake_rate, eff_rake_cap));
         float payoff;
         if (traverser_folded) {
             payoff = -traverser_stake;
