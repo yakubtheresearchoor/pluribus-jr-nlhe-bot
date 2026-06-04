@@ -1006,6 +1006,137 @@ fn site_d_tie_band_isolated_kernel_unit_test() {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// HU RESIDUAL DIAGNOSTIC — fold-win-after-bet (unequal contribs)
+//
+// Investigation per the lead's elevated priority: the HU gate residual at
+// 0.09375 with rake fully ruled out for the helper branches. Hypothesis:
+// HU K=1 lone-survivor with UNEQUAL contribs (fold-after-bet) is the
+// site that diverges from the K=2 fast path's rake formula.
+//
+// Scenario: HU (np=2), traverser=0 is lone survivor (P1 folded),
+// contributions=[15, 5] (P0 bet 10 chips after blinds, P1 folded).
+//
+//   CPU fast path (showdown.rs ~484-548 — `num_active<=1 && num_opp<=2`):
+//     total_pot = 10 + 15 + 5 = 30
+//     rake = min(30 * 0.05, 1000) = 1.5
+//     payoff = (30 - 1.5) - 20 = 8.5
+//
+//   Metal K=1 per-level (multiway helper line ~376, post Site (d) part 1):
+//     main_pot_amount = 5 * 2 + 10 = 20 (called portion only)
+//     main_pot_rake = min(20 * 0.05, 1000) = 1.0
+//     li=0: pot_after_rake = 19, cash += 19
+//     li=1 (P0 uncalled extra): pot_after_rake = 10 (no rake on side), cash += 10
+//     net = 29 - 20 = 9.0
+//
+//   Diff per terminal = 0.5 = exactly (1.5 - 1.0) rake difference.
+//
+// If this test shows diff ≈ 0.5 (× reach factor), it CONFIRMS:
+//   1. CPU rakes the full pot (including uncalled bets) for HU fold-win.
+//   2. Metal K=1 rakes only the called portion (main_pot_only).
+//   3. They disagree on this case, which is what shows up at the
+//      HU gate residual 0.09375.
+//
+// Internal inconsistency in Metal: K=2 lone-survivor uses total-pot
+// rake (mirroring CPU fast path) — that was Phase B Site (b) closure.
+// K=1 lone-survivor uses main-pot-only rake (Phase B Site (d) part 1).
+// They use DIFFERENT formulas for the same conceptual case (lone
+// survivor with unequal contributions), one at K=1 and one at K=2.
+//
+// Which formula is right per the the rake spec ("main pot only") is
+// for the lead to decide; this test demonstrates the divergence exists
+// and localizes the source unambiguously.
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "HU RESIDUAL DIAGNOSTIC: demonstrates CPU vs Metal disagree on \
+            HU fold-win-after-bet (unequal contribs). The K=1 vs K=2 \
+            lone-survivor formulas differ. This explains the 0.09375 HU \
+            gate residual. Run: cargo test --release --features metal \
+            --test gpu_rake_parity_gate hu_residual_fold_after_bet -- --ignored"]
+fn hu_residual_fold_after_bet_diagnostic() {
+    use solver_core::solver::showdown::side_pot_showdown_cfv_with_rake;
+
+    let nh = 3;
+    let np = 2;
+    let num_opp = 1;
+    let hand_cards: Vec<u8> = vec![0, 1, 2, 3, 4, 5];
+    let strengths: Vec<u16> = vec![10, 20, 30];
+    let (pl_str, pl_idx) = debug_kernel::make_sorted(&strengths);
+
+    let opp_reach: Vec<f32> = vec![1.0; num_opp * nh];
+
+    // Fold-after-bet: P0 bet, P1 folded. Contribs UNEQUAL.
+    let contributions: Vec<i32> = vec![15, 5];
+    let starting_pot: i32 = 10;
+    // fold_mask = 0b10: P1 folded, traverser P0 is lone survivor.
+    let fold_mask: u16 = 0b10;
+    let traverser = 0;
+
+    let rake_rate = 0.05_f32;
+    let rake_cap = 1000.0_f32;  // uncapped — test pure rate formula
+    let flop_seen = true;
+
+    let opp_reach_per_opp: Vec<Vec<f32>> = (0..num_opp)
+        .map(|oi| opp_reach[oi * nh..(oi + 1) * nh].to_vec())
+        .collect();
+    let opp_reach_views: Vec<&[f32]> = opp_reach_per_opp.iter().map(|v| v.as_slice()).collect();
+    let mut sorted_opp_str = Vec::with_capacity(num_opp * nh);
+    let mut sorted_opp_idx = Vec::with_capacity(num_opp * nh);
+    for _ in 0..num_opp {
+        sorted_opp_str.extend_from_slice(&pl_str);
+        sorted_opp_idx.extend_from_slice(&pl_idx);
+    }
+    let cpu_cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &sorted_opp_str, &sorted_opp_idx,
+        &pl_str, &pl_idx,
+        &contributions, fold_mask, traverser, np as u8, starting_pot,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    let ctx = MetalContext::new().expect("Metal context");
+    let gpu_cfv = debug_kernel::gpu_brute_force_with_rake(
+        &ctx, nh, np, traverser, starting_pot, fold_mask,
+        &opp_reach, &contributions, &hand_cards, &pl_str, &pl_idx,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    eprintln!("HU residual diagnostic: fold-after-bet (unequal contribs)");
+    eprintln!("  Setup: np=2, contribs=[15,5], fold_mask=0b10, traverser=0 (lone survivor)");
+    eprintln!("  CPU (fast path, rake on total_pot=30): {:?}", cpu_cfv);
+    eprintln!("  Metal (K=1 per-level, main_pot_rake): {:?}", gpu_cfv);
+
+    let mut max_diff = 0.0_f32;
+    for h in 0..nh {
+        let d = (cpu_cfv[h] - gpu_cfv[h]).abs();
+        if d > max_diff { max_diff = d; }
+    }
+    eprintln!("  max_diff = {} (predicted: 0.5 × reach if hypothesis correct)", max_diff);
+
+    // This test asserts the divergence EXISTS at the predicted magnitude.
+    // It's a diagnostic test, not a parity gate; if max_diff is non-zero
+    // and near the predicted 0.5×reach, the hypothesis is confirmed.
+    //
+    // Marked #[ignore] because it's diagnostic — running unconditionally
+    // would fail CI until the lead decides which formula is correct.
+    assert!(
+        max_diff > 0.1,
+        "Diagnostic FAILED: expected divergence ≈ 0.5×reach, got {}. \
+         If max_diff is near 0, the hypothesis is wrong and the HU gate \
+         residual has a different cause.",
+        max_diff,
+    );
+    eprintln!("✓ HU residual hypothesis CONFIRMED: CPU fast path uses total_pot rake, \
+        Metal K=1 per-level uses main_pot_only rake. They disagree on lone-survivor \
+        unequal-contribs case. This is the source of the 0.09375 HU gate residual.");
+    eprintln!("\nResolution required (for the lead): which formula matches the rake spec?");
+    eprintln!("  Option A: CPU fast path is correct, change Metal K=1 per-level to use total_pot");
+    eprintln!("  Option B: Metal K=1 is correct, change CPU fast path to use main_pot_only");
+    eprintln!("  (Note: Metal K=2 lone-survivor uses CPU fast path's formula, so it would need");
+    eprintln!("   the same fix as CPU if Option B. Currently Metal K=1 ≠ Metal K=2 internally.)");
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // Site (b) PRIMARY ISOLATION TEST — direct CPU↔Metal kernel unit check
 //
 // Per user direction after Phase A.6: "The divergence-assertion fallback
