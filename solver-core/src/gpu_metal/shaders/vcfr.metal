@@ -215,6 +215,21 @@ inline void multiway_brute_force_showdown(
             thread const float* reach_1 = opp_reach_local + 1 * nh;
             float k = (float)num_active_opp;
 
+            // ── Slice 2 Phase B Site (a): K=2 all-equal-brute rake ──
+            // Mirror CPU `side_pot_showdown_cfv_with_rake` lines 699-779.
+            // rake = min(total_pot * eff_rake_rate, eff_rake_cap)
+            // rake_per_unit_stake = rake / half_pot
+            // payoff_unit adjustments:
+            //   loss (max_opp > h_str):  -1                       (rake-invariant)
+            //   tie  (max_opp == h_str): (K+1-T)/T - rps/T         (T winners split pot-rake)
+            //   win  (max_opp < h_str):  K - rps                   (strict win, T=1)
+            // Computed ONCE outside the per-(h,g0,g1) loops since
+            // total_pot/rake/rps are all-equal-contribs constants here.
+            int32_t total_pot_int = (int)starting_pot;
+            for (int p = 0; p < np; p++) total_pot_int += (int)contributions[p];
+            float rake = fmax(0.0f, fmin((float)total_pot_int * eff_rake_rate, eff_rake_cap));
+            float rake_per_unit_stake = (half_pot > 0.0f) ? (rake / half_pot) : 0.0f;
+
             for (int h = 0; h < nh; h++) {
                 int hc1 = hand_cards[h * 2];
                 int hc2 = hand_cards[h * 2 + 1];
@@ -241,14 +256,15 @@ inline void multiway_brute_force_showdown(
 
                         float payoff_unit;
                         if (max_opp > h_str) {
-                            payoff_unit = -1.0f;
+                            payoff_unit = -1.0f;  // loss: rake-invariant
                         } else if (max_opp == h_str) {
                             uint t = 1;
                             if (s0 == h_str) t++;
                             if (s1 == h_str) t++;
-                            payoff_unit = (k + 1.0f - (float)t) / (float)t;
+                            float t_f = (float)t;
+                            payoff_unit = (k + 1.0f - t_f) / t_f - rake_per_unit_stake / t_f;
                         } else {
-                            payoff_unit = k;
+                            payoff_unit = k - rake_per_unit_stake;  // strict win
                         }
                         accum += r0 * r1 * payoff_unit;
                     }
@@ -313,6 +329,30 @@ inline void multiway_brute_force_showdown(
         int32_t c_opp_b = contributions[opp_b];
         bool a_folded = (fold_mask & (uint16_t)(1u << opp_a)) != 0;
         bool b_folded = (fold_mask & (uint16_t)(1u << opp_b)) != 0;
+
+        // ── Slice 2 Phase B Site (c): main-pot-only rake (the rake spec) ──
+        // Mirror CPU `side_pot_showdown_cfv_with_rake` ~870-910.
+        // Rake applies ONLY at li==0 (main pot). Side-pot levels
+        // (li>=1) are UN-RAKED per site convention. The cap is
+        // applied ONCE here (not per-level), making the unit-test
+        // discriminating: a per-level rake or per-level cap error
+        // would fail against this CPU reference immediately.
+        //
+        // main_pot_amount = levels[0] * num_main_contributors + starting_pot
+        //   where num_main_contributors = #players (including folded)
+        //   whose contribution >= levels[0].
+        int32_t main_pot_amount;
+        if (num_levels == 0) {
+            main_pot_amount = starting_pot;
+        } else {
+            int num_main_contributors = 0;
+            for (int p = 0; p < np; p++) {
+                if (contributions[p] >= levels[0]) num_main_contributors++;
+            }
+            main_pot_amount = levels[0] * num_main_contributors + starting_pot;
+        }
+        float main_pot_rake = fmax(0.0f, fmin(
+            (float)main_pot_amount * eff_rake_rate, eff_rake_cap));
 
         for (int h = 0; h < nh; h++) {
             int hc1 = hand_cards[h * 2];
@@ -384,7 +424,12 @@ inline void multiway_brute_force_showdown(
                             if (b_elig && s_b == max_str) tied++;
 
                             if (h_str == max_str) {
-                                cash += pot_l / float(tied);
+                                // Slice 2 Site (c): rake from main pot
+                                // only (li == 0); side pots (li > 0) clean.
+                                float pot_after_rake = (li == 0)
+                                    ? (pot_l - main_pot_rake)
+                                    : pot_l;
+                                cash += pot_after_rake / float(tied);
                             }
                             prev_l = lev;
                         }
