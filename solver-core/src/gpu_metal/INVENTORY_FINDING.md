@@ -300,6 +300,119 @@ The standing method for catching unmapped locations (revised):
 This is the deepest lesson the rake arc produced and it is bigger than
 rake.
 
+## Fourth iteration: inline payoff sites bypass the helper
+
+Phase B Site (d) part 2 attempted to mirror rake into the production
+`sorted_sweep_showdown_vcfr_local` call sites. Two production sites
+were correctly edited. But the HU gate stayed at exactly 0.09375006,
+unchanged. The standing question revealed: vcfr_bottom_up_batched has
+~5+ INLINE payoff computations that bypass the sorted_sweep helper
+entirely:
+
+  | Line  | Output                                    | Status     |
+  |-------|-------------------------------------------|------------|
+  | 1719  | multiway helper call                      | rake-correct |
+  | 1772  | out[h] = payoff * cfreach (inline)        | RAKE-FREE  |
+  | 1820  | out[h] = payoff * (...) (inline)          | RAKE-FREE  |
+  | 1872  | sorted_sweep_with_components              | rake-correct |
+  | 1932  | out[h] = (sp/np+c_t) * (...) inline       | RAKE-FREE  |
+  | 1959  | out[h] = payoff                           | RAKE-FREE  |
+  | 1995  | sorted_sweep_with_components              | rake-correct |
+  | 2069+ | per-level inline computations             | RAKE-FREE  |
+
+So searching for the helper's call sites was insufficient: inlined
+logic doesn't call the helper. The fourth-iteration refinement:
+
+  **OPERATIONAL METHOD FOR ENUMERATING PAYOFF SITES**:
+
+  Enumerate by the OUTPUT-WRITE PATTERN (`out[h] = ...`,
+  `cfv[h] = ...`, `returned_cfv[h] = ...`), NOT by helper-call
+  search. A helper-call search is BLIND to code that inlines the
+  helper's logic. The output-write pattern catches every assignment
+  to a per-hand CFV result, helper-mediated or not. Then classify
+  each by which CPU showdown path it mirrors and verify rake-correct.
+
+## Build-system bug: validation history needed re-verification
+
+A related but distinct failure surfaced in the same session:
+
+**The bug**: `cargo:rerun-if-changed` in `solver-core/build.rs` was
+watching `src/gpu/metal/shaders/{}` — a non-existent path. The actual
+location is `src/gpu_metal/shaders/{}`. So cargo was NOT reliably
+recompiling the .metal shader on Metal-only edits.
+
+**Why it didn't fail visibly until now**: earlier Phase B edits all
+included adjacent Rust struct changes (extending BParams, DebugBruteForce
+Params, etc.). Those Rust changes invalidated other build artifacts,
+which transitively re-ran build.rs, which recompiled the metallib.
+So edits like "kernel + Rust struct" recompiled correctly. But
+edits like "kernel-only" would NOT have triggered a rebuild — they'd
+test against stale metallib binary.
+
+**Why this matters**: this is the build-system equivalent of a
+false-green signal. The same standing principle applies to validation
+history: "the tests passed → the kernel must have rebuilt" was an
+ASSUMPTION, exactly the kind the principle says to distrust. The
+green test results from before the build fix could have been
+validating stale shader binary in any place where the edit was
+Metal-only.
+
+**Required action (not optional cleanup)**: with the path fixed,
+force a clean rebuild and re-run the entire Phase B validation suite
+against a verified-fresh shader. If results hold, the earlier
+history was real (Rust changes did trigger rebuilds in practice).
+If anything regresses, that result was validated against stale
+binary and the closure has to be redone.
+
+**Re-verification result (done before this update was banked)**: all
+13 Phase B unit tests still pass at 0.0 against the freshly-built
+shader; rake=0 baseline passes; broader parity tests
+(three_max_parity, three_max_reach, flop_start_cpu_test,
+iter_divergence, gpu_brute_force_unit) all pass. The Phase B
+validation history is real — but now VERIFIED, not assumed.
+
+**Standing lesson**: build-system correctness is part of the trust
+chain. A green signal whose recompile-on-edit cannot be guaranteed
+is the same false-green class as a gate that doesn't exercise the
+thing under test. Verify the build is wired correctly before
+trusting it as a coverage harness.
+
+## Surgery direction: Option 2 (refactor) over Option 1 (per-site mirror)
+
+The Phase B Site (d) part 2 finding (5+ inline payoff sites) creates
+a choice for closing site (d) fully:
+
+  Option 1: mirror rake into each inline site individually.
+            Leaves N scattered payoff sites each carrying rake.
+            Each is a future-divergence risk and a future
+            "missed a site" finding waiting to happen.
+
+  Option 2: refactor vcfr_bottom_up_batched so all showdowns route
+            through the rake-correct helpers, removing the inline
+            fast paths. Consolidates to ONE rake path.
+
+The discipline lesson of this arc — four inventory failures, all
+caused by scattered payoff sites being un-enumerable — argues for
+Option 2 specifically because it ELIMINATES the failure mode rather
+than mitigating it. Option 1 mitigates (find these 5 sites, fix
+them); Option 2 eliminates (there will only ever be one site,
+provably).
+
+The cost: larger immediate surgery, possibly performance impact
+(the inline fast paths presumably exist for speed). The performance
+concern is real for the real-time search path but acceptable for
+the blueprint-offline path. Even for real-time, the correctness-
+and-maintainability of one rake path likely outweighs the fast-
+path speed.
+
+**Caution if Option 2 is taken**: it re-touches validated kernel
+paths. The rake=0 baseline is the INVARIANT that guards the refactor
+(the refactor changes the path but not the rake-free result, so
+rake=0 must stay green throughout). Each formerly-inline case has
+to validate via unit test routed to it that the helper-mediated
+result matches what the inline used to produce. Same discipline as
+everything else, applied to a larger surgery.
+
 ## Altitude: where the rake arc sits in the larger plan
 
 The rake arc started as "implement rake, ~1-2 hours" and has become a
@@ -336,18 +449,47 @@ be rake-correct). So:
   - Real-time search: requires the remaining GPU rake work
   - The two are independent and can run in parallel
 
-The remaining Phase B work (site (d) part 2, site (e), instrumented
-coverage check for the done-declaration) is well-scoped and should
-be finished while context and detection method are fresh. But if it
-extends further (site (e) being more complex and possibly multi-
-location like site (d) turned out to be), the blueprint can proceed
-in parallel rather than waiting. This is not a redirect; it's a
-sequencing option to keep visible.
+**ELEVATED to recommended action (Phase B Site (d) part 2 update)**:
 
-The sharpening of the principle to "actually exercises the thing"
-applies broadly. The remaining sites should be finished, validated
-under the sharpened principle, and the blueprint can be computed in
-parallel on the rake-correct CPU path whenever convenient.
+The GPU rake has now revealed itself to be substantially bigger than
+the five-site plan. Four inventory failures have surfaced, the
+sorted_sweep mirror revealed ~5+ inline sites in vcfr_bottom_up_
+batched, the build-system bug required re-verifying the whole arc,
+and even the cleanest path forward (Option 2 refactor) re-touches
+validated kernel paths and is plausibly several more sessions of
+careful work.
+
+The blueprint is genuinely unblocked on the CPU rake-correct path.
+The GPU rake serves the downstream real-time-search use case, which
+sits BELOW having a blueprint at all in the dependency graph.
+Sequencing the harder-and-now-deeper downstream-only work BEFORE
+the thing it supports has become the more expensive ordering.
+
+This is the moment where "the blueprint can proceed in parallel"
+stops being a note and becomes the recommended action: **start the
+CPU blueprint while the GPU rake continues**, because:
+
+  1. The GPU rake is no longer a quick finish (build bug, inline
+     sites, possible refactor, possible further unmapped sites)
+  2. The blueprint is the actual goal and it's ready
+  3. The CPU rake is already validated (Slice 1.x hand-anchored,
+     end-to-end at Slice 1.6, all CPU tests green)
+  4. Running them in parallel surfaces production blueprint
+     properties (convergence, exploitability, range outputs) that
+     are themselves likely to surface other findings worth
+     responding to
+
+The discipline that has made the GPU rake longer than estimated is
+the same discipline that should be running on the CPU blueprint
+now. The GPU rake completes correctly via the standing detection
+method (gate residual + unit tests + Option 2 refactor + build-
+verified); the blueprint runs in parallel on the validated CPU
+path. Both proceed under the same principle.
+
+This isn't a redirect away from finishing the GPU rake — the
+remaining work is real and should be finished. It's the recognition
+that the blueprint doesn't have to wait for that completion, and
+delaying the blueprint is now the wrong-direction tradeoff.
 
 ## Carry for site (e)
 
