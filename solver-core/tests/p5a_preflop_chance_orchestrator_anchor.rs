@@ -161,14 +161,23 @@ fn p5a_aggregate_preflop_chance_f32_matches_f64_reference() {
     assert_eq!(ref_f64_cast.len(), NUM_PREFLOP_CLASSES);
 
     // Discrimination check: at every class, |production f32 - reference f64-cast|
-    // must be at f32 floor (≤ several ULPs at the result scale).
+    // must be at the f32 LINEAR-accumulation floor for 1755 terms.
     //
-    // The result scale: synthetic input values are O(1e-3 × n_canon) ≈ 2 per
-    // entry, p is O(1/n_canon) ≈ 6e-4, so each per-flop contribution is
-    // O(1e-3). Summed across 1755 terms (alternating signs), result is
-    // O(1e-1 to 1). A single f32 ULP at scale 1.0 is ~1.2e-7. Across 1755
-    // accumulations, accumulated f32 ULPs can be ~2e-4 in the worst case.
-    let tol = 1e-4_f32;
+    // The result scale and predicted floor: synthetic input scale = 1e-3,
+    // so per-term contribution after p × v is O(1e-7) and the running sum
+    // is O(1e-3). The f32 LINEAR accumulation bound across N=1755 terms is
+    // N × ULP × |result| ≈ 1755 × 1.19e-7 × 1e-3 ≈ 2.1e-7. The
+    // cancellation pattern in this synthetic input may push this up to
+    // ~5e-7 (within ~2.5x the linear bound, confirmed by the
+    // scale-discriminating diagnostic that proves diff scales linearly
+    // with input magnitude).
+    //
+    // Setting tolerance at 1e-5 (50x predicted) gives healthy headroom
+    // while keeping the gate sensitive to order-of-magnitude regressions.
+    // The scale-discriminating diagnostic (separate test below) proves
+    // the diff IS the f32 accumulation floor (NOT a quiet loosening of
+    // an f64 path that should be ~1e-13 like P2.5a's STUB anchor).
+    let tol = 1e-5_f32;
     let mut max_abs_diff = 0.0_f32;
     let mut max_h = 0usize;
     let mut max_prod = 0.0_f32;
@@ -224,6 +233,142 @@ fn p5a_aggregate_preflop_chance_with_zeros_is_exact() {
             "zero input produced nonzero output at class {}: {}", h, v);
     }
     eprintln!("  ✓ zero-input aggregation produces exact zero at all 169 classes");
+}
+
+/// DISCRIMINATING diagnostic: confirm the observed P5a diff is the expected
+/// f32 accumulation floor (sqrt(N) × ULP × result_scale) rather than a
+/// quiet loosening of an f64 path that should be ~1e-13 (the P2.5a precedent).
+///
+/// Per the standing discipline: "4.657e-7 well under tolerance" shouldn't
+/// paper over whether it's input-precision floor (expected) or f64-non-exactness
+/// (quiet loosening). The test runs the same aggregation at MULTIPLE input
+/// scales and asserts the diff scales LINEARLY with input magnitude.
+///
+/// Why this discriminates:
+///   - If diff is f32 accumulation floor: diff ∝ input_scale (linear scaling).
+///   - If diff is a fixed-magnitude bug (constant offset): diff stays similar
+///     regardless of scale → ratio diverges from 1.0 with scale.
+///   - If diff is f64 non-exactness: diff would already be far below f32
+///     ULP × scale and would not scale with input.
+///
+/// At input scale s, the result scale is also ~s (the aggregation preserves
+/// scale). Predicted f32 accumulation floor: sqrt(1755) × 1.19e-7 × s ≈ 5e-6 × s.
+/// At s=1e-3 (Check 1's scale): predicted ~5e-9, observed 4.657e-7. The
+/// observed is HIGHER than predicted, suggesting worst-case linear bound
+/// rather than sqrt-statistical. Either way it should SCALE with s.
+#[test]
+fn p5a_diff_scales_with_input_magnitude_confirming_f32_accumulation_floor() {
+    eprintln!("\n=== P5a discriminating diagnostic: diff vs input scale ===");
+    eprintln!("Per the standing discipline (the lead 2026-06-04): confirm 4.657e-7");
+    eprintln!("is the f32 accumulation floor (expected, scales with input) and");
+    eprintln!("NOT a quiet loosening of an f64 path that should be ~1e-13.\n");
+
+    let table = PreflopChanceTable::new(
+        2,
+        vec![vec![1.0f32; NUM_PREFLOP_CLASSES]; 2],
+    );
+    let n_canon = table.num_canonical_flops();
+
+    // Run at multiple scales spanning 6 orders of magnitude. If diff is the
+    // f32 accumulation floor, it should scale roughly linearly with input
+    // magnitude (i.e., diff/scale stays bounded). If diff is constant
+    // (fixed offset bug) or sub-linear (f64 non-exactness), the ratio
+    // diff/scale changes systematically with scale.
+    let scales = [1e-6_f32, 1e-3_f32, 1.0_f32, 1e3_f32];
+    let mut diffs_per_scale: Vec<(f32, f32, f32)> = Vec::new(); // (scale, max_diff, max_diff / scale)
+
+    for &scale in &scales {
+        let flop_cfvs: Vec<Vec<f32>> = (0..n_canon)
+            .map(|f| {
+                (0..NUM_PREFLOP_CLASSES).map(|h| {
+                    let raw = ((f as f32) - (n_canon as f32 / 2.0))
+                        + ((h as f32) - (NUM_PREFLOP_CLASSES as f32 / 2.0)) * 0.1;
+                    raw * scale
+                }).collect()
+            })
+            .collect();
+
+        let prod_f32 = aggregate_preflop_chance(&table, &flop_cfvs);
+        let ref_f64_cast = aggregate_preflop_chance_f64_reference(&table, &flop_cfvs);
+
+        let mut max_diff = 0.0_f32;
+        for h in 0..NUM_PREFLOP_CLASSES {
+            let d = (prod_f32[h] - ref_f64_cast[h]).abs();
+            if d > max_diff { max_diff = d; }
+        }
+        let normalized = max_diff / scale;
+        eprintln!("  scale = {:>8.0e}:  max_diff = {:>10.3e}  diff/scale = {:>10.3e}",
+            scale, max_diff, normalized);
+        diffs_per_scale.push((scale, max_diff, normalized));
+    }
+
+    // Assert linear scaling: diff/scale should be roughly constant across
+    // the 9 orders of input magnitude. Specifically, the ratio of normalized
+    // diffs (max diff/scale over min diff/scale) should be < 100 (allowing
+    // for some sqrt-N statistical variance and pattern-dependent worst case),
+    // proving the diff is input-magnitude-dependent (accumulation floor)
+    // not a fixed-magnitude bug.
+    let normalized_diffs: Vec<f32> = diffs_per_scale.iter().map(|t| t.2).collect();
+    let max_n = normalized_diffs.iter().cloned().fold(0.0f32, f32::max);
+    let min_n = normalized_diffs.iter().cloned().filter(|&v| v > 0.0).fold(f32::INFINITY, f32::min);
+    let ratio = max_n / min_n;
+    eprintln!("\n  Normalized diff range: min={:.3e}, max={:.3e}, ratio={:.2}",
+        min_n, max_n, ratio);
+
+    assert!(
+        ratio < 100.0,
+        "Normalized diff (diff/scale) varies by {}x across input scales spanning 9 \
+         orders of magnitude. Expected: roughly constant (linear scaling proves \
+         f32 accumulation floor). Observed ratio too large suggests fixed-magnitude \
+         offset or sub-linear scaling, indicating a real bug rather than the \
+         expected floor.",
+        ratio
+    );
+
+    // Absolute-magnitude check: at scale 1.0, the diff should be in the
+    // f32 LINEAR-accumulation regime (N × ULP × max_term_scale). With
+    // mixed-sign cancellation across 1755 terms, the worst-case bound is:
+    //   N × ULP × |term| = 1755 × 1.19e-7 × |term|
+    // where |term| ~ scale (after p × v with p~1e-4 and v~scale). So the
+    // predicted linear bound at scale 1.0 is approximately
+    //   1755 × 1.19e-7 × 1.0 ≈ 2.1e-4
+    // The observed 5.0e-4 is ~2.4x the linear-worst-case bound, which is
+    // within the acceptable range for the cancellation pattern in this
+    // synthetic input. The KEY discriminator is the linearity (ratio
+    // check above), not the absolute magnitude.
+    //
+    // Allow 10x the linear bound (2.1e-3) as the absolute ceiling to
+    // catch order-of-magnitude regressions while accepting the observed
+    // ~2.4x factor from cancellation patterns.
+    let scale_1_diff = diffs_per_scale.iter()
+        .find(|t| (t.0 - 1.0_f32).abs() < 1e-3)
+        .expect("scale=1.0 entry must exist").1;
+    let predicted_linear_bound_at_scale_1 = 2.1e-4_f32; // N × ULP at result scale 1.0
+    let ceiling = 10.0 * predicted_linear_bound_at_scale_1;
+    assert!(
+        scale_1_diff < ceiling,
+        "At input scale 1.0, observed diff {} is more than 10x the f32 \
+         linear-accumulation worst-case bound ({}). Either production has \
+         algorithmic error beyond f32 accumulation, or inputs trigger \
+         pathological cancellation needing investigation. (Observed factor: \
+         {:.2}x the linear bound.)",
+        scale_1_diff, predicted_linear_bound_at_scale_1,
+        scale_1_diff / predicted_linear_bound_at_scale_1
+    );
+
+    eprintln!("\n  ✓ Diff scales linearly with input magnitude (ratio={:.2}, < 100).", ratio);
+    eprintln!("    Confirmed: the diff IS the f32 accumulation floor (linear N×ULP regime),");
+    eprintln!("    NOT a quiet loosening of an f64 path. The diff is input-magnitude-");
+    eprintln!("    bounded as required by f32 accumulators across {} terms.", n_canon);
+    eprintln!("");
+    eprintln!("    Comparison to P2.5a precedent:");
+    eprintln!("    - P2.5a (~1e-13): stub anchor where ENTIRE computation could be f64");
+    eprintln!("    - P5a (~5e-4 at scale 1.0): orchestrator anchor with f32 ACCUMULATORS");
+    eprintln!("      in production by design. The accumulator precision IS f32, and");
+    eprintln!("      the diff measures how much the f32 accumulator drifts from the");
+    eprintln!("      f64 reference accumulator across 1755 terms.");
+    eprintln!("    Different measurements, different expected floors. The 5e-4-per-unit-");
+    eprintln!("    scale floor IS the right answer for f32 accumulation at this N.");
 }
 
 #[test]
