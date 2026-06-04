@@ -556,6 +556,145 @@ fn standing_showdown_oracle_battery() {
         });
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // Slice (Phase 1 #40): Option B coverage extension.
+    //
+    // Option B is the postflop action abstraction with 2 bet sizes
+    // (PotRelative(0.5), PotRelative(1.0)) and 2 raise sizes (same).
+    // It produces terminal contribution patterns that the existing
+    // oracle cases do not exercise: THREE OR MORE DISTINCT
+    // CONTRIBUTION LEVELS AMONG ACTIVE PLAYERS, arising when multiple
+    // players go all-in at different stack depths or when the bet/raise
+    // chain hits 3+ allin steps before showdown.
+    //
+    // The existing battery tops out at 2 levels (e.g., [15,15,15,15,15,5]
+    // is 2 levels). Option B produces 3 and 4 level patterns. Per the
+    // standing question, the oracle must actually exercise the cases
+    // production trees produce. Anchor coverage for arithmetic at scale.
+    //
+    // Each case below is verified against the formula-free independent
+    // enumerator (the trusted reference for showdown arithmetic).
+    // ─────────────────────────────────────────────────────────────────
+
+    // 3p three-level all-active: a multi-raise terminal where every
+    // player is in for a different amount. contribs=[10, 30, 60],
+    // all distinct, no folds. Exercises K=2 per-level brute force at
+    // 3 levels.
+    cases.push(ShowdownCase {
+        name: "3p three-level all-active [10,30,60]",
+        np: 3, nh, traverser: 0, starting_pot: 15,
+        contributions: vec![10, 30, 60], fold_mask: 0,
+        hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+        opp_reach: vec![r_quarter.clone(), r_quarter.clone()],
+        num_combinations: 64.0,
+    });
+
+    // 3p three-level traverser-shortest: traverser=0 short at 10, opps at 30 and 60.
+    // Exercises eligibility transitions where traverser drops out at higher levels.
+    cases.push(ShowdownCase {
+        name: "3p three-level traverser-short [10,30,60] trav=0",
+        np: 3, nh, traverser: 0, starting_pot: 15,
+        contributions: vec![10, 30, 60], fold_mask: 0,
+        hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+        opp_reach: vec![r_quarter.clone(), r_quarter.clone()],
+        num_combinations: 64.0,
+    });
+
+    // 3p three-level traverser-deepest: traverser=2 at 60. Tests the
+    // traverser-uniquely-eligible case at the top side pot level (no
+    // contest at the top, traverser wins that level uncontested).
+    cases.push(ShowdownCase {
+        name: "3p three-level traverser-deep [10,30,60] trav=2",
+        np: 3, nh, traverser: 2, starting_pot: 15,
+        contributions: vec![10, 30, 60], fold_mask: 0,
+        hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+        opp_reach: vec![r_quarter.clone(), r_quarter.clone()],
+        num_combinations: 64.0,
+    });
+
+    // 3p three-level with mid-level fold: contributions [10, 30, 60]
+    // but p1 (mid) folded. Exercises dead-money distribution at the
+    // mid level while top and bottom are still contested. Common in
+    // Option B trees when the mid-stack folds after a re-raise.
+    cases.push(ShowdownCase {
+        name: "3p three-level mid-fold [10,30,60] p1 folded",
+        np: 3, nh, traverser: 0, starting_pot: 15,
+        contributions: vec![10, 30, 60], fold_mask: 0b010,
+        hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+        opp_reach: vec![r_quarter.clone(), r_quarter.clone()],
+        num_combinations: 64.0,
+    });
+
+    // 4p four-level all-active: contribs=[10, 25, 50, 100].
+    // Four distinct levels. Exercises K>=3 factored per-level path
+    // (multiway_brute_force_showdown's K>=3 branch). This is the
+    // Option B endgame configuration where every player went allin
+    // at a different depth.
+    {
+        let mut reach = Vec::new();
+        for _ in 0..3 { reach.push(r_uniform.clone()); }
+        cases.push(ShowdownCase {
+            name: "4p four-level all-active [10,25,50,100]",
+            np: 4, nh, traverser: 0, starting_pot: 20,
+            contributions: vec![10, 25, 50, 100], fold_mask: 0,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: reach,
+            num_combinations: 256.0,
+        });
+    }
+
+    // 4p four-level traverser-deepest: traverser=3 (the deepest stack)
+    // wins the top side pot uncontested. Specifically exercises the
+    // K>=3 factored path's static_cash accumulation at the top level
+    // where only the traverser is eligible (sole-eligible static_cash
+    // path the K=2 cluster doesn't hit).
+    {
+        let mut reach = Vec::new();
+        for _ in 0..3 { reach.push(r_uniform.clone()); }
+        cases.push(ShowdownCase {
+            name: "4p four-level traverser-deep [10,25,50,100] trav=3",
+            np: 4, nh, traverser: 3, starting_pot: 20,
+            contributions: vec![10, 25, 50, 100], fold_mask: 0,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: reach,
+            num_combinations: 256.0,
+        });
+    }
+
+    // 4p four-level with one fold: contribs=[10, 25, 50, 100], p2 folded
+    // mid-tournament (their 50 is dead money). Exercises dead-money
+    // distribution across multiple side-pot levels with K=3 active.
+    {
+        let mut reach = Vec::new();
+        for _ in 0..3 { reach.push(r_uniform.clone()); }
+        cases.push(ShowdownCase {
+            name: "4p four-level + mid-fold [10,25,50,100] p2 folded",
+            np: 4, nh, traverser: 0, starting_pot: 20,
+            contributions: vec![10, 25, 50, 100], fold_mask: 0b0100,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: reach,
+            num_combinations: 256.0,
+        });
+    }
+
+    // 6p three-level mixed: simulates a tournament-style allin from
+    // multiple short stacks. contribs=[15, 15, 5, 15, 5, 50] with no
+    // folds, three distinct levels [5, 15, 50]. Exercises K>=3 factored
+    // path with multiple shorts at the same level (two players at 5,
+    // three at 15, one at 50).
+    {
+        let mut reach = Vec::new();
+        for _ in 0..5 { reach.push(r_uniform.clone()); }
+        cases.push(ShowdownCase {
+            name: "6p three-level mixed [15,15,5,15,5,50]",
+            np: 6, nh, traverser: 0, starting_pot: 30,
+            contributions: vec![15, 15, 5, 15, 5, 50], fold_mask: 0,
+            hand_cards: hand_cards.clone(), hand_strength: hand_strength.clone(),
+            opp_reach: reach,
+            num_combinations: 4096.0,
+        });
+    }
+
     // Run them all.
     eprintln!("\nRunning {} cases against independent enumerator...\n", cases.len());
     for tc in &cases {
