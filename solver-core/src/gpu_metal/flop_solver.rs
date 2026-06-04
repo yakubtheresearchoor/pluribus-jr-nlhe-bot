@@ -86,6 +86,20 @@ pub struct MetalFlopStartSolver {
     d_river_reach: MetalBuffer<f32>, // [nn * np * nh] for river zone per-(tc,rc)
     d_cfv: MetalBuffer<f32>,     // [nn * nh]
 
+    // ─── Slice 2 Phase B Step 5: chokepoint instrumentation marker ───
+    // Per-(terminal-node, hand) marker buffer sized [nn × nh] u8. Written
+    // by the two production payoff-computing kernels (vcfr_bottom_up at
+    // buffer 18, vcfr_bottom_up_batched at buffer 20) right after the
+    // multiway_brute_force_showdown helper returns. After a solve, the
+    // host downloads this and asserts every terminal-node-hand cell is
+    // marked (1 = rake-applied, 2 = rake-correctly-skipped per
+    // no-flop-no-drop). An unmarked cell (0) means that terminal
+    // bypassed the chokepoint — a bug. The standing CI guard against
+    // any future change reintroducing a payoff path that doesn't apply
+    // rake. Per the lead: "the instrumentation is the protection for all
+    // future kernel work, not just a Phase B closeout."
+    d_rake_marker: MetalBuffer<u8>,
+
     // Game data (read-only)
     d_initial_weight: MetalBuffer<f32>,
     d_hand_cards: MetalBuffer<u8>,
@@ -287,6 +301,12 @@ impl MetalFlopStartSolver {
         };
         let d_hand_cards = MetalBuffer::from_slice(device, &table.hand_cards);
 
+        // Step 5 chokepoint instrumentation buffer: [nn × nh] u8 markers,
+        // initialized to zero (= unmarked). Kernel writes 1 (rake-applied)
+        // or 2 (rake-correctly-skipped per no-flop-no-drop) at every
+        // terminal it processes via multiway_brute_force_showdown.
+        let d_rake_marker = MetalBuffer::<u8>::zeros(device, nn * nh);
+
         let (opp_str, opp_idx, pl_str, pl_idx, _) = table.sorted_opp_arrays_base();
         let d_sorted_opp_strength = MetalBuffer::from_slice(device, &opp_str);
         let d_sorted_opp_indices = MetalBuffer::from_slice(device, &opp_idx);
@@ -390,6 +410,7 @@ impl MetalFlopStartSolver {
             d_turn_reach,
             d_river_reach,
             d_cfv,
+            d_rake_marker,
             d_initial_weight,
             d_hand_cards,
             d_sorted_opp_strength,
@@ -943,6 +964,8 @@ impl MetalFlopStartSolver {
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
             enc.set_buffer(18, Some(self.d_river_board_mask.as_ref()), prob_byte_off as u64);
             enc.set_buffer(19, Some(self.d_debug_out.as_ref()), 0);
+            // Step 5 chokepoint instrumentation marker (river dispatch).
+            enc.set_buffer(20, Some(self.d_rake_marker.as_ref()), 0);
 
             let grid_size = metal::MTLSize { width: count as u64, height: 1, depth: 1 };
             let tg_size = metal::MTLSize { width: 1, height: 1, depth: 1 };
@@ -1040,6 +1063,12 @@ impl MetalFlopStartSolver {
             enc.set_buffer(16, Some(self.d_turn_pl_idx.as_ref()), sps_byte_off as u64);
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
             enc.set_buffer(18, Some(self.d_turn_chance_prob.as_ref()), (ti * nh * 4) as u64);
+            // debug_out at buffer(19) — bind to debug buffer for completeness
+            // (turn dispatch did not previously bind this, but adding rake_marker
+            // at buffer(20) means we need 19 bound too for Metal to validate).
+            enc.set_buffer(19, Some(self.d_debug_out.as_ref()), 0);
+            // Step 5 chokepoint instrumentation marker (turn dispatch).
+            enc.set_buffer(20, Some(self.d_rake_marker.as_ref()), 0);
 
             let grid_size = metal::MTLSize { width: count as u64, height: 1, depth: 1 };
             let tg_size = metal::MTLSize { width: 1, height: 1, depth: 1 };
@@ -1108,6 +1137,8 @@ impl MetalFlopStartSolver {
             enc.set_buffer(15, Some(self.d_sorted_pl_strength.as_ref()), 0);
             enc.set_buffer(16, Some(self.d_sorted_pl_indices.as_ref()), 0);
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
+            // Step 5 chokepoint instrumentation marker (flop dispatch).
+            enc.set_buffer(18, Some(self.d_rake_marker.as_ref()), 0);
 
             let grid_size = metal::MTLSize { width: count as u64, height: 1, depth: 1 };
             let tg_size = metal::MTLSize { width: 1, height: 1, depth: 1 };
@@ -1392,6 +1423,15 @@ impl MetalFlopStartSolver {
     pub fn download_regrets(&self) -> Vec<f32> { self.d_regrets.to_vec() }
     pub fn download_cfv(&self) -> Vec<f32> { self.d_cfv.to_vec() }
     pub fn download_reach(&self) -> Vec<f32> { self.d_reach.to_vec() }
+    /// Step 5 chokepoint instrumentation: download the per-(terminal-node,
+    /// hand) rake marker buffer. Returns Vec<u8> of length nn × nh. Cell
+    /// values: 0 = unmarked (BUG — terminal bypassed the chokepoint),
+    /// 1 = rake-applied (flop_seen=true), 2 = rake-correctly-skipped
+    /// (flop_seen=false per no-flop-no-drop). After a representative
+    /// solve, ALL terminal-node-hand cells must be 1 or 2; any 0 at a
+    /// terminal indicates a payoff path bypassed the rake-applying
+    /// chokepoint multiway_brute_force_showdown.
+    pub fn download_rake_marker(&self) -> Vec<u8> { self.d_rake_marker.to_vec() }
     pub fn download_turn_reach(&self) -> Vec<f32> { self.d_turn_reach.to_vec() }
     pub fn download_river_reach(&self) -> Vec<f32> { self.d_river_reach.to_vec() }
     pub fn download_turn_cfv_batch(&self) -> Vec<f32> { self.d_turn_cfv_batch.to_vec() }

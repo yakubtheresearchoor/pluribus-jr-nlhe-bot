@@ -855,6 +855,13 @@ kernel void vcfr_bottom_up(
     device const uint16_t* sorted_pl_strength   [[buffer(15)]],
     device const uint16_t* sorted_pl_indices     [[buffer(16)]],
     device const uint8_t* hand_cards          [[buffer(17)]],
+    // ── Step 5: chokepoint instrumentation (Phase B completion guard) ──
+    // Per-(terminal-node, hand) marker, sized [nn * nh] u8.
+    //   0 = unmarked (BUG: terminal bypassed the chokepoint)
+    //   1 = rake-applied (flop_seen=true at this terminal)
+    //   2 = rake-correctly-skipped (flop_seen=false, no-flop-no-drop)
+    // Written right after multiway_brute_force_showdown returns.
+    device uchar* rake_marker                [[buffer(18)]],
     uint gid [[thread_position_in_grid]]
 ) {
     int idx = int(gid);
@@ -912,6 +919,15 @@ kernel void vcfr_bottom_up(
             local_out
         );
         for (int h = 0; h < nh; h++) out[h] = local_out[h];
+
+        // ── Step 5: chokepoint instrumentation marker write ──
+        // Every production terminal evaluation goes through this site,
+        // so writing a marker here proves the terminal was rake-processed.
+        // 1 = rake-applied (flop_seen=true), 2 = rake-correctly-skipped.
+        uchar marker = flop_seen ? (uchar)1 : (uchar)2;
+        for (int h = 0; h < nh; h++) {
+            rake_marker[node_id * nh + h] = marker;
+        }
 
         if (params.num_combinations > 0.0f) {
             for (int h = 0; h < nh; h++) out[h] /= params.num_combinations;
@@ -1580,6 +1596,9 @@ kernel void vcfr_bottom_up_batched(
     device const uint8_t* hand_cards         [[buffer(17)]],
     device const float* chance_prob          [[buffer(18)]],
     device float* debug_out                  [[buffer(19)]],
+    // ── Step 5: chokepoint instrumentation marker buffer ──
+    // Same semantics as vcfr_bottom_up's rake_marker (buffer 18 there).
+    device uchar* rake_marker                [[buffer(20)]],
     uint gid [[thread_position_in_grid]]
 ) {
     int idx = int(gid);
@@ -1644,6 +1663,15 @@ kernel void vcfr_bottom_up_batched(
             local_out
         );
         for (int h = 0; h < nh; h++) out[h] = local_out[h];
+
+        // ── Step 5: chokepoint instrumentation marker write ──
+        // Every production terminal evaluation in vcfr_bottom_up_batched
+        // goes through this site, so the marker proves the terminal was
+        // rake-processed. 1 = rake-applied, 2 = rake-correctly-skipped.
+        uchar marker = flop_seen ? (uchar)1 : (uchar)2;
+        for (int h = 0; h < nh; h++) {
+            rake_marker[node_id * nh + h] = marker;
+        }
 
         if (params.num_combinations > 0.0f) {
             for (int h = 0; h < nh; h++) out[h] /= params.num_combinations;

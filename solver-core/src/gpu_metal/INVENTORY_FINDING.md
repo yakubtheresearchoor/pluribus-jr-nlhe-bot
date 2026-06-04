@@ -521,6 +521,117 @@ to validate via unit test routed to it that the helper-mediated
 result matches what the inline used to produce. Same discipline as
 everything else, applied to a larger surgery.
 
+## Sixth iteration: even the trusted CPU reference can be silently wrong
+
+After the consolidation (chokepoint = single helper, all 5 branches
+unit-test-validated at 0.0), Phase B closure looked done modulo the
+HU gate residual at 0.09375. the lead flagged the clean fraction (3/32)
+as suspicious: "the last time a clean-fraction parity gap was assumed
+benign it was the inclusion-exclusion bug."
+
+Diagnosis via targeted unit test (one shot, predicted divergence
+confirmed byte-for-byte):
+
+  CPU fast path:   rake = (total_pot × rate).min(cap)  ← bug
+  Metal K=1:       rake = (main_pot × rate).min(cap)   ← spec-correct
+
+For HU fold-win-after-bet (P0 bets 15, P1 has 5 and folds), the two
+disagree by exactly (total - main_pot) × rate = 10 × 0.05 = 0.5 per
+hand. Reach-weighted: matches the 0.09375 HU gate residual.
+
+**The CPU was the trusted reference, but its anchor for the
+fold-win case used EQUAL contributions** (contributions=[50, 50]
+where main_pot == total_pot). The unequal-contributions case
+(fold-after-bet, where uncalled bets matter) was a COVERAGE GAP in
+the anchors. The CPU was silently wrong on that case.
+
+the lead's spec confirmation: main-pot-only is correct (uncalled bets
+returned un-raked per the site). Fix applied:
+  1. CPU fast path: change to main_pot_amount rake
+  2. Metal K=2 fast path: same change (it mirrored buggy CPU)
+  3. Metal K=1: unchanged (already main-pot-only by per-level structure)
+  4. New CPU anchor: verify_rake_fold_win_after_bet_uncalled_returned_unraked
+     (contributions=[15, 5], hand-computed payoff 4.5, validates the spec)
+
+Result: HU gate dropped from 0.09375 → 9.5e-7 (five orders of
+magnitude), all 13 CPU anchors pass, all 5 Metal helper-branch unit
+tests pass, all gates at f32 floor.
+
+**Sixth-iteration refinement to the standing method**:
+
+  **EVEN THE TRUSTED REFERENCE NEEDS ANCHORS THAT ACTUALLY COVER
+  THE CASES.** A case the anchor doesn't exercise is a case the
+  reference can be silently wrong on. The disturbance-test
+  reachability discipline (fifth iteration, for CODE coverage) has
+  its counterpart: ANCHOR COVERAGE for ARITHMETIC. When the
+  trusted-reference status of CPU was "validated by hand
+  computation," that validation only held for the cases the anchors
+  exercised. Coverage gaps in anchors = silent correctness gaps in
+  the reference.
+
+## Seventh iteration: tests that use kernels but don't validate them
+
+Surfaced as a side effect of disturbance-testing
+factored_showdown_unified (which was confirmed production-dead):
+the test files unified_kernel_gates and precision_attribution_check
+DO use the kernel, get NaN back, print `gpu=NaN diff=NaN` for every
+hand, and still report `test result: ok`. The assertions in those
+tests are weak enough to pass on NaN output.
+
+This is the seventh false-green pattern: a test that uses a kernel
+but doesn't validate its CFV values. NaN passes through the test as
+"not measurably different from CPU within tolerance."
+
+Not blocking Phase B (these are test-only tests on production-dead
+code), but the test infrastructure should be hardened in a separate
+cleanup to detect NaN as failure.
+
+## Eight false-greens caught in this arc (the operational principle)
+
+  1. Loose 0.5 parity gate (hid inclusion-exclusion bug)
+  2. rake=0 gates (validated nothing about rake)
+  3. Constant stub (didn't exercise value-dependent path)
+  4. Source-reading inventory (missed inline sites)
+  5. Output-write enumeration (missed `if (false)` gates)
+  6. CPU-Metal parity residual assumed benign (was over-rake bug)
+  7. Test that uses a kernel but doesn't validate (NaN passes through)
+  Plus the build.rs path bug: recompile not always triggered
+
+All caught by the SAME operational question:
+  **"Does this signal actually exercise what I claim it validates?"**
+
+Applied to readings (inventory), execution signals (gates), test
+assertions (do they fire on bad input?), build state (does the edit
+actually compile in?), and arithmetic anchors (does the anchor
+exercise the case?). Eight findings, one question.
+
+## Chokepoint instrumentation as the standing future-proofing guard
+
+Per the lead's Step 5: "Now that the live path is a single chokepoint
+(multiway_brute_force_showdown), the instrumentation's job is to
+confirm every production terminal routes through that chokepoint
+and the chokepoint applied rake (or correctly skipped it)."
+
+Implemented at chokepoint exit (the two production helper-call sites
+in vcfr_bottom_up and vcfr_bottom_up_batched). Marker buffer per-
+(terminal-node, hand), three states: 1 = rake-applied (flop_seen=true),
+2 = rake-correctly-skipped (flop_seen=false per no-flop-no-drop),
+0 = unmarked (BUG: bypassed the chokepoint).
+
+The standing question applied to the instrumentation ITSELF (per
+the lead): verify it fires at every terminal by counting marker writes
+and comparing to num_terminals × nh. Test
+`chokepoint_instrumentation_every_terminal_marked` does exactly this
++ asserts non-terminal cells stay zero + asserts all marked cells
+have the expected value.
+
+PERMANENT CI test (not #[ignore]). Per the lead: "keep it permanent
+because even with the chokepoint, a future change could add a payoff
+path that bypasses the helper, and the instrumentation is the
+standing guard, especially with the real-time-search kernel work
+coming. It should be in place before that work can reintroduce a
+bypass."
+
 ## Altitude: where the rake arc sits in the larger plan
 
 The rake arc started as "implement rake, ~1-2 hours" and has become a
