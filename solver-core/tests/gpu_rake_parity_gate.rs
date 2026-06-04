@@ -692,6 +692,115 @@ fn site_e_4p_factored_rake() {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// Site (d) DIAGNOSTIC ISOLATION TEST — discriminates kernel-math
+// correctness from gate signal coverage
+//
+// Per user direction added during Phase B: "(d) HU is okay with
+// gate-primary plus per-site f64 (genuinely isolated, no num_opp=1
+// sibling) ... if either's gate behaves unexpectedly when closed
+// (doesn't drop, or moves another), that's the trigger to add their
+// unit test too."
+//
+// Phase B Site (d) kernel rake was applied to `multiway_brute_force_
+// showdown`'s K=1 branch (vcfr.metal ~376). Result: HU gate dropped
+// 0.73333 → 0.09375 — significantly but NOT to f32 floor. That's
+// the user-predicted unexpected behavior, and the trigger for this
+// unit test.
+//
+// What it discriminates:
+//   - If THIS test → 0.0 (multiway K=1 correct in isolation) but
+//     gate stays at 0.09: site (d) has a SECOND code location not
+//     yet mirrored. Likely candidate: `sorted_sweep_showdown_vcfr_
+//     local` (lines ~1155, ~1600, ~1706, ~2132) which is a separate
+//     helper called at HU showdown sites in production kernels and
+//     is currently rake-free.
+//   - If THIS test ALSO fails: the multiway K=1 rake math itself
+//     is wrong; the gate residual is honest.
+//
+// Either result is informative. The user's discipline applied:
+// "The principle 'trigger is the measurement, not the assumption'
+// is right, and applied correctly it says..." — measurement
+// triggered, so we measure.
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "Slice 2 Phase B Site (d) DIAGNOSTIC: HU multiway K=1 isolation. \
+            Discriminates kernel-math correctness from gate signal coverage \
+            after the HU gate behaved unexpectedly (dropped substantially \
+            but not to f32 floor) post site (d) closure. Run: cargo test \
+            --release --features metal --test gpu_rake_parity_gate \
+            site_d_isolated -- --ignored"]
+fn site_d_isolated_kernel_unit_test() {
+    use solver_core::solver::showdown::side_pot_showdown_cfv_with_rake;
+
+    // np=2 → num_opp=1 → routes to multiway K=1 branch (site d).
+    let nh = 3;
+    let np = 2;
+    let num_opp = 1;
+    let hand_cards: Vec<u8> = vec![0, 1, 2, 3, 4, 5];
+    let strengths: Vec<u16> = vec![10, 20, 30];
+    let (pl_str, pl_idx) = debug_kernel::make_sorted(&strengths);
+
+    let opp_reach: Vec<f32> = vec![1.0; num_opp * nh];
+    let contributions: Vec<i32> = vec![5, 5];  // HU equal
+    let starting_pot: i32 = 10;
+    let fold_mask: u16 = 0;
+    let traverser = 0;
+
+    let rake_rate = 0.05_f32;
+    let rake_cap = 1.0_f32;
+    let flop_seen = true;
+
+    let opp_reach_per_opp: Vec<Vec<f32>> = (0..num_opp)
+        .map(|oi| opp_reach[oi * nh..(oi + 1) * nh].to_vec())
+        .collect();
+    let opp_reach_views: Vec<&[f32]> = opp_reach_per_opp.iter().map(|v| v.as_slice()).collect();
+    let mut sorted_opp_str = Vec::with_capacity(num_opp * nh);
+    let mut sorted_opp_idx = Vec::with_capacity(num_opp * nh);
+    for _ in 0..num_opp {
+        sorted_opp_str.extend_from_slice(&pl_str);
+        sorted_opp_idx.extend_from_slice(&pl_idx);
+    }
+    let cpu_cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &sorted_opp_str, &sorted_opp_idx,
+        &pl_str, &pl_idx,
+        &contributions, fold_mask, traverser, np as u8, starting_pot,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    let ctx = MetalContext::new().expect("Metal context");
+    let gpu_cfv = debug_kernel::gpu_brute_force_with_rake(
+        &ctx, nh, np, traverser, starting_pot, fold_mask,
+        &opp_reach, &contributions, &hand_cards, &pl_str, &pl_idx,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    eprintln!("Site (d) HU multiway K=1 isolated kernel unit test:");
+    eprintln!("  CPU (with rake): {:?}", cpu_cfv);
+    eprintln!("  Metal (multiway K=1 with rake): {:?}", gpu_cfv);
+
+    let mut max_diff = 0.0_f32;
+    let mut max_h = 0;
+    for h in 0..nh {
+        let d = (cpu_cfv[h] - gpu_cfv[h]).abs();
+        if d > max_diff { max_diff = d; max_h = h; }
+    }
+    eprintln!("  max_diff = {} at h={}", max_diff, max_h);
+    eprintln!("  → If 0.0: multiway K=1 math correct. Gate residual is from sorted_sweep_showdown_vcfr_local (separate HU helper, currently rake-free).");
+    eprintln!("  → If non-zero: multiway K=1 math itself is wrong.");
+
+    assert!(max_diff < 1e-4,
+        "Site (d) HU multiway K=1 isolated unit test FAILED: max_diff = {} \
+         at h={}. If gate dropped substantially but not to floor AND this \
+         test fails, multiway K=1 has its own math bug. If gate dropped \
+         but this test PASSES, the residual is from sorted_sweep_showdown_\
+         vcfr_local (separate HU helper that's not yet rake-mirrored).",
+        max_diff, max_h);
+    eprintln!("✓ Site (d) HU multiway K=1 isolated unit test PASSED");
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // Site (b) PRIMARY ISOLATION TEST — direct CPU↔Metal kernel unit check
 //
 // Per user direction after Phase A.6: "The divergence-assertion fallback

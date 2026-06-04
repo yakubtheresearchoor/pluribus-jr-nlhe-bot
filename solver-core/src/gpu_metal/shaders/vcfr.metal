@@ -450,6 +450,24 @@ inline void multiway_brute_force_showdown(
         int32_t c_opp_a = contributions[opp_a];
         bool a_folded = (fold_mask & (uint16_t)(1u << opp_a)) != 0;
 
+        // ── Slice 2 Phase B Site (d): K=1 HU main-pot-only rake ──
+        // Mirror CPU `side_pot_showdown_cfv_with_rake` ~1070-1140 (HU path).
+        // Same main-pot-only/cap-once spec as site (c) — rake applies at
+        // li==0 only, side-pot levels (li>=1) un-raked, cap once.
+        // Computed ONCE before the (h, g_a) loops.
+        int32_t hu_main_pot_amount;
+        if (num_levels == 0) {
+            hu_main_pot_amount = starting_pot;
+        } else {
+            int num_main_contributors = 0;
+            for (int p = 0; p < np; p++) {
+                if (contributions[p] >= levels[0]) num_main_contributors++;
+            }
+            hu_main_pot_amount = levels[0] * num_main_contributors + starting_pot;
+        }
+        float hu_main_pot_rake = fmax(0.0f, fmin(
+            (float)hu_main_pot_amount * eff_rake_rate, eff_rake_cap));
+
         for (int h = 0; h < nh; h++) {
             int hc1 = hand_cards[h * 2];
             int hc2 = hand_cards[h * 2 + 1];
@@ -483,14 +501,18 @@ inline void multiway_brute_force_showdown(
                         bool trav_elig = c_t >= lev;
                         bool a_elig = !a_folded && c_opp_a >= lev;
                         if (!trav_elig) { prev_l = lev; continue; }
+                        // Slice 2 Site (d): rake from main pot only (li==0).
+                        float pot_after_rake = (li == 0)
+                            ? (pot_l - hu_main_pot_rake)
+                            : pot_l;
                         if (!a_elig) {
-                            cash += pot_l;
+                            cash += pot_after_rake;
                         } else {
                             uint16_t max_str = (h_str > s_a) ? h_str : s_a;
                             int tied = 0;
                             if (h_str == max_str) tied++;
                             if (s_a == max_str) tied++;
-                            if (h_str == max_str) cash += pot_l / float(tied);
+                            if (h_str == max_str) cash += pot_after_rake / float(tied);
                         }
                         prev_l = lev;
                     }
