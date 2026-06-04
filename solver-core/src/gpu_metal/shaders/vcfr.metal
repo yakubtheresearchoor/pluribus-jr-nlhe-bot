@@ -538,6 +538,25 @@ inline void multiway_brute_force_showdown(
     // unifies them.
     // ========================================================================
 
+    // ── Slice 2 Phase B Site (e): K≥3 factored main-pot-only rake ──
+    // Mirror CPU `side_pot_showdown_cfv_with_rake` main-pot-only spec
+    // (showdown.rs ~870-910). Rake applies ONLY at li==0 (main pot);
+    // side-pot levels (li>=1) un-raked; cap applied ONCE per hand.
+    // Computed ONCE before the h loop since main_pot is determined by
+    // contributions and starting_pot, not by h.
+    int32_t e_main_pot_amount;
+    if (num_levels == 0) {
+        e_main_pot_amount = starting_pot;
+    } else {
+        int num_main_contributors = 0;
+        for (int p = 0; p < np; p++) {
+            if (contributions[p] >= levels[0]) num_main_contributors++;
+        }
+        e_main_pot_amount = levels[0] * num_main_contributors + starting_pot;
+    }
+    float e_main_pot_rake = fmax(0.0f, fmin(
+        (float)e_main_pot_amount * eff_rake_rate, eff_rake_cap));
+
     for (int h = 0; h < nh; h++) {
         ulong h_m = (1ul << hand_cards[h * 2]) | (1ul << hand_cards[h * 2 + 1]);
         ushort h_str = hand_strength[h];
@@ -562,6 +581,9 @@ inline void multiway_brute_force_showdown(
             }
             float pot_l = (float)(pc * num_contrib);
             if (li == 0) pot_l += (float)starting_pot;
+            // Site (e) rake: at li==0 (main pot) winner-share gets pot
+            // reduced by main_pot_rake. Side pots (li>=1) un-raked.
+            float pot_after_rake = (li == 0) ? (pot_l - e_main_pot_rake) : pot_l;
 
             uint elig_opps = 0u;
             int oi = 0;
@@ -576,9 +598,12 @@ inline void multiway_brute_force_showdown(
             bool has_active_elig = (elig_opps != 0);
 
             if (!has_active_elig && trav_elig) {
-                static_cash += pot_l;
+                // Traverser sole eligible — wins (raked) pot at this level.
+                static_cash += pot_after_rake;
             } else if (!has_active_elig && !trav_elig) {
                 if (contributions[traverser] >= lev) {
+                    // Dead-money return — NO RAKE (refund, not a win).
+                    // Matches CPU n_elig==0 branch.
                     float trav_contrib = (float)pc;
                     if (li == 0) trav_contrib += (float)starting_pot / (float)np;
                     static_cash += trav_contrib;
@@ -586,10 +611,11 @@ inline void multiway_brute_force_showdown(
             } else if (!trav_elig) {
                 // Case D: traverser ineligible at contested level — no cash.
             } else {
+                // Case C: contested level. Share of post-rake pot.
                 float share = factored_share_for_level_thread(
                     num_opp, elig_opps, 0u, h_m, h_str,
                     opp_reach_local, hand_cards, hand_strength, nh);
-                case_c += pot_l * share;
+                case_c += pot_after_rake * share;
             }
             prev_l = lev;
         }

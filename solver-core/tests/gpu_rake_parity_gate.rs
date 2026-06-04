@@ -692,6 +692,100 @@ fn site_e_4p_factored_rake() {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// Site (e) PRIMARY ISOLATION TEST — direct CPU↔Metal kernel unit check
+//
+// Routing to site (e)'s K≥3 factored branch (line ~528 in
+// multiway_brute_force_showdown post-deletion):
+//   - np = 4 (num_opp = 3 → K≥3 → enters factored path)
+//   - fold_mask = 0 (no folds, all-equal contribs)
+//   - traverser = 0
+//   - → kernel falls through K=1/K=2 branches, enters K≥3 factored
+//
+// CPU reference: side_pot_showdown_cfv_with_rake at the K≥3
+// per-level brute-force path (showdown.rs ~870-910, main-pot-only,
+// cap-once). The factored Metal implementation produces the same
+// CFV via the K-1 recursive expansion with eligibility-restricted
+// strength comparison.
+//
+// Today (pre-Phase-B-Step-4): Metal site (e) is rake-free; CPU
+// applies main-pot rake. Diff = main-pot rake fraction × reach.
+// After Step 4 lands: diff → f32 floor.
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "Slice 2 Phase B Site (e) ISOLATION (primary): direct CPU↔Metal \
+            kernel-level check of site (e)'s K≥3 factored branch rake math. \
+            np=4, fold_mask=0, equal contribs → routes through factored \
+            per-level. Run: cargo test --release --features metal --test \
+            gpu_rake_parity_gate site_e_isolated -- --ignored"]
+fn site_e_isolated_kernel_unit_test() {
+    use solver_core::solver::showdown::side_pot_showdown_cfv_with_rake;
+
+    let nh = 4;
+    let np = 4;
+    let num_opp = 3;
+    // 4 hands using 8 distinct cards (no conflicts).
+    let hand_cards: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7];
+    let strengths: Vec<u16> = vec![10, 20, 30, 40];
+    let (pl_str, pl_idx) = debug_kernel::make_sorted(&strengths);
+
+    let opp_reach: Vec<f32> = vec![1.0; num_opp * nh];
+    let contributions: Vec<i32> = vec![5, 5, 5, 5];  // all equal → K≥3 factored
+    let starting_pot: i32 = 20;
+    let fold_mask: u16 = 0;
+    let traverser = 0;
+
+    let rake_rate = 0.05_f32;
+    let rake_cap = 1.0_f32;
+    let flop_seen = true;
+
+    let opp_reach_per_opp: Vec<Vec<f32>> = (0..num_opp)
+        .map(|oi| opp_reach[oi * nh..(oi + 1) * nh].to_vec())
+        .collect();
+    let opp_reach_views: Vec<&[f32]> = opp_reach_per_opp.iter().map(|v| v.as_slice()).collect();
+    let mut sorted_opp_str = Vec::with_capacity(num_opp * nh);
+    let mut sorted_opp_idx = Vec::with_capacity(num_opp * nh);
+    for _ in 0..num_opp {
+        sorted_opp_str.extend_from_slice(&pl_str);
+        sorted_opp_idx.extend_from_slice(&pl_idx);
+    }
+    let cpu_cfv = side_pot_showdown_cfv_with_rake(
+        &opp_reach_views, &hand_cards, nh,
+        &sorted_opp_str, &sorted_opp_idx,
+        &pl_str, &pl_idx,
+        &contributions, fold_mask, traverser, np as u8, starting_pot,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    let ctx = MetalContext::new().expect("Metal context");
+    let gpu_cfv = debug_kernel::gpu_brute_force_with_rake(
+        &ctx, nh, np, traverser, starting_pot, fold_mask,
+        &opp_reach, &contributions, &hand_cards, &pl_str, &pl_idx,
+        rake_rate, rake_cap, flop_seen,
+    );
+
+    eprintln!("Site (e) K≥3 factored isolated kernel unit test:");
+    eprintln!("  CPU (with rake): {:?}", cpu_cfv);
+    eprintln!("  Metal (with rake): {:?}", gpu_cfv);
+
+    let mut max_diff = 0.0_f32;
+    let mut max_h = 0;
+    for h in 0..nh {
+        let d = (cpu_cfv[h] - gpu_cfv[h]).abs();
+        if d > max_diff { max_diff = d; max_h = h; }
+    }
+    eprintln!("  max_diff = {} at h={}", max_diff, max_h);
+
+    assert!(max_diff < 1e-4,
+        "Site (e) isolated unit test FAILED: max_diff = {} at h={}. \
+         CPU computes K≥3 factored with main-pot-only rake; Metal \
+         computes it. Phase B Step 4 must add rake math at K≥3 \
+         factored branch in multiway_brute_force_showdown line ~528.",
+        max_diff, max_h);
+    eprintln!("✓ Site (e) isolated unit test PASSED");
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // Site (d) DIAGNOSTIC ISOLATION TEST — discriminates kernel-math
 // correctness from gate signal coverage
 //
