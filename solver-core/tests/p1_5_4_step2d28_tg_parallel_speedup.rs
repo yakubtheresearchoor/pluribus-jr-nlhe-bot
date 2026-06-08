@@ -122,7 +122,10 @@ fn step2d28_tg_parallel_ab_compare() {
     eprintln!("{:>4}  {:>4}  {:>12}  {:>12}  {:>10}", "np", "nh", "OLD ms/it", "NEW ms/it", "speedup");
 
     for &(np, nh, n_iters) in &[
-        (4u8, 20usize, 5u32),
+        (3u8, 16usize, 10u32),
+        (3, 30, 5),
+        (3, 50, 5),
+        (4, 20, 5),
         (4, 30, 5),
         (4, 50, 3),
         (5, 16, 5),

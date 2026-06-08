@@ -1522,13 +1522,24 @@ impl MetalFlopStartSolver {
             };
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            // Step 2.D.28: branch on num_opp. For 6-max (num_opp >= 3) the
-            // K>=3 factored CFV path has a fully-independent outer h loop,
-            // so we use the tg-parallel kernel (1 threadgroup per node,
-            // TG_SIZE threads cooperating). HU/3p keep the serial kernel.
-            // Env override SOLVER_DISABLE_TG_PARALLEL=1 forces serial for A/B
-            // measurement; remove once production speedup is validated.
-            let use_tg_parallel = num_opp >= 3
+            // Step 2.D.28: branch on num_opp. K>=2 (3p, 4p, 5p, 6p) uses the
+            // tg-parallel kernel (1 threadgroup per node, TG_SIZE threads
+            // cooperating). HU (num_opp==1) keeps the serial kernel because
+            // its per-node work is too small (~nh ops, sweep + output) to
+            // benefit from within-node parallelism — 32-nodes-per-group
+            // parallelism on the OLD kernel wins by ~32× at HU scale.
+            //
+            // K=2 routes through the factored share helper (k2_tg), which
+            // produces the SAME mathematical result as the CPU's K=2 brute
+            // force but with different float ordering. Bit-exact CPU↔Metal
+            // parity is intentionally relaxed for K=2; rules-oracle gate
+            // (zero-sum, card-conflict, walker-agreement) is the
+            // disambiguator. The K=2 brute-force rake parity gates
+            // (site_a/b/c, --ignored by default) document this gap.
+            //
+            // Env override SOLVER_DISABLE_TG_PARALLEL=1 forces serial for
+            // A/B measurement; remove once production speedup is validated.
+            let use_tg_parallel = num_opp >= 2
                 && std::env::var_os("SOLVER_DISABLE_TG_PARALLEL").is_none();
             let pipeline = if use_tg_parallel {
                 &self.batched_tg_parallel_pipeline
@@ -1661,7 +1672,9 @@ impl MetalFlopStartSolver {
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             // Step 2.D.28: branch on num_opp (see bottom_up_river for rationale).
-            let use_tg_parallel = num_opp >= 3;
+            // num_opp >= 2: use new kernel. HU (num_opp==1) stays on serial.
+            let use_tg_parallel = num_opp >= 2
+                && std::env::var_os("SOLVER_DISABLE_TG_PARALLEL").is_none();
             let pipeline = if use_tg_parallel {
                 &self.batched_tg_parallel_pipeline
             } else {
