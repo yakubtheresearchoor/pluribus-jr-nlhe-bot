@@ -290,6 +290,19 @@ pub struct MetalFlopStartSolver {
     // Parameters buffer for passing params to kernels
     d_params_buf: std::cell::UnsafeCell<MetalBuffer<u8>>,
 
+    /// #117 Fix C: GPU-resident orchestration mode. When true, stage
+    /// functions commit command buffers but skip the per-stage
+    /// wait_until_completed; the caller (run()) flushes at end of all
+    /// iterations via a final empty-buffer wait. This eliminates ~14
+    /// CPU↔GPU sync points per iter (one per stage) × num_iters × np
+    /// traversers — at production scale, this is thousands of sync
+    /// points per blueprint.
+    ///
+    /// Profiling (run_profiled) keeps async_mode=false because per-
+    /// stage timing requires synchronous waits to attribute GPU time
+    /// to stages.
+    async_mode: std::cell::Cell<bool>,
+
     // Layout parameters
     num_players: u8,
     nh: usize,
@@ -599,6 +612,7 @@ impl MetalFlopStartSolver {
             d_flop_zone_nodes,
             d_flop_level_nodes,
             d_params_buf,
+            async_mode: std::cell::Cell::new(false),
             num_players: np,
             nh,
             nn,
@@ -992,6 +1006,26 @@ impl MetalFlopStartSolver {
 
     /// Run N iterations of the flop-start VCFR solver on Metal.
     /// Mirrors the CPU FlopStartVectorCfr::run() exactly.
+    /// Conditional wait. In async_mode (Fix C orchestration), skip the
+    /// per-stage GPU sync — the caller flushes at end. In sync mode
+    /// (default / run_profiled / debug paths), wait as before.
+    #[inline]
+    fn maybe_wait(&self, buf: &metal::CommandBufferRef) {
+        if !self.async_mode.get() {
+            buf.wait_until_completed();
+        }
+    }
+
+    /// Flush queued GPU work by committing an empty command buffer and
+    /// waiting on it. Metal serializes command buffers within a queue,
+    /// so waiting on a LATER buffer guarantees all prior buffers have
+    /// completed. Used to terminate async-mode runs.
+    fn flush(&self, ctx: &MetalContext) {
+        let final_buf = ctx.new_command_buffer();
+        final_buf.commit();
+        final_buf.wait_until_completed();
+    }
+
     pub fn run(
         &mut self,
         ctx: &MetalContext,
@@ -999,9 +1033,16 @@ impl MetalFlopStartSolver {
         game: &FlopStartGame,
         num_iterations: u32,
     ) {
+        // #117 Fix C: GPU-resident orchestration. Stage functions commit
+        // command buffers but skip per-stage waits; final flush at end
+        // amortizes ~14 sync points per iter × np × num_iterations into
+        // ONE sync at the end.
+        self.async_mode.set(true);
         for _ in 0..num_iterations {
             self.run_one_iter(ctx, tree, game, None);
         }
+        self.async_mode.set(false);
+        self.flush(ctx);
     }
 
     /// Profiled variant of `run()`. Returns a `StageProfile` accumulating
@@ -1175,8 +1216,6 @@ impl MetalFlopStartSolver {
         #[derive(Clone, Copy)]
         struct Params { num_infosets: i32, nh: i32, base_offset: i32 }
         let p = Params { num_infosets: num_infosets as i32, nh: nh as i32, base_offset: base_offset as i32 };
-        self.upload_params(&p);
-        let params_buf = self.params_buf_ref();
 
         let cmd = ctx.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -1186,14 +1225,17 @@ impl MetalFlopStartSolver {
         enc.set_buffer(2, Some(decision_ids.as_ref()), 0);
         enc.set_buffer(3, Some(self.d_nodes.as_ref()), 0);
         enc.set_buffer(4, Some(infoset_offsets.as_ref()), 0);
-        enc.set_buffer(5, Some(params_buf), 0);
+        // #117 Fix C race-fix: inline params per-encoder to avoid shared
+        // d_params_buf race in async mode (CPU writes faster than GPU reads).
+        enc.set_bytes(5, std::mem::size_of::<Params>() as u64,
+            &p as *const Params as *const std::ffi::c_void);
 
         let max_tpg = self.strategies_pipeline.max_total_threads_per_threadgroup() as usize;
         let (grid, tg) = ctx.dispatch_2d(num_infosets, nh, max_tpg);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.maybe_wait(cmd);
     }
 
     fn compute_strategies_batched(
@@ -1217,9 +1259,6 @@ impl MetalFlopStartSolver {
             outcome_stride: outcome_stride as i32,
             base_offset: base_offset as i32,
         };
-        self.upload_params(&p);
-        let params_buf = self.params_buf_ref();
-
         let cmd = ctx.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.strategies_batched_pipeline);
@@ -1228,7 +1267,8 @@ impl MetalFlopStartSolver {
         enc.set_buffer(2, Some(decision_ids.as_ref()), 0);
         enc.set_buffer(3, Some(self.d_nodes.as_ref()), 0);
         enc.set_buffer(4, Some(infoset_offsets.as_ref()), 0);
-        enc.set_buffer(5, Some(params_buf), 0);
+        enc.set_bytes(5, std::mem::size_of::<Params>() as u64,
+            &p as *const Params as *const std::ffi::c_void);
 
         let max_tpg = self.strategies_batched_pipeline.max_total_threads_per_threadgroup() as usize;
         // Map 3D problem to 2D: x = outcome * num_infosets + infoset, y = hand
@@ -1237,7 +1277,7 @@ impl MetalFlopStartSolver {
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.maybe_wait(cmd);
     }
 
     // ─── Reach computation ───
@@ -1259,20 +1299,20 @@ impl MetalFlopStartSolver {
             #[derive(Clone, Copy)]
             struct Params { total_reach: i32, np_nh: i32 }
             let p = Params { total_reach: (nn * np_nh) as i32, np_nh: np_nh as i32 };
-            self.upload_params(&p);
 
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.init_reach_pipeline);
             enc.set_buffer(0, Some(self.d_reach.as_ref()), 0);
             enc.set_buffer(1, Some(self.d_initial_weight.as_ref()), 0);
-            enc.set_buffer(2, Some(unsafe { (*self.d_params_buf.get()).as_ref() }), 0);
+            enc.set_bytes(2, std::mem::size_of::<Params>() as u64,
+                &p as *const Params as *const std::ffi::c_void);
 
             let (grid, tg) = ctx.dispatch_1d(nn * np_nh, 256);
             enc.dispatch_thread_groups(grid, tg);
             enc.end_encoding();
             cmd.commit();
-            cmd.wait_until_completed();
+            self.maybe_wait(cmd);
         }
 
         // Top-down through flop zone using flop strategy
@@ -1291,13 +1331,13 @@ impl MetalFlopStartSolver {
             #[derive(Clone, Copy)]
             struct Params { level_count: i32, num_players: i32, nh: i32, strategy_base: i32 }
             let p = Params { level_count: count as i32, num_players: np as i32, nh: nh as i32, strategy_base: self.flop_offset as i32 };
-            self.upload_params(&p);
 
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.top_down_pipeline);
             enc.set_buffer(0, Some(ln.as_ref()), 0);
-            enc.set_buffer(1, Some(unsafe { (*self.d_params_buf.get()).as_ref() }), 0);
+            enc.set_bytes(1, std::mem::size_of::<Params>() as u64,
+                &p as *const Params as *const std::ffi::c_void);
             enc.set_buffer(2, Some(self.d_nodes.as_ref()), 0);
             enc.set_buffer(3, Some(self.d_children.as_ref()), 0);
             enc.set_buffer(4, Some(self.d_strategy.as_ref()), 0);
@@ -1309,7 +1349,7 @@ impl MetalFlopStartSolver {
             enc.dispatch_thread_groups(grid, tg);
             enc.end_encoding();
             cmd.commit();
-            cmd.wait_until_completed();
+            self.maybe_wait(cmd);
         }
     }
 
@@ -1518,7 +1558,7 @@ impl MetalFlopStartSolver {
         // command-buffer execution within a queue, so waiting on the last one
         // waits for all prior ones to complete.
         if let Some(cmd) = last_cmd {
-            cmd.wait_until_completed();
+            self.maybe_wait(cmd);
         }
     }
 
@@ -1623,7 +1663,7 @@ impl MetalFlopStartSolver {
         }
 
         if let Some(cmd) = last_cmd {
-            cmd.wait_until_completed();
+            self.maybe_wait(cmd);
         }
     }
 
@@ -1698,7 +1738,7 @@ impl MetalFlopStartSolver {
         }
 
         if let Some(cmd) = last_cmd {
-            cmd.wait_until_completed();
+            self.maybe_wait(cmd);
         }
     }
 
@@ -1717,41 +1757,31 @@ impl MetalFlopStartSolver {
 
         for ri in 0..n_river {
             // Upload params for this outcome
-            #[repr(C)]
-            #[repr(C)]
 
-            #[derive(Clone, Copy)]
-            struct Params { num_chance_children: i32, nh: i32, outcome: i32 }
-            let p = Params {
-                num_chance_children: cc as i32,
-                nh: nh as i32,
-                outcome: ri as i32, // river outcome index for chance_prob lookup
-            };
-            self.upload_params(&p);
-            let params_buf = unsafe { (*self.d_params_buf.get()).as_ref() };
+            let num_cc_val: i32 = cc as i32;
+            let nh_val: i32 = nh as i32;
+            let outcome_val: i32 = ri as i32;
 
             let total = cc * nh;
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.chance_accum_pipeline);
-            // cfv_accum = river_accum
             enc.set_buffer(0, Some(self.d_river_accum.as_ref()), 0);
-            // cfv = river_cfv_batch offset to this ri's CFVs
             let cfv_byte_off = (ri * nn * nh) * 4;
             enc.set_buffer(1, Some(self.d_river_cfv_batch.as_ref()), cfv_byte_off as u64);
-            // chance_prob = river_chance_prob offset to this turn card's probs
             let prob_byte_off = (ti * self.max_river * nh) * 4;
             enc.set_buffer(2, Some(self.d_river_chance_prob.as_ref()), prob_byte_off as u64);
             enc.set_buffer(3, Some(self.d_river_chance_children.as_ref()), 0);
-            enc.set_buffer(4, Some(params_buf), 0); // num_chance_children
-            enc.set_buffer(5, Some(params_buf), 4); // nh (same struct, offset 4)
-            enc.set_buffer(6, Some(params_buf), 8); // outcome (same struct, offset 8)
+            // #117 Fix C race-fix: inline scalar params per-encoder.
+            enc.set_bytes(4, 4, &num_cc_val as *const i32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &nh_val as *const i32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &outcome_val as *const i32 as *const std::ffi::c_void);
 
             let (grid, tg) = ctx.dispatch_1d(total, 256);
             enc.dispatch_thread_groups(grid, tg);
             enc.end_encoding();
             cmd.commit();
-            cmd.wait_until_completed();
+            self.maybe_wait(cmd);
         }
     }
 
@@ -1763,34 +1793,26 @@ impl MetalFlopStartSolver {
         let cc = self.river_cc_count;
         let total = cc * nh;
 
-        #[repr(C)]
-        #[repr(C)]
 
-        #[derive(Clone, Copy)]
-        struct Params { num_chance_children: i32, nh_val: i32 }
-        let p = Params { num_chance_children: cc as i32, nh_val: nh as i32 };
-        self.upload_params(&p);
-        let params_buf = unsafe { (*self.d_params_buf.get()).as_ref() };
+        let num_cc_val: i32 = cc as i32;
+        let nh_val_local: i32 = nh as i32;
 
-        // The turn CFV batch is indexed by turn card: ti * nn * nh
         let turn_cfv_byte_off = (ti * self.nn * nh) * 4;
 
         let cmd = ctx.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.chance_final_pipeline);
-        // cfv = turn_cfv_batch offset to this ti
         enc.set_buffer(0, Some(self.d_turn_cfv_batch.as_ref()), turn_cfv_byte_off as u64);
-        // cfv_accum = river_accum
         enc.set_buffer(1, Some(self.d_river_accum.as_ref()), 0);
         enc.set_buffer(2, Some(self.d_river_chance_children.as_ref()), 0);
-        enc.set_buffer(3, Some(params_buf), 0); // num_chance_children at offset 0
-        enc.set_buffer(4, Some(params_buf), 4); // nh_val at offset 4
+        enc.set_bytes(3, 4, &num_cc_val as *const i32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &nh_val_local as *const i32 as *const std::ffi::c_void);
 
         let (grid, tg) = ctx.dispatch_1d(total, 256);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.maybe_wait(cmd);
     }
 
     pub fn chance_accumulate_turn(&self, ctx: &MetalContext) {
@@ -1802,40 +1824,29 @@ impl MetalFlopStartSolver {
         let n_turn = self.n_turn;
 
         for ti in 0..n_turn {
-            #[repr(C)]
-            #[repr(C)]
 
-            #[derive(Clone, Copy)]
-            struct Params { num_chance_children: i32, nh: i32, outcome: i32 }
-            let p = Params {
-                num_chance_children: cc as i32,
-                nh: nh as i32,
-                outcome: ti as i32,
-            };
-            self.upload_params(&p);
-            let params_buf = unsafe { (*self.d_params_buf.get()).as_ref() };
+            let num_cc_val: i32 = cc as i32;
+            let nh_val_local: i32 = nh as i32;
+            let outcome_val: i32 = ti as i32;
 
             let total = cc * nh;
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.chance_accum_pipeline);
-            // cfv_accum = d_cfv (main CFV buffer, accumulated across turn cards)
             enc.set_buffer(0, Some(self.d_cfv.as_ref()), 0);
-            // cfv = turn_cfv_batch offset to this ti's CFVs
             let cfv_byte_off = (ti * nn * nh) * 4;
             enc.set_buffer(1, Some(self.d_turn_cfv_batch.as_ref()), cfv_byte_off as u64);
-            // chance_prob = turn_chance_prob
             enc.set_buffer(2, Some(self.d_turn_chance_prob.as_ref()), 0);
             enc.set_buffer(3, Some(self.d_turn_chance_children.as_ref()), 0);
-            enc.set_buffer(4, Some(params_buf), 0); // num_chance_children
-            enc.set_buffer(5, Some(params_buf), 4); // nh (same struct, offset 4)
-            enc.set_buffer(6, Some(params_buf), 8); // outcome (same struct, offset 8)
+            enc.set_bytes(4, 4, &num_cc_val as *const i32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &nh_val_local as *const i32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &outcome_val as *const i32 as *const std::ffi::c_void);
 
             let (grid, tg) = ctx.dispatch_1d(total, 256);
             enc.dispatch_thread_groups(grid, tg);
             enc.end_encoding();
             cmd.commit();
-            cmd.wait_until_completed();
+            self.maybe_wait(cmd);
         }
     }
 
@@ -1859,13 +1870,8 @@ impl MetalFlopStartSolver {
             100 => self.d_cfv.len(),
             _ => panic!("unknown buffer"),
         };
-        #[repr(C)]
-        #[repr(C)]
 
-        #[derive(Clone, Copy)]
-        struct Params { count: i32 }
-        let p = Params { count: len as i32 };
-        self.upload_params(&p);
+        let count_val: i32 = len as i32;
 
         let cmd = ctx.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -1882,12 +1888,12 @@ impl MetalFlopStartSolver {
             _ => panic!("unknown buffer"),
         };
         enc.set_buffer(0, Some(buf_ref), 0);
-        enc.set_buffer(1, Some(unsafe { (*self.d_params_buf.get()).as_ref() }), 0);
+        enc.set_bytes(1, 4, &count_val as *const i32 as *const std::ffi::c_void);
         let (grid, tg) = ctx.dispatch_1d(len, 256);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.maybe_wait(cmd);
     }
 
     fn upload_params<T: Copy>(&self, params: &T) {
@@ -1913,13 +1919,9 @@ impl MetalFlopStartSolver {
         if count == 0 { return; }
         let total = count * np_nh;
 
-        #[repr(C)]
-        #[repr(C)]
 
-        #[derive(Clone, Copy)]
-        struct Params { count: i32, np_nh: i32 }
-        let p = Params { count: count as i32, np_nh: np_nh as i32 };
-        self.upload_params(&p);
+        let count_val: i32 = count as i32;
+        let np_nh_val: i32 = np_nh as i32;
 
         let cmd = ctx.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -1927,14 +1929,14 @@ impl MetalFlopStartSolver {
         enc.set_buffer(0, Some(dst.as_ref()), 0);
         enc.set_buffer(1, Some(src.as_ref()), 0);
         enc.set_buffer(2, Some(chance_children.as_ref()), 0);
-        enc.set_buffer(3, Some(unsafe { (*self.d_params_buf.get()).as_ref() }), 0);
-        enc.set_buffer(4, Some(unsafe { (*self.d_params_buf.get()).as_ref() }), 4); // np_nh at offset 4
+        enc.set_bytes(3, 4, &count_val as *const i32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &np_nh_val as *const i32 as *const std::ffi::c_void);
 
         let (grid, tg) = ctx.dispatch_1d(total, 256);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.maybe_wait(cmd);
     }
 
     fn launch_top_down_zone(
@@ -1952,13 +1954,13 @@ impl MetalFlopStartSolver {
         #[derive(Clone, Copy)]
         struct Params { level_count: i32, num_players: i32, nh: i32 }
         let p = Params { level_count: count as i32, num_players: np as i32, nh: nh as i32 };
-        self.upload_params(&p);
 
         let cmd = ctx.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.top_down_pipeline);
         enc.set_buffer(0, Some(level_nodes.as_ref()), 0);
-        enc.set_buffer(1, Some(unsafe { (*self.d_params_buf.get()).as_ref() }), 0);
+        enc.set_bytes(1, std::mem::size_of::<Params>() as u64,
+            &p as *const Params as *const std::ffi::c_void);
         enc.set_buffer(2, Some(self.d_nodes.as_ref()), 0);
         enc.set_buffer(3, Some(self.d_children.as_ref()), 0);
         enc.set_buffer(4, Some(self.d_strategy.as_ref()), strategy_byte_offset);
@@ -1970,7 +1972,7 @@ impl MetalFlopStartSolver {
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.maybe_wait(cmd);
     }
 
     pub fn download_regrets(&self) -> Vec<f32> { self.d_regrets.to_vec() }
@@ -2100,7 +2102,7 @@ impl MetalFlopStartSolver {
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.maybe_wait(cmd);
 
         d_output.to_vec()
     }
@@ -2162,7 +2164,7 @@ impl MetalFlopStartSolver {
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.maybe_wait(cmd);
 
         d_output.to_vec()
     }
@@ -2212,7 +2214,7 @@ impl MetalFlopStartSolver {
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        self.maybe_wait(cmd);
 
         d_output.to_vec()
     }
