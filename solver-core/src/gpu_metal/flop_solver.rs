@@ -20,6 +20,153 @@ use crate::solver::flop_start_game::FlopStartGame;
 use crate::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use crate::tree::flat::{FlatTree, MAX_NA};
 use metal::ComputePipelineState;
+use std::time::{Duration, Instant};
+
+/// GPU-side mirror of CPU's `RiverPersistenceMode`. In `InMemory` (default),
+/// the river region of `d_regrets`/`d_strategy`/`d_cum_strategy` holds all
+/// `(tc, rc)` pairs simultaneously — same layout as before 2.B landed.
+/// In `DiskBacked`, two files hold the per-pair persistent state and the
+/// caller is responsible for invoking `load_river_pair_gpu(ti, ri)` before
+/// any per-pair read and `save_river_pair_gpu(ti, ri)` after any per-pair
+/// mutation. The file format is the same as CPU's `DiskBacked` so the same
+/// files can in principle be shared (not yet exercised; future work).
+///
+/// Step 2.B.1 (foundation): file I/O round-trips into the existing
+/// in-place buffer layout. Buffers stay full-sized; the disk path is
+/// equivalent to a no-op modulo seek/read/write. Validation: write known
+/// pattern → save → zero in-buffer → load → verify recovered.
+///
+/// Step 2.B.2 (integration): shrink river buffers to `river_stride`
+/// scratch, change kernel dispatch offsets to use `outcome_idx = 0` in
+/// `DiskBacked`, wire load/save into `run_one_iter`, add I/O fields to
+/// `StageProfile`.
+#[derive(Clone, Debug)]
+pub enum GpuRiverMode {
+    /// All [n_turn × max_river × river_stride] f32 stays in GPU memory.
+    /// Default; matches the layout the solver used before 2.B.
+    InMemory,
+    /// Two binary files hold the full per-(tc, rc) state for the river
+    /// region of d_regrets and d_cum_strategy. The GPU buffers are
+    /// streamed via load/save_river_pair_gpu.
+    DiskBacked {
+        regrets_path: std::path::PathBuf,
+        cum_strategy_path: std::path::PathBuf,
+    },
+}
+
+/// Per-stage wall-clock budget accumulated across one or more iterations of
+/// `run_profiled()`. Each field is the total time spent in that stage,
+/// summed across iters and traversers.
+///
+/// Fields mirror the structure of the production GPU iter loop in
+/// `MetalFlopStartSolver::run_one_iter` so adding/removing stages stays
+/// localized. Step 2.B will add I/O stages (`load_river_pair`,
+/// `save_river_pair`) here when DiskBacked GPU mode lands.
+#[derive(Default, Clone, Debug)]
+pub struct StageProfile {
+    /// Total wall-clock for the profiled run (covers all iters and stages,
+    /// including host overhead not attributed to any stage).
+    pub total: Duration,
+    pub compute_strategies: Duration,
+    pub compute_reach_flop: Duration,
+    pub compute_reach_turn: Duration,
+    pub compute_reach_river: Duration,
+    /// `bottom_up_river` includes the fused unified factored showdown CFV
+    /// kernel — the kernels are not separable at the dispatch level.
+    pub bottom_up_river: Duration,
+    pub bottom_up_turn: Duration,
+    pub bottom_up_flop: Duration,
+    pub chance_accumulate_river: Duration,
+    pub chance_finalize_river: Duration,
+    pub chance_accumulate_turn: Duration,
+    pub chance_finalize_turn: Duration,
+    pub zero_buffer_total: Duration,
+    /// 2.B.2: time spent in `load_river_pair_gpu` (file → GPU scratch).
+    /// Zero in InMemory mode (load is a no-op there).
+    pub load_river_pair: Duration,
+    /// 2.B.2: time spent in `save_river_pair_gpu` (GPU scratch → file).
+    /// Zero in InMemory mode.
+    pub save_river_pair: Duration,
+    /// 2.B.2: time spent in `compute_river_strategy_pair` (per-pair river
+    /// strategy compute). Zero in InMemory mode — there the batched call
+    /// inside `compute_all_strategies` does this work and the time lands
+    /// in `compute_strategies` instead.
+    pub compute_river_strategy_pair: Duration,
+}
+
+impl StageProfile {
+    pub fn new() -> Self { Self::default() }
+
+    /// Sum of all attributed stage durations. The gap between `total` and
+    /// `attributed()` is host orchestration overhead (command-buffer setup,
+    /// dispatch overhead not bracketed inside a stage, etc.).
+    pub fn attributed(&self) -> Duration {
+        self.compute_strategies
+            + self.compute_reach_flop
+            + self.compute_reach_turn
+            + self.compute_reach_river
+            + self.bottom_up_river
+            + self.bottom_up_turn
+            + self.bottom_up_flop
+            + self.chance_accumulate_river
+            + self.chance_finalize_river
+            + self.chance_accumulate_turn
+            + self.chance_finalize_turn
+            + self.zero_buffer_total
+            + self.load_river_pair
+            + self.save_river_pair
+            + self.compute_river_strategy_pair
+    }
+
+    /// Format a one-line-per-stage report with percentages of `self.total`.
+    pub fn report(&self) -> String {
+        let total_s = self.total.as_secs_f64().max(1e-12);
+        let fmt = |name: &str, d: Duration| -> String {
+            let s = d.as_secs_f64();
+            format!("  {:30} {:>10.4} s  ({:>5.1}%)\n", name, s, s / total_s * 100.0)
+        };
+        let mut out = String::new();
+        out.push_str(&format!("=== StageProfile (total {:.4} s) ===\n", total_s));
+        out.push_str(&fmt("compute_strategies", self.compute_strategies));
+        out.push_str(&fmt("compute_reach_flop", self.compute_reach_flop));
+        out.push_str(&fmt("compute_reach_turn", self.compute_reach_turn));
+        out.push_str(&fmt("compute_reach_river", self.compute_reach_river));
+        out.push_str(&fmt("bottom_up_river", self.bottom_up_river));
+        out.push_str(&fmt("bottom_up_turn", self.bottom_up_turn));
+        out.push_str(&fmt("bottom_up_flop", self.bottom_up_flop));
+        out.push_str(&fmt("chance_accumulate_river", self.chance_accumulate_river));
+        out.push_str(&fmt("chance_finalize_river", self.chance_finalize_river));
+        out.push_str(&fmt("chance_accumulate_turn", self.chance_accumulate_turn));
+        out.push_str(&fmt("chance_finalize_turn", self.chance_finalize_turn));
+        out.push_str(&fmt("zero_buffer_total", self.zero_buffer_total));
+        out.push_str(&fmt("load_river_pair (I/O)", self.load_river_pair));
+        out.push_str(&fmt("save_river_pair (I/O)", self.save_river_pair));
+        out.push_str(&fmt("compute_river_strategy_pair", self.compute_river_strategy_pair));
+        out.push_str(&fmt("attributed (sum)", self.attributed()));
+        let unattributed = self.total.saturating_sub(self.attributed());
+        out.push_str(&fmt("unattributed (host overhead)", unattributed));
+        out
+    }
+}
+
+/// Wrap `$body` with `Instant::now()` bracketing IFF `$profile` is `Some`,
+/// adding the elapsed time to `$profile.$field`. When `$profile` is `None`,
+/// the body runs without any timing overhead (zero-cost-when-disabled).
+///
+/// Designed for use inside `run_one_iter` so the same loop body serves both
+/// `run()` (profile = None) and `run_profiled()` (profile = Some).
+macro_rules! time_stage {
+    ($profile:expr, $field:ident, $body:expr) => {{
+        if let Some(p) = $profile.as_deref_mut() {
+            let __t = std::time::Instant::now();
+            let __r = $body;
+            p.$field += __t.elapsed();
+            __r
+        } else {
+            $body
+        }
+    }};
+}
 
 const UNUSED: u32 = u32::MAX;
 
@@ -197,6 +344,20 @@ pub struct MetalFlopStartSolver {
     turn_deck: Vec<u8>,
     river_decks: Vec<Vec<u8>>,
 
+    // ─── Step 2.B.1: DiskBacked river persistence (foundation) ───
+    // Mirror of CPU's RiverPersistenceMode + river_files. See GpuRiverMode
+    // docstring at top of this file. In InMemory (default), gpu_river_files
+    // is None and load/save_river_pair_gpu are no-ops. In DiskBacked, the
+    // files hold the persistent per-pair state and load/save round-trip
+    // them into the in-place buffer slots.
+    gpu_river_mode: GpuRiverMode,
+    gpu_river_files: Option<(std::fs::File, std::fs::File)>,
+    /// Tracks which (ti, ri) pair is currently loaded into the river region
+    /// of d_regrets/d_cum_strategy. Used by `save_river_pair_gpu` as a
+    /// debug-only assertion that the caller is saving the same pair they
+    /// loaded.
+    gpu_current_river_pair: Option<(usize, usize)>,
+
     // Zone nodes per level for reach computation (flat lists filtered by zone)
     flop_zone_nodes_flat: Vec<MetalBuffer<u32>>,
     turn_zone_nodes_flat: Vec<MetalBuffer<u32>>,
@@ -264,28 +425,26 @@ impl MetalFlopStartSolver {
         let d_river_decision_ids = MetalBuffer::from_slice(device, &river_ids);
         let d_river_infoset_offsets = MetalBuffer::from_slice(device, &river_offs);
 
-        // Solver state
-        let d_regrets = {
-            let mut buf = Vec::with_capacity(flop_stride + turn_total + river_total);
-            buf.extend_from_slice(cpu_solver.regrets_flop());
-            buf.extend_from_slice(cpu_solver.regrets_turn());
-            buf.extend_from_slice(cpu_solver.regrets_river());
-            MetalBuffer::from_slice(device, &buf)
-        };
-        let d_strategy = {
-            let mut buf = Vec::with_capacity(flop_stride + turn_total + river_total);
-            buf.extend_from_slice(cpu_solver.strategy_flop());
-            buf.extend_from_slice(cpu_solver.strategy_turn());
-            buf.extend_from_slice(cpu_solver.strategy_river());
-            MetalBuffer::from_slice(device, &buf)
-        };
-        let d_cum_strategy = {
-            let mut buf = Vec::with_capacity(flop_stride + turn_total + river_total);
-            buf.extend_from_slice(cpu_solver.cum_strategy_flop());
-            buf.extend_from_slice(cpu_solver.cum_strategy_turn());
-            buf.extend_from_slice(cpu_solver.cum_strategy_river());
-            MetalBuffer::from_slice(device, &buf)
-        };
+        // Solver state.
+        //
+        // GPU IS INDEPENDENT OF CPU (architecture: CPU as lossless reference,
+        // GPU as production, each running its own complete solve, validated
+        // by parity comparison — no CPU→GPU data crossing the boundary).
+        //
+        // The three solver state buffers are zero-initialized. Justification:
+        //   - d_regrets: at iter-0 CFR all regrets are zero. After iter-0 the
+        //     GPU updates regrets in-place; the init value isn't transported
+        //     from CPU.
+        //   - d_strategy: derived from regrets. The GPU run loop begins each
+        //     iter with compute_all_strategies(ctx) which overwrites every
+        //     slot before any read. Disturbance verified 2026-06-05: NaN
+        //     init produced iter-0 max_rel=0.00% divergence vs CPU and
+        //     identical iter-99 exploitability (0.037445 GPU vs 0.037472 CPU).
+        //   - d_cum_strategy: at iter-0 zero, accumulated in-place by GPU
+        //     across iters. Init value not transported from CPU.
+        let d_regrets = MetalBuffer::zeros(device, flop_stride + turn_total + river_total);
+        let d_strategy = MetalBuffer::zeros(device, flop_stride + turn_total + river_total);
+        let d_cum_strategy = MetalBuffer::zeros(device, flop_stride + turn_total + river_total);
         let d_reach = MetalBuffer::zeros(device, nn * np as usize * nh);
         let d_turn_reach = MetalBuffer::zeros(device, nn * np as usize * nh);
         let d_river_reach = MetalBuffer::zeros(device, nn * np as usize * nh);
@@ -480,7 +639,250 @@ impl MetalFlopStartSolver {
             flop_zone_nodes_flat: vec![],
             turn_zone_nodes_flat: vec![],
             river_zone_nodes_flat: vec![],
+            // Step 2.B.1: default InMemory; promote via into_disk_backed_gpu().
+            gpu_river_mode: GpuRiverMode::InMemory,
+            gpu_river_files: None,
+            gpu_current_river_pair: None,
         }
+    }
+
+    // ─── Step 2.B.1: DiskBacked river persistence (foundation) ───
+    //
+    // Mirror of CPU's into_disk_backed + load_river_pair + save_river_pair.
+    // File format is bit-compatible with CPU's: f32 little-endian, offset
+    // `(ti * max_river + ri) * river_stride * 4` bytes per pair, total file
+    // size `n_turn * max_river * river_stride * 4` bytes.
+    //
+    // Step 2.B.1 keeps the GPU river buffers full-sized — load/save round-
+    // trip the in-place per-pair slot. Step 2.B.2 will shrink to a single
+    // scratch slot and change kernel dispatch offsets accordingly.
+
+    pub fn gpu_river_mode(&self) -> &GpuRiverMode { &self.gpu_river_mode }
+    // max_river() defined further below; not duplicating here.
+    pub fn river_offset(&self) -> usize { self.river_offset }
+    pub fn river_stride(&self) -> usize { self.river_stride }
+
+    /// Returns the buffer outcome index for river kernel dispatches.
+    ///
+    /// In InMemory mode the river region of d_regrets / d_strategy /
+    /// d_cum_strategy holds all (ti, ri) pairs at
+    /// `river_offset + outcome_idx * river_stride` — return
+    /// `ti * max_river + ri`.
+    ///
+    /// In DiskBacked mode the river region acts as a single scratch slot
+    /// holding only the currently-loaded (ti, ri) pair, so every river
+    /// kernel must address slot 0 — return 0. The caller is responsible
+    /// for invoking `load_river_pair_gpu(ti, ri)` before any kernel reads
+    /// the scratch and `save_river_pair_gpu(ti, ri)` after any kernel
+    /// writes it.
+    ///
+    /// CONSOLIDATION PRINCIPLE: this is the single source of truth for
+    /// the river-buffer outcome index across modes. Every site that
+    /// previously computed `ti * self.max_river + ri` for river-buffer
+    /// addressing now calls this method instead. An offset bug now
+    /// surfaces at EVERY dispatch site simultaneously rather than
+    /// quietly at one — loud-everywhere instead of quiet-at-one-site.
+    ///
+    /// Note: this returns the kernel/buffer outcome index, NOT the file
+    /// offset. File offsets in load/save_river_pair_gpu always use
+    /// `ti * max_river + ri` because the file holds all pairs.
+    #[inline]
+    pub fn river_outcome_idx(&self, ti: usize, ri: usize) -> usize {
+        match self.gpu_river_mode {
+            GpuRiverMode::InMemory => ti * self.max_river + ri,
+            GpuRiverMode::DiskBacked { .. } => 0,
+        }
+    }
+
+    /// Convert this solver from `InMemory` to `DiskBacked`. Creates the
+    /// two persistence files (sized to hold the full river state), seeds
+    /// them with the current in-buffer river state, then SHRINKS the
+    /// d_regrets / d_strategy / d_cum_strategy GPU buffers so their river
+    /// region holds only `river_stride` (a single scratch slot for the
+    /// currently-loaded pair). This is the load-bearing optimization for
+    /// production scale: at HU OptB nh=1176 the river region drops from
+    /// 175 GB to 76 MB per buffer.
+    ///
+    /// SHRINK SAFETY (per the audit-arc discipline): the buffer shrink
+    /// is potentially-bug-exposing — any code path that secretly
+    /// addresses river-region slots beyond slot 0 in DiskBacked will now
+    /// access OOB. The discriminator is the 2.B.2 bit-exact parity gate
+    /// (`p1_5_4_step2b2_disk_backed_gpu_bit_exact_parity`), which is
+    /// re-run after this slice. If a kernel was reading slot 1+ in
+    /// DiskBacked, the OOB now produces nondeterministic f32 → parity
+    /// mismatch → test fails loudly. The shrink is not assumed safe; it
+    /// is VALIDATED by the gate.
+    pub fn into_disk_backed_gpu<P: AsRef<std::path::Path>>(
+        &mut self,
+        ctx: &MetalContext,
+        regrets_path: P,
+        cum_strategy_path: P,
+    ) -> std::io::Result<()> {
+        use std::fs::OpenOptions;
+        use std::io::{Seek, SeekFrom, Write};
+
+        assert!(
+            matches!(self.gpu_river_mode, GpuRiverMode::InMemory),
+            "into_disk_backed_gpu called on a solver already in DiskBacked mode"
+        );
+
+        let regrets_path = regrets_path.as_ref().to_path_buf();
+        let cum_strategy_path = cum_strategy_path.as_ref().to_path_buf();
+
+        // Full-size file (holds all (ti, ri) pairs).
+        let total_bytes = (self.n_turn * self.max_river * self.river_stride
+            * std::mem::size_of::<f32>()) as u64;
+
+        let mut regrets_file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(&regrets_path)?;
+        let mut cum_strategy_file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(&cum_strategy_path)?;
+
+        regrets_file.set_len(total_bytes)?;
+        cum_strategy_file.set_len(total_bytes)?;
+
+        // Seed both files with the current FULL in-buffer river state.
+        // This preserves any per-pair state from prior iters and seeds the
+        // (zero) starting state at iter 0. Done BEFORE the shrink (we
+        // still have access to all per-pair data here).
+        regrets_file.seek(SeekFrom::Start(0))?;
+        let river_byte_off = self.river_offset * std::mem::size_of::<f32>();
+        let river_byte_len = self.n_turn * self.max_river * self.river_stride
+            * std::mem::size_of::<f32>();
+        let regrets_bytes = unsafe {
+            let p = self.d_regrets.as_slice().as_ptr() as *const u8;
+            std::slice::from_raw_parts(p.add(river_byte_off), river_byte_len)
+        };
+        regrets_file.write_all(regrets_bytes)?;
+        regrets_file.flush()?;
+
+        cum_strategy_file.seek(SeekFrom::Start(0))?;
+        let cum_bytes = unsafe {
+            let p = self.d_cum_strategy.as_slice().as_ptr() as *const u8;
+            std::slice::from_raw_parts(p.add(river_byte_off), river_byte_len)
+        };
+        cum_strategy_file.write_all(cum_bytes)?;
+        cum_strategy_file.flush()?;
+
+        // ──── SHRINK: reallocate d_regrets, d_strategy, d_cum_strategy
+        //              at (flop_stride + turn_total + river_stride). The
+        //              river region beyond slot 0 is no longer addressable;
+        //              any kernel that secretly accesses it will now go OOB.
+        //
+        // The mode field must be flipped BEFORE the shrink so that
+        // `river_outcome_idx` returns 0 from this point on. The kernels
+        // we just shrunk for already use the helper, so they're correct.
+        // Subsequent calls follow the DiskBacked code path.
+        self.gpu_river_mode = GpuRiverMode::DiskBacked {
+            regrets_path,
+            cum_strategy_path,
+        };
+        self.gpu_river_files = Some((regrets_file, cum_strategy_file));
+        self.gpu_current_river_pair = None;
+
+        let device = ctx.device();
+        let new_size = self.flop_stride + self.turn_total + self.river_stride;
+
+        // Allocate new buffers; copy flop+turn region from old to new.
+        // Slot 0 of the new river region stays zeros — first
+        // `load_river_pair_gpu` will populate it from the file.
+        let mut new_regrets = MetalBuffer::<f32>::zeros(device, new_size);
+        let mut new_strategy = MetalBuffer::<f32>::zeros(device, new_size);
+        let mut new_cum_strategy = MetalBuffer::<f32>::zeros(device, new_size);
+        new_regrets.as_mut_slice()[..self.river_offset]
+            .copy_from_slice(&self.d_regrets.as_slice()[..self.river_offset]);
+        new_strategy.as_mut_slice()[..self.river_offset]
+            .copy_from_slice(&self.d_strategy.as_slice()[..self.river_offset]);
+        new_cum_strategy.as_mut_slice()[..self.river_offset]
+            .copy_from_slice(&self.d_cum_strategy.as_slice()[..self.river_offset]);
+
+        // Replace. Old buffers drop here.
+        self.d_regrets = new_regrets;
+        self.d_strategy = new_strategy;
+        self.d_cum_strategy = new_cum_strategy;
+
+        Ok(())
+    }
+
+    /// Load the (ti, ri) slice of regrets and cum_strategy from disk
+    /// into the in-buffer river slot. No-op in InMemory.
+    ///
+    /// Buffer slot uses `river_outcome_idx(ti, ri)` (0 in DiskBacked —
+    /// the scratch). File offset uses `ti * max_river + ri` regardless
+    /// of mode because the file holds all pairs at canonical offsets.
+    pub fn load_river_pair_gpu(&mut self, ti: usize, ri: usize) -> std::io::Result<()> {
+        if !matches!(self.gpu_river_mode, GpuRiverMode::DiskBacked { .. }) {
+            return Ok(());
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        let stride = self.river_stride;
+        let buf_off = self.river_offset + self.river_outcome_idx(ti, ri) * stride;
+        let file_off = ((ti * self.max_river + ri) * stride
+            * std::mem::size_of::<f32>()) as u64;
+        let byte_len = stride * std::mem::size_of::<f32>();
+
+        let (rf, cf) = self.gpu_river_files.as_mut()
+            .expect("DiskBacked mode requires gpu_river_files");
+
+        rf.seek(SeekFrom::Start(file_off))?;
+        let regrets_bytes = unsafe {
+            let p = self.d_regrets.as_mut_slice().as_mut_ptr() as *mut u8;
+            std::slice::from_raw_parts_mut(p.add(buf_off * std::mem::size_of::<f32>()), byte_len)
+        };
+        rf.read_exact(regrets_bytes)?;
+
+        cf.seek(SeekFrom::Start(file_off))?;
+        let cum_bytes = unsafe {
+            let p = self.d_cum_strategy.as_mut_slice().as_mut_ptr() as *mut u8;
+            std::slice::from_raw_parts_mut(p.add(buf_off * std::mem::size_of::<f32>()), byte_len)
+        };
+        cf.read_exact(cum_bytes)?;
+
+        self.gpu_current_river_pair = Some((ti, ri));
+        Ok(())
+    }
+
+    /// Save the (ti, ri) slice of regrets and cum_strategy from the
+    /// in-buffer river slot to disk. No-op in InMemory.
+    ///
+    /// Buffer slot uses `river_outcome_idx(ti, ri)`; file offset uses
+    /// `ti * max_river + ri`. See `river_outcome_idx` for the consolidation
+    /// rationale.
+    pub fn save_river_pair_gpu(&mut self, ti: usize, ri: usize) -> std::io::Result<()> {
+        if !matches!(self.gpu_river_mode, GpuRiverMode::DiskBacked { .. }) {
+            return Ok(());
+        }
+        use std::io::{Seek, SeekFrom, Write};
+        debug_assert_eq!(self.gpu_current_river_pair, Some((ti, ri)),
+            "save_river_pair_gpu({}, {}) called but current loaded pair is {:?}",
+            ti, ri, self.gpu_current_river_pair);
+
+        let stride = self.river_stride;
+        let buf_off = self.river_offset + self.river_outcome_idx(ti, ri) * stride;
+        let file_off = ((ti * self.max_river + ri) * stride
+            * std::mem::size_of::<f32>()) as u64;
+        let byte_len = stride * std::mem::size_of::<f32>();
+
+        let (rf, cf) = self.gpu_river_files.as_mut()
+            .expect("DiskBacked mode requires gpu_river_files");
+
+        rf.seek(SeekFrom::Start(file_off))?;
+        let regrets_bytes = unsafe {
+            let p = self.d_regrets.as_slice().as_ptr() as *const u8;
+            std::slice::from_raw_parts(p.add(buf_off * std::mem::size_of::<f32>()), byte_len)
+        };
+        rf.write_all(regrets_bytes)?;
+
+        cf.seek(SeekFrom::Start(file_off))?;
+        let cum_bytes = unsafe {
+            let p = self.d_cum_strategy.as_slice().as_ptr() as *const u8;
+            std::slice::from_raw_parts(p.add(buf_off * std::mem::size_of::<f32>()), byte_len)
+        };
+        cf.write_all(cum_bytes)?;
+
+        Ok(())
     }
 
     /// Debug: run one traverser pass on GPU and return intermediate CFVs.
@@ -597,66 +999,163 @@ impl MetalFlopStartSolver {
         game: &FlopStartGame,
         num_iterations: u32,
     ) {
-        let np = self.num_players as usize;
-        let nh = self.nh;
-        let nn = self.nn;
-
         for _ in 0..num_iterations {
-            let params = DcfrParams::new(self.iteration);
-            self.iteration += 1;
+            self.run_one_iter(ctx, tree, game, None);
+        }
+    }
 
-            for traverser in 0..np {
-                // Sequential: recompute strategies before each traverser
+    /// Profiled variant of `run()`. Returns a `StageProfile` accumulating
+    /// per-stage wall-clock across all `num_iterations`. Use this in
+    /// performance tests instead of duplicating the run loop with bespoke
+    /// `Instant::now()` bracketing — the duplicated loops drift whenever
+    /// the production `run()` is refactored. (Phase 0.C / Slice 7a tests
+    /// previously did exactly that; 2.C formalizes the timing surface.)
+    ///
+    /// Overhead: per-stage `Instant::now()` calls add ~30 ns each on Apple
+    /// Silicon. Negligible for diagnostic runs; not for hot-path production
+    /// (use plain `run()` there).
+    pub fn run_profiled(
+        &mut self,
+        ctx: &MetalContext,
+        tree: &FlatTree,
+        game: &FlopStartGame,
+        num_iterations: u32,
+    ) -> StageProfile {
+        let mut profile = StageProfile::default();
+        let t_total = Instant::now();
+        for _ in 0..num_iterations {
+            self.run_one_iter(ctx, tree, game, Some(&mut profile));
+        }
+        profile.total = t_total.elapsed();
+        profile
+    }
+
+    /// Body of a single CFR iter — shared between `run()` (profile = None,
+    /// zero-cost) and `run_profiled()` (profile = Some, per-stage timing
+    /// via the `time_stage!` macro).
+    ///
+    /// The structure mirrors the original `run()` loop body verbatim;
+    /// only the timing wrappers are new. Adding a stage means adding a
+    /// field to `StageProfile` and wrapping the call site in
+    /// `time_stage!(profile, new_field, { ... });`.
+    fn run_one_iter(
+        &mut self,
+        ctx: &MetalContext,
+        _tree: &FlatTree,
+        _game: &FlopStartGame,
+        mut profile: Option<&mut StageProfile>,
+    ) {
+        let np = self.num_players as usize;
+        let params = DcfrParams::new(self.iteration);
+        self.iteration += 1;
+
+        for traverser in 0..np {
+            // Sequential: recompute strategies before each traverser
+            time_stage!(profile, compute_strategies, {
                 self.compute_all_strategies(ctx);
+            });
 
-                // Flop zone reach
+            // Flop zone reach
+            time_stage!(profile, compute_reach_flop, {
                 self.compute_reach_flop(ctx);
+            });
 
-                // Zero main CFV (flop_cfv in CPU) for this traverser
+            // Zero main CFV (flop_cfv in CPU) and turn CFV batch for this traverser
+            time_stage!(profile, zero_buffer_total, {
                 self.zero_buffer_name(ctx, 100);
-
-                // Zero turn CFV batch
                 self.zero_buffer_name(ctx, 2);
+            });
 
-                // Per turn card: river → turn pipeline
-                for ti in 0..self.n_turn {
-                    let n_river = self.river_outcomes_per_turn[ti];
+            // Per turn card: river → turn pipeline
+            //
+            // 2.B.2: the per-(ti, ri) inner block branches on
+            // `gpu_river_mode`. InMemory uses the original flow (strategy
+            // already populated by `compute_all_strategies`'s batched call).
+            // DiskBacked brackets each pair with load/save and computes
+            // the per-pair strategy from the just-loaded regrets via
+            // `compute_river_strategy_pair`. The kernel-dispatch offsets
+            // are routed through `river_outcome_idx`, so the kernels are
+            // identical across modes; only the buffer slot differs (full
+            // per-pair vs scratch).
+            let is_disk_backed = matches!(self.gpu_river_mode, GpuRiverMode::DiskBacked { .. });
+            for ti in 0..self.n_turn {
+                let n_river = self.river_outcomes_per_turn[ti];
 
-                    // Zero river CFV batch and accum
+                // Zero river CFV batch and accum
+                time_stage!(profile, zero_buffer_total, {
                     self.zero_buffer_name(ctx, 0);
                     self.zero_buffer_name(ctx, 1);
+                });
 
-                    // Compute turn reach for this tc
+                // Compute turn reach for this tc
+                time_stage!(profile, compute_reach_turn, {
                     self.compute_reach_turn(ctx, ti);
+                });
 
-                    // River zone: per river card
-                    for ri in 0..n_river {
-                        // Compute river reach for this (tc, rc)
-                        self.compute_reach_river(ctx, ti, ri);
-
-                        // Bottom-up river zone (single outcome: ri)
-                        self.bottom_up_river(ctx, ti, ri, traverser as u32, &params);
+                // River zone: per river card
+                for ri in 0..n_river {
+                    if is_disk_backed {
+                        // DiskBacked: cycle the scratch through file I/O.
+                        time_stage!(profile, load_river_pair, {
+                            self.load_river_pair_gpu(ti, ri)
+                                .expect("load_river_pair_gpu in run_one_iter");
+                        });
+                        // Per-pair river strategy from freshly-loaded regrets.
+                        time_stage!(profile, compute_river_strategy_pair, {
+                            self.compute_river_strategy_pair(ctx, ti, ri);
+                        });
                     }
 
-                    // Chance accumulate: weight river CFVs by chance probability → river_accum
-                    self.chance_accumulate_river(ctx, ti, n_river);
+                    // Compute river reach for this (tc, rc)
+                    time_stage!(profile, compute_reach_river, {
+                        self.compute_reach_river(ctx, ti, ri);
+                    });
 
-                    // Chance finalize: copy river_accum into turn CFV batch at river chance children
-                    self.chance_finalize_river(ctx, ti);
+                    // Bottom-up river zone (single outcome: ri)
+                    time_stage!(profile, bottom_up_river, {
+                        self.bottom_up_river(ctx, ti, ri, traverser as u32, &params);
+                    });
 
-                    // Bottom-up turn zone for this turn card
-                    self.bottom_up_turn(ctx, ti, traverser as u32, &params);
+                    if is_disk_backed {
+                        // Persist the per-pair mutations (regrets + cum) back
+                        // to file before the next pair overwrites the scratch.
+                        time_stage!(profile, save_river_pair, {
+                            self.save_river_pair_gpu(ti, ri)
+                                .expect("save_river_pair_gpu in run_one_iter");
+                        });
+                    }
                 }
 
-                // Chance accumulate turn: weight turn CFV batch by turn chance probability
-                self.chance_accumulate_turn(ctx);
+                // Chance accumulate: weight river CFVs by chance probability → river_accum
+                time_stage!(profile, chance_accumulate_river, {
+                    self.chance_accumulate_river(ctx, ti, n_river);
+                });
 
-                // Chance finalize turn: sum into main CFV at turn chance children
-                self.chance_finalize_turn(ctx);
+                // Chance finalize: copy river_accum into turn CFV batch at river chance children
+                time_stage!(profile, chance_finalize_river, {
+                    self.chance_finalize_river(ctx, ti);
+                });
 
-                // Bottom-up flop zone
-                self.bottom_up_flop(ctx, traverser as u32, &params);
+                // Bottom-up turn zone for this turn card
+                time_stage!(profile, bottom_up_turn, {
+                    self.bottom_up_turn(ctx, ti, traverser as u32, &params);
+                });
             }
+
+            // Chance accumulate turn: weight turn CFV batch by turn chance probability
+            time_stage!(profile, chance_accumulate_turn, {
+                self.chance_accumulate_turn(ctx);
+            });
+
+            // Chance finalize turn: sum into main CFV at turn chance children
+            time_stage!(profile, chance_finalize_turn, {
+                self.chance_finalize_turn(ctx);
+            });
+
+            // Bottom-up flop zone
+            time_stage!(profile, bottom_up_flop, {
+                self.bottom_up_flop(ctx, traverser as u32, &params);
+            });
         }
     }
 
@@ -853,8 +1352,11 @@ impl MetalFlopStartSolver {
         self.launch_seed_reach(ctx, &self.d_river_reach, &self.d_turn_reach,
                                &self.d_river_chance_children, cc_count, np_nh);
 
-        // Top-down through river zone using river[ti*max_river+ri] strategy
-        let outcome_idx = ti * self.max_river + ri;
+        // Top-down through river zone using strategy at the kernel-buffer
+        // outcome slot. In DiskBacked, `river_outcome_idx` returns 0 (the
+        // scratch); the caller must have loaded (ti, ri) into the scratch
+        // first via `load_river_pair_gpu`.
+        let outcome_idx = self.river_outcome_idx(ti, ri);
         let strat_byte_offset = ((self.river_offset + outcome_idx * self.river_stride) * 4) as u64;
         for level in 0..=self.max_depth {
             let count = self.river_zone_counts[level];
@@ -878,40 +1380,76 @@ impl MetalFlopStartSolver {
         let cfv_batch_stride = nn * nh;
         let sorted_opp_stride = num_opp * nh;
 
-        let outcome_idx = ti * self.max_river + ri;
-
-        // Byte offsets into contiguous strategy/regret/cum buffers
+        let outcome_idx = self.river_outcome_idx(ti, ri);
         let strat_byte_off = (self.river_offset + outcome_idx * self.river_stride) * 4;
         let regret_byte_off = (self.river_offset + outcome_idx * self.river_stride) * 4;
         let cum_byte_off = (self.river_offset + outcome_idx * self.river_stride) * 4;
         let cfv_byte_off = ri * nn * nh * 4;
-
-        // Sorted array offsets: table uses tc_card * 52 + rc_card indexing
         let tc_card = self.turn_deck[ti] as usize;
         let rc_card = self.river_decks[tc_card][ri] as usize;
-        let sos_byte_off = ((tc_card * 52 + rc_card) * num_opp * nh) * 2; // u16 = 2 bytes
+        let sos_byte_off = ((tc_card * 52 + rc_card) * num_opp * nh) * 2;
         let sps_byte_off = ((tc_card * 52 + rc_card) * num_opp * nh) * 2;
-        let prob_byte_off = ((ti * self.max_river + ri) * nh) * 4; // f32 = 4 bytes
+        let prob_byte_off = ((ti * self.max_river + ri) * nh) * 4;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct BParams {
+            level_count: i32, num_outcomes: i32, cfv_batch_stride: i32,
+            sorted_opp_stride: i32, num_players: i32, nh: i32,
+            traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
+            regret_floor: f32, starting_pot: i32, num_combinations: f32,
+            regret_outcome_stride: i32, cum_outcome_stride: i32,
+            pruning_enabled: i32, pruning_threshold: f32,
+            iteration: i32, pruning_stride: i32, board_state: i32,
+            rake_rate: f32, rake_cap: f32,
+        }
+
+        // #117 FIX B (per-level wait elimination): encode ALL levels'
+        // dispatches into a SINGLE command buffer with a SINGLE wait at the
+        // end. Metal's command-buffer ordering preserves intra-buffer
+        // sequencing: dispatch N+1 sees the results of dispatch N within
+        // the same buffer (compute encoder dependency tracking handles this).
+        // Pre-fix: 1 cmd buffer + 1 wait per level (~10 levels per pair ×
+        // 2162 pairs = ~20k CPU↔GPU round trips per iter at production).
+        // Post-fix: 1 cmd buffer + 1 wait per pair.
+        //
+        // PARAMS NOTE: per-level params previously uploaded via
+        // self.upload_params(&bp) which writes to a shared params buffer.
+        // Since multiple levels' kernels read this buffer at different
+        // GPU-time points within the same cmd buffer, we'd race on the
+        // shared params slot. Fix by uploading each level's params to a
+        // per-level offset in a larger params staging buffer... but that
+        // requires a buffer refactor. SIMPLER FIRST CUT: only the
+        // level_count varies per level; everything else is constant per
+        // bottom_up_river call. If we can encode level_count as a
+        // function-constant or via a per-level small uniform, the shared
+        // params buffer holds the constant fields. For now, since
+        // level_count is the only varying field and the kernel uses it
+        // for the work-divisor (outcome = idx / level_count), we need
+        // per-level. Push this through via PER-LEVEL params buffer
+        // allocation; tiny cost, eliminates the race.
+        //
+        // SIMPLEST CORRECT IMPL: collect all dispatches into one cmd
+        // buffer using SEPARATE compute encoders, each with its own
+        // upload_params call. Each encoder's params upload happens at
+        // encode-time (host side, sequential). The GPU then reads the
+        // current params-buffer contents at dispatch time. PROBLEM:
+        // each encoder may execute on GPU after later encoders have
+        // overwritten the params buffer. RACE.
+        //
+        // CORRECT FIX: upload params for ALL levels FIRST (to per-level
+        // slots in a staging buffer), then encode dispatches that read
+        // from the per-level offsets. For this first cut, fall back to
+        // per-level command buffer commit (no wait) — Metal queues them
+        // and GPU runs them in order, but CPU doesn't block. Wait only
+        // at the end (single waitUntilCompleted on the LAST cmd buffer).
+        let mut last_cmd: Option<&metal::CommandBufferRef> = None;
 
         for level in (0..=self.max_depth).rev() {
             let count = self.river_zone_counts[level];
             if count == 0 { continue; }
             let ln = self.d_river_zone_nodes[level].as_ref().unwrap();
 
-            #[repr(C)]
-            #[derive(Clone, Copy)]
-            struct BParams {
-                level_count: i32, num_outcomes: i32, cfv_batch_stride: i32,
-                sorted_opp_stride: i32, num_players: i32, nh: i32,
-                traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
-                regret_floor: f32, starting_pot: i32, num_combinations: f32,
-                regret_outcome_stride: i32, cum_outcome_stride: i32,
-                // ─── Phase 1.A pruning (Option A) ───
-                pruning_enabled: i32, pruning_threshold: f32,
-                iteration: i32, pruning_stride: i32, board_state: i32,
-                // ─── Slice 2 rake (CPU↔Metal parity) ───
-                rake_rate: f32, rake_cap: f32,
-            }
             let bp = BParams {
                 level_count: count as i32,
                 num_outcomes: 1,
@@ -928,28 +1466,28 @@ impl MetalFlopStartSolver {
                 num_combinations: self.num_combinations,
                 regret_outcome_stride: self.river_stride as i32,
                 cum_outcome_stride: self.river_stride as i32,
-                // Phase 1.A pruning (river: board_state=2 → kernel never prunes river anyway)
                 pruning_enabled: if self.pruning_enabled { 1 } else { 0 },
                 pruning_threshold: self.pruning_threshold,
                 iteration: self.iteration as i32,
                 pruning_stride: self.pruning_stride as i32,
-                board_state: 2,  // RIVER
+                board_state: 2,
                 rake_rate: self.rake_rate,
                 rake_cap: self.rake_cap,
             };
-            self.upload_params(&bp);
-            let params_buf = unsafe { (*self.d_params_buf.get()).as_ref() };
-
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.batched_pipeline);
             enc.set_buffer(0, Some(ln.as_ref()), 0);
-            enc.set_buffer(1, Some(params_buf), 0);
+            // #117 FIX B race-fix: use set_bytes to inline params per-encoder.
+            // The shared d_params_buf gets overwritten between commit and GPU
+            // execution if we don't wait; set_bytes copies the data into the
+            // command buffer at encode time, eliminating the race.
+            let bp_bytes = &bp as *const BParams as *const std::ffi::c_void;
+            enc.set_bytes(1, std::mem::size_of::<BParams>() as u64, bp_bytes);
             enc.set_buffer(2, Some(self.d_nodes.as_ref()), 0);
             enc.set_buffer(3, Some(self.d_children.as_ref()), 0);
             enc.set_buffer(4, Some(self.d_contributions.as_ref()), 0);
             enc.set_buffer(5, Some(self.d_folded_masks.as_ref()), 0);
-            // Strategy/Cumul/Regrets with per-outcome byte offset
             enc.set_buffer(6, Some(self.d_strategy.as_ref()), strat_byte_off as u64);
             enc.set_buffer(7, Some(self.d_infoset_offsets.as_ref()), 0);
             enc.set_buffer(8, Some(self.d_river_reach.as_ref()), 0);
@@ -964,14 +1502,22 @@ impl MetalFlopStartSolver {
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
             enc.set_buffer(18, Some(self.d_river_board_mask.as_ref()), prob_byte_off as u64);
             enc.set_buffer(19, Some(self.d_debug_out.as_ref()), 0);
-            // Step 5 chokepoint instrumentation marker (river dispatch).
             enc.set_buffer(20, Some(self.d_rake_marker.as_ref()), 0);
 
-            let grid_size = metal::MTLSize { width: count as u64, height: 1, depth: 1 };
-            let tg_size = metal::MTLSize { width: 1, height: 1, depth: 1 };
+            let tg_width: u64 = 32;
+            let n_groups: u64 = (count as u64 + tg_width - 1) / tg_width;
+            let grid_size = metal::MTLSize { width: n_groups, height: 1, depth: 1 };
+            let tg_size = metal::MTLSize { width: tg_width, height: 1, depth: 1 };
             enc.dispatch_thread_groups(grid_size, tg_size);
             enc.end_encoding();
-            cmd.commit();
+            cmd.commit();  // commit but DON'T wait — GPU queues sequentially
+            last_cmd = Some(cmd);
+        }
+
+        // Wait only on the LAST committed command buffer. Metal serializes
+        // command-buffer execution within a queue, so waiting on the last one
+        // waits for all prior ones to complete.
+        if let Some(cmd) = last_cmd {
             cmd.wait_until_completed();
         }
     }
@@ -994,25 +1540,27 @@ impl MetalFlopStartSolver {
         let sos_byte_off = (tc_card * num_opp * nh) * 2;
         let sps_byte_off = (tc_card * num_opp * nh) * 2;
 
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct BParams {
+            level_count: i32, num_outcomes: i32, cfv_batch_stride: i32,
+            sorted_opp_stride: i32, num_players: i32, nh: i32,
+            traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
+            regret_floor: f32, starting_pot: i32, num_combinations: f32,
+            regret_outcome_stride: i32, cum_outcome_stride: i32,
+            pruning_enabled: i32, pruning_threshold: f32,
+            iteration: i32, pruning_stride: i32, board_state: i32,
+            rake_rate: f32, rake_cap: f32,
+        }
+
+        // #117 Fix A+B applied to turn (mirror of bottom_up_river fix).
+        let mut last_cmd: Option<&metal::CommandBufferRef> = None;
+
         for level in (0..=self.max_depth).rev() {
             let count = self.turn_zone_counts[level];
             if count == 0 { continue; }
             let ln = self.d_turn_zone_nodes[level].as_ref().unwrap();
 
-            #[repr(C)]
-            #[derive(Clone, Copy)]
-            struct BParams {
-                level_count: i32, num_outcomes: i32, cfv_batch_stride: i32,
-                sorted_opp_stride: i32, num_players: i32, nh: i32,
-                traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
-                regret_floor: f32, starting_pot: i32, num_combinations: f32,
-                regret_outcome_stride: i32, cum_outcome_stride: i32,
-                // ─── Phase 1.A pruning (Option A) ───
-                pruning_enabled: i32, pruning_threshold: f32,
-                iteration: i32, pruning_stride: i32, board_state: i32,
-                // ─── Slice 2 rake (CPU↔Metal parity) ───
-                rake_rate: f32, rake_cap: f32,
-            }
             let bp = BParams {
                 level_count: count as i32,
                 num_outcomes: 1,
@@ -1029,23 +1577,21 @@ impl MetalFlopStartSolver {
                 num_combinations: self.num_combinations,
                 regret_outcome_stride: self.turn_stride as i32,
                 cum_outcome_stride: self.turn_stride as i32,
-                // Phase 1.A pruning (turn: board_state=1)
                 pruning_enabled: if self.pruning_enabled { 1 } else { 0 },
                 pruning_threshold: self.pruning_threshold,
                 iteration: self.iteration as i32,
                 pruning_stride: self.pruning_stride as i32,
-                board_state: 1,  // TURN
+                board_state: 1,
                 rake_rate: self.rake_rate,
                 rake_cap: self.rake_cap,
             };
-            self.upload_params(&bp);
-            let params_buf = unsafe { (*self.d_params_buf.get()).as_ref() };
 
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.batched_pipeline);
             enc.set_buffer(0, Some(ln.as_ref()), 0);
-            enc.set_buffer(1, Some(params_buf), 0);
+            let bp_bytes = &bp as *const BParams as *const std::ffi::c_void;
+            enc.set_bytes(1, std::mem::size_of::<BParams>() as u64, bp_bytes);
             enc.set_buffer(2, Some(self.d_nodes.as_ref()), 0);
             enc.set_buffer(3, Some(self.d_children.as_ref()), 0);
             enc.set_buffer(4, Some(self.d_contributions.as_ref()), 0);
@@ -1063,43 +1609,45 @@ impl MetalFlopStartSolver {
             enc.set_buffer(16, Some(self.d_turn_pl_idx.as_ref()), sps_byte_off as u64);
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
             enc.set_buffer(18, Some(self.d_turn_chance_prob.as_ref()), (ti * nh * 4) as u64);
-            // debug_out at buffer(19) — bind to debug buffer for completeness
-            // (turn dispatch did not previously bind this, but adding rake_marker
-            // at buffer(20) means we need 19 bound too for Metal to validate).
             enc.set_buffer(19, Some(self.d_debug_out.as_ref()), 0);
-            // Step 5 chokepoint instrumentation marker (turn dispatch).
             enc.set_buffer(20, Some(self.d_rake_marker.as_ref()), 0);
 
-            let grid_size = metal::MTLSize { width: count as u64, height: 1, depth: 1 };
-            let tg_size = metal::MTLSize { width: 1, height: 1, depth: 1 };
+            let tg_width: u64 = 32;
+            let n_groups: u64 = (count as u64 + tg_width - 1) / tg_width;
+            let grid_size = metal::MTLSize { width: n_groups, height: 1, depth: 1 };
+            let tg_size = metal::MTLSize { width: tg_width, height: 1, depth: 1 };
             enc.dispatch_thread_groups(grid_size, tg_size);
             enc.end_encoding();
             cmd.commit();
+            last_cmd = Some(cmd);
+        }
+
+        if let Some(cmd) = last_cmd {
             cmd.wait_until_completed();
         }
     }
 
     pub fn bottom_up_flop(&self, ctx: &MetalContext, traverser: u32, params: &DcfrParams) {
-        // Flop zone uses the single-outcome bottom_up kernel
         let nh = self.nh;
         let np = self.num_players as usize;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct BuParams {
+            level_count: i32, num_players: i32, nh: i32,
+            traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
+            regret_floor: f32, starting_pot: i32, num_combinations: f32,
+            rake_rate: f32, rake_cap: f32,
+        }
+
+        // #117 Fix A+B applied to flop (mirror of bottom_up_river fix).
+        let mut last_cmd: Option<&metal::CommandBufferRef> = None;
 
         for level in (0..=self.max_depth).rev() {
             let count = self.flop_zone_counts[level];
             if count == 0 { continue; }
             let ln = self.d_flop_zone_nodes[level].as_ref().unwrap();
 
-            #[repr(C)]
-            #[repr(C)]
-
-            #[derive(Clone, Copy)]
-            struct BuParams {
-                level_count: i32, num_players: i32, nh: i32,
-                traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
-                regret_floor: f32, starting_pot: i32, num_combinations: f32,
-                // ─── Slice 2 rake (CPU↔Metal parity) ───
-                rake_rate: f32, rake_cap: f32,
-            }
             let bp = BuParams {
                 level_count: count as i32,
                 num_players: np as i32,
@@ -1114,13 +1662,13 @@ impl MetalFlopStartSolver {
                 rake_rate: self.rake_rate,
                 rake_cap: self.rake_cap,
             };
-            self.upload_params(&bp);
 
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.bottom_up_pipeline);
             enc.set_buffer(0, Some(ln.as_ref()), 0);
-            enc.set_buffer(1, Some(unsafe { (*self.d_params_buf.get()).as_ref() }), 0);
+            let bp_bytes = &bp as *const BuParams as *const std::ffi::c_void;
+            enc.set_bytes(1, std::mem::size_of::<BuParams>() as u64, bp_bytes);
             enc.set_buffer(2, Some(self.d_nodes.as_ref()), 0);
             enc.set_buffer(3, Some(self.d_children.as_ref()), 0);
             enc.set_buffer(4, Some(self.d_contributions.as_ref()), 0);
@@ -1137,14 +1685,19 @@ impl MetalFlopStartSolver {
             enc.set_buffer(15, Some(self.d_sorted_pl_strength.as_ref()), 0);
             enc.set_buffer(16, Some(self.d_sorted_pl_indices.as_ref()), 0);
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
-            // Step 5 chokepoint instrumentation marker (flop dispatch).
             enc.set_buffer(18, Some(self.d_rake_marker.as_ref()), 0);
 
-            let grid_size = metal::MTLSize { width: count as u64, height: 1, depth: 1 };
-            let tg_size = metal::MTLSize { width: 1, height: 1, depth: 1 };
+            let tg_width: u64 = 32;
+            let n_groups: u64 = (count as u64 + tg_width - 1) / tg_width;
+            let grid_size = metal::MTLSize { width: n_groups, height: 1, depth: 1 };
+            let tg_size = metal::MTLSize { width: tg_width, height: 1, depth: 1 };
             enc.dispatch_thread_groups(grid_size, tg_size);
             enc.end_encoding();
             cmd.commit();
+            last_cmd = Some(cmd);
+        }
+
+        if let Some(cmd) = last_cmd {
             cmd.wait_until_completed();
         }
     }
@@ -1444,6 +1997,14 @@ impl MetalFlopStartSolver {
     pub fn upload_cum_strategy(&mut self, data: &[f32]) {
         self.d_cum_strategy.as_mut_slice().copy_from_slice(data);
     }
+    /// Test-only: overwrite d_strategy with arbitrary values. Used by the
+    /// disturbance test to prove that the GPU's compute_all_strategies(ctx)
+    /// pass at the start of run() overwrites the strategy buffer before
+    /// anything reads it — if true, init values (including NaN) leak nowhere.
+    pub fn poison_strategy(&mut self, data: &[f32]) {
+        self.d_strategy.as_mut_slice().copy_from_slice(data);
+    }
+    pub fn strategy_buffer_len(&self) -> usize { self.d_strategy.to_vec().len() }
     pub fn river_outcomes_per_turn(&self) -> &[usize] { &self.river_outcomes_per_turn }
     pub fn compute_all_strategies(&self, ctx: &MetalContext) {
         // Flop zone: single outcome
@@ -1458,11 +2019,40 @@ impl MetalFlopStartSolver {
             self.turn_infosets, self.n_turn, self.turn_offset, self.turn_stride,
         );
 
-        // River zone: n_turn * max_river outcomes
+        // River zone:
+        //   InMemory: batched over all n_turn * max_river outcomes.
+        //   DiskBacked: SKIPPED here. The per-pair flow in `run_one_iter`
+        //     calls `compute_river_strategy_pair(ti, ri)` after each
+        //     `load_river_pair_gpu(ti, ri)` so the strategy is computed
+        //     from the regrets currently loaded into the scratch.
+        match self.gpu_river_mode {
+            GpuRiverMode::InMemory => {
+                self.compute_strategies_batched(
+                    ctx, &self.d_river_decision_ids, &self.d_river_infoset_offsets,
+                    self.river_infosets, self.n_turn * self.max_river,
+                    self.river_offset, self.river_stride,
+                );
+            }
+            GpuRiverMode::DiskBacked { .. } => {
+                // No-op; compute_river_strategy_pair handles per-pair.
+            }
+        }
+    }
+
+    /// Compute river strategy for the single (ti, ri) pair currently
+    /// loaded into the scratch (DiskBacked) or for the per-pair slot in
+    /// the full buffer (InMemory). One-pair version of the batched call
+    /// in `compute_all_strategies` — same kernel, num_outcomes = 1, base
+    /// offset routed through `river_outcome_idx`.
+    ///
+    /// In DiskBacked, the caller must invoke `load_river_pair_gpu(ti, ri)`
+    /// before calling this so the scratch holds the right regrets.
+    pub fn compute_river_strategy_pair(&self, ctx: &MetalContext, ti: usize, ri: usize) {
+        let outcome_idx = self.river_outcome_idx(ti, ri);
+        let base_offset = self.river_offset + outcome_idx * self.river_stride;
         self.compute_strategies_batched(
             ctx, &self.d_river_decision_ids, &self.d_river_infoset_offsets,
-            self.river_infosets, self.n_turn * self.max_river,
-            self.river_offset, self.river_stride,
+            self.river_infosets, 1, base_offset, self.river_stride,
         );
     }
     pub fn download_strategy(&self) -> Vec<f32> { self.d_strategy.to_vec() }
