@@ -203,6 +203,10 @@ pub struct MetalFlopStartSolver {
     top_down_pipeline: ComputePipelineState,
     bottom_up_pipeline: ComputePipelineState,
     batched_pipeline: ComputePipelineState,
+    // Step 2.D.28: threadgroup-parallel kernel for 6-max (num_opp >= 3).
+    // Same buffer layout as batched_pipeline; dispatch uses 1 threadgroup
+    // per (outcome, node) with TG_SIZE threads cooperating on each node.
+    batched_tg_parallel_pipeline: ComputePipelineState,
     chance_accum_pipeline: ComputePipelineState,
     chance_final_pipeline: ComputePipelineState,
     chance_grouped_pipeline: ComputePipelineState,
@@ -413,6 +417,7 @@ impl MetalFlopStartSolver {
         let top_down_pipeline = ctx.create_pipeline("vcfr_top_down_reach").expect("top_down");
         let bottom_up_pipeline = ctx.create_pipeline("vcfr_bottom_up").expect("bottom_up");
         let batched_pipeline = ctx.create_pipeline("vcfr_bottom_up_batched").expect("batched");
+        let batched_tg_parallel_pipeline = ctx.create_pipeline("vcfr_bottom_up_batched_tg_parallel").expect("batched_tg_parallel");
         let chance_accum_pipeline = ctx.create_pipeline("vcfr_chance_accumulate").expect("chance_accum");
         let chance_final_pipeline = ctx.create_pipeline("vcfr_chance_finalize").expect("chance_final");
         let chance_grouped_pipeline = ctx.create_pipeline("vcfr_chance_accumulate_grouped").expect("chance_grouped");
@@ -559,6 +564,7 @@ impl MetalFlopStartSolver {
             top_down_pipeline,
             bottom_up_pipeline,
             batched_pipeline,
+            batched_tg_parallel_pipeline,
             chance_accum_pipeline,
             chance_final_pipeline,
             chance_grouped_pipeline,
@@ -1516,7 +1522,20 @@ impl MetalFlopStartSolver {
             };
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.batched_pipeline);
+            // Step 2.D.28: branch on num_opp. For 6-max (num_opp >= 3) the
+            // K>=3 factored CFV path has a fully-independent outer h loop,
+            // so we use the tg-parallel kernel (1 threadgroup per node,
+            // TG_SIZE threads cooperating). HU/3p keep the serial kernel.
+            // Env override SOLVER_DISABLE_TG_PARALLEL=1 forces serial for A/B
+            // measurement; remove once production speedup is validated.
+            let use_tg_parallel = num_opp >= 3
+                && std::env::var_os("SOLVER_DISABLE_TG_PARALLEL").is_none();
+            let pipeline = if use_tg_parallel {
+                &self.batched_tg_parallel_pipeline
+            } else {
+                &self.batched_pipeline
+            };
+            enc.set_compute_pipeline_state(pipeline);
             enc.set_buffer(0, Some(ln.as_ref()), 0);
             // #117 FIX B race-fix: use set_bytes to inline params per-encoder.
             // The shared d_params_buf gets overwritten between commit and GPU
@@ -1544,8 +1563,21 @@ impl MetalFlopStartSolver {
             enc.set_buffer(19, Some(self.d_debug_out.as_ref()), 0);
             enc.set_buffer(20, Some(self.d_rake_marker.as_ref()), 0);
 
-            let tg_width: u64 = 32;
-            let n_groups: u64 = (count as u64 + tg_width - 1) / tg_width;
+            let (n_groups, tg_width): (u64, u64) = if use_tg_parallel {
+                // 1 threadgroup per node; threads cooperate on per-h work.
+                // num_outcomes is 1 for the river path so total groups = count.
+                let max_tpg = pipeline.max_total_threads_per_threadgroup() as u64;
+                // Env tunable for fast iteration on tg_size optimum.
+                let env_tg = std::env::var("SOLVER_TG_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok());
+                let w = env_tg.unwrap_or(64).min(max_tpg).max(32);
+                (count as u64, w)
+            } else {
+                // Serial kernel: 32 threads per group, 1 thread per node.
+                let w: u64 = 32;
+                ((count as u64 + w - 1) / w, w)
+            };
             let grid_size = metal::MTLSize { width: n_groups, height: 1, depth: 1 };
             let tg_size = metal::MTLSize { width: tg_width, height: 1, depth: 1 };
             enc.dispatch_thread_groups(grid_size, tg_size);
@@ -1628,7 +1660,14 @@ impl MetalFlopStartSolver {
 
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.batched_pipeline);
+            // Step 2.D.28: branch on num_opp (see bottom_up_river for rationale).
+            let use_tg_parallel = num_opp >= 3;
+            let pipeline = if use_tg_parallel {
+                &self.batched_tg_parallel_pipeline
+            } else {
+                &self.batched_pipeline
+            };
+            enc.set_compute_pipeline_state(pipeline);
             enc.set_buffer(0, Some(ln.as_ref()), 0);
             let bp_bytes = &bp as *const BParams as *const std::ffi::c_void;
             enc.set_bytes(1, std::mem::size_of::<BParams>() as u64, bp_bytes);
@@ -1652,8 +1691,18 @@ impl MetalFlopStartSolver {
             enc.set_buffer(19, Some(self.d_debug_out.as_ref()), 0);
             enc.set_buffer(20, Some(self.d_rake_marker.as_ref()), 0);
 
-            let tg_width: u64 = 32;
-            let n_groups: u64 = (count as u64 + tg_width - 1) / tg_width;
+            let (n_groups, tg_width): (u64, u64) = if use_tg_parallel {
+                let max_tpg = pipeline.max_total_threads_per_threadgroup() as u64;
+                // Env tunable for fast iteration on tg_size optimum.
+                let env_tg = std::env::var("SOLVER_TG_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok());
+                let w = env_tg.unwrap_or(64).min(max_tpg).max(32);
+                (count as u64, w)
+            } else {
+                let w: u64 = 32;
+                ((count as u64 + w - 1) / w, w)
+            };
             let grid_size = metal::MTLSize { width: n_groups, height: 1, depth: 1 };
             let tg_size = metal::MTLSize { width: tg_width, height: 1, depth: 1 };
             enc.dispatch_thread_groups(grid_size, tg_size);

@@ -3658,3 +3658,294 @@ inline float factored_share_for_level_tg(
     }
     return share;
 }
+
+// ============================================================================
+// Step 2.D.28: vcfr_bottom_up_batched_tg_parallel (6-max parallel kernel)
+//
+// 6-max throughput primitive. Each threadgroup processes ONE (outcome,
+// node_in_level) pair. Threads within the group cooperatively load
+// opp_reach + hand_strength into threadgroup memory, then parallelize
+// the outer h loop via tid stride.
+//
+// Only valid for num_opp >= 3 (np >= 4). The K>=3 factored path has a
+// fully-independent outer h loop, so per-h work is embarrassingly
+// parallel within the threadgroup. CPU dispatcher branches: HU/3p use
+// the existing vcfr_bottom_up_batched kernel (different math paths),
+// 4p/5p/6p use this kernel.
+//
+// Threadgroup memory footprint:
+//   opp_reach_tg:      5 * 1326 * 4 = 26,520 B
+//   hand_strength_tg:  1326 * 2     =  2,652 B
+//   contribs_tg:       8 * 4        =     32 B
+//   Total:                          ~= 29,204 B (under 32 KB Apple limit)
+//
+// All math matches the K>=3 branch of multiway_brute_force_showdown
+// (lines 700-797). PLAYER and CHANCE nodes are also parallelized over
+// h with tid-stride - same float ordering as the serial kernel since
+// each h slot is independent.
+// ============================================================================
+kernel void vcfr_bottom_up_batched_tg_parallel(
+    device const uint32_t* level_nodes       [[buffer(0)]],
+    constant BatchedParams& params           [[buffer(1)]],
+    device const FlatNode* nodes             [[buffer(2)]],
+    device const uint32_t* children          [[buffer(3)]],
+    device const int32_t* contributions      [[buffer(4)]],
+    device const uint16_t* folded_masks      [[buffer(5)]],
+    device const float* strategy             [[buffer(6)]],
+    device const uint32_t* infoset_offsets   [[buffer(7)]],
+    device const float* reach                [[buffer(8)]],
+    device float* cfv                        [[buffer(9)]],
+    device float* regrets                    [[buffer(10)]],
+    device float* cum_strategy               [[buffer(11)]],
+    device const float* initial_weight       [[buffer(12)]],
+    device const uint16_t* sorted_opp_str    [[buffer(13)]],
+    device const uint16_t* sorted_opp_idx    [[buffer(14)]],
+    device const uint16_t* sorted_pl_str     [[buffer(15)]],
+    device const uint16_t* sorted_pl_idx     [[buffer(16)]],
+    device const uint8_t* hand_cards         [[buffer(17)]],
+    device const float* chance_prob          [[buffer(18)]],
+    device float* debug_out                  [[buffer(19)]],
+    device uchar* rake_marker                [[buffer(20)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    int outcome = int(tgid) / params.level_count;
+    int node_in_level = int(tgid) % params.level_count;
+    if (outcome >= params.num_outcomes) return;
+
+    uint node_id = level_nodes[node_in_level];
+    FlatNode node = nodes[node_id];
+    int np = params.num_players;
+    int nh = params.nh;
+    int num_opp = np - 1;
+
+    int cfv_off = outcome * params.cfv_batch_stride;
+    int sps_off = outcome * params.sorted_opp_stride;
+
+    const device uint16_t* pl_str = sorted_pl_str + sps_off;
+    const device uint16_t* pl_idx = sorted_pl_idx + sps_off;
+    device float* cfv_o = cfv + cfv_off;
+
+    // -- Threadgroup memory (static allocation; ~29 KB total) --
+    threadgroup float opp_reach_tg[5 * 1326];
+    threadgroup ushort hand_strength_tg[1326];
+    threadgroup int32_t contribs_tg[8];
+
+    // === TERMINAL NODE (K>=3 factored showdown, parallel over h) ===
+    if (node.node_type == NODE_TYPE_TERMINAL) {
+        int node_reach_base = int(node_id) * np * nh;
+        uint16_t fold_mask = folded_masks[int(node_id)];
+        device float* out = cfv_o + int(node_id) * nh;
+
+        // Cooperative load: contribs (np <= 8 so 1 thread per p).
+        if (int(tid) < np) {
+            contribs_tg[tid] = contributions[int(node_id) * np + int(tid)];
+        }
+
+        // Cooperative build hand_strength_tg from sorted_pl arrays.
+        for (int si = int(tid); si < nh; si += int(tg_size)) {
+            hand_strength_tg[pl_idx[si]] = pl_str[si];
+        }
+
+        // Cooperative build opp_reach_tg with chance_prob masking.
+        for (int oi = 0; oi < num_opp; oi++) {
+            int opp = (oi < int(params.traverser)) ? oi : (oi + 1);
+            const device float* opp_r = reach + node_reach_base + opp * nh;
+            for (int h = int(tid); h < nh; h += int(tg_size)) {
+                opp_reach_tg[oi * nh + h] = (chance_prob[h] == 0.0f) ? 0.0f : opp_r[h];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // All threads now redundantly compute per-h constants. Cheap
+        // (np<=8 loops) and avoids cross-thread state. K>=3 factored
+        // math below matches multiway_brute_force_showdown lines 700-797.
+        int32_t c_t = contribs_tg[params.traverser];
+        bool flop_seen = (node.board_state != 3);
+        float eff_rake_rate = flop_seen ? params.rake_rate : 0.0f;
+        float eff_rake_cap  = flop_seen ? params.rake_cap  : 0.0f;
+
+        int levels[8];
+        int num_levels = 0;
+        for (int p = 0; p < np; p++) {
+            int32_t c = contribs_tg[p];
+            bool found = false;
+            for (int l = 0; l < num_levels; l++) {
+                if (levels[l] == c) { found = true; break; }
+            }
+            if (!found && num_levels < 8) { levels[num_levels++] = (int)c; }
+        }
+        for (int i = 0; i < num_levels - 1; i++) {
+            for (int j = i + 1; j < num_levels; j++) {
+                if (levels[j] < levels[i]) {
+                    int tmp = levels[i]; levels[i] = levels[j]; levels[j] = tmp;
+                }
+            }
+        }
+
+        float traverser_stake = float(params.starting_pot) / float(np) + float(c_t);
+        bool traverser_folded = (fold_mask & (uint16_t)(1u << params.traverser)) != 0;
+
+        int32_t e_main_pot_amount;
+        if (num_levels == 0) {
+            e_main_pot_amount = params.starting_pot;
+        } else {
+            int num_main_contributors = 0;
+            for (int p = 0; p < np; p++) {
+                if (contribs_tg[p] >= levels[0]) num_main_contributors++;
+            }
+            e_main_pot_amount = levels[0] * num_main_contributors + params.starting_pot;
+        }
+        float e_main_pot_rake = fmax(0.0f, fmin(
+            (float)e_main_pot_amount * eff_rake_rate, eff_rake_cap));
+
+        uchar marker = flop_seen ? (uchar)1 : (uchar)2;
+
+        // -- PARALLEL outer h loop --
+        for (int h = int(tid); h < nh; h += int(tg_size)) {
+            ulong h_m = (1ul << hand_cards[h * 2]) | (1ul << hand_cards[h * 2 + 1]);
+            ushort h_str = hand_strength_tg[h];
+
+            float tvrp = factored_share_for_level_tg(
+                num_opp, 0u, 0u, h_m, h_str,
+                opp_reach_tg, hand_cards, hand_strength_tg, nh);
+
+            float static_cash = 0.0f;
+            float case_c = 0.0f;
+            int prev_l = 0;
+            for (int li = 0; li < num_levels; li++) {
+                int lev = levels[li];
+                int pc = lev - prev_l;
+                int num_contrib = 0;
+                for (int p = 0; p < np; p++) {
+                    if (contribs_tg[p] >= lev) num_contrib++;
+                }
+                float pot_l = (float)(pc * num_contrib);
+                if (li == 0) pot_l += (float)params.starting_pot;
+                if (pot_l == 0.0f) { prev_l = lev; continue; }
+                float pot_after_rake = (li == 0) ? (pot_l - e_main_pot_rake) : pot_l;
+
+                uint elig_opps = 0u;
+                int oi = 0;
+                for (int p = 0; p < np; p++) {
+                    if (p == int(params.traverser)) continue;
+                    bool p_folded = (fold_mask & (uint16_t)(1u << p)) != 0;
+                    bool p_elig = !p_folded && (contribs_tg[p] >= lev);
+                    if (p_elig) elig_opps |= (1u << oi);
+                    oi++;
+                }
+                bool trav_elig = !traverser_folded && (c_t >= lev);
+                bool has_active_elig = (elig_opps != 0);
+
+                if (!has_active_elig && trav_elig) {
+                    static_cash += pot_after_rake;
+                } else if (!has_active_elig && !trav_elig) {
+                    if (contribs_tg[params.traverser] >= lev) {
+                        float trav_contrib = (float)pc;
+                        if (li == 0) trav_contrib += (float)params.starting_pot / (float)np;
+                        static_cash += trav_contrib;
+                    }
+                } else if (!trav_elig) {
+                    // Case D: traverser ineligible at contested level - no cash.
+                } else {
+                    float share = factored_share_for_level_tg(
+                        num_opp, elig_opps, 0u, h_m, h_str,
+                        opp_reach_tg, hand_cards, hand_strength_tg, nh);
+                    case_c += pot_after_rake * share;
+                }
+                prev_l = lev;
+            }
+
+            float cfv_val = (static_cash - traverser_stake) * tvrp + case_c;
+            if (params.num_combinations > 0.0f) {
+                cfv_val /= params.num_combinations;
+            }
+            out[h] = cfv_val;
+            rake_marker[node_id * nh + h] = marker;
+        }
+        return;
+    }
+
+    // === CHANCE NODE (parallel over h) ===
+    if (node.node_type == NODE_TYPE_CHANCE) {
+        device float* out = cfv_o + int(node_id) * nh;
+        int n_children = int(node.num_children);
+        uint children_start = node.children_start;
+        for (int h = int(tid); h < nh; h += int(tg_size)) {
+            float sum = 0.0f;
+            for (int a = 0; a < n_children; a++) {
+                uint child = children[children_start + a];
+                sum += cfv_o[int(child) * nh + h];
+            }
+            out[h] = sum;
+        }
+        return;
+    }
+
+    // === PLAYER NODE (parallel over h) ===
+    int owner = int(node.player_id);
+    int na = int(node.num_children);
+    uint infoset_id = infoset_offsets[int(node_id)];
+    int stride = MAX_NA * nh;
+    int strat_outcome_off = outcome * params.regret_outcome_stride;
+    const device float* sigma = strategy + strat_outcome_off + int(infoset_id) * stride;
+    uint children_start = node.children_start;
+    device float* out_node = cfv_o + int(node_id) * nh;
+
+    if (owner == int(params.traverser)) {
+        int regret_base = outcome * params.regret_outcome_stride + int(infoset_id) * stride;
+        int cum_base = outcome * params.cum_outcome_stride + int(infoset_id) * stride;
+
+        bool re_enable_iter = (params.pruning_stride > 0)
+            && (params.iteration % params.pruning_stride == 0);
+
+        for (int h = int(tid); h < nh; h += int(tg_size)) {
+            // Compute cfv_avg for this h.
+            float cfv_avg_h = 0.0f;
+            for (int a = 0; a < na; a++) {
+                uint child = children[children_start + a];
+                cfv_avg_h += sigma[a * nh + h] * cfv_o[int(child) * nh + h];
+            }
+
+            // Per-action regret/cum update.
+            for (int a = 0; a < na; a++) {
+                uint child = children[children_start + a];
+                bool action_leads_to_terminal = (nodes[child].node_type == NODE_TYPE_TERMINAL);
+                bool can_prune_this_action = (params.pruning_enabled != 0)
+                    && !re_enable_iter
+                    && (params.board_state != 2)
+                    && !action_leads_to_terminal;
+
+                float inst_regret = cfv_o[int(child) * nh + h] - cfv_avg_h;
+                int ridx = regret_base + a * nh + h;
+                float old_r = regrets[ridx];
+
+                if (can_prune_this_action && old_r < params.pruning_threshold) {
+                    continue;
+                }
+
+                float coef = (old_r >= 0.0f) ? params.alpha_t : params.beta_t;
+                float new_r = coef * old_r + inst_regret;
+                if (new_r < params.regret_floor) new_r = params.regret_floor;
+                regrets[ridx] = new_r;
+
+                int cidx = cum_base + a * nh + h;
+                cum_strategy[cidx] = params.gamma_t * cum_strategy[cidx] + sigma[a * nh + h];
+            }
+
+            out_node[h] = cfv_avg_h;
+        }
+    } else {
+        // Non-traverser: just sum child CFVs (unweighted).
+        for (int h = int(tid); h < nh; h += int(tg_size)) {
+            float cfv_avg_h = 0.0f;
+            for (int a = 0; a < na; a++) {
+                uint child = children[children_start + a];
+                cfv_avg_h += cfv_o[int(child) * nh + h];
+            }
+            out_node[h] = cfv_avg_h;
+        }
+    }
+}
