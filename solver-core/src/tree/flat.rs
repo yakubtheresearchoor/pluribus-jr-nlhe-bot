@@ -78,23 +78,7 @@ impl FlatNode {
 // 6-max config; the current value of 6 is the starting placeholder
 // (fold + call + 4 raise sizes = Pluribus postflop blueprint).
 pub const MAX_NA_PREFLOP: usize = 16;
-// Phase 4 EMPIRICAL DELIVERABLE: fold + check/call + 2 bet sizes
-// + 1 raise = 5 actions sufficient for postflop blueprint. Measured at
-// 6-max nh=6 with asymmetric stacks ([100,200,50,150,80,120]) and 4
-// chance outcomes (2 turn × 2 river). Rich config with 4 bets + 2 raises
-// converged to 0.0000% pot exploitability; lean config with the banded-
-// selection top-by-mass {0.3p, 0.6p} bet sizes + 1 raise also converged
-// to 0.0000% pot, matching within tolerance (PRODUCTION targets are
-// 1% pot loose / 0.05% pot tight — both far above f32 floor reached here).
-// Per-iter wall speedup at convergence: 1.25× from going lean.
-// Sharper than Pluribus's "fold + call + 3 sizes = 5" (we only need 2
-// bet sizes at this scale). See p1_5_4_step2d32_phase4_bootstrap.rs.
-//
-// Caveat: cross-action-space exploitability (lean strategy played AGAINST
-// rich-action-space opponents) was deferred — it would tighten the
-// validation but requires a best-response evaluator that operates in
-// the rich action space against a lean strategy upload.
-pub const MAX_NA_POSTFLOP: usize = 5;
+pub const MAX_NA_POSTFLOP: usize = 6;
 
 pub const VCFR_NO_INFOSET: u32 = u32::MAX;
 
