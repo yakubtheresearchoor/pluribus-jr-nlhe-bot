@@ -1,5 +1,15 @@
 // Core CFR kernels ported from vcfr.cu to Metal Shading Language.
 // Phase 1-2: All kernels needed for vector CFR on river/turn-start games.
+//
+// STEP 2.A.2 BUG FIX 2026-06: disable FMA contraction file-wide so that
+// `a * b + c` is NOT folded into a fused multiply-add. The CPU Rust f32
+// path NEVER contracts (no implicit FMA), so any contracted GPU op
+// produces 1-ULP divergence relative to CPU. These 1-ULP divergences
+// compound 2.8x per iteration through the CFR feedback loop into the
+// order-of-magnitude multi-iter divergence observed at stratum 1 iter 5+.
+// The build.rs also passes -ffp-contract=off and -fno-fast-math, but
+// this pragma is the authoritative source-level guarantee.
+#pragma METAL fp contract(off)
 
 #include "flat_tree.metal"
 
@@ -74,6 +84,125 @@ inline void sorted_sweep_showdown_vcfr_local(
                 - cfreach_minus[hand_cards[h * 2]]
                 - cfreach_minus[hand_cards[h * 2 + 1]];
             returned_cfv[h] -= cfreach;
+        }
+    }
+}
+
+
+// ============================================================================
+// Helper: sorted-sweep with rake components (mirrors CPU
+// sorted_sweep_with_rake_components in solver/showdown.rs:175).
+//
+// Computes three per-hand outputs in one O(num_opp * nh) sweep:
+//   sweep_net[h] = wins_strict - losses_strict (with inclusion-exclusion
+//                  card-blocking correction)
+//   win_reach[h] = strict wins (same component, kept separate for rake)
+//   tie_reach[h] = ties at top (with self-correction for HU since opp==h
+//                  is in the tie band)
+//
+// Then caller computes:
+//   cfv[h] = half_pot * sweep_net[h] - rake * (win_reach[h] + 0.5 * tie_reach[h])
+//
+// STEP 2.A.2 BIT-EXACT-MATCH FIX 2026-06: CPU's HU path uses this sweep
+// formulation for ALL non-folded-traverser HU terminals (showdown.rs:598).
+// The brute-force path (showdown.rs:1093) and the sweep produce the SAME
+// mathematical answer but DIFFERENT float-rounding order. Using sweep
+// here makes GPU=CPU bit-exact at every HU terminal under non-uniform
+// reach, eliminating the 1-ULP-per-entry compounding source.
+// ============================================================================
+inline void sorted_sweep_with_rake_components_local(
+    thread const float* opp_reach_all, int num_opp, int nh,
+    const device uint16_t* opp_strength, const device uint16_t* opp_indices,
+    const device uint16_t* player_strength, const device uint16_t* player_indices,
+    const device uint8_t* hand_cards,
+    thread float* sweep_net,
+    thread float* win_reach,
+    thread float* tie_reach
+) {
+    for (int h = 0; h < nh; h++) {
+        sweep_net[h] = 0.0f;
+        win_reach[h] = 0.0f;
+        tie_reach[h] = 0.0f;
+    }
+
+    for (int oi = 0; oi < num_opp; oi++) {
+        thread const float* reach = opp_reach_all + oi * nh;
+        float cfreach_sum = 0.0f;
+        float cfreach_minus[52];
+        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+
+        // FORWARD PASS: wins (opp_str < pl_str), with tie look-ahead.
+        int i = 0;
+        for (int si = 0; si < nh; si++) {
+            uint16_t str_h = player_strength[si];
+            uint16_t h = player_indices[si];
+            // Win accumulation
+            while (i < nh && opp_strength[oi * nh + i] < str_h) {
+                uint16_t ho = opp_indices[oi * nh + i];
+                float r = reach[ho];
+                if (r != 0.0f) {
+                    cfreach_sum += r;
+                    cfreach_minus[hand_cards[ho * 2]] += r;
+                    cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                }
+                i++;
+            }
+            float win_val = cfreach_sum
+                - cfreach_minus[hand_cards[h * 2]]
+                - cfreach_minus[hand_cards[h * 2 + 1]];
+            sweep_net[h] += win_val;
+            win_reach[h] += win_val;
+
+            // Tie look-ahead: opp_str == str_h, doesn't advance i.
+            // Inclusion-exclusion correction: the only opp using BOTH of
+            // h's cards is opp = h itself, and in HU showdown opp_str =
+            // pl_str so opp = h IS in the tie band → add self correction.
+            float tie_sum = 0.0f;
+            float tie_minus[52];
+            for (int c = 0; c < 52; c++) tie_minus[c] = 0.0f;
+            int j = i;
+            bool tie_includes_self = false;
+            while (j < nh && opp_strength[oi * nh + j] == str_h) {
+                uint16_t ho = opp_indices[oi * nh + j];
+                float r = reach[ho];
+                if (r != 0.0f) {
+                    tie_sum += r;
+                    tie_minus[hand_cards[ho * 2]] += r;
+                    tie_minus[hand_cards[ho * 2 + 1]] += r;
+                    if (ho == h) tie_includes_self = true;
+                }
+                j++;
+            }
+            float self_correction = tie_includes_self ? reach[h] : 0.0f;
+            float tie_val = tie_sum
+                - tie_minus[hand_cards[h * 2]]
+                - tie_minus[hand_cards[h * 2 + 1]]
+                + self_correction;
+            tie_reach[h] += tie_val;
+        }
+
+        // BACKWARD PASS: losses (opp_str > pl_str). Subtract from sweep_net.
+        cfreach_sum = 0.0f;
+        for (int c = 0; c < 52; c++) cfreach_minus[c] = 0.0f;
+
+        int i_b = nh;
+        for (int si = nh - 1; si >= 0; si--) {
+            uint16_t str_h = player_strength[si];
+            uint16_t h = player_indices[si];
+            while (i_b > 0 && opp_strength[oi * nh + i_b - 1] > str_h) {
+                i_b--;
+                uint16_t ho = opp_indices[oi * nh + i_b];
+                float r = reach[ho];
+                if (r != 0.0f) {
+                    cfreach_sum += r;
+                    cfreach_minus[hand_cards[ho * 2]] += r;
+                    cfreach_minus[hand_cards[ho * 2 + 1]] += r;
+                }
+            }
+            float loss_val = cfreach_sum
+                - cfreach_minus[hand_cards[h * 2]]
+                - cfreach_minus[hand_cards[h * 2 + 1]];
+            sweep_net[h] -= loss_val;
         }
     }
 }
@@ -412,13 +541,15 @@ inline void multiway_brute_force_showdown(
                         for (int li = 0; li < num_levels; li++) {
                             int lev = levels[li];
                             int pc = lev - prev_l;
-                            if (pc == 0) { prev_l = lev; continue; }
+                            // 2.A.2 FIX: skip only when total pot at this
+                            // level is 0 (after starting_pot addition).
                             int num_contrib = 0;
                             for (int p = 0; p < np; p++) {
                                 if (contributions[p] >= lev) num_contrib++;
                             }
                             float pot_l = float(pc * num_contrib);
                             if (li == 0) pot_l += float(starting_pot);
+                            if (pot_l == 0.0f) { prev_l = lev; continue; }
 
                             bool trav_elig = c_t >= lev;
                             bool a_elig = !a_folded && c_opp_a >= lev;
@@ -471,82 +602,98 @@ inline void multiway_brute_force_showdown(
     }
 
     if (num_opp == 1) {
+        // ── STEP 2.A.2 BIT-EXACT-MATCH FIX 2026-06 ──
+        // HU showdown: mirror CPU `side_pot_showdown_cfv_with_rake` at
+        // showdown.rs:598 (np==2 && !traverser_folded → sorted sweep) and
+        // showdown.rs:484-568 (lone-survivor / traverser-folded → fast path).
+        //
+        // The CPU NEVER takes the per-level brute-force path for HU;
+        // it always uses either the sorted sweep (active HU showdown)
+        // or the inclusion-exclusion fast path (HU fold-end). The GPU
+        // was previously running per-level brute-force for HU, which is
+        // mathematically equivalent but differs from CPU by 1 ULP in
+        // float-rounding order. Those 1-ULP differences then compounded
+        // 2.8x per iter through the CFR feedback loop into the
+        // order-of-magnitude multi-iter divergence observed at stratum 1.
+        //
+        // Localized via tests/p1_5_4_step2a2_iter1_noise_source.rs
+        // (61% of terminal CFV entries differ at 1 ULP under non-uniform
+        // reach; reach itself bit-exact, contributions [0,0] at node 13).
         int opp_a = (traverser == 0) ? 1 : 0;
         thread const float* reach_a = opp_reach_local + 0 * nh;
         int32_t c_opp_a = contributions[opp_a];
         bool a_folded = (fold_mask & (uint16_t)(1u << opp_a)) != 0;
 
-        // ── Slice 2 Phase B Site (d): K=1 HU main-pot-only rake ──
-        // Mirror CPU `side_pot_showdown_cfv_with_rake` ~1070-1140 (HU path).
-        // Same main-pot-only/cap-once spec as site (c) — rake applies at
-        // li==0 only, side-pot levels (li>=1) un-raked, cap once.
-        // Computed ONCE before the (h, g_a) loops.
-        int32_t hu_main_pot_amount;
-        if (num_levels == 0) {
-            hu_main_pot_amount = starting_pot;
-        } else {
+        if (traverser_folded || a_folded) {
+            // ── HU fold-end: constant-payoff inclusion-exclusion ──
+            // Mirror CPU showdown.rs:484-568 (num_opp == 1 fast path).
+            int total_pot = (int)starting_pot;
+            for (int p = 0; p < np; p++) total_pot += (int)contributions[p];
+            int min_contrib = contributions[0];
+            for (int p = 1; p < np; p++) {
+                if (contributions[p] < min_contrib) min_contrib = contributions[p];
+            }
             int num_main_contributors = 0;
             for (int p = 0; p < np; p++) {
-                if (contributions[p] >= levels[0]) num_main_contributors++;
+                if (contributions[p] >= min_contrib) num_main_contributors++;
             }
-            hu_main_pot_amount = levels[0] * num_main_contributors + starting_pot;
+            int main_pot_amount = min_contrib * num_main_contributors + (int)starting_pot;
+            float rake = fmax(0.0f, fmin(
+                (float)main_pot_amount * eff_rake_rate, eff_rake_cap));
+            float payoff = traverser_folded
+                ? -traverser_stake
+                : ((float)total_pot - rake) - traverser_stake;
+
+            float opp_reach_sum = 0.0f;
+            float opp_reach_minus[52];
+            for (int c = 0; c < 52; c++) opp_reach_minus[c] = 0.0f;
+            for (int ho = 0; ho < nh; ho++) {
+                float r = reach_a[ho];
+                if (r != 0.0f) {
+                    opp_reach_sum += r;
+                    opp_reach_minus[hand_cards[ho * 2]] += r;
+                    opp_reach_minus[hand_cards[ho * 2 + 1]] += r;
+                }
+            }
+            for (int h = 0; h < nh; h++) {
+                // Inclusion-exclusion: subtract opp hands using either of
+                // h's cards, then ADD BACK reach_a[h] because the only
+                // opp using BOTH of h's cards is h itself and we
+                // double-subtracted it (audit-fix #37 in CPU).
+                float cfreach = opp_reach_sum
+                    - opp_reach_minus[hand_cards[h * 2]]
+                    - opp_reach_minus[hand_cards[h * 2 + 1]]
+                    + reach_a[h];
+                out[h] = payoff * cfreach;
+            }
+            return;
         }
-        float hu_main_pot_rake = fmax(0.0f, fmin(
-            (float)hu_main_pot_amount * eff_rake_rate, eff_rake_cap));
+
+        // ── HU active showdown: sorted-sweep + half-pot scaling ──
+        // Mirror CPU showdown.rs:598-639.
+        // For HU, opp and player share the same hand-strength evaluation
+        // (same board), so sorted_opp arrays equal sorted_pl. We pass
+        // sorted_pl for both opp and player arguments.
+        int min_active_contrib = (c_t < c_opp_a) ? c_t : c_opp_a;
+        float half_pot = float(starting_pot) / float(np) + float(min_active_contrib);
+        int total_pot = (int)starting_pot + (int)c_t + (int)c_opp_a;
+        float rake = fmax(0.0f, fmin(
+            (float)total_pot * eff_rake_rate, eff_rake_cap));
+
+        float sweep_net_arr[1326];
+        float win_reach_arr[1326];
+        float tie_reach_arr[1326];
+        sorted_sweep_with_rake_components_local(
+            opp_reach_local, 1, nh,
+            sorted_pl_strength, sorted_pl_indices,  // opp = pl in HU
+            sorted_pl_strength, sorted_pl_indices,
+            hand_cards,
+            sweep_net_arr, win_reach_arr, tie_reach_arr
+        );
 
         for (int h = 0; h < nh; h++) {
-            int hc1 = hand_cards[h * 2];
-            int hc2 = hand_cards[h * 2 + 1];
-            uint16_t h_str = hand_strength[h];
-            float accum = 0.0f;
-
-            for (int g_a = 0; g_a < nh; g_a++) {
-                int g_ac1 = hand_cards[g_a * 2];
-                int g_ac2 = hand_cards[g_a * 2 + 1];
-                if (g_ac1 == hc1 || g_ac1 == hc2 || g_ac2 == hc1 || g_ac2 == hc2) continue;
-                float ra = reach_a[g_a];
-                if (ra == 0.0f) continue;
-                uint16_t s_a = hand_strength[g_a];
-
-                float net;
-                if (traverser_folded) {
-                    net = -traverser_stake;
-                } else {
-                    float cash = 0.0f;
-                    int prev_l = 0;
-                    for (int li = 0; li < num_levels; li++) {
-                        int lev = levels[li];
-                        int pc = lev - prev_l;
-                        if (pc == 0) { prev_l = lev; continue; }
-                        int num_contrib = 0;
-                        for (int p = 0; p < np; p++) {
-                            if (contributions[p] >= lev) num_contrib++;
-                        }
-                        float pot_l = float(pc * num_contrib);
-                        if (li == 0) pot_l += float(starting_pot);
-                        bool trav_elig = c_t >= lev;
-                        bool a_elig = !a_folded && c_opp_a >= lev;
-                        if (!trav_elig) { prev_l = lev; continue; }
-                        // Slice 2 Site (d): rake from main pot only (li==0).
-                        float pot_after_rake = (li == 0)
-                            ? (pot_l - hu_main_pot_rake)
-                            : pot_l;
-                        if (!a_elig) {
-                            cash += pot_after_rake;
-                        } else {
-                            uint16_t max_str = (h_str > s_a) ? h_str : s_a;
-                            int tied = 0;
-                            if (h_str == max_str) tied++;
-                            if (s_a == max_str) tied++;
-                            if (h_str == max_str) cash += pot_after_rake / float(tied);
-                        }
-                        prev_l = lev;
-                    }
-                    net = cash - traverser_stake;
-                }
-                accum += ra * net;
-            }
-            out[h] = accum;
+            out[h] = half_pot * sweep_net_arr[h]
+                   - rake * (win_reach_arr[h] + 0.5f * tie_reach_arr[h]);
         }
         return;
     }
@@ -598,14 +745,14 @@ inline void multiway_brute_force_showdown(
         for (int li = 0; li < num_levels; li++) {
             int lev = levels[li];
             int pc = lev - prev_l;
-            if (pc == 0) { prev_l = lev; continue; }
-
+            // 2.A.2 FIX: see HU branch lines 520-537 for rationale.
             int num_contrib = 0;
             for (int p = 0; p < np; p++) {
                 if (contributions[p] >= lev) num_contrib++;
             }
             float pot_l = (float)(pc * num_contrib);
             if (li == 0) pot_l += (float)starting_pot;
+            if (pot_l == 0.0f) { prev_l = lev; continue; }
             // Site (e) rake: at li==0 (main pot) winner-share gets pot
             // reduced by main_pot_rake. Side pots (li>=1) un-raked.
             float pot_after_rake = (li == 0) ? (pot_l - e_main_pot_rake) : pot_l;
@@ -746,6 +893,131 @@ kernel void vcfr_zero_buffer(
 ) {
     int idx = int(gid);
     if (idx < params.size) buf[idx] = 0.0f;
+}
+
+// ============================================================================
+// vcfr_aggregate_preflop_chance (Step 2.D.3)
+//
+// Computes:
+//   out[class] = Σ over canonical of prob_table[canonical, class] × flop_cfvs[canonical, class]
+//
+// Same arithmetic order as CPU `aggregate_preflop_chance` in
+// preflop_start_game.rs:779 — outer iteration over canonicals so the
+// per-class sum sees canonical CFVs in iteration order. The prob_table
+// is precomputed on CPU from PreflopChanceTable::chance_probability_flop
+// and uploaded as a flat [n_canon * nh] f32 buffer.
+//
+// Threading: one thread per class. nh threads, each summing n_canon
+// terms. For nh = 169 and n_canon = 1755 this is trivially parallel.
+// ============================================================================
+
+struct AggregatePreflopChanceParams {
+    int n_canon;
+    int nh;
+};
+
+kernel void vcfr_aggregate_preflop_chance(
+    device float*       out                    [[buffer(0)]],   // [nh]
+    device const float* prob_table             [[buffer(1)]],   // [n_canon * nh]
+    device const float* flop_cfvs              [[buffer(2)]],   // [n_canon * nh]
+    constant AggregatePreflopChanceParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int class_idx = int(gid);
+    if (class_idx >= params.nh) return;
+    float sum = 0.0f;
+    for (int c = 0; c < params.n_canon; c++) {
+        sum += prob_table[c * params.nh + class_idx]
+             * flop_cfvs[c * params.nh + class_idx];
+    }
+    out[class_idx] = sum;
+}
+
+// ============================================================================
+// vcfr_preflop_bottom_up_player (Step 2.D.4)
+//
+// Processes one level of preflop PLAYER decision nodes. Per (node, lane)
+// thread:
+//   1. If traverser-owned: cfv_avg = Σ strategy[a, lane] × cfv[child_a][lane].
+//      Else (opp): cfv_avg = Σ cfv[child_a][lane] (plain sum).
+//   2. Write cfv[node][lane] = cfv_avg.
+//   3. Traverser only: for each a, inst_regret = cfv[child_a][lane] - cfv_avg;
+//      regrets[a, lane] = (old >= 0 ? alpha_t : beta_t) × old + inst_regret;
+//      cum_strategy[a, lane] = gamma_t × old + strategy[a, lane].
+//
+// Mirrors CPU `bottom_up_recursive` in preflop_cfr.rs:598 — same per-a
+// iteration order, same DCFR formula. cfv buffer layout: [node_id × lanes
+// + lane] (mirror of CPU `cfv: Vec<Vec<f32>>` with shape [nn][n_classes]).
+// strategy/regrets/cum_strategy: [infoset_id × MAX_NA × lanes + a × lanes + lane].
+// ============================================================================
+
+struct PreflopBottomUpParams {
+    int level_count;
+    int lanes;
+    uint32_t traverser;
+    float alpha_t;
+    float beta_t;
+    float gamma_t;
+};
+
+kernel void vcfr_preflop_bottom_up_player(
+    device const uint32_t* level_nodes        [[buffer(0)]],
+    constant PreflopBottomUpParams& params    [[buffer(1)]],
+    device const FlatNode* nodes              [[buffer(2)]],
+    device const uint32_t* children           [[buffer(3)]],
+    device const uint32_t* infoset_offsets    [[buffer(4)]],
+    device const float* strategy              [[buffer(5)]],
+    device float* regrets                     [[buffer(6)]],
+    device float* cum_strategy                [[buffer(7)]],
+    device float* cfv                         [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int idx = int(gid.x);
+    int lane = int(gid.y);
+    int lanes = params.lanes;
+    if (idx >= params.level_count || lane >= lanes) return;
+
+    uint node_id = level_nodes[idx];
+    FlatNode node = nodes[node_id];
+    int na = int(node.num_children);
+    int stride = MAX_NA * lanes;
+
+    bool is_traverser = (int(node.player_id) == int(params.traverser));
+
+    float cfv_avg = 0.0f;
+    if (is_traverser) {
+        uint infoset_id = infoset_offsets[node_id];
+        const device float* sigma = strategy + infoset_id * stride;
+        for (int a = 0; a < na; a++) {
+            uint child = children[node.children_start + a];
+            float s = sigma[a * lanes + lane];
+            float v = cfv[child * lanes + lane];
+            cfv_avg += s * v;
+        }
+    } else {
+        for (int a = 0; a < na; a++) {
+            uint child = children[node.children_start + a];
+            cfv_avg += cfv[child * lanes + lane];
+        }
+    }
+    cfv[node_id * lanes + lane] = cfv_avg;
+
+    if (is_traverser) {
+        uint infoset_id = infoset_offsets[node_id];
+        const device float* sigma = strategy + infoset_id * stride;
+        device float* r = regrets + infoset_id * stride;
+        device float* g = cum_strategy + infoset_id * stride;
+        for (int a = 0; a < na; a++) {
+            uint child = children[node.children_start + a];
+            float v_child = cfv[child * lanes + lane];
+            float inst_regret = v_child - cfv_avg;
+            int ridx = a * lanes + lane;
+            float old_r = r[ridx];
+            float coef = (old_r >= 0.0f) ? params.alpha_t : params.beta_t;
+            r[ridx] = coef * old_r + inst_regret;
+            g[ridx] = params.gamma_t * g[ridx] + sigma[ridx];
+        }
+    }
 }
 
 // ============================================================================
@@ -2995,6 +3267,41 @@ inline float factored_share_k1_thread(
     return share;
 }
 
+// ─── Step 2.D.28 (#1): threadgroup-storage variants for 6-max parallel
+// kernel. Same math as _thread variants; input arrays (reach,
+// hand_strength) live in threadgroup memory so they can be shared across
+// threads in a threadgroup. Internal per-thread accumulators (b_a_pc[52]
+// etc) stay in thread storage.
+inline float factored_share_k1_tg(
+    int oi,
+    bool elig,
+    ulong dead_mask,
+    ushort h_str,
+    uint tied_offset,
+    threadgroup const float* reach,
+    const device uchar* hand_cards,
+    threadgroup const ushort* hand_strength,
+    int nh
+) {
+    float share = 0.0f;
+    int o_off = oi * nh;
+    for (int g = 0; g < nh; g++) {
+        ulong g_m = (1ul << hand_cards[g * 2]) | (1ul << hand_cards[g * 2 + 1]);
+        if ((g_m & dead_mask) != 0) continue;
+        float r = reach[o_off + g];
+        if (r == 0.0f) continue;
+        ushort s = hand_strength[g];
+        if (elig) {
+            if (s > h_str) continue;
+            uint t = (s == h_str) ? (tied_offset + 1) : tied_offset;
+            share += r / (1.0f + (float)t);
+        } else {
+            share += r / (1.0f + (float)tied_offset);
+        }
+    }
+    return share;
+}
+
 inline float factored_share_k2_thread(
     int oa, int ob,
     bool ea, bool eb,
@@ -3004,6 +3311,91 @@ inline float factored_share_k2_thread(
     thread const float* reach,
     const device uchar* hand_cards,
     thread const ushort* hand_strength,
+    int nh
+) {
+    int oa_off = oa * nh;
+    int ob_off = ob * nh;
+    float b_a = 0.0f, t_a = 0.0f, s_a = 0.0f;
+    float b_b = 0.0f, t_b = 0.0f, s_b = 0.0f;
+    float b_a_pc[52], t_a_pc[52], s_a_pc[52];
+    float b_b_pc[52], t_b_pc[52], s_b_pc[52];
+    for (int c = 0; c < 52; c++) {
+        b_a_pc[c] = 0.0f; t_a_pc[c] = 0.0f; s_a_pc[c] = 0.0f;
+        b_b_pc[c] = 0.0f; t_b_pc[c] = 0.0f; s_b_pc[c] = 0.0f;
+    }
+    float h_bb = 0.0f, h_tt = 0.0f, h_ss = 0.0f;
+    for (int g = 0; g < nh; g++) {
+        ulong g_m = (1ul << hand_cards[g * 2]) | (1ul << hand_cards[g * 2 + 1]);
+        if ((g_m & dead_mask) != 0) continue;
+        float r_a = reach[oa_off + g];
+        float r_b = reach[ob_off + g];
+        if (r_a == 0.0f && r_b == 0.0f) continue;
+        ushort s = hand_strength[g];
+        int gc1 = hand_cards[g * 2];
+        int gc2 = hand_cards[g * 2 + 1];
+        if (s < h_str) {
+            b_a += r_a; b_a_pc[gc1] += r_a; b_a_pc[gc2] += r_a;
+            b_b += r_b; b_b_pc[gc1] += r_b; b_b_pc[gc2] += r_b;
+            h_bb += r_a * r_b;
+        } else if (s == h_str) {
+            t_a += r_a; t_a_pc[gc1] += r_a; t_a_pc[gc2] += r_a;
+            t_b += r_b; t_b_pc[gc1] += r_b; t_b_pc[gc2] += r_b;
+            h_tt += r_a * r_b;
+        } else {
+            s_a += r_a; s_a_pc[gc1] += r_a; s_a_pc[gc2] += r_a;
+            s_b += r_b; s_b_pc[gc1] += r_b; s_b_pc[gc2] += r_b;
+            h_ss += r_a * r_b;
+        }
+    }
+    float r_a_tot = b_a + t_a + s_a;
+    float r_b_tot = b_b + t_b + s_b;
+    float h_tot = h_bb + h_tt + h_ss;
+    float edge_bb = 0.0f, edge_bt = 0.0f, edge_tb = 0.0f, edge_tt = 0.0f;
+    float edge_be = 0.0f, edge_te = 0.0f, edge_eb = 0.0f, edge_et = 0.0f;
+    float edge_ee = 0.0f;
+    for (int c = 0; c < 52; c++) {
+        if ((dead_mask & (1ul << c)) != 0) continue;
+        float bac = b_a_pc[c], tac = t_a_pc[c], sac = s_a_pc[c];
+        float bbc = b_b_pc[c], tbc = t_b_pc[c], sbc = s_b_pc[c];
+        float rac = bac + tac + sac;
+        float rbc = bbc + tbc + sbc;
+        edge_bb += bac * bbc; edge_bt += bac * tbc;
+        edge_tb += tac * bbc; edge_tt += tac * tbc;
+        edge_be += bac * rbc; edge_te += tac * rbc;
+        edge_eb += rac * bbc; edge_et += rac * tbc;
+        edge_ee += rac * rbc;
+    }
+    float pair_bb = b_a * b_b - edge_bb + h_bb;
+    float pair_bt = b_a * t_b - edge_bt;
+    float pair_tb = t_a * b_b - edge_tb;
+    float pair_tt = t_a * t_b - edge_tt + h_tt;
+    float pair_be = b_a * r_b_tot - edge_be + h_bb;
+    float pair_te = t_a * r_b_tot - edge_te + h_tt;
+    float pair_eb = r_a_tot * b_b - edge_eb + h_bb;
+    float pair_et = r_a_tot * t_b - edge_et + h_tt;
+    float pair_ee = r_a_tot * r_b_tot - edge_ee + h_tot;
+    float tf = (float)tied_offset;
+    if (ea && eb) {
+        return pair_bb / (1.0f + tf) + pair_bt / (2.0f + tf) + pair_tb / (2.0f + tf) + pair_tt / (3.0f + tf);
+    } else if (ea && !eb) {
+        return pair_be / (1.0f + tf) + pair_te / (2.0f + tf);
+    } else if (!ea && eb) {
+        return pair_eb / (1.0f + tf) + pair_et / (2.0f + tf);
+    } else {
+        return pair_ee / (1.0f + tf);
+    }
+}
+
+// ─── Step 2.D.28 (#1): threadgroup-storage variant of factored_share_k2.
+inline float factored_share_k2_tg(
+    int oa, int ob,
+    bool ea, bool eb,
+    ulong dead_mask,
+    ushort h_str,
+    uint tied_offset,
+    threadgroup const float* reach,
+    const device uchar* hand_cards,
+    threadgroup const ushort* hand_strength,
     int nh
 ) {
     int oa_off = oa * nh;
@@ -3165,6 +3557,102 @@ inline float factored_share_for_level_thread(
                 float p012 = p01 * r2;
                 share += p012 * factored_share_k2_thread(k2a, k2b, ek2a, ek2b, m3, h_str, t012,
                                                           reach, hand_cards, hand_strength, nh);
+            }
+        }
+    }
+    return share;
+}
+
+// ─── Step 2.D.28 (#1): threadgroup-storage variant of factored_share_for_level.
+// Same recursive K-1 expansion as _thread variant but operates on threadgroup-
+// storage `reach` and `hand_strength` arrays so multiple threads in a group
+// can call this concurrently for different h values without per-thread copies.
+inline float factored_share_for_level_tg(
+    int num_opp,
+    uint elig_opps,
+    uint tied_offset,
+    ulong h_m,
+    ushort h_str,
+    threadgroup const float* reach,
+    const device uchar* hand_cards,
+    threadgroup const ushort* hand_strength,
+    int nh
+) {
+    if (num_opp == 1) {
+        bool e0 = (elig_opps >> 0) & 1u;
+        return factored_share_k1_tg(0, e0, h_m, h_str, tied_offset,
+                                     reach, hand_cards, hand_strength, nh);
+    }
+    if (num_opp == 2) {
+        bool e0 = (elig_opps >> 0) & 1u;
+        bool e1 = (elig_opps >> 1) & 1u;
+        return factored_share_k2_tg(0, 1, e0, e1, h_m, h_str, tied_offset,
+                                     reach, hand_cards, hand_strength, nh);
+    }
+    int k2a = num_opp - 2;
+    int k2b = num_opp - 1;
+    bool ek2a = (elig_opps >> k2a) & 1u;
+    bool ek2b = (elig_opps >> k2b) & 1u;
+    bool e0 = (elig_opps >> 0) & 1u;
+    float share = 0.0f;
+    for (int g0 = 0; g0 < nh; g0++) {
+        ulong g0_m = (1ul << hand_cards[g0 * 2]) | (1ul << hand_cards[g0 * 2 + 1]);
+        if ((g0_m & h_m) != 0) continue;
+        float r0 = reach[0 * nh + g0];
+        if (r0 == 0.0f) continue;
+        ushort s0 = hand_strength[g0];
+        uint t0;
+        if (e0) {
+            if (s0 > h_str) continue;
+            t0 = (s0 == h_str) ? (tied_offset + 1) : tied_offset;
+        } else {
+            t0 = tied_offset;
+        }
+        ulong m1 = h_m | g0_m;
+        if (num_opp == 3) {
+            share += r0 * factored_share_k2_tg(k2a, k2b, ek2a, ek2b, m1, h_str, t0,
+                                                reach, hand_cards, hand_strength, nh);
+            continue;
+        }
+        bool e1 = (elig_opps >> 1) & 1u;
+        for (int g1 = 0; g1 < nh; g1++) {
+            ulong g1_m = (1ul << hand_cards[g1 * 2]) | (1ul << hand_cards[g1 * 2 + 1]);
+            if ((g1_m & m1) != 0) continue;
+            float r1 = reach[1 * nh + g1];
+            if (r1 == 0.0f) continue;
+            ushort s1 = hand_strength[g1];
+            uint t01;
+            if (e1) {
+                if (s1 > h_str) continue;
+                t01 = (s1 == h_str) ? (t0 + 1) : t0;
+            } else {
+                t01 = t0;
+            }
+            ulong m2 = m1 | g1_m;
+            float p01 = r0 * r1;
+            if (num_opp == 4) {
+                share += p01 * factored_share_k2_tg(k2a, k2b, ek2a, ek2b, m2, h_str, t01,
+                                                     reach, hand_cards, hand_strength, nh);
+                continue;
+            }
+            bool e2 = (elig_opps >> 2) & 1u;
+            for (int g2 = 0; g2 < nh; g2++) {
+                ulong g2_m = (1ul << hand_cards[g2 * 2]) | (1ul << hand_cards[g2 * 2 + 1]);
+                if ((g2_m & m2) != 0) continue;
+                float r2 = reach[2 * nh + g2];
+                if (r2 == 0.0f) continue;
+                ushort s2 = hand_strength[g2];
+                uint t012;
+                if (e2) {
+                    if (s2 > h_str) continue;
+                    t012 = (s2 == h_str) ? (t01 + 1) : t01;
+                } else {
+                    t012 = t01;
+                }
+                ulong m3 = m2 | g2_m;
+                float p012 = p01 * r2;
+                share += p012 * factored_share_k2_tg(k2a, k2b, ek2a, ek2b, m3, h_str, t012,
+                                                      reach, hand_cards, hand_strength, nh);
             }
         }
     }
