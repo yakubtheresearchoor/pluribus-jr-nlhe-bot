@@ -56,7 +56,7 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
     // multiway caveat.
     let first_player = match config.initial_state {
         BoardState::Preflop => builder.first_preflop_player(&active_players),
-        _ => builder.first_postflop_player(&active_players),
+        _ => builder.first_postflop_player_with_button(&active_players),
     };
 
     let root = FlatNode::player(first_player, config.initial_state, 0);
@@ -67,11 +67,40 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
             .set_contribution(root_idx, p as u8, initial_contributions[p]);
     }
 
+    // committed_at_round_start initialization.
+    //
+    // **Postflop trees (initial_state != Preflop):** at flop-start /
+    // turn-start / river-start, the round begins with all PRIOR-STREET
+    // chips already committed. `initial_contributions` represents what
+    // each player put in pre-this-street (e.g., at flop-start, the
+    // pre-flop pot share per player). So committed_at_round_start =
+    // initial_contributions = current stacks. Then per_street_committed
+    // = stacks - committed_at_round_start = 0 at the root, correctly
+    // signaling "no bets THIS street yet".
+    //
+    // **Preflop trees (initial_state == Preflop):** the blinds ARE
+    // first-round actions, not pre-existing chips from a prior street.
+    // No round preceded preflop, so committed_at_round_start at the
+    // preflop root should be 0 for every player — meaning blinds are
+    // counted as IN-ROUND chips. Then per_street_committed = stacks =
+    // initial_contributions = blinds, so BB's per_street = 2, SB's = 1,
+    // others = 0, and UTG (per_street = 0) faces a max_other_per_street
+    // of 2 → is_facing_bet = true → action set = {Fold, Call, Raise},
+    // matching real preflop poker.
+    //
+    // The previous initialization (committed_at_round_start = stacks
+    // for ALL initial states) treated preflop blinds as pre-existing
+    // dead money, leading to per_street = 0 for everyone at the
+    // preflop root, is_facing_bet = false for UTG, and an action set
+    // of {Check, Bet, AllIn} where Check let SB / UTG see the flop
+    // without matching the BB — the free-flop wrong-game bug surfaced
+    // by the chip trace and the seam test (2026-06-04, the lead).
+    let committed_at_round_start = match config.initial_state {
+        BoardState::Preflop => vec![0_i32; num_players],
+        _ => stacks.clone(),
+    };
     let info = BuildInfo {
-        // committed_at_round_start: on the first street (the initial state of
-        // the FlopStartGame, etc.), the round starts with the blinds/antes
-        // already in. Same value as initial_contributions = current stacks.
-        committed_at_round_start: stacks.clone(),
+        committed_at_round_start,
         stacks,
         active: active_players,
         folded: vec![false; num_players],
@@ -102,24 +131,30 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
         );
     }
 
-    // Phase 5 build-time abstraction-cap assert: every PLAYER node's child
-    // count must fit within MAX_NA. GPU kernel strides are hard-coded to
-    // MAX_NA = {}; a config that legitimately exceeds it (e.g., multi-raise
-    // sizes pushing facing-bet beyond 4 actions) must force an explicit
-    // abstraction decision (cap actions, or raise MAX_NA + update strides),
-    // never silently corrupt GPU buffers by writing past the stride bound.
-    use crate::tree::flat::MAX_NA;
+    // Build-time abstraction-cap assert: every PLAYER node's child count
+    // must fit within the action-slot stride of the buffer it'll be stored
+    // in. With per-stage MAX_NA (Phase 2), preflop allows MAX_NA_PREFLOP
+    // actions (=16) and postflop allows MAX_NA_POSTFLOP (=6, tuned in
+    // Phase 4). Hitting these caps means the bet_sizes config produces a
+    // legal action set wider than the stride bound for that stage — force
+    // an explicit abstraction decision (cap actions, or bump the constant
+    // in src/tree/flat.rs which auto-regenerates all derived strides via
+    // build.rs codegen).
+    use crate::tree::action::BoardState;
+    use crate::tree::flat::{MAX_NA_POSTFLOP, MAX_NA_PREFLOP};
     for (i, n) in builder.tree.nodes.iter().enumerate() {
         if n.is_player() {
+            let is_preflop = n.board_state == BoardState::Preflop as u8;
+            let cap = if is_preflop { MAX_NA_PREFLOP } else { MAX_NA_POSTFLOP };
+            let stage_name = if is_preflop { "MAX_NA_PREFLOP" } else { "MAX_NA_POSTFLOP" };
             assert!(
-                (n.num_children as usize) <= MAX_NA,
-                "PLAYER node[{}] has {} children, exceeds MAX_NA={}. The \
-                 abstraction (bet_sizes config) produces a legal action set \
-                 wider than the GPU strides allow. Either cap the action set \
-                 (Option A) or raise MAX_NA and update strides in \
-                 flop_solver.rs / flop_start_vector_cfr.rs / vcfr.metal \
-                 (Option B). See Phase 5 of the rewrite plan.",
-                i, n.num_children, MAX_NA
+                (n.num_children as usize) <= cap,
+                "PLAYER node[{}] (board_state={}) has {} children, exceeds {}={}. \
+                 The abstraction (bet_sizes config) produces a legal action set \
+                 wider than the per-stage stride. Either cap the action set \
+                 (Option A) or raise {} in src/tree/flat.rs (build.rs auto- \
+                 regenerates the Metal header; Option B).",
+                i, n.board_state, n.num_children, stage_name, cap, stage_name
             );
         }
     }
@@ -295,31 +330,74 @@ impl<'a> TreeBuilder<'a> {
         0
     }
 
-    /// First player to act PREFLOP. Distinct from `first_postflop_player`.
+    /// First player to act PREFLOP.
     ///
-    /// HU CONVENTION (np=2): the button = SB = highest-indexed active
-    /// player acts first preflop. Postflop, BB (= lowest-indexed active
-    /// player) acts first. This is the action-order reversal the
-    /// `hu_completeness.rs` scope note explicitly flagged as needing new
-    /// machinery, NOT reusable from `first_postflop_player`.
+    /// Behavior depends on `config.button_player`:
     ///
-    /// MULTIWAY (np > 2): standard preflop convention has UTG (the seat
-    /// after BB) acting first. Identifying UTG requires knowing which
-    /// seat is the BB, which is not currently encoded in TreeConfig
-    /// beyond the initial_contributions structure. For multiway preflop,
-    /// this function returns the highest-indexed active player (button
-    /// position), which is HU-correct but NOT multiway-correct (the
-    /// button acts LAST preflop in multiway, not first). Multiway
-    /// preflop ordering is a deferred configuration question; the first
-    /// preflop component validation focuses on HU per the plan.
+    /// **Explicit button (`button_player = Some(b)`)**: derives positions
+    /// by rotation per the standard poker convention.
+    ///   - HU (np=2): button == SB, so the button itself acts first
+    ///     preflop. Returns `b`.
+    ///   - Multiway (np>=3): UTG = (button + 3) mod np acts first.
+    ///     Returns `(b + 3) % np`.
+    ///
+    /// **Legacy inference (`button_player = None`)**: returns the
+    /// highest-indexed active player. HU-correct under the convention
+    /// "higher-indexed seat is the button" (e.g., `initial_contributions
+    /// = [2, 1]` with BB at player 0 and SB at player 1). Multiway-
+    /// incorrect (returns the button instead of UTG); all multiway
+    /// preflop callers MUST set `button_player` explicitly.
     fn first_preflop_player(&self, active: &[bool]) -> u8 {
         let num_players = self.config.num_players as usize;
+        if let Some(button) = self.config.button_player {
+            let button = button as usize;
+            assert!(button < num_players,
+                "button_player {} out of range for num_players {}", button, num_players);
+            let first = if num_players == 2 {
+                // HU: button == SB acts first preflop.
+                button
+            } else {
+                // Multiway: UTG = (button + 3) % np acts first preflop.
+                (button + 3) % num_players
+            };
+            assert!(active[first],
+                "first preflop player (computed from button {}) is inactive at index {}",
+                button, first);
+            return first as u8;
+        }
+        // Legacy: highest-indexed active player. HU-correct under the
+        // higher-indexed-is-button convention; multiway-incorrect.
         for i in (0..num_players).rev() {
             if active[i] {
                 return i as u8;
             }
         }
         0
+    }
+
+    /// First player to act POSTFLOP.
+    ///
+    /// **Explicit button (`button_player = Some(b)`)**: SB = (button + 1)
+    /// mod np acts first. At HU (np=2), this is BB = (button + 1) mod 2
+    /// since SB == button; the formula collapses correctly.
+    ///
+    /// **Legacy inference (`button_player = None`)**: returns the lowest-
+    /// indexed active player. HU-correct under the convention that BB is
+    /// the lowest-indexed seat; multiway-incorrect if SB isn't player 0.
+    fn first_postflop_player_with_button(&self, active: &[bool]) -> u8 {
+        let num_players = self.config.num_players as usize;
+        if let Some(button) = self.config.button_player {
+            let button = button as usize;
+            let mut idx = (button + 1) % num_players;
+            // Skip folded/inactive players in clockwise order.
+            for _ in 0..num_players {
+                if active[idx] { return idx as u8; }
+                idx = (idx + 1) % num_players;
+            }
+            return 0;
+        }
+        // Legacy: lowest-indexed active.
+        self.first_postflop_player(active)
     }
 
     fn next_active_player(&self, current: usize, active: &[bool]) -> Option<usize> {
@@ -361,13 +439,29 @@ impl<'a> TreeBuilder<'a> {
             return true;
         }
 
-        // (a) All active have equal cumulative — standard Model A check.
-        let first = info.stacks[active[0]];
-        if active.iter().all(|&p| info.stacks[p] == first) {
+        // (a) Standing-bet rule (corrected from cum_eq 2026-06-04, the lead):
+        // The round is complete when every active player has matched the
+        // standing bet (the max contribution among active players) OR is
+        // all-in at their personal max_committable. The previous
+        // "all stacks equal" check rejected legal round-end states where
+        // some active players were all-in for less than the standing bet
+        // (capped by their max_committable, with the excess from larger
+        // stacks being uncalled-bet-returned per poker rules). The
+        // unequal commits at the seam from those all-in-at-less states
+        // were the foundation bug surviving past the initial
+        // committed_at_round_start fix; this is the parallel correction
+        // in is_round_complete.
+        let standing_bet = active.iter().map(|&p| info.stacks[p]).max().unwrap();
+        let all_matched_or_allin = active.iter().all(|&p| {
+            info.stacks[p] == standing_bet || info.stacks[p] >= self.max_committable(p)
+        });
+        if all_matched_or_allin {
             return true;
         }
 
         // (b) No betting this street — all active have per-street commit 0.
+        // Handles the postflop check-around case (no actions, round ends
+        // when all checked).
         if active.iter().all(|&p| Self::per_street_committed(info, p) == 0) {
             return true;
         }
@@ -387,9 +481,25 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn build_recursive(&mut self, node_idx: usize, info: BuildInfo) {
-        if info.depth > MAX_DEPTH {
-            return;
-        }
+        // MAX_DEPTH was previously a SILENT return — it silently dropped
+        // recursion past depth 64, producing incomplete trees with no
+        // signal. This hid the all-in-mixed-commits round-completion bug
+        // for the entire history of this work (the lead's MAX_DEPTH lesson
+        // 2026-06-04: "a silent cap that no enumerator happens to
+        // overflow against would never be found"). Made LOUD (panic):
+        // any depth exceeded now signals a real round-termination
+        // issue, not silently truncates the tree.
+        assert!(
+            info.depth <= MAX_DEPTH,
+            "build_recursive depth {} exceeds MAX_DEPTH {}. This signals a \
+             round-termination bug (the round-completion logic is rejecting \
+             legal round-end states; the recursion never terminates). \
+             Previously a silent return that hid this bug as truncated trees; \
+             made loud per the lead's audit-silent-truncations directive. \
+             Investigate is_round_complete / all-in handling for this \
+             configuration before raising MAX_DEPTH.",
+            info.depth, MAX_DEPTH
+        );
 
         // EARLY RETURN: if this node was already constructed as TERMINAL or
         // CHANCE by make_child_node (e.g., the FOLD action correctly sets
@@ -536,7 +646,7 @@ impl<'a> TreeBuilder<'a> {
         // that's correct.
 
         let child_node = {
-            let first = self.first_postflop_player(&info.active);
+            let first = self.first_postflop_player_with_button(&info.active);
             FlatNode::player(first, info.board_state, self.tree.nodes[parent_idx].amount)
         };
         let child_idx = self.tree.alloc_node(child_node);
@@ -552,7 +662,7 @@ impl<'a> TreeBuilder<'a> {
 
         info.has_acted_this_round = vec![false; self.config.num_players as usize];
         info.num_bets = 0;
-        info.round_starter = self.first_postflop_player(&info.active) as usize;
+        info.round_starter = self.first_postflop_player_with_button(&info.active) as usize;
         // Refresh per-street commit snapshot at the chance boundary. The new
         // round begins with all players' current cumulative committed values
         // as their "starting" position for the next betting round.
@@ -954,7 +1064,7 @@ impl<'a> TreeBuilder<'a> {
 
         if matches!(action, Action::Check) {
             if self.is_round_complete(info) {
-                return self.first_postflop_player(&info.active) as usize;
+                return self.first_postflop_player_with_button(&info.active) as usize;
             }
             return self
                 .next_active_player(current, &info.active)

@@ -1,5 +1,5 @@
 use crate::gpu_metal::{MetalBuffer, MetalContext};
-use crate::tree::flat::{FlatNode, FlatTree, MAX_NA};
+use crate::tree::flat::{FlatNode, FlatTree, MAX_NA_POSTFLOP};
 
 use metal::{MTLSize, ComputePipelineState};
 
@@ -101,7 +101,7 @@ impl MetalVectorCfr {
         let nh = num_hands;
         let num_infosets = tree.num_infosets as usize;
         let max_depth = tree.max_depth as usize;
-        let infoset_data_size = num_infosets * MAX_NA * nh;
+        let infoset_data_size = num_infosets * MAX_NA_POSTFLOP * nh;
 
         // Create pipelines
         let strategies_pipeline = ctx.create_pipeline("vcfr_compute_strategies")
@@ -464,7 +464,7 @@ impl MetalVectorCfr {
             .iter()
             .map(|&off| {
                 if off == UNUSED { usize::MAX }
-                else { off as usize * MAX_NA * nh }
+                else { off as usize * MAX_NA_POSTFLOP * nh }
             })
             .collect()
     }
@@ -476,7 +476,7 @@ impl MetalVectorCfr {
     fn node_data_offset(&self, node_idx: usize) -> usize {
         let off = self.d_infoset_offsets.as_slice()[node_idx];
         if off == UNUSED { usize::MAX }
-        else { off as usize * MAX_NA * self.num_hands }
+        else { off as usize * MAX_NA_POSTFLOP * self.num_hands }
     }
 
     // ---- Diagnostic methods for debugging kernel divergence ----

@@ -151,6 +151,8 @@ fn build_minimal() -> (FlatTree, FlopStartGame) {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+
     };
     let tree = build_tree(&config).unwrap();
     let game = FlopStartGame::new(table);
@@ -179,7 +181,7 @@ fn exploitability_cross_check() {
 
     // Also compute using best_response.rs with uniform strategy
     let nn = tree.num_nodes();
-    let na_max = 4; // MAX_NA from flat.rs
+    let na_max = 4; // MAX_NA_POSTFLOP from flat.rs
 
     // Build uniform strategy for all decision nodes
     let mut cum_strat = vec![0.0f32; nn * na_max * nh];

@@ -8,9 +8,9 @@
 /// to per-outcome regret slots — no atomic accumulation needed.
 ///
 /// Regret layout (contiguous buffer: flop | turn | river):
-///   Flop:  regrets[infoset * MAX_NA * nh + a * nh + h]
-///   Turn:  regrets[flop_total + tc * turn_stride + infoset * MAX_NA * nh + a * nh + h]
-///   River: regrets[flop_total + turn_total + (tc*max_river+rc) * river_stride + infoset * MAX_NA * nh + a * nh + h]
+///   Flop:  regrets[infoset * MAX_NA_POSTFLOP * nh + a * nh + h]
+///   Turn:  regrets[flop_total + tc * turn_stride + infoset * MAX_NA_POSTFLOP * nh + a * nh + h]
+///   River: regrets[flop_total + turn_total + (tc*max_river+rc) * river_stride + infoset * MAX_NA_POSTFLOP * nh + a * nh + h]
 ///
 /// Strategy computed from regrets via regret matching, separately per outcome.
 /// DCFR discount applied inline during the bottom-up pass.
@@ -18,7 +18,7 @@
 use crate::gpu_metal::{MetalBuffer, MetalContext};
 use crate::solver::flop_start_game::FlopStartGame;
 use crate::solver::flop_start_vector_cfr::FlopStartVectorCfr;
-use crate::tree::flat::{FlatTree, MAX_NA};
+use crate::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
 use metal::ComputePipelineState;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,30 @@ use std::time::{Duration, Instant};
 /// scratch, change kernel dispatch offsets to use `outcome_idx = 0` in
 /// `DiskBacked`, wire load/save into `run_one_iter`, add I/O fields to
 /// `StageProfile`.
+/// Zone selector for inter-zone offset computations on the postflop
+/// d_regrets / d_strategy / d_cum_strategy buffers. All three buffers share
+/// the same layout — they were allocated in lockstep with identical strides —
+/// so a single set of zone offsets describes all three.
+///
+/// The variants carry the outcome index because each zone other than Flop
+/// has per-outcome substructure:
+///   - Flop has exactly one outcome (no chance dimension at the flop root)
+///   - Turn has one outcome per turn card index `ti`
+///   - River has one outcome per (ti, ri) pair, encoded as `outcome_idx`
+///
+/// See `MetalFlopStartSolver::infoset_float_offset` /
+/// `infoset_byte_offset` — the consolidated offset helpers (Phase 2). The
+/// inline form that this replaces was a known stride-bug source — flop_solver
+/// historically miscounted outcome offsets at sites like `disk_backed_load`
+/// because each site re-derived `zone_offset + outcome_idx * zone_stride`
+/// from raw fields, so centralizing it eliminates the duplication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferZone {
+    Flop,
+    Turn { ti: usize },
+    River { outcome_idx: usize },
+}
+
 #[derive(Clone, Debug)]
 pub enum GpuRiverMode {
     /// All [n_turn × max_river × river_stride] f32 stays in GPU memory.
@@ -404,9 +428,9 @@ impl MetalFlopStartSolver {
         let flop_infosets = cpu_solver.flop_infosets();
         let turn_infosets = cpu_solver.turn_infosets();
         let river_infosets = cpu_solver.river_infosets();
-        let flop_stride = flop_infosets * MAX_NA * nh;
-        let turn_stride = turn_infosets * MAX_NA * nh;
-        let river_stride = river_infosets * MAX_NA * nh;
+        let flop_stride = flop_infosets * MAX_NA_POSTFLOP * nh;
+        let turn_stride = turn_infosets * MAX_NA_POSTFLOP * nh;
+        let river_stride = river_infosets * MAX_NA_POSTFLOP * nh;
         let turn_total = n_turn * turn_stride;
         let river_total = n_turn * max_river * river_stride;
         let flop_offset = 0;
@@ -686,6 +710,39 @@ impl MetalFlopStartSolver {
     // max_river() defined further below; not duplicating here.
     pub fn river_offset(&self) -> usize { self.river_offset }
     pub fn river_stride(&self) -> usize { self.river_stride }
+    /// Public accessors mirroring river_*, added in Phase 2 so the offset-
+    /// helper unit tests can hand-compute reference values.
+    pub fn turn_offset(&self) -> usize { self.turn_offset }
+    pub fn turn_stride(&self) -> usize { self.turn_stride }
+    pub fn flop_offset(&self) -> usize { self.flop_offset }
+
+    /// Float-offset into d_regrets / d_strategy / d_cum_strategy for the start
+    /// of the requested zone's outcome slice. All three buffers share this
+    /// layout — they were allocated together with identical stride math, so a
+    /// single helper covers all three.
+    ///
+    /// This is the consolidation of the pattern that used to be inlined at
+    /// every dispatch site as `(self.river_offset + outcome_idx * self.river_stride) * 4`,
+    /// etc. The inline form was a desync hazard — Phase 2's per-stage MAX_NA
+    /// makes the stride math stage-dependent, and the user's directive
+    /// explicitly called out stride-math sites as "historically bug-prone".
+    /// Centralizing into this helper + unit testing it per zone is the
+    /// disambiguator.
+    pub fn infoset_float_offset(&self, zone: BufferZone) -> usize {
+        match zone {
+            BufferZone::Flop => self.flop_offset,
+            BufferZone::Turn { ti } => self.turn_offset + ti * self.turn_stride,
+            BufferZone::River { outcome_idx } => {
+                self.river_offset + outcome_idx * self.river_stride
+            }
+        }
+    }
+
+    /// Byte offset (suitable for set_buffer offset args). Equals
+    /// `infoset_float_offset(zone) * size_of::<f32>()`.
+    pub fn infoset_byte_offset(&self, zone: BufferZone) -> u64 {
+        (self.infoset_float_offset(zone) * std::mem::size_of::<f32>()) as u64
+    }
 
     /// Returns the buffer outcome index for river kernel dispatches.
     ///
@@ -1380,7 +1437,7 @@ impl MetalFlopStartSolver {
 
         // Top-down through turn zone using turn[ti] strategy
         // Strategy byte offset: turn_offset + ti * turn_stride, each element is f32 (4 bytes)
-        let strat_byte_offset = ((self.turn_offset + ti * self.turn_stride) * 4) as u64;
+        let strat_byte_offset = self.infoset_byte_offset(BufferZone::Turn { ti });
         for level in 0..=self.max_depth {
             let count = self.turn_zone_counts[level];
             if count == 0 { continue; }
@@ -1408,7 +1465,7 @@ impl MetalFlopStartSolver {
         // scratch); the caller must have loaded (ti, ri) into the scratch
         // first via `load_river_pair_gpu`.
         let outcome_idx = self.river_outcome_idx(ti, ri);
-        let strat_byte_offset = ((self.river_offset + outcome_idx * self.river_stride) * 4) as u64;
+        let strat_byte_offset = self.infoset_byte_offset(BufferZone::River { outcome_idx });
         for level in 0..=self.max_depth {
             let count = self.river_zone_counts[level];
             if count == 0 { continue; }
@@ -1432,9 +1489,13 @@ impl MetalFlopStartSolver {
         let sorted_opp_stride = num_opp * nh;
 
         let outcome_idx = self.river_outcome_idx(ti, ri);
-        let strat_byte_off = (self.river_offset + outcome_idx * self.river_stride) * 4;
-        let regret_byte_off = (self.river_offset + outcome_idx * self.river_stride) * 4;
-        let cum_byte_off = (self.river_offset + outcome_idx * self.river_stride) * 4;
+        // Consolidated zone-offset helper (Phase 2). All three buffers
+        // (d_regrets / d_strategy / d_cum_strategy) share the same layout,
+        // so one call sets the byte offset for all three.
+        let buf_off = self.infoset_byte_offset(BufferZone::River { outcome_idx }) as usize;
+        let strat_byte_off = buf_off;
+        let regret_byte_off = buf_off;
+        let cum_byte_off = buf_off;
         let cfv_byte_off = ri * nn * nh * 4;
         let tc_card = self.turn_deck[ti] as usize;
         let rc_card = self.river_decks[tc_card][ri] as usize;
@@ -1618,9 +1679,10 @@ impl MetalFlopStartSolver {
         let np = self.num_players as usize;
         let num_opp = np - 1;
 
-        let strat_byte_off = (self.turn_offset + ti * self.turn_stride) * 4;
-        let regret_byte_off = (self.turn_offset + ti * self.turn_stride) * 4;
-        let cum_byte_off = (self.turn_offset + ti * self.turn_stride) * 4;
+        let buf_off = self.infoset_byte_offset(BufferZone::Turn { ti }) as usize;
+        let strat_byte_off = buf_off;
+        let regret_byte_off = buf_off;
+        let cum_byte_off = buf_off;
         let cfv_byte_off = ti * self.nn * self.nh * 4;
 
         // Turn zone uses sorted arrays for this turn card (indexed by raw card value)
@@ -2151,7 +2213,7 @@ impl MetalFlopStartSolver {
     /// before calling this so the scratch holds the right regrets.
     pub fn compute_river_strategy_pair(&self, ctx: &MetalContext, ti: usize, ri: usize) {
         let outcome_idx = self.river_outcome_idx(ti, ri);
-        let base_offset = self.river_offset + outcome_idx * self.river_stride;
+        let base_offset = self.infoset_float_offset(BufferZone::River { outcome_idx });
         self.compute_strategies_batched(
             ctx, &self.d_river_decision_ids, &self.d_river_infoset_offsets,
             self.river_infosets, 1, base_offset, self.river_stride,

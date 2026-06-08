@@ -76,7 +76,7 @@ fn investigate_sequential_iteration1_regrets() {
     let gpu_snap0 = gpu_solver.run_one_iteration_diagnostic(&ctx, &tree, 0);
     let cpu_snap0 = cpu_solver.run_one_iteration_diagnostic(&tree, &game, 0);
 
-    let stride = solver_core::tree::flat::MAX_NA * nh;
+    let stride = solver_core::tree::flat::MAX_NA_POSTFLOP * nh;
 
     // Compare regrets after traverser 0
     let max_reg_diff_t0: f32 = cpu_snap0.regrets.iter().zip(gpu_snap0.regrets.iter())

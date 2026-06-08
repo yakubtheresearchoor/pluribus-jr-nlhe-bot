@@ -35,7 +35,7 @@ use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
-use solver_core::tree::flat::{FlatTree, MAX_NA};
+use solver_core::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
 use std::time::Instant;
 
 fn build_6p_table(nh: usize) -> (FlatTree, FlopChanceTable) {
@@ -106,15 +106,15 @@ fn measure_exploitability(
 /// Analyze the converged strategy for mixedness.
 ///
 /// cum_strategy layout: per-zone (flop / turn / river), each is
-/// [outcome × infoset × MAX_NA × nh] with na varying per infoset (≤ MAX_NA).
+/// [outcome × infoset × MAX_NA_POSTFLOP × nh] with na varying per infoset (≤ MAX_NA_POSTFLOP).
 /// To get σ_avg at a specific (infoset, hand), normalize over actions.
 ///
 /// We don't have direct na-per-infoset access here, so we approximate by
-/// considering all MAX_NA action slots and ignoring zero-valued ones. If a
-/// node has na=2, action slots 2..MAX_NA are all 0 and don't affect entropy.
+/// considering all MAX_NA_POSTFLOP action slots and ignoring zero-valued ones. If a
+/// node has na=2, action slots 2..MAX_NA_POSTFLOP are all 0 and don't affect entropy.
 fn analyze_mixedness(cum_strategy: &[f32], nh: usize) -> (f32, f32, usize, usize) {
-    // Iterate cum_strategy by chunks of (MAX_NA * nh). Each chunk = one infoset.
-    let chunk_size = MAX_NA * nh;
+    // Iterate cum_strategy by chunks of (MAX_NA_POSTFLOP * nh). Each chunk = one infoset.
+    let chunk_size = MAX_NA_POSTFLOP * nh;
     let mut total_entropy = 0.0f64;
     let mut total_decisions = 0usize;
     let mut dirac_count = 0usize;
@@ -126,8 +126,8 @@ fn analyze_mixedness(cum_strategy: &[f32], nh: usize) -> (f32, f32, usize, usize
         // For each hand h in this infoset, compute σ_avg over actions.
         for h in 0..nh {
             let mut sum = 0.0f32;
-            let mut probs = [0.0f32; MAX_NA];
-            for a in 0..MAX_NA {
+            let mut probs = [0.0f32; MAX_NA_POSTFLOP];
+            for a in 0..MAX_NA_POSTFLOP {
                 let v = cum_strategy[base + a * nh + h].max(0.0);
                 probs[a] = v;
                 sum += v;
@@ -139,7 +139,7 @@ fn analyze_mixedness(cum_strategy: &[f32], nh: usize) -> (f32, f32, usize, usize
             let mut entropy = 0.0f64;
             let mut max_p = 0.0f32;
             let mut nonzero_actions = 0;
-            for a in 0..MAX_NA {
+            for a in 0..MAX_NA_POSTFLOP {
                 let p = probs[a] / sum;
                 if p > 1e-9 {
                     entropy -= (p as f64) * (p as f64).ln();

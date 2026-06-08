@@ -1,4 +1,4 @@
-use crate::tree::flat::{FlatTree, MAX_NA, VCFR_NO_INFOSET};
+use crate::tree::flat::{FlatTree, MAX_NA_POSTFLOP, VCFR_NO_INFOSET};
 use super::game::GameSpec;
 
 const UNUSED: usize = usize::MAX;
@@ -48,7 +48,7 @@ impl VectorCfr {
         }
 
         let num_infosets = tree.num_infosets as usize;
-        let data_per_infoset = MAX_NA * nh;
+        let data_per_infoset = MAX_NA_POSTFLOP * nh;
 
         let mut node_data_offset = vec![UNUSED; tree.num_nodes()];
         for &node_id in &tree.decision_node_ids {
@@ -75,7 +75,7 @@ impl VectorCfr {
         if offset == UNUSED {
             return None;
         }
-        Some(&self.strategy[offset..offset + MAX_NA * self.nh])
+        Some(&self.strategy[offset..offset + MAX_NA_POSTFLOP * self.nh])
     }
 
     fn get_strategy_at(&self, node_idx: usize, num_actions: usize) -> Vec<f32> {

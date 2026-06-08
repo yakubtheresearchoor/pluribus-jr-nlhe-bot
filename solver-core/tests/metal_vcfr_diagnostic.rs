@@ -96,7 +96,7 @@ fn diagnostic_strategy_computation() {
     println!("\n--- Strategy comparison ---");
     let (mut s_match, mut s_mismatch) = (0usize, 0usize);
     let mut max_strat_diff = 0.0f32;
-    let stride = solver_core::tree::flat::MAX_NA * nh;
+    let stride = solver_core::tree::flat::MAX_NA_POSTFLOP * nh;
     for infoset in 0..tree.num_infosets as usize {
         for a in 0..2 {
             for h in 0..nh {

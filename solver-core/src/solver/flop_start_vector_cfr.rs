@@ -1,12 +1,36 @@
 use crate::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use crate::solver::game::GameSpec;
 use crate::solver::showdown::side_pot_showdown_cfv_with_rake;
-use crate::tree::flat::{FlatTree, MAX_NA, VCFR_NO_INFOSET};
+use crate::tree::flat::{FlatTree, MAX_NA_POSTFLOP, VCFR_NO_INFOSET};
 
 const UNUSED: usize = usize::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Zone { Flop, Turn, River, Preflop }
+
+/// Storage strategy for `regrets_river` and `cum_strategy_river`. At full
+/// nh on real-game configs the full per-(tc, rc) buffers are 175 GB each
+/// (HU OptB nh=1176), which doesn't fit physical RAM. `DiskBacked` swaps
+/// per-pair via load_river_pair/save_river_pair.
+///
+/// Architecture choice: the access pattern in run() and freeze is per-pair
+/// sequential — never all (tc, rc) simultaneously — so disk-backed
+/// streaming is feasible. Verified by measurement-C-redux 2026-06-05.
+#[derive(Clone)]
+pub enum RiverPersistenceMode {
+    /// All [n_turn × max_n_river × river_stride] f32 stays in RAM. Default,
+    /// fast, but caps the achievable nh by physical memory.
+    InMemory,
+    /// Two binary files (regrets, cum_strategy) hold the full per-(tc, rc)
+    /// state. In-RAM scratch is [river_stride] f32 each. `load_river_pair`
+    /// reads from file, `save_river_pair` writes back. Caller (run, freeze)
+    /// is responsible for invoking load before any per-pair op and save
+    /// after any per-pair mutation.
+    DiskBacked {
+        regrets_path: std::path::PathBuf,
+        cum_strategy_path: std::path::PathBuf,
+    },
+}
 
 pub struct DcfrParams {
     alpha_t: f32,
@@ -30,6 +54,13 @@ impl DcfrParams {
             gamma_t: pow_gamma as f32,
         }
     }
+
+    /// Accessors for cross-module callers (e.g., preflop_cfr's
+    /// bottom-up regret update). Fields stay private to avoid silent
+    /// mutation; values are computed at `new()` from the iteration.
+    pub fn alpha_t(&self) -> f32 { self.alpha_t }
+    pub fn beta_t(&self) -> f32 { self.beta_t }
+    pub fn gamma_t(&self) -> f32 { self.gamma_t }
 }
 
 /// Per-outcome regrets for flop-start games.
@@ -80,20 +111,61 @@ pub struct FlopStartVectorCfr {
     river_stride: usize,   // river_infoset_count × MAX_NA × nh
 
     // ── Per-outcome regret storage ──
-    // Flop: [flop_stride]
+    //
+    // Memory layout (post 2026-06-05 streaming-strategy refactor):
+    //
+    //   regrets_* and cum_strategy_*: PERSISTENT across iterations, sized
+    //   per-outcome (turn carries n_turn copies; river carries
+    //   n_turn × max_n_river copies). These accumulate over iters and
+    //   cannot be discarded.
+    //
+    //   strategy_*: SCRATCH, sized per-stride (one outcome's worth). Each
+    //   iter, the strategy for ONE (tc, rc) is regret-matched into this
+    //   scratch just before the bottom_up_zone call that reads it. Strategy
+    //   does not need to persist across iters or across outcomes — it's
+    //   always a function of the current regrets for a specific outcome.
+    //
+    //   This eliminates 175 GB (river) + 671 MB (turn) of strategy buffer
+    //   at HU OptB nh=1176, replacing it with 76 MB + 14 MB scratches.
+    //   No semantic change: strategy values for any (tc, rc) are identical
+    //   to the pre-refactor full-buffer values, just computed on-demand.
+
+    // Flop: [flop_stride] (small enough to keep full-size for strategy too)
     regrets_flop: Vec<f32>,
     strategy_flop: Vec<f32>,
     cum_strategy_flop: Vec<f32>,
 
-    // Turn: [n_turn × turn_stride]
+    // Turn: regrets/cum_strategy [n_turn × turn_stride], strategy scratch [turn_stride]
     regrets_turn: Vec<f32>,
-    strategy_turn: Vec<f32>,
+    strategy_turn: Vec<f32>,        // SCRATCH: holds current tc's strategy only
     cum_strategy_turn: Vec<f32>,
 
-    // River: [n_turn × max_n_river × river_stride]
+    // River: regrets/cum_strategy storage depends on river_mode.
+    //   - InMemory (default): [n_turn × max_n_river × river_stride] f32 each,
+    //     ~175 GB at HU OptB nh=1176. Fits only at small effective nh or with
+    //     enough physical RAM.
+    //   - DiskBacked: scratch buffer of [river_stride] f32 each, ~76 MB at
+    //     HU OptB nh=1176. The full per-(tc, rc) state lives in two binary
+    //     files; load_river_pair(tc, rc) reads from file into scratch,
+    //     save_river_pair(tc, rc) writes scratch back to file. Total in-RAM
+    //     working set: ~76 MB × 3 (regrets + cum_strategy + strategy) per
+    //     active pair, swapped one (tc, rc) at a time.
+    //
+    // Strategy scratch is always per-pair-sized [river_stride] (strategy is
+    // derived from regrets per-iter, never persisted across pairs/iters).
     regrets_river: Vec<f32>,
-    strategy_river: Vec<f32>,
+    strategy_river: Vec<f32>,       // SCRATCH: holds current (tc, rc)'s strategy only
     cum_strategy_river: Vec<f32>,
+
+    // River persistence mode + machinery (post 2026-06-05 hybrid A: disk-
+    // backed per-board persistence for the 175 GB river buffers).
+    river_mode: RiverPersistenceMode,
+    /// DiskBacked only: open file handles for the two persistent buffers.
+    river_files: Option<(std::fs::File, std::fs::File)>,
+    /// DiskBacked only: which (tc, rc) is currently loaded into the scratch
+    /// buffers. None = nothing loaded yet (a load is required before the
+    /// scratches contain valid data for any pair).
+    current_river_pair: Option<(usize, usize)>,
 
     // ── Chance node bookkeeping ──
     river_chance_children: Vec<u32>,
@@ -256,9 +328,9 @@ impl FlopStartVectorCfr {
             .max()
             .unwrap_or(0);
 
-        let flop_stride = flop_count * MAX_NA * nh;
-        let turn_stride = turn_count * MAX_NA * nh;
-        let river_stride = river_count * MAX_NA * nh;
+        let flop_stride = flop_count * MAX_NA_POSTFLOP * nh;
+        let turn_stride = turn_count * MAX_NA_POSTFLOP * nh;
+        let river_stride = river_count * MAX_NA_POSTFLOP * nh;
 
         let mut river_deck_sizes = vec![0usize; 52];
         for &tc in &table.remaining_deck {
@@ -308,11 +380,14 @@ impl FlopStartVectorCfr {
             strategy_flop: vec![0.0; flop_stride],
             cum_strategy_flop: vec![0.0; flop_stride],
             regrets_turn: vec![0.0; n_turn * turn_stride],
-            strategy_turn: vec![0.0; n_turn * turn_stride],
+            strategy_turn: vec![0.0; turn_stride],   // SCRATCH: current tc's strategy
             cum_strategy_turn: vec![0.0; n_turn * turn_stride],
             regrets_river: vec![0.0; n_turn * max_n_river * river_stride],
-            strategy_river: vec![0.0; n_turn * max_n_river * river_stride],
+            strategy_river: vec![0.0; river_stride],   // SCRATCH: current (tc, rc)'s strategy
             cum_strategy_river: vec![0.0; n_turn * max_n_river * river_stride],
+            river_mode: RiverPersistenceMode::InMemory,
+            river_files: None,
+            current_river_pair: None,
             river_chance_children: river_cc,
             turn_chance_children: turn_cc,
             n_turn,
@@ -330,6 +405,181 @@ impl FlopStartVectorCfr {
     }
 
     // ══════════════════════════════════════════════
+    // River persistence (hybrid A: disk-backed per-board state)
+    // ══════════════════════════════════════════════
+
+    /// Total length of one persistent river buffer = n_turn × max_n_river × river_stride.
+    pub fn river_persistent_len(&self) -> usize {
+        self.n_turn * self.max_n_river * self.river_stride
+    }
+
+    /// File byte offset for the (tc, rc) slice.
+    fn river_pair_byte_offset(&self, tc: usize, rc: usize) -> u64 {
+        debug_assert!(tc < self.n_turn && rc < self.max_n_river);
+        let pair_index = (tc * self.max_n_river + rc) as u64;
+        let stride_bytes = (self.river_stride * std::mem::size_of::<f32>()) as u64;
+        pair_index * stride_bytes
+    }
+
+    /// Convert this solver from `InMemory` to `DiskBacked` river persistence.
+    /// Writes the current full regrets_river / cum_strategy_river content
+    /// (initially all zeros) to two binary files, then replaces the in-memory
+    /// buffers with per-pair scratch (size river_stride). After this:
+    ///   - `regrets_river` and `cum_strategy_river` are SCRATCH for the
+    ///     currently-loaded pair only.
+    ///   - All per-pair callers (run, freeze, compute_*_strategy_for_pair)
+    ///     must invoke `load_river_pair(tc, rc)` before reading and
+    ///     `save_river_pair(tc, rc)` after writing.
+    ///
+    /// In-RAM working set per pair drops from 175 GB (full buffers) to
+    /// 76 MB (regrets scratch) + 76 MB (cum_strategy scratch) + 76 MB
+    /// (strategy scratch, already there) = ~228 MB at HU OptB nh=1176.
+    pub fn into_disk_backed<P: AsRef<std::path::Path>>(
+        mut self,
+        regrets_path: P,
+        cum_strategy_path: P,
+    ) -> std::io::Result<Self> {
+        use std::io::Write;
+        let regrets_path = regrets_path.as_ref().to_path_buf();
+        let cum_strategy_path = cum_strategy_path.as_ref().to_path_buf();
+
+        assert!(
+            matches!(self.river_mode, RiverPersistenceMode::InMemory),
+            "into_disk_backed called on a solver already in DiskBacked mode"
+        );
+
+        // Sanity: the full buffers exist at the expected length.
+        let full_len = self.river_persistent_len();
+        assert_eq!(self.regrets_river.len(), full_len,
+            "regrets_river length {} != expected full length {} — InMemory mode invariant violated",
+            self.regrets_river.len(), full_len);
+        assert_eq!(self.cum_strategy_river.len(), full_len,
+            "cum_strategy_river length {} != expected full length {}",
+            self.cum_strategy_river.len(), full_len);
+
+        // Persist the current full content to disk.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true).write(true).create(true).truncate(true)
+                .open(&regrets_path)?;
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.regrets_river.as_ptr() as *const u8,
+                    self.regrets_river.len() * std::mem::size_of::<f32>(),
+                )
+            };
+            f.write_all(bytes)?;
+            f.flush()?;
+        }
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true).write(true).create(true).truncate(true)
+                .open(&cum_strategy_path)?;
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.cum_strategy_river.as_ptr() as *const u8,
+                    self.cum_strategy_river.len() * std::mem::size_of::<f32>(),
+                )
+            };
+            f.write_all(bytes)?;
+            f.flush()?;
+        }
+
+        // Re-open files for read+write (no truncate this time) and store handles.
+        let regrets_file = std::fs::OpenOptions::new()
+            .read(true).write(true).open(&regrets_path)?;
+        let cum_strategy_file = std::fs::OpenOptions::new()
+            .read(true).write(true).open(&cum_strategy_path)?;
+
+        // Replace full buffers with per-pair scratches.
+        self.regrets_river = vec![0.0; self.river_stride];
+        self.cum_strategy_river = vec![0.0; self.river_stride];
+        self.river_mode = RiverPersistenceMode::DiskBacked {
+            regrets_path, cum_strategy_path,
+        };
+        self.river_files = Some((regrets_file, cum_strategy_file));
+        self.current_river_pair = None;
+
+        Ok(self)
+    }
+
+    /// Load the (tc, rc) slice of regrets and cum_strategy into the scratches.
+    /// No-op in InMemory mode (data is always "loaded"). In DiskBacked mode,
+    /// seeks to the per-pair offset in each file and reads river_stride×4
+    /// bytes into the corresponding scratch.
+    pub fn load_river_pair(&mut self, tc: usize, rc: usize) -> std::io::Result<()> {
+        match &self.river_mode {
+            RiverPersistenceMode::InMemory => Ok(()),
+            RiverPersistenceMode::DiskBacked { .. } => {
+                use std::io::{Read, Seek, SeekFrom};
+                let off = self.river_pair_byte_offset(tc, rc);
+                let stride = self.river_stride;
+                let (rf, cf) = self.river_files.as_mut()
+                    .expect("DiskBacked mode requires river_files");
+                rf.seek(SeekFrom::Start(off))?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.regrets_river.as_mut_ptr() as *mut u8,
+                        stride * std::mem::size_of::<f32>(),
+                    )
+                };
+                rf.read_exact(bytes)?;
+
+                cf.seek(SeekFrom::Start(off))?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.cum_strategy_river.as_mut_ptr() as *mut u8,
+                        stride * std::mem::size_of::<f32>(),
+                    )
+                };
+                cf.read_exact(bytes)?;
+
+                self.current_river_pair = Some((tc, rc));
+                Ok(())
+            }
+        }
+    }
+
+    /// Write the scratches back to disk at the (tc, rc) offset.
+    /// No-op in InMemory mode. In DiskBacked mode, must be called after
+    /// any mutation to regrets_river / cum_strategy_river to persist.
+    pub fn save_river_pair(&mut self, tc: usize, rc: usize) -> std::io::Result<()> {
+        match &self.river_mode {
+            RiverPersistenceMode::InMemory => Ok(()),
+            RiverPersistenceMode::DiskBacked { .. } => {
+                use std::io::{Seek, SeekFrom, Write};
+                debug_assert_eq!(self.current_river_pair, Some((tc, rc)),
+                    "save_river_pair({}, {}) called but current loaded pair is {:?}",
+                    tc, rc, self.current_river_pair);
+                let off = self.river_pair_byte_offset(tc, rc);
+                let stride = self.river_stride;
+                let (rf, cf) = self.river_files.as_mut()
+                    .expect("DiskBacked mode requires river_files");
+                rf.seek(SeekFrom::Start(off))?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.regrets_river.as_ptr() as *const u8,
+                        stride * std::mem::size_of::<f32>(),
+                    )
+                };
+                rf.write_all(bytes)?;
+
+                cf.seek(SeekFrom::Start(off))?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.cum_strategy_river.as_ptr() as *const u8,
+                        stride * std::mem::size_of::<f32>(),
+                    )
+                };
+                cf.write_all(bytes)?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn river_mode(&self) -> &RiverPersistenceMode { &self.river_mode }
+
+    // ══════════════════════════════════════════════
     // Storage accessors
     // ══════════════════════════════════════════════
 
@@ -337,61 +587,96 @@ impl FlopStartVectorCfr {
     // Strategy computation (regret matching)
     // ══════════════════════════════════════════════
 
-    pub fn compute_all_strategies(&mut self, tree: &FlatTree) {
+    /// Compute the flop-zone strategy from current regrets.
+    /// Flop strategy is small (flop_stride = flop_infosets × MAX_NA × nh)
+    /// and used by every traverser walk, so it's kept fully materialized.
+    pub fn compute_flop_strategy(&mut self, tree: &FlatTree) {
         let nh = self.nh;
-
-        // Flop zone: one strategy from shared regrets
         for &nid in &tree.decision_node_ids {
             let idx = nid as usize;
             if self.zones[idx] != Zone::Flop { continue; }
             let local = self.flop_local_offset[idx];
             if local == UNUSED { continue; }
             let na = tree.nodes[idx].num_children as usize;
-            let off = local * MAX_NA * nh;
+            let off = local * MAX_NA_POSTFLOP * nh;
             regret_matching_into(
                 &self.regrets_flop[off..off + na * nh],
                 na, nh,
                 &mut self.strategy_flop[off..off + na * nh],
             );
         }
+    }
 
-        // Turn zone: one strategy per turn card
-        for tc in 0..self.n_turn {
-            let base = tc * self.turn_stride;
-            for &nid in &tree.decision_node_ids {
-                let idx = nid as usize;
-                if self.zones[idx] != Zone::Turn { continue; }
-                let local = self.turn_local_offset[idx];
-                if local == UNUSED { continue; }
-                let na = tree.nodes[idx].num_children as usize;
-                let off = base + local * MAX_NA * nh;
-                regret_matching_into(
-                    &self.regrets_turn[off..off + na * nh],
-                    na, nh,
-                    &mut self.strategy_turn[off..off + na * nh],
-                );
-            }
+    /// Compute the turn-zone strategy for ONE turn card (tc) from its
+    /// per-tc regrets, writing into the strategy_turn SCRATCH (size
+    /// turn_stride). Call before any code path that reads turn strategy
+    /// for THIS tc (compute_reach_turn, bottom_up_zone(Turn, tc)).
+    pub fn compute_turn_strategy_for_tc(&mut self, tree: &FlatTree, tc: usize) {
+        let nh = self.nh;
+        let base = tc * self.turn_stride;   // regrets are per-tc
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::Turn { continue; }
+            let local = self.turn_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let off_persist = base + local * MAX_NA_POSTFLOP * nh;
+            let off_scratch = local * MAX_NA_POSTFLOP * nh;  // strategy scratch: no tc base
+            regret_matching_into(
+                &self.regrets_turn[off_persist..off_persist + na * nh],
+                na, nh,
+                &mut self.strategy_turn[off_scratch..off_scratch + na * nh],
+            );
         }
+    }
 
-        // River zone: one strategy per (turn, river) pair
-        let turn_deck = &self.river_deck_sizes; // dummy, we iterate all n_turn × max_n_river
-        for tc in 0..self.n_turn {
-            let n_river = self.max_n_river;
-            for rc in 0..n_river {
-                let base = (tc * self.max_n_river + rc) * self.river_stride;
-                for &nid in &tree.decision_node_ids {
-                    let idx = nid as usize;
-                    if self.zones[idx] != Zone::River { continue; }
-                    let local = self.river_local_offset[idx];
-                    if local == UNUSED { continue; }
-                    let na = tree.nodes[idx].num_children as usize;
-                    let off = base + local * MAX_NA * nh;
-                    regret_matching_into(
-                        &self.regrets_river[off..off + na * nh],
-                        na, nh,
-                        &mut self.strategy_river[off..off + na * nh],
-                    );
-                }
+    /// Compute the river-zone strategy for ONE (tc, rc) pair from its
+    /// per-(tc,rc) regrets, writing into the strategy_river SCRATCH (size
+    /// river_stride). Call before any code path that reads river strategy
+    /// for THIS pair (compute_reach_river, bottom_up_zone(River, tc, rc)).
+    pub fn compute_river_strategy_for_pair(&mut self, tree: &FlatTree, tc: usize, rc: usize) {
+        let nh = self.nh;
+        // In InMemory mode, regrets_river holds all (tc, rc) at once; index
+        // with the per-pair base. In DiskBacked mode, regrets_river is a
+        // scratch holding the currently-loaded pair only; index from 0.
+        let base = match self.river_mode {
+            RiverPersistenceMode::InMemory => (tc * self.max_n_river + rc) * self.river_stride,
+            RiverPersistenceMode::DiskBacked { .. } => {
+                debug_assert_eq!(self.current_river_pair, Some((tc, rc)),
+                    "compute_river_strategy_for_pair({}, {}) requires matching load_river_pair; \
+                     currently loaded: {:?}",
+                    tc, rc, self.current_river_pair);
+                0
+            }
+        };
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::River { continue; }
+            let local = self.river_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let off_persist = base + local * MAX_NA_POSTFLOP * nh;
+            let off_scratch = local * MAX_NA_POSTFLOP * nh;  // strategy scratch: no (tc,rc) base
+            regret_matching_into(
+                &self.regrets_river[off_persist..off_persist + na * nh],
+                na, nh,
+                &mut self.strategy_river[off_scratch..off_scratch + na * nh],
+            );
+        }
+    }
+
+    /// DEPRECATED in favor of per-zone / per-pair strategy compute. Kept
+    /// for back-compat with existing tests that call this directly. Calling
+    /// this populates only the flop strategy (which fits) and the FIRST
+    /// turn/river outcome's scratch (the rest of the scratch is undefined
+    /// at the start of an iter — callers should call compute_*_strategy_*
+    /// per-outcome just-in-time).
+    pub fn compute_all_strategies(&mut self, tree: &FlatTree) {
+        self.compute_flop_strategy(tree);
+        if self.n_turn > 0 {
+            self.compute_turn_strategy_for_tc(tree, 0);
+            if self.max_n_river > 0 {
+                self.compute_river_strategy_for_pair(tree, 0, 0);
             }
         }
     }
@@ -429,7 +714,7 @@ impl FlopStartVectorCfr {
                     let na = node.num_children as usize;
                     let local = self.flop_local_offset[idx];
                     let sigma = if local != UNUSED {
-                        let off = local * MAX_NA * nh;
+                        let off = local * MAX_NA_POSTFLOP * nh;
                         &self.strategy_flop[off..off + na * nh]
                     } else {
                         continue;
@@ -497,8 +782,11 @@ impl FlopStartVectorCfr {
             }
         }
 
-        // Top-down through turn zone using per-tc strategy
-        let tc_base = tc * self.turn_stride;
+        // Top-down through turn zone using per-tc strategy.
+        // POST 2026-06-05 REFACTOR: strategy_turn is now SCRATCH (size turn_stride),
+        // holding the strategy for the CURRENT tc only. Caller is responsible for
+        // populating it via compute_turn_strategy_for_tc(tc) before calling this.
+        let _ = tc; // tc no longer used to index strategy_turn (kept for regrets indexing in callers)
         for level in 0..=tree.max_depth {
             for &nid in tree.nodes_at_level(level as u32) {
                 let idx = nid as usize;
@@ -510,7 +798,7 @@ impl FlopStartVectorCfr {
                     let na = node.num_children as usize;
                     let local = self.turn_local_offset[idx];
                     let sigma = if local != UNUSED {
-                        let off = tc_base + local * MAX_NA * nh;
+                        let off = local * MAX_NA_POSTFLOP * nh;   // scratch: no tc base
                         &self.strategy_turn[off..off + na * nh]
                     } else {
                         continue;
@@ -559,8 +847,11 @@ impl FlopStartVectorCfr {
             }
         }
 
-        // Top-down through river zone using per-(tc,rc) strategy
-        let rc_base = (tc * self.max_n_river + rc) * self.river_stride;
+        // Top-down through river zone using per-(tc,rc) strategy.
+        // POST 2026-06-05 REFACTOR: strategy_river is now SCRATCH (size river_stride),
+        // holding the strategy for the CURRENT (tc, rc) pair only. Caller is responsible
+        // for populating it via compute_river_strategy_for_pair(tc, rc) before this.
+        let _ = (tc, rc); // tc, rc no longer used to index strategy_river (kept for regrets in callers)
         for level in 0..=tree.max_depth {
             for &nid in tree.nodes_at_level(level as u32) {
                 let idx = nid as usize;
@@ -572,7 +863,7 @@ impl FlopStartVectorCfr {
                     let na = node.num_children as usize;
                     let local = self.river_local_offset[idx];
                     let sigma = if local != UNUSED {
-                        let off = rc_base + local * MAX_NA * nh;
+                        let off = local * MAX_NA_POSTFLOP * nh;   // scratch: no (tc,rc) base
                         &self.strategy_river[off..off + na * nh]
                     } else {
                         continue;
@@ -610,6 +901,28 @@ impl FlopStartVectorCfr {
         let mut root_cfv_sum = vec![0.0f32; nh];
         let mut count = 0u32;
 
+        // HOISTED BUFFERS (perf fix, 2026-06-05): previously allocated
+        // fresh inside the river/turn loops, producing 13.5k allocations
+        // of nn*nh*4 bytes per iter at 6-max (~97 TB of allocator traffic
+        // per iter). Each is now reused across all iterations × traversers
+        // × turns × rivers. Slots that subsequent code reads as
+        // accumulator-zero (river_chance_children / turn_chance_children
+        // indices) are explicitly zeroed at the right scope; all other
+        // slots are overwritten by bottom_up_zone's deeper-first walk
+        // before being read, so stale data is unreachable.
+        //
+        // Correctness invariant: bottom_up_zone(Z, ...) writes every
+        // zone-Z node slot in cfv as a function of cfv at children
+        // (which are zone-Z deeper levels, written by this same call,
+        // or boundary nodes (the chance-children) seeded just-prior
+        // by the explicit accumulator/seed loops below). No stale-read
+        // path exists. Validated by p1_5_4_step1_run_alloc_fix_identity
+        // bit-exact pre/post and flop_cfv_crosscheck identity.
+        let mut flop_cfv = vec![0.0f32; nn * nh];
+        let mut river_cfv_accum = vec![0.0f32; nn * nh];
+        let mut cfv = vec![0.0f32; nn * nh];
+        let mut turn_cfv = vec![0.0f32; nn * nh];
+
         for _ in 0..num_iterations {
             let params = if self.vanilla_mode {
                 DcfrParams { alpha_t: 1.0, beta_t: 1.0, gamma_t: 1.0 }
@@ -619,13 +932,16 @@ impl FlopStartVectorCfr {
             self.iteration += 1;
 
             for traverser in 0..np {
-                // Sequential: recompute strategies before each traverser
-                self.compute_all_strategies(tree);
+                // Sequential: recompute strategies before each traverser.
+                // POST 2026-06-05 STREAMING REFACTOR: only flop is fully
+                // materialized here. Turn strategy is computed per-tc and
+                // river strategy is computed per-(tc,rc) just-in-time below.
+                self.compute_flop_strategy(tree);
 
                 if self.debug && traverser == 0 {
                     // Print strategy at root node (node 0)
                     let na = tree.nodes[0].num_children as usize;
-                    let off = self.flop_local_offset[0] * MAX_NA * self.nh;
+                    let off = self.flop_local_offset[0] * MAX_NA_POSTFLOP * self.nh;
                     let strat = &self.strategy_flop[off..off + na * self.nh];
                     let mut avg = vec![0.0f32; na];
                     for a in 0..na {
@@ -645,24 +961,54 @@ impl FlopStartVectorCfr {
                 // Flop zone reach (shared)
                 let flop_reach = self.compute_reach_flop(tree, game);
 
-                // Flop zone CFV: aggregate turn outcomes
-                let mut flop_cfv = vec![0.0f32; nn * nh];
+                // Reset flop_cfv accumulator slots (turn_chance_children) for
+                // this traverser. Other flop_cfv slots are overwritten by the
+                // bottom_up_zone(Flop) call below (deeper-first walk → fresh
+                // writes before reads).
+                for &child_id in &self.turn_chance_children {
+                    let off = child_id as usize * nh;
+                    for h in 0..nh { flop_cfv[off + h] = 0.0; }
+                }
 
                 for (ti, &tc) in turn_deck.iter().enumerate() {
+                    // STREAMING-STRATEGY: populate turn scratch for this tc
+                    // before compute_reach_turn or bottom_up_zone(Turn) read it.
+                    self.compute_turn_strategy_for_tc(tree, ti);
                     let turn_reach = self.compute_reach_turn(tree, ti, &flop_reach);
                     let n_river = self.river_deck_sizes[tc as usize];
 
-                    // River zone: process each river outcome
-                    let mut river_cfv_accum = vec![0.0f32; nn * nh];
+                    // Reset river_cfv_accum accumulator slots (river_chance_
+                    // children) for this turn. Other slots are not read.
+                    for &child_id in &self.river_chance_children {
+                        let off = child_id as usize * nh;
+                        for h in 0..nh { river_cfv_accum[off + h] = 0.0; }
+                    }
+
                     for ri in 0..n_river {
+                        // HYBRID A: in DiskBacked mode, read this pair's
+                        // regrets+cum_strategy from disk into scratch. No-op in
+                        // InMemory mode.
+                        self.load_river_pair(ti, ri)
+                            .expect("load_river_pair failed (DiskBacked I/O)");
+                        // STREAMING-STRATEGY: populate river scratch for this
+                        // (ti, ri) before compute_reach_river or bottom_up_zone read it.
+                        self.compute_river_strategy_for_pair(tree, ti, ri);
                         let river_reach = self.compute_reach_river(tree, ti, ri, &turn_reach);
-                        let mut cfv = vec![0.0f32; nn * nh];
+                        // cfv: bottom_up_zone(River, ti, ri) overwrites every
+                        // river_zone_nodes slot; the read below only accesses
+                        // river_chance_children, which are river-zone nodes
+                        // written by this call. No reset required.
 
                         self.bottom_up_zone(
                             tree, table, traverser as u8, &river_reach, &mut cfv,
                             Zone::River, Some(ti), Some(ri),
                             &params,
                         );
+
+                        // HYBRID A: bottom_up_zone wrote into regrets/cum_strategy
+                        // scratches. Persist to disk before moving to next pair.
+                        self.save_river_pair(ti, ri)
+                            .expect("save_river_pair failed (DiskBacked I/O)");
 
                         // Weight by river chance probability and accumulate
                         for &child_id in &self.river_chance_children {
@@ -674,8 +1020,9 @@ impl FlopStartVectorCfr {
                         }
                     }
 
-                    // Turn zone: seed CFV from river accumulation
-                    let mut turn_cfv = vec![0.0f32; nn * nh];
+                    // Turn zone seed: overwrite river_chance_children slots
+                    // from the just-accumulated river_cfv_accum. Other turn_cfv
+                    // slots will be overwritten by bottom_up_zone(Turn) walk.
                     for &child_id in &self.river_chance_children {
                         for h in 0..nh {
                             turn_cfv[child_id as usize * nh + h] =
@@ -956,7 +1303,7 @@ impl FlopStartVectorCfr {
         let len = na * self.nh;
         match zone {
             Zone::Flop => {
-                let off = self.flop_local_offset[node_id] * MAX_NA * self.nh;
+                let off = self.flop_local_offset[node_id] * MAX_NA_POSTFLOP * self.nh;
                 let r = &mut self.regrets_flop[off..off + len];
                 let s = &self.strategy_flop[off..off + len];
                 let c = &mut self.cum_strategy_flop[off..off + len];
@@ -964,20 +1311,39 @@ impl FlopStartVectorCfr {
             }
             Zone::Turn => {
                 let tc = tc.unwrap();
-                let off = tc * self.turn_stride + self.turn_local_offset[node_id] * MAX_NA * self.nh;
-                let r = &mut self.regrets_turn[off..off + len];
-                let s = &self.strategy_turn[off..off + len];
-                let c = &mut self.cum_strategy_turn[off..off + len];
+                let local_off = self.turn_local_offset[node_id] * MAX_NA_POSTFLOP * self.nh;
+                let off_persist = tc * self.turn_stride + local_off;
+                let off_scratch = local_off;  // strategy is SCRATCH (no tc multiplier)
+                let r = &mut self.regrets_turn[off_persist..off_persist + len];
+                let s = &self.strategy_turn[off_scratch..off_scratch + len];
+                let c = &mut self.cum_strategy_turn[off_persist..off_persist + len];
                 (r, s, c)
             }
             Zone::River => {
                 let tc = tc.unwrap();
                 let rc = rc.unwrap();
-                let off = (tc * self.max_n_river + rc) * self.river_stride
-                    + self.river_local_offset[node_id] * MAX_NA * self.nh;
-                let r = &mut self.regrets_river[off..off + len];
-                let s = &self.strategy_river[off..off + len];
-                let c = &mut self.cum_strategy_river[off..off + len];
+                let local_off = self.river_local_offset[node_id] * MAX_NA_POSTFLOP * self.nh;
+                // In InMemory mode, regrets_river and cum_strategy_river are full
+                // [n_turn × max_n_river × river_stride] buffers indexed per-pair.
+                // In DiskBacked mode they are river_stride-sized scratches; the
+                // currently-loaded pair must match (tc, rc) — load_river_pair(tc, rc)
+                // must have been called before this access.
+                let off_persist = match self.river_mode {
+                    RiverPersistenceMode::InMemory => {
+                        (tc * self.max_n_river + rc) * self.river_stride + local_off
+                    }
+                    RiverPersistenceMode::DiskBacked { .. } => {
+                        debug_assert_eq!(self.current_river_pair, Some((tc, rc)),
+                            "DiskBacked get_mut_slices(River, tc={}, rc={}) without matching \
+                             load_river_pair — currently loaded: {:?}",
+                            tc, rc, self.current_river_pair);
+                        local_off
+                    }
+                };
+                let off_scratch = local_off;  // strategy is SCRATCH (no (tc,rc) multiplier)
+                let r = &mut self.regrets_river[off_persist..off_persist + len];
+                let s = &self.strategy_river[off_scratch..off_scratch + len];
+                let c = &mut self.cum_strategy_river[off_persist..off_persist + len];
                 (r, s, c)
             }
             Zone::Preflop => unreachable!(
@@ -1019,6 +1385,28 @@ impl FlopStartVectorCfr {
     pub fn cum_strategy_turn_mut(&mut self) -> &mut [f32] { &mut self.cum_strategy_turn }
     pub fn river_chance_children(&self) -> &[u32] { &self.river_chance_children }
     pub fn turn_chance_children(&self) -> &[u32] { &self.turn_chance_children }
+
+    /// Local infoset offset for a player decision node within its zone's
+    /// strategy/regret/cum_strategy buffers. Returns None if the node has
+    /// no infoset slot (UNUSED — typically na ≤ 1 nodes). Caller computes
+    /// byte offset as `local * MAX_NA_POSTFLOP * nh`.
+    ///
+    /// Added 2026-06-07 for the freeze+extract rules anchor (#108) — the
+    /// K≥2 walker needs to read σ_avg per (idx, action, hand) from the
+    /// frozen strategy buffers, which requires knowing the per-zone local
+    /// offset assigned at solver construction.
+    pub fn flop_local_offset_at(&self, idx: usize) -> Option<usize> {
+        let v = self.flop_local_offset[idx];
+        if v == UNUSED { None } else { Some(v) }
+    }
+    pub fn turn_local_offset_at(&self, idx: usize) -> Option<usize> {
+        let v = self.turn_local_offset[idx];
+        if v == UNUSED { None } else { Some(v) }
+    }
+    pub fn river_local_offset_at(&self, idx: usize) -> Option<usize> {
+        let v = self.river_local_offset[idx];
+        if v == UNUSED { None } else { Some(v) }
+    }
     pub fn flop_local_offset(&self) -> &[usize] { &self.flop_local_offset }
     pub fn river_local_offset(&self) -> &[usize] { &self.river_local_offset }
     pub fn num_players(&self) -> u8 { self.num_players }
@@ -1029,6 +1417,120 @@ impl FlopStartVectorCfr {
     pub fn cum_strategy_river(&self) -> &[f32] { &self.cum_strategy_river }
     pub fn cum_strategy_river_mut(&mut self) -> &mut [f32] { &mut self.cum_strategy_river }
     pub fn river_stride(&self) -> usize { self.river_stride }
+
+    /// Mutable accessors for strategy buffers. Needed by callers (e.g.,
+    /// `compute_v_flop_at_root_converged`) that want to freeze the
+    /// time-averaged strategy into the current-strategy slot before
+    /// running a final CFV pass.
+    pub fn strategy_flop_mut(&mut self) -> &mut [f32] { &mut self.strategy_flop }
+    pub fn strategy_turn_mut(&mut self) -> &mut [f32] { &mut self.strategy_turn }
+    pub fn strategy_river_mut(&mut self) -> &mut [f32] { &mut self.strategy_river }
+
+    /// After running CFR for N iterations, replace `strategy_{flop,turn,river}`
+    /// with the time-averaged strategy (normalized per-infoset per-hand from
+    /// cum_strategy). Subsequent `compute_reach_*` + `bottom_up_zone` calls
+    /// then compute CFV using the Nash-converging average, not the
+    /// oscillating current strategy.
+    ///
+    /// Per-infoset, per-hand normalization: for each (infoset, hand),
+    /// strategy[a, hand] = cum_strategy[a, hand] / Σ_a cum_strategy[a, hand]
+    /// if the denominator > 0; else uniform 1/na.
+    ///
+    /// Stride convention: each infoset gets `MAX_NA_POSTFLOP * nh` floats; indexed
+    /// `[a * nh + h]` within an infoset. Outside-na slots are zeroed
+    /// (matches uniform-init convention).
+    /// Freeze the flop-zone averaged strategy. Flop strategy is fully
+    /// materialized (small), so this populates the entire strategy_flop
+    /// buffer.
+    pub fn freeze_average_strategy_flop(&mut self, tree: &FlatTree) {
+        let nh = self.nh;
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::Flop { continue; }
+            let local = self.flop_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let off = local * MAX_NA_POSTFLOP * nh;
+            normalize_cum_into_strategy(
+                &self.cum_strategy_flop[off..off + na * nh],
+                na, nh,
+                &mut self.strategy_flop[off..off + na * nh],
+            );
+        }
+    }
+
+    /// Freeze the time-averaged turn-zone strategy for ONE turn card (tc)
+    /// into the strategy_turn SCRATCH. Call before any code path that
+    /// uses the FROZEN turn strategy for THIS tc (replacing the
+    /// regret-matched current strategy for Nash-converging CFV).
+    pub fn freeze_average_strategy_for_turn(&mut self, tree: &FlatTree, tc: usize) {
+        let nh = self.nh;
+        let base = tc * self.turn_stride;
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::Turn { continue; }
+            let local = self.turn_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let off_persist = base + local * MAX_NA_POSTFLOP * nh;
+            let off_scratch = local * MAX_NA_POSTFLOP * nh;
+            normalize_cum_into_strategy(
+                &self.cum_strategy_turn[off_persist..off_persist + na * nh],
+                na, nh,
+                &mut self.strategy_turn[off_scratch..off_scratch + na * nh],
+            );
+        }
+    }
+
+    /// Freeze the time-averaged river-zone strategy for ONE (tc, rc) pair
+    /// into the strategy_river SCRATCH. Call before any code path that
+    /// uses the FROZEN river strategy for THIS pair.
+    pub fn freeze_average_strategy_for_river_pair(
+        &mut self, tree: &FlatTree, tc: usize, rc: usize,
+    ) {
+        let nh = self.nh;
+        let base = match self.river_mode {
+            RiverPersistenceMode::InMemory => (tc * self.max_n_river + rc) * self.river_stride,
+            RiverPersistenceMode::DiskBacked { .. } => {
+                debug_assert_eq!(self.current_river_pair, Some((tc, rc)),
+                    "freeze_average_strategy_for_river_pair({}, {}) requires matching \
+                     load_river_pair; currently loaded: {:?}",
+                    tc, rc, self.current_river_pair);
+                0
+            }
+        };
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::River { continue; }
+            let local = self.river_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let off_persist = base + local * MAX_NA_POSTFLOP * nh;
+            let off_scratch = local * MAX_NA_POSTFLOP * nh;
+            normalize_cum_into_strategy(
+                &self.cum_strategy_river[off_persist..off_persist + na * nh],
+                na, nh,
+                &mut self.strategy_river[off_scratch..off_scratch + na * nh],
+            );
+        }
+    }
+
+    /// DEPRECATED in favor of per-zone/per-pair freeze. Pre 2026-06-05
+    /// this iterated all (tc, rc) and wrote the full strategy buffers.
+    /// Post-refactor strategy_turn/river are SCRATCH (one outcome's
+    /// worth each), so this method now only freezes the flop zone fully
+    /// and the first turn/river outcome's scratch. Callers MUST call
+    /// freeze_average_strategy_for_turn(tc) / for_river_pair(tc, rc)
+    /// just before reading the corresponding strategy slice.
+    pub fn freeze_average_strategy(&mut self, tree: &FlatTree) {
+        self.freeze_average_strategy_flop(tree);
+        if self.n_turn > 0 {
+            self.freeze_average_strategy_for_turn(tree, 0);
+            if self.max_n_river > 0 {
+                self.freeze_average_strategy_for_river_pair(tree, 0, 0);
+            }
+        }
+    }
 
     /// Return zone nodes organized by level for GPU dispatch.
     /// Returns (river, turn, flop) each as Vec<Vec<u32>> (one Vec per level).
@@ -1151,7 +1653,7 @@ impl FlopStartVectorCfr {
     pub fn dump_all_regrets(&self, tree: &FlatTree, game: &FlopStartGame) {
         let table = game.table();
         let nh = self.nh;
-        let na_max = MAX_NA;
+        let na_max = MAX_NA_POSTFLOP;
 
         println!("  ── Flop zone regrets/strategy ──");
         for &nid in &tree.decision_node_ids {
@@ -1159,7 +1661,7 @@ impl FlopStartVectorCfr {
             if self.zones[idx] != Zone::Flop { continue; }
             let local = self.flop_local_offset[idx];
             let na = tree.nodes[idx].num_children as usize;
-            let off = local * MAX_NA * nh;
+            let off = local * MAX_NA_POSTFLOP * nh;
             println!("    Node {} (P{}, {} actions):", idx, tree.nodes[idx].player_id, na);
             for a in 0..na {
                 let r: Vec<f32> = (0..nh).map(|h| self.regrets_flop[off + a * nh + h]).collect();
@@ -1182,7 +1684,7 @@ impl FlopStartVectorCfr {
                 let local = self.turn_local_offset[idx];
                 if local == UNUSED { continue; }
                 let na = tree.nodes[idx].num_children as usize;
-                let off = base + local * MAX_NA * nh;
+                let off = base + local * MAX_NA_POSTFLOP * nh;
                 println!("      Node {} (P{}, {} actions):", idx, tree.nodes[idx].player_id, na);
                 for a in 0..na {
                     let r: Vec<f32> = (0..nh).map(|h| self.regrets_turn[off + a * nh + h]).collect();
@@ -1207,7 +1709,7 @@ impl FlopStartVectorCfr {
                     let local = self.river_local_offset[idx];
                     if local == UNUSED { continue; }
                     let na = tree.nodes[idx].num_children as usize;
-                    let off = base + local * MAX_NA * nh;
+                    let off = base + local * MAX_NA_POSTFLOP * nh;
                     println!("        Node {} (P{}, {} actions):", idx, tree.nodes[idx].player_id, na);
                     for a in 0..na {
                         let r: Vec<f32> = (0..nh).map(|h| self.regrets_river[off + a * nh + h]).collect();
@@ -1232,12 +1734,12 @@ impl FlopStartVectorCfr {
         let nn = tree.num_nodes();
         let nh = self.nh;
         let num_infosets = tree.num_infosets as usize;
-        let mut flat_cum = vec![0.0f32; num_infosets * MAX_NA * nh];
+        let mut flat_cum = vec![0.0f32; num_infosets * MAX_NA_POSTFLOP * nh];
         let mut offsets = vec![UNUSED; nn];
 
         // Copy tree's infoset offsets
         for &nid in &tree.decision_node_ids {
-            offsets[nid as usize] = tree.infoset_offsets[nid as usize] as usize * MAX_NA * nh;
+            offsets[nid as usize] = tree.infoset_offsets[nid as usize] as usize * MAX_NA_POSTFLOP * nh;
         }
 
         // Flop zone: direct copy
@@ -1247,7 +1749,7 @@ impl FlopStartVectorCfr {
             let local = self.flop_local_offset[idx];
             if local == UNUSED { continue; }
             let na = tree.nodes[idx].num_children as usize;
-            let src_off = local * MAX_NA * nh;
+            let src_off = local * MAX_NA_POSTFLOP * nh;
             let dst_off = offsets[idx];
             flat_cum[dst_off..dst_off + na * nh]
                 .copy_from_slice(&self.cum_strategy_flop[src_off..src_off + na * nh]);
@@ -1264,7 +1766,7 @@ impl FlopStartVectorCfr {
             let dst_off = offsets[idx];
 
             for tc in 0..n_turn {
-                let src_off = tc * self.turn_stride + local * MAX_NA * nh;
+                let src_off = tc * self.turn_stride + local * MAX_NA_POSTFLOP * nh;
                 for i in 0..na * nh {
                     flat_cum[dst_off + i] += self.cum_strategy_turn[src_off + i];
                 }
@@ -1290,7 +1792,7 @@ impl FlopStartVectorCfr {
                     0 // placeholder
                 ];
                 for rc in 0..n_river {
-                    let src_off = (tc * self.max_n_river + rc) * self.river_stride + local * MAX_NA * nh;
+                    let src_off = (tc * self.max_n_river + rc) * self.river_stride + local * MAX_NA_POSTFLOP * nh;
                     for i in 0..na * nh {
                         flat_cum[dst_off + i] += self.cum_strategy_river[src_off + i];
                     }
@@ -1343,14 +1845,14 @@ impl FlopStartVectorCfr {
             Zone::Flop => {
                 let local = self.flop_local_offset[node_idx];
                 if local == UNUSED { return vec![1.0 / na as f32; len]; }
-                let off = local * MAX_NA * nh;
+                let off = local * MAX_NA_POSTFLOP * nh;
                 self.cum_strategy_flop[off..off + len].to_vec()
             }
             Zone::Turn => {
                 let tc = tc_idx.unwrap_or(0);
                 let local = self.turn_local_offset[node_idx];
                 if local == UNUSED { return vec![1.0 / na as f32; len]; }
-                let off = tc * self.turn_stride + local * MAX_NA * nh;
+                let off = tc * self.turn_stride + local * MAX_NA_POSTFLOP * nh;
                 self.cum_strategy_turn[off..off + len].to_vec()
             }
             Zone::River => {
@@ -1358,7 +1860,7 @@ impl FlopStartVectorCfr {
                 let rc = rc_idx.unwrap_or(0);
                 let local = self.river_local_offset[node_idx];
                 if local == UNUSED { return vec![1.0 / na as f32; len]; }
-                let off = (tc * self.max_n_river + rc) * self.river_stride + local * MAX_NA * nh;
+                let off = (tc * self.max_n_river + rc) * self.river_stride + local * MAX_NA_POSTFLOP * nh;
                 self.cum_strategy_river[off..off + len].to_vec()
             }
             Zone::Preflop => unreachable!(
@@ -1566,6 +2068,36 @@ fn normalize_strategy(strategy: &mut [f32], na: usize, nh: usize) {
 /// Regret matching: compute strategy from regrets.
 /// Bug B fix: regret matching epsilon to prevent ULP-level strategy flips.
 const REGRET_MATCH_EPS: f32 = 1e-5;
+
+/// Normalize cumulative-strategy into a per-(infoset, hand) probability
+/// distribution over actions. Same layout convention as
+/// `regret_matching_into` (per-infoset slice of `na * nh`, indexed
+/// `[a * nh + h]`).
+///
+/// Identity property: at convergence the average strategy is the Nash
+/// strategy; this function exposes it for callers (e.g. preflop CFR's
+/// converged per-flop solver) that need to compute CFV under the
+/// averaged strategy rather than the oscillating current-iter strategy.
+fn normalize_cum_into_strategy(cum: &[f32], na: usize, nh: usize, strategy: &mut [f32]) {
+    for h in 0..nh {
+        let mut sum = 0.0f32;
+        for a in 0..na {
+            let v = cum[a * nh + h];
+            if v > 0.0 { sum += v; }
+        }
+        if sum > 0.0 {
+            for a in 0..na {
+                let v = cum[a * nh + h];
+                strategy[a * nh + h] = if v > 0.0 { v / sum } else { 0.0 };
+            }
+        } else {
+            let uniform = 1.0 / na as f32;
+            for a in 0..na {
+                strategy[a * nh + h] = uniform;
+            }
+        }
+    }
+}
 
 fn regret_matching_into(regrets: &[f32], na: usize, nh: usize, strategy: &mut [f32]) {
     for h in 0..nh {

@@ -6,12 +6,12 @@
 // set per the abstraction. P3 extends this to the richer abstractions
 // production preflop solves require: multiple bet sizes plus raise sizes
 // (3-bet, 4-bet variants), exercising the collapse machinery that
-// MAX_NA Option B verified for postflop.
+// MAX_NA_PREFLOP Option B verified for postflop.
 //
 // THE DISCRIMINATING QUESTION (per the standing project discipline):
 // when the rich preflop action set produces 5+ nominal actions per node
 // (fold, call, multiple raise sizes, allin), the abstraction expects
-// the collapse to reduce them to <= MAX_NA=4 by ACTION-COINCIDENCE
+// the collapse to reduce them to <= MAX_NA_PREFLOP=4 by ACTION-COINCIDENCE
 // (multiple formal actions clamping to the same physical amount, merged
 // lossless into one tree child) rather than SILENT DROP (formal actions
 // at distinct amounts dropped to fit the budget, losing sequences from
@@ -45,7 +45,7 @@
 //         (no raises) builds correctly
 //   P2.4: preflop showdown oracle + no-flop-no-drop verified
 //   THIS (P3): preflop with RICH action abstraction (raises) is
-//              complete per the SPEC; collapse to MAX_NA=4 is
+//              complete per the SPEC; collapse to MAX_NA_PREFLOP=4 is
 //              action-coincidence lossless, not silent drop.
 
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
@@ -315,13 +315,21 @@ fn ref_count(cfg: &TreeConfig, s: &RefState) -> (usize, usize, usize) {
     // cumulative commits equal OR per-street commits all zero (no-betting
     // case for asymmetric blinds).
     let all_acted = unfolded.iter().all(|&p| s.has_acted[p]);
-    let cum_eq = unfolded
-        .iter()
-        .all(|&p| s.commits[p] == s.commits[unfolded[0]]);
+    // Standing-bet rule (parallel fix to builder.rs is_round_complete,
+    // 2026-06-04): the round is complete when every active player has
+    // matched the standing bet OR is all-in at max_committable. The
+    // previous cum_eq check rejected legal round-end states where some
+    // active players were all-in for less than the standing bet, causing
+    // unbounded recursion at multiway and silent MAX_DEPTH truncation in
+    // the builder.
+    let standing_bet = unfolded.iter().map(|&p| s.commits[p]).max().unwrap();
+    let matched_or_allin = unfolded.iter().all(|&p| {
+        s.commits[p] == standing_bet || s.commits[p] >= ref_max_committable(cfg, p)
+    });
     let no_betting = unfolded
         .iter()
         .all(|&p| s.commits[p] - s.round_start[p] == 0);
-    let round_complete = all_acted && (cum_eq || no_betting);
+    let round_complete = all_acted && (matched_or_allin || no_betting);
 
     if round_complete {
         if s.street == 3 {
@@ -355,25 +363,53 @@ fn ref_count(cfg: &TreeConfig, s: &RefState) -> (usize, usize, usize) {
     (tot_p, tot_c, tot_t)
 }
 
-/// Preflop-aware initial state: to_act respects button-first preflop convention.
+/// Preflop-aware initial state. The `to_act` field is derived FROM THE
+/// CONVENTION SPEC (not by calling builder code) — independence is
+/// load-bearing for the completeness check.
+///
+/// Convention (matches the button_player-aware builder logic, derived
+/// independently here from the same poker rules the builder encodes):
+///   - Preflop at HU (np=2): button = SB acts first → to_act = button
+///   - Preflop at multiway (np>=3): UTG acts first → to_act = (button + 3) % np
+///   - Postflop (any np): SB acts first → to_act = (button + 1) % np
+///
+/// If `button_player` is `None`, the legacy inference is used to mirror
+/// the builder's `None` path: highest-indexed active for preflop (HU-
+/// correct only); leftmost active for postflop.
 fn ref_initial(cfg: &TreeConfig) -> RefState {
     let np = cfg.num_players as usize;
-    // HU preflop: button (player 1) acts first per builder::first_preflop_player.
-    // Multiway preflop ordering is deferred per the plan; this test focuses on HU.
-    // Postflop: leftmost-active acts first (player 0 in unfolded state).
     let to_act = match cfg.initial_state {
         BoardState::Preflop => {
-            assert_eq!(np, 2, "P3 reference only handles HU preflop currently \
-                (multiway preflop ordering deferred per plan)");
-            // HU: button is the higher-indexed player.
-            1u8
+            if let Some(button) = cfg.button_player {
+                let button = button as usize;
+                if np == 2 { button as u8 } else { ((button + 3) % np) as u8 }
+            } else {
+                // Legacy: highest-indexed active. HU-correct under the
+                // higher-indexed-is-button convention; multiway tests
+                // MUST set button_player explicitly.
+                assert_eq!(np, 2, "ref enumerator requires button_player set for multiway preflop");
+                (np - 1) as u8
+            }
         }
-        _ => 0u8,
+        _ => {
+            if let Some(button) = cfg.button_player {
+                ((button as usize + 1) % np) as u8
+            } else {
+                0u8  // legacy: leftmost-active
+            }
+        }
+    };
+    // round_start: parallel fix to builder.rs's committed_at_round_start.
+    // At preflop, blinds are first-round actions, so round_start = 0.
+    // At postflop, initial_contributions are pre-this-street → round_start = initial.
+    let round_start = match cfg.initial_state {
+        BoardState::Preflop => vec![0_i32; np],
+        _ => cfg.initial_contributions.clone(),
     };
     RefState {
-        street: cfg.initial_state.street(),  // chronological ordinal
+        street: cfg.initial_state.street(),
         commits: cfg.initial_contributions.clone(),
-        round_start: cfg.initial_contributions.clone(),
+        round_start,
         folded: vec![false; np],
         has_acted: vec![false; np],
         allin_flag: false,
@@ -423,7 +459,7 @@ fn run_completeness_check(cfg: &TreeConfig, label: &str) {
     assert_eq!(tt, rt, "[{}] TERMINAL mismatch.", label);
     eprintln!(
         "  ✓ Rich preflop abstraction is COMPLETE under the spec: tree count \
-         matches independent reference. Collapse to MAX_NA budget is action-\
+         matches independent reference. Collapse to MAX_NA_PREFLOP budget is action-\
          coincidence (lossless), not silent drop."
     );
 }
@@ -454,12 +490,14 @@ fn config_hu_preflop_with_one_raise() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
     }
+
 }
 
 fn config_hu_preflop_option_b_style() -> TreeConfig {
     // Step 2: Option B applied to preflop — 2 bet sizes + 2 raise sizes.
-    // This is the configuration that approaches MAX_NA=4 budget tightly,
+    // This is the configuration that approaches MAX_NA_PREFLOP=4 budget tightly,
     // where the collapse machinery has to do real work. If the collapse
     // is action-coincidence (lossless), tree count matches reference. If
     // it is silent drop (lossy), reference > tree.
@@ -477,7 +515,9 @@ fn config_hu_preflop_option_b_style() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
     }
+
 }
 
 #[test]
@@ -493,5 +533,182 @@ fn count_hu_preflop_option_b_style() {
     run_completeness_check(
         &config_hu_preflop_option_b_style(),
         "HU preflop, 2 bet + 2 raise (Option B applied to preflop)",
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// B.4 6-max preflop completeness tests (the lead 2026-06-04)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Per the lead's guidance: the independent enumerator above is derived
+// FROM THE ACTION-ABSTRACTION SPEC (bet/raise sizes + clamp + dedup),
+// not from builder logic. At 6-max the temptation to reuse builder
+// helpers is stronger because the enumerator is more complex (multiway
+// situation diversity: each position faces different prior-action
+// sequences), but reusing them would defeat the independence and the
+// match between enumerator and builder would prove nothing. The
+// enumerator below relies only on `RefState`, `ref_actions`,
+// `ref_apply`, `ref_count`, and `ref_initial` — all defined in this
+// file FROM THE SPEC, not by calling into builder code.
+//
+// What B.4 verifies:
+//
+//   1. Node-count match between builder and enumerator at 6-max
+//      (necessary condition for completeness).
+//
+//   2. The lossless-collapse property: where actions collapse to fit
+//      MAX_NA_PREFLOP=4, the dedup is action-coincidence (distinct formal
+//      actions with the same clamped target), not silent loss of
+//      distinct actions. The enumerator's sort+dedup at the granularity
+//      of (kind, amount) IS the lossless-collapse logic; if it dedups
+//      below MAX_NA_PREFLOP, the collapse is by coincidence; if it would dedup
+//      above MAX_NA_PREFLOP, the builder's build-time assert fires and the
+//      test PANICS at tree build time — a finding (the abstraction
+//      doesn't fit MAX_NA_PREFLOP losslessly at 6-max for this configuration).
+//
+//   3. Be open to the finding "MAX_NA_PREFLOP=4 fits HU losslessly but not
+//      6-max" — multiway action richness may legitimately exceed 4
+//      distinct actions per node, and the right response is surfacing
+//      the finding (need more actions or fewer bet sizes), NOT silently
+//      engineering around it.
+
+fn config_6max_preflop_simplest() -> TreeConfig {
+    // Simplest 6-max preflop: 1 bet size, 0 raise sizes. The trivial
+    // abstraction. Per B.3 measurement: 29,882 nodes built with this
+    // config under `button_player: None` (wrong-ordering tree). With
+    // `button_player: Some(5)` the tree should rebuild with UTG-first
+    // ordering and may have a different node count (different action
+    // sequences fork from UTG vs from the button).
+    TreeConfig {
+        num_players: 6,
+        initial_state: BoardState::Preflop,
+        starting_pot: 3,
+        // 6 seats: SB (player 0), BB (player 1), UTG, MP, CO, BTN
+        starting_stacks: vec![100, 100, 100, 100, 100, 100],
+        initial_contributions: vec![1, 2, 0, 0, 0, 0],
+        rake_rate: 0.0, rake_cap: 0.0,
+        bet_sizes: BetSizeOptions {
+            bet: vec![BetSize::PotRelative(1.0)],
+            raise: vec![],
+        },
+        add_allin_threshold: 1.0,
+        force_allin_threshold: 1.0,
+        merging_threshold: 0.0,
+        button_player: Some(5),  // Player 5 is on the button → UTG = (5+3)%6 = 2
+    }
+}
+
+fn config_6max_preflop_with_one_raise() -> TreeConfig {
+    // 6-max with 1 bet + 1 raise size. Tests the multiway action
+    // richness: at HU this fit MAX_NA_PREFLOP easily; at 6-max each player
+    // faces a wider variety of prior-action contexts, so the action
+    // count per situation may stress MAX_NA_PREFLOP.
+    TreeConfig {
+        num_players: 6,
+        initial_state: BoardState::Preflop,
+        starting_pot: 3,
+        starting_stacks: vec![100; 6],
+        initial_contributions: vec![1, 2, 0, 0, 0, 0],
+        rake_rate: 0.0, rake_cap: 0.0,
+        bet_sizes: BetSizeOptions {
+            bet: vec![BetSize::PotRelative(1.0)],
+            raise: vec![BetSize::PotRelative(1.0)],
+        },
+        add_allin_threshold: 1.0,
+        force_allin_threshold: 1.0,
+        merging_threshold: 0.0,
+        button_player: Some(5),
+    }
+}
+
+/// Helper: run a completeness check on a large-stack thread. The
+/// recursive ref_count enumerator walks the entire tree (~30k+ nodes
+/// at 6-max); on macOS, the main thread's 8 MB stack is exhausted by
+/// the recursion + per-frame Vec allocations. 256 MB is safe.
+fn run_with_large_stack(cfg: TreeConfig, label: &'static str) {
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            run_completeness_check(&cfg, label);
+        })
+        .expect("failed to spawn large-stack thread");
+    handle.join().expect("test thread panicked (completeness mismatch or builder panic — \
+                          see stderr above)");
+}
+
+#[test]
+fn b4_count_6max_preflop_simplest() {
+    run_with_large_stack(
+        config_6max_preflop_simplest(),
+        "6-max preflop, 1 bet + 0 raise (multiway minimal action set)",
+    );
+}
+
+#[test]
+fn b4_count_6max_preflop_with_one_raise() {
+    // If this test PANICS at build_tree with "exceeds MAX_NA_PREFLOP=4", that's
+    // the finding the lead anticipated: multiway action diversity legitimately
+    // produces a node where more than 4 distinct actions are available
+    // (fold/call/raise/allin etc. in a specific multiway situation),
+    // and MAX_NA_PREFLOP=4 doesn't fit losslessly at 6-max with this abstraction.
+    // The fix is then either MAX_NA_PREFLOP expansion or bet-size reduction; not
+    // silently engineering around it.
+    //
+    // If it PASSES, the multiway action set fits within MAX_NA_PREFLOP=4
+    // losslessly for this abstraction (action-coincidence collapse,
+    // not silent loss), and the completeness is verified at 6-max for
+    // the 1+1 abstraction.
+    run_with_large_stack(
+        config_6max_preflop_with_one_raise(),
+        "6-max preflop, 1 bet + 1 raise (multiway action richness check)",
+    );
+}
+
+fn config_6max_preflop_option_b_style() -> TreeConfig {
+    // 6-max with 2 bet sizes + 2 raise sizes — the postflop Option B
+    // abstraction (verified lossless at HU postflop and HU preflop)
+    // applied to 6-max preflop. The trace verification confirmed the
+    // deepest-raise chain force-allins to 3 children at the button when
+    // both raise sizes round to allin; this completeness check verifies
+    // the SAME action-coincidence collapse is the only mechanism by which
+    // any node fits within MAX_NA_PREFLOP=4 across the full tree, with no silent
+    // drops anywhere.
+    //
+    // This is the production-realistic abstraction at 6-max preflop and
+    // the 162,650-node measurement's validity depends on this check
+    // passing — same lossless-collapse prerequisite as the postflop
+    // max_na_option_b_completeness check at HU.
+    TreeConfig {
+        num_players: 6,
+        initial_state: BoardState::Preflop,
+        starting_pot: 3,
+        starting_stacks: vec![100; 6],
+        initial_contributions: vec![1, 2, 0, 0, 0, 0],
+        rake_rate: 0.0, rake_cap: 0.0,
+        bet_sizes: BetSizeOptions {
+            bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)],
+            raise: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)],
+        },
+        add_allin_threshold: 1.0,
+        force_allin_threshold: 1.0,
+        merging_threshold: 0.0,
+        button_player: Some(5),
+    }
+}
+
+#[test]
+fn b4_count_6max_preflop_option_b_style() {
+    // The lossless-collapse verification at 6-max for the Option-B-equivalent
+    // preflop abstraction. If this test fails by COUNT MISMATCH, MAX_NA_PREFLOP=4 is
+    // dropping legal lines silently and the 162,650 number is an under-count
+    // (same silent-incompleteness pattern as the prior MAX_DEPTH bug).
+    // If it PANICS at build_tree with "exceeds MAX_NA_PREFLOP=4", the collapse is not
+    // tight enough at some node and either MAX_NA_PREFLOP must be raised or the
+    // abstraction tightened.
+    // If it PASSES, the 162,650-node Option-B 6-max tree is verified lossless
+    // and that number can be treated as the production cost baseline.
+    run_with_large_stack(
+        config_6max_preflop_option_b_style(),
+        "6-max preflop Option-B (2 bet + 2 raise) — lossless-collapse prerequisite for 162,650-node baseline",
     );
 }

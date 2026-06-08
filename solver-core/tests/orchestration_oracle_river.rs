@@ -155,6 +155,8 @@ fn build_minimal_table() -> (FlatTree, FlopChanceTable) {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+
     };
     let tree = build_tree(&config).expect("tree build");
     (tree, table)
@@ -405,7 +407,7 @@ fn orchestration_oracle_river_zone_hu_symmetric() {
 
                     // Map to CPU's regret storage layout. The CPU's
                     // regrets_river is laid out per river outcome:
-                    //   [outcome * river_stride + local_infoset * MAX_NA * nh + a * nh + h]
+                    //   [outcome * river_stride + local_infoset * MAX_NA_POSTFLOP * nh + a * nh + h]
                     // For outcome=0 (ti=0, ri=0 → index 0 in batch) and using
                     // node's local infoset offset — we need that mapping. Use
                     // CPU's debug accessor by walking river_local_offset which

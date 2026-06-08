@@ -137,6 +137,8 @@ fn build_game(np: u8, nh: usize) -> (FlatTree, FlopStartGame) {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+
     };
     let tree = build_tree(&config).unwrap();
     let game = FlopStartGame::new(table);
@@ -185,13 +187,13 @@ fn baseline_6p_nh8_validated_solver() {
 
     // Memory observation: capture RSS estimate via resident-size APIs would
     // require an external dep. The solver's main allocations are
-    // regrets/cum_strategy/strategy at sizes nh × MAX_NA × infoset_count
+    // regrets/cum_strategy/strategy at sizes nh × MAX_NA_POSTFLOP × infoset_count
     // per zone. Print sizes so we can read out actual memory.
     let nh_bytes_per_slot = nh * 4; // f32
-    let flop_slot = cpu.flop_infosets() * solver_core::tree::flat::MAX_NA * nh_bytes_per_slot;
-    let turn_slot = cpu.turn_infosets() * solver_core::tree::flat::MAX_NA * nh_bytes_per_slot
+    let flop_slot = cpu.flop_infosets() * solver_core::tree::flat::MAX_NA_POSTFLOP * nh_bytes_per_slot;
+    let turn_slot = cpu.turn_infosets() * solver_core::tree::flat::MAX_NA_POSTFLOP * nh_bytes_per_slot
                     * cpu.n_turn_outcomes();
-    let river_slot = cpu.river_infosets() * solver_core::tree::flat::MAX_NA * nh_bytes_per_slot
+    let river_slot = cpu.river_infosets() * solver_core::tree::flat::MAX_NA_POSTFLOP * nh_bytes_per_slot
                     * cpu.n_turn_outcomes() * cpu.max_river_outcomes();
     // Three arrays each (regrets, strategy, cum_strategy).
     let total_solver_arrays = 3 * (flop_slot + turn_slot + river_slot);

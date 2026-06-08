@@ -1,7 +1,7 @@
-// MAX_NA decision (#31) verification step: completeness check on Option B.
+// MAX_NA_POSTFLOP decision (#31) verification step: completeness check on Option B.
 //
 // The convenient structural fact to verify: "Option B's 2 bet + 2 raise
-// abstraction fits within MAX_NA=4 with max_children=4." The five-actions-
+// abstraction fits within MAX_NA_POSTFLOP=4 with max_children=4." The five-actions-
 // look-like-they-should-be-but-fit-in-four claim. The bet-collapse bug
 // the rewrite arc taught us to verify rather than accept.
 //
@@ -292,7 +292,7 @@ fn count_tree(tree: &FlatTree) -> (usize, usize, usize) {
 fn option_b_completeness_check_hu() {
     eprintln!("\n=== Option B completeness check (HU symmetric [5,5]) ===");
     eprintln!("Verifying that 2 bet + 2 raise abstraction is fully expanded by the");
-    eprintln!("builder, not silently collapsed to fit MAX_NA=4.\n");
+    eprintln!("builder, not silently collapsed to fit MAX_NA_POSTFLOP=4.\n");
 
     let opt_b = TreeConfig {
         num_players: 2, initial_state: BoardState::Flop, starting_pot: 10,
@@ -303,6 +303,8 @@ fn option_b_completeness_check_hu() {
             raise: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)],
         },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+
     };
     let tree = build_tree(&opt_b).unwrap();
     let (tp, tc, tt) = count_tree(&tree);
@@ -320,7 +322,7 @@ fn option_b_completeness_check_hu() {
 
     if tp == rp && tc == rc && tt == rt {
         eprintln!("✓ COMPLETENESS CONFIRMED: tree exactly matches the unshortcuted");
-        eprintln!("  reference enumeration. The fit-within-MAX_NA=4 is achieved by");
+        eprintln!("  reference enumeration. The fit-within-MAX_NA_POSTFLOP=4 is achieved by");
         eprintln!("  legitimate action coincidence (clamp + force_allin + dedup), not");
         eprintln!("  by silently dropping abstraction lines. Option B can be adopted.");
         eprintln!();
@@ -329,7 +331,7 @@ fn option_b_completeness_check_hu() {
         eprintln!("  with blueprint solving on Option B.");
     } else {
         eprintln!("✗ INCOMPLETE: the builder is producing fewer nodes than the");
-        eprintln!("  abstraction implies. The fit-within-MAX_NA=4 is achieved by");
+        eprintln!("  abstraction implies. The fit-within-MAX_NA_POSTFLOP=4 is achieved by");
         eprintln!("  silently dropping bet/raise sizes. The 5× exploitability win");
         eprintln!("  measured by max_na_exploitability.rs is on an INCOMPLETE Option B");
         eprintln!("  tree. The decision is WRONG until this is resolved.");

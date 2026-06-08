@@ -25,7 +25,7 @@ use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
-use solver_core::tree::flat::{FlatTree, MAX_NA};
+use solver_core::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
 
 fn build_6p_rich(nh: usize, bet_fractions: &[f64], raise_fractions: &[f64]) -> (FlatTree, FlopChanceTable) {
     let board: Vec<Card> = ["2h", "7d", "Ks"]
@@ -79,7 +79,7 @@ fn build_6p_rich(nh: usize, bet_fractions: &[f64], raise_fractions: &[f64]) -> (
 /// Returns (mean_per_decision_entropy, dirac_frac, total_decisions).
 /// Same logic as M3 REDUX.
 fn analyze_mixedness(cum_strategy: &[f32], nh: usize) -> (f32, f32, usize) {
-    let chunk_size = MAX_NA * nh;
+    let chunk_size = MAX_NA_POSTFLOP * nh;
     let mut total_entropy = 0.0f64;
     let mut total_decisions = 0usize;
     let mut dirac_count = 0usize;
@@ -88,8 +88,8 @@ fn analyze_mixedness(cum_strategy: &[f32], nh: usize) -> (f32, f32, usize) {
         let base = ci * chunk_size;
         for h in 0..nh {
             let mut sum = 0.0f32;
-            let mut probs = [0.0f32; MAX_NA];
-            for a in 0..MAX_NA {
+            let mut probs = [0.0f32; MAX_NA_POSTFLOP];
+            for a in 0..MAX_NA_POSTFLOP {
                 let v = cum_strategy[base + a * nh + h].max(0.0);
                 probs[a] = v;
                 sum += v;
@@ -98,7 +98,7 @@ fn analyze_mixedness(cum_strategy: &[f32], nh: usize) -> (f32, f32, usize) {
             let mut entropy = 0.0f64;
             let mut max_p = 0.0f32;
             let mut nonzero = 0;
-            for a in 0..MAX_NA {
+            for a in 0..MAX_NA_POSTFLOP {
                 let p = probs[a] / sum;
                 if p > 1e-9 { entropy -= (p as f64) * (p as f64).ln(); nonzero += 1; }
                 if p > max_p { max_p = p; }
@@ -117,11 +117,11 @@ fn analyze_mixedness(cum_strategy: &[f32], nh: usize) -> (f32, f32, usize) {
 #[test]
 #[ignore = "P2.1: rich-action 6p tree + confirm mixed equilibrium"]
 fn p2_rich_action_mixed_equilibrium() {
-    // MAX_NA=4 in the GPU kernels caps per-node actions at 4. Fold + check/
+    // MAX_NA_POSTFLOP=4 in the GPU kernels caps per-node actions at 4. Fold + check/
     // call + 2 betsizes already fills the budget. So "rich" at this stage =
     // 2 betsizes per street (small + large), and "lean" = 1 (whichever the
     // equilibrium prefers). This is a tight rich/lean comparison but matches
-    // the architecture; bumping MAX_NA is a Phase 5 change per the panic
+    // the architecture; bumping MAX_NA_POSTFLOP is a Phase 5 change per the panic
     // message in tree::builder::build_tree.
     let bet_fractions = vec![0.50, 1.50];
     let raise_fractions = vec![1.00];
@@ -206,7 +206,7 @@ fn analyze_action_distribution(
 ) -> Vec<(u8, u8, i32, f32, usize)> {
     // (board_state, action_label, amount_diff, mean_prob, count)
     // Strategy buffer layout: by zone (flop/turn/river), then per-infoset
-    // [MAX_NA × nh]. We use cpu.cum_strategy_flop/turn/river accessors to
+    // [MAX_NA_POSTFLOP × nh]. We use cpu.cum_strategy_flop/turn/river accessors to
     // locate offsets properly.
     let mut result: Vec<(u8, u8, i32, f32, usize)> = Vec::new();
 
@@ -249,7 +249,7 @@ fn analyze_action_distribution(
             _ => continue,  // Preflop — not used in this test
         };
 
-        let stride = MAX_NA * nh;
+        let stride = MAX_NA_POSTFLOP * nh;
         let base = iset * stride;
         if base + stride > zone_slice.len() { continue; }
 
@@ -393,13 +393,13 @@ fn p2_observe_sizes_and_validate_lean() {
             // For more precision we'd map size index to amount_diff value; here we
             // accept all as "significant" if their total mean probability across
             // distinct nodes exceeds the threshold.
-            true  // CONSERVATIVE: keep all in this small test; refine when MAX_NA > 4
+            true  // CONSERVATIVE: keep all in this small test; refine when MAX_NA_POSTFLOP > 4
         })
         .map(|(_, &f)| f)
         .collect();
 
     // For methodology demonstration: define lean = drop the second betsize
-    // since with MAX_NA=4 we have only 2 betsizes; lean means picking the
+    // since with MAX_NA_POSTFLOP=4 we have only 2 betsizes; lean means picking the
     // dominant one. Pick whichever has higher mean prob in the rich dist.
     let mut prob_per_bet_amount: std::collections::BTreeMap<i32, f32> = std::collections::BTreeMap::new();
     for (bs, lbl, amt, p, _) in &dist {

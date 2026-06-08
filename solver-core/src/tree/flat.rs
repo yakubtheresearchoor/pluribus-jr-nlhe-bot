@@ -66,7 +66,19 @@ impl FlatNode {
     }
 }
 
-pub const MAX_NA: usize = 4;
+// Per-stage action-slot strides. The single MAX_NA constant was split during
+// Phase 2 of the per-stage MAX_NA work so preflop can carry a Pluribus-style
+// rich action set (16 = fold + call + up to 14 raise sizes) without inflating
+// postflop buffers (which are O(MAX_NA^5) sensitive via the K=5 factored
+// showdown — see M2's nh^4.84 measurement). build.rs reads THIS file and
+// regenerates the Metal header (max_na_generated.metal) so the constants are
+// structurally locked together; updating one and not the other is impossible.
+//
+// Phase 4 will empirically tune MAX_NA_POSTFLOP on a non-trivial mixed-eq
+// 6-max config; the current value of 6 is the starting placeholder
+// (fold + call + 4 raise sizes = Pluribus postflop blueprint).
+pub const MAX_NA_PREFLOP: usize = 16;
+pub const MAX_NA_POSTFLOP: usize = 6;
 
 pub const VCFR_NO_INFOSET: u32 = u32::MAX;
 

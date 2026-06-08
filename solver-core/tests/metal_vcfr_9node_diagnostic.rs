@@ -105,7 +105,7 @@ fn diagnostic_9node_1iter() {
     println!("nh = {}, nn = {}, np = {}", nh, tree.num_nodes(), np);
 
     // Strategies
-    let stride = solver_core::tree::flat::MAX_NA * nh;
+    let stride = solver_core::tree::flat::MAX_NA_POSTFLOP * nh;
     let max_strat_diff: f32 = (0..cpu_snap.strategies.len())
         .map(|i| (cpu_snap.strategies[i] - gpu_snap.strategies[i]).abs())
         .fold(0.0f32, f32::max);

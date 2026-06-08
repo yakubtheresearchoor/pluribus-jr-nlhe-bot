@@ -9,7 +9,7 @@ use solver_core::card::{card_from_str, index_to_card_pair, Card, NUM_POSSIBLE_HA
 use solver_core::hand::eval::Hand;
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::{FlopStartVectorCfr, Zone};
-const MAX_NA: usize = 4;
+const MAX_NA_POSTFLOP: usize = 4;
 use solver_core::solver::game::GameSpec;
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
@@ -132,6 +132,8 @@ fn build_minimal() -> (FlatTree, FlopStartGame) {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+
     };
     let tree = build_tree(&config).unwrap();
     let game = FlopStartGame::new(table);
@@ -179,8 +181,8 @@ fn trace_turn_regret_update() {
     }
 
     // Show regret slots for tc=0 and tc=1 BEFORE iteration
-    let off0 = 0 * turn_stride + local * MAX_NA * nh;
-    let off1 = 1 * turn_stride + local * MAX_NA * nh;
+    let off0 = 0 * turn_stride + local * MAX_NA_POSTFLOP * nh;
+    let off1 = 1 * turn_stride + local * MAX_NA_POSTFLOP * nh;
 
     println!("  BEFORE run:");
     println!("    tc=0 regrets[0]: {:?}", &solver.regrets_turn()[off0..off0 + nh]);

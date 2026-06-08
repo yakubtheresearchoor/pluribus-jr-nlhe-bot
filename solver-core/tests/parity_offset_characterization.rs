@@ -26,7 +26,7 @@ use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
-use solver_core::tree::flat::{FlatTree, MAX_NA};
+use solver_core::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
 
 // Copy of metal_flop_parity's minimal table builder for direct comparison.
 fn build_minimal_table() -> (FlatTree, FlopChanceTable) {
@@ -184,6 +184,8 @@ fn build_minimal_table() -> (FlatTree, FlopChanceTable) {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+
     };
     let tree = build_tree(&config).expect("tree build");
     (tree, table)
@@ -220,7 +222,7 @@ fn characterize_metal_pipeline_offset_pattern() {
     let cpu_river = cpu.regrets_river();
     let gpu_all = gpu.download_regrets();
 
-    // Layout: regrets[infoset_idx * MAX_NA * nh + action * nh + hand]
+    // Layout: regrets[infoset_idx * MAX_NA_POSTFLOP * nh + action * nh + hand]
     // For each (infoset, action) pair, the nh hand-indexed diffs should all
     // be equal if the hypothesis "per-(infoset, action) constant offset"
     // holds.

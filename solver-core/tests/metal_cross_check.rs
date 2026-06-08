@@ -91,7 +91,7 @@ fn cross_check_exploitability() {
 
     // Compare raw strategies at each decision node
     println!("\n--- Raw strategy comparison ---");
-    let stride = solver_core::tree::flat::MAX_NA * nh;
+    let stride = solver_core::tree::flat::MAX_NA_POSTFLOP * nh;
     let num_infosets = tree.num_infosets as usize;
     let mut max_cum_diff = 0.0f32;
     let mut max_cum_idx = 0;
@@ -135,7 +135,7 @@ fn cross_check_exploitability() {
     println!("  GPU:  {:?}", &gpu_strat[1][..10.min(nh)]);
 
     println!("\n--- Per-infoset regret divergence ---");
-    let stride = solver_core::tree::flat::MAX_NA * nh;
+    let stride = solver_core::tree::flat::MAX_NA_POSTFLOP * nh;
     let num_infosets = tree.num_infosets as usize;
     let cpu_reg = cpu.regrets_slice();
     let gpu_reg = gpu.regrets_slice();

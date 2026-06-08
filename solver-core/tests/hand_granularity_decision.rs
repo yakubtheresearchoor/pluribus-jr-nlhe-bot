@@ -27,7 +27,7 @@ use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
-use solver_core::tree::flat::{FlatTree, MAX_NA};
+use solver_core::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
 use std::time::Instant;
 
 const NP: u8 = 4;
@@ -245,7 +245,9 @@ fn tree_config() -> TreeConfig {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
     }
+
 }
 
 /// Sum_p Sum_h max(0, BR_p[h] - SV_p[h]).
@@ -282,7 +284,7 @@ fn lift_strategy(
     // Per-zone lift: cum_strategy_{zone}[off + a*nh + h]
     //   reduced[(off_r) + a*nh_r + reduced_hand]
     //   base   [(off_b) + a*nh_b + base_hand]
-    // where off = local_offset * MAX_NA * nh per zone.
+    // where off = local_offset * MAX_NA_POSTFLOP * nh per zone.
 
     // FLOP
     {
@@ -290,9 +292,9 @@ fn lift_strategy(
         let src = reduced.cum_strategy_flop().to_vec();
         let dst = target.cum_strategy_flop_mut();
         for local in 0..n_inf {
-            let off_r = local * MAX_NA * nh_r;
-            let off_b = local * MAX_NA * nh_b;
-            for a in 0..MAX_NA {
+            let off_r = local * MAX_NA_POSTFLOP * nh_r;
+            let off_b = local * MAX_NA_POSTFLOP * nh_b;
+            for a in 0..MAX_NA_POSTFLOP {
                 let ar = off_r + a * nh_r;
                 let ab = off_b + a * nh_b;
                 for h_b in 0..nh_b {
@@ -313,14 +315,14 @@ fn lift_strategy(
         let src = reduced.cum_strategy_turn().to_vec();
         let dst = target.cum_strategy_turn_mut();
         let _ = (n_inf, stride_r, stride_b);
-        // Turn cum_strategy layout: tc * turn_stride + local * MAX_NA * nh + a*nh + h
+        // Turn cum_strategy layout: tc * turn_stride + local * MAX_NA_POSTFLOP * nh + a*nh + h
         for tc in 0..n_turn {
             let tc_base_r = tc * stride_r;
             let tc_base_b = tc * stride_b;
             for local in 0..n_inf {
-                let off_r = tc_base_r + local * MAX_NA * nh_r;
-                let off_b = tc_base_b + local * MAX_NA * nh_b;
-                for a in 0..MAX_NA {
+                let off_r = tc_base_r + local * MAX_NA_POSTFLOP * nh_r;
+                let off_b = tc_base_b + local * MAX_NA_POSTFLOP * nh_b;
+                for a in 0..MAX_NA_POSTFLOP {
                     let ar = off_r + a * nh_r;
                     let ab = off_b + a * nh_b;
                     for h_b in 0..nh_b {
@@ -347,9 +349,9 @@ fn lift_strategy(
                 let rc_base_r = tc * max_n_river * stride_r + rc * stride_r;
                 let rc_base_b = tc * max_n_river * stride_b + rc * stride_b;
                 for local in 0..n_inf {
-                    let off_r = rc_base_r + local * MAX_NA * nh_r;
-                    let off_b = rc_base_b + local * MAX_NA * nh_b;
-                    for a in 0..MAX_NA {
+                    let off_r = rc_base_r + local * MAX_NA_POSTFLOP * nh_r;
+                    let off_b = rc_base_b + local * MAX_NA_POSTFLOP * nh_b;
+                    for a in 0..MAX_NA_POSTFLOP {
                         let ar = off_r + a * nh_r;
                         let ab = off_b + a * nh_b;
                         for h_b in 0..nh_b {

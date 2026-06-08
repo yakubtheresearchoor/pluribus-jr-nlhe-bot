@@ -134,6 +134,8 @@ fn build_table() -> (solver_core::tree::flat::FlatTree, FlopChanceTable) {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+
     };
     let tree = build_tree(&config).unwrap();
     (tree, table)
@@ -254,7 +256,7 @@ fn iter_by_iter_divergence() {
             diffs.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
             eprintln!("  Top divergences ({} total > 0.001):", diffs.len());
             for (i, cpu, gpu, d, zone) in diffs.iter().take(10) {
-                // Decode: nh=NUM_HANDS, MAX_NA=4, index = node_local * MAX_NA * nh + action * nh + hand
+                // Decode: nh=NUM_HANDS, MAX_NA_POSTFLOP=4, index = node_local * MAX_NA_POSTFLOP * nh + action * nh + hand
                 let hand = i % NUM_HANDS;
                 let action = (i / NUM_HANDS) % 4;
                 let node_local = i / (4 * NUM_HANDS);
