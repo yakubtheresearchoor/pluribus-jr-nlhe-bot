@@ -1106,6 +1106,19 @@ struct BottomUpParams {
     // applied at evaluation site as: `eff_rate/eff_cap = flop_seen ? rake : 0`.
     float rake_rate;
     float rake_cap;
+    // ─── Pluribus-style negative-regret pruning (P1) ───
+    // Mirror BatchedParams's pruning fields. Mandatory carve-outs:
+    //   1. pruning_enabled master switch (off → no effect)
+    //   2. re_enable_iter: every Kth iter we traverse all (5% of iters
+    //      when stride=20) so dormant actions get a chance to recover.
+    //   3. board_state != 2: NEVER prune on the river (last betting round).
+    //   4. action_leads_to_terminal: NEVER prune actions leading directly
+    //      to terminal nodes (skipping these can cause CFV mis-estimation).
+    int32_t pruning_enabled;
+    float pruning_threshold;
+    int32_t iteration;
+    int32_t pruning_stride;
+    int32_t board_state;
 };
 
 kernel void vcfr_bottom_up(
@@ -4162,6 +4175,12 @@ kernel void vcfr_bottom_up_tg_parallel(
 
     if (owner == int(params.traverser)) {
         int offset = infoset_id * stride;
+        // Pluribus pruning carve-outs (P1):
+        //   - re_enable_iter: every Kth iter is a full traversal
+        //   - board_state != 2: NEVER prune on the river
+        // action_leads_to_terminal is computed per-action below.
+        bool re_enable_iter = (params.pruning_stride > 0)
+            && (params.iteration % params.pruning_stride == 0);
         for (int h = int(tid); h < nh; h += int(tg_size)) {
             // Compute cfv_avg for this h.
             float cfv_avg_h = 0.0f;
@@ -4172,10 +4191,21 @@ kernel void vcfr_bottom_up_tg_parallel(
             // Per-action regret + cum_strategy update.
             for (int a = 0; a < na; a++) {
                 uint child = children[children_start + a];
+                bool action_leads_to_terminal = (nodes[child].node_type == NODE_TYPE_TERMINAL);
+                bool can_prune_this_action = (params.pruning_enabled != 0)
+                    && !re_enable_iter
+                    && (params.board_state != 2)
+                    && !action_leads_to_terminal;
                 float inst_regret = cfv[child * nh + h] - cfv_avg_h;
                 uint ridx = uint(offset + a * nh + h);
-                float coef = (regrets[ridx] >= 0.0f) ? params.alpha_t : params.beta_t;
-                regrets[ridx] = coef * regrets[ridx] + inst_regret;
+                float old_r = regrets[ridx];
+                // Pluribus carve-out applies HERE: skip the regret + cum
+                // update if this action was confidently dismissed last iter.
+                if (can_prune_this_action && old_r < params.pruning_threshold) {
+                    continue;
+                }
+                float coef = (old_r >= 0.0f) ? params.alpha_t : params.beta_t;
+                regrets[ridx] = coef * old_r + inst_regret;
                 if (regrets[ridx] < params.regret_floor) regrets[ridx] = params.regret_floor;
 
                 uint cidx = uint(offset + a * nh + h);

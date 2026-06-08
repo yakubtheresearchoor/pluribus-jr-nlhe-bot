@@ -1745,6 +1745,11 @@ impl MetalFlopStartSolver {
             traverser: u32, alpha_t: f32, beta_t: f32, gamma_t: f32,
             regret_floor: f32, starting_pot: i32, num_combinations: f32,
             rake_rate: f32, rake_cap: f32,
+            // P1: Pluribus pruning fields (mirror BatchedParams). The flop
+            // kernel reads board_state=0 (Flop), so the "no pruning on river"
+            // carve-out is automatically satisfied at the flop level.
+            pruning_enabled: i32, pruning_threshold: f32,
+            iteration: i32, pruning_stride: i32, board_state: i32,
         }
 
         // #117 Fix A+B applied to flop (mirror of bottom_up_river fix).
@@ -1768,6 +1773,15 @@ impl MetalFlopStartSolver {
                 num_combinations: self.num_combinations,
                 rake_rate: self.rake_rate,
                 rake_cap: self.rake_cap,
+                // Flop zone runs at board_state=0 (Flop). board_state != 2
+                // is automatically true → pruning carve-out for river
+                // doesn't trigger here. The kernel still respects the
+                // re_enable_iter and action-leads-to-terminal carve-outs.
+                pruning_enabled: if self.pruning_enabled { 1 } else { 0 },
+                pruning_threshold: self.pruning_threshold,
+                iteration: self.iteration as i32,
+                pruning_stride: self.pruning_stride as i32,
+                board_state: 0,
             };
 
             let cmd = ctx.new_command_buffer();
