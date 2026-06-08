@@ -202,6 +202,9 @@ pub struct MetalFlopStartSolver {
     init_reach_pipeline: ComputePipelineState,
     top_down_pipeline: ComputePipelineState,
     bottom_up_pipeline: ComputePipelineState,
+    // Flop port (M2 follow-up): tg-parallel version of vcfr_bottom_up.
+    // Used by bottom_up_flop when num_opp >= 2. HU keeps the serial kernel.
+    bottom_up_tg_parallel_pipeline: ComputePipelineState,
     batched_pipeline: ComputePipelineState,
     // Step 2.D.28: threadgroup-parallel kernel for 6-max (num_opp >= 3).
     // Same buffer layout as batched_pipeline; dispatch uses 1 threadgroup
@@ -416,6 +419,7 @@ impl MetalFlopStartSolver {
         let init_reach_pipeline = ctx.create_pipeline("vcfr_init_reach").expect("init_reach");
         let top_down_pipeline = ctx.create_pipeline("vcfr_top_down_reach").expect("top_down");
         let bottom_up_pipeline = ctx.create_pipeline("vcfr_bottom_up").expect("bottom_up");
+        let bottom_up_tg_parallel_pipeline = ctx.create_pipeline("vcfr_bottom_up_tg_parallel").expect("bottom_up_tg_parallel");
         let batched_pipeline = ctx.create_pipeline("vcfr_bottom_up_batched").expect("batched");
         let batched_tg_parallel_pipeline = ctx.create_pipeline("vcfr_bottom_up_batched_tg_parallel").expect("batched_tg_parallel");
         let chance_accum_pipeline = ctx.create_pipeline("vcfr_chance_accumulate").expect("chance_accum");
@@ -563,6 +567,7 @@ impl MetalFlopStartSolver {
             init_reach_pipeline,
             top_down_pipeline,
             bottom_up_pipeline,
+            bottom_up_tg_parallel_pipeline,
             batched_pipeline,
             batched_tg_parallel_pipeline,
             chance_accum_pipeline,
@@ -1767,7 +1772,19 @@ impl MetalFlopStartSolver {
 
             let cmd = ctx.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.bottom_up_pipeline);
+            // M2 follow-up: branch on num_opp. K>=2 (3p+) uses the tg-parallel
+            // flop kernel. HU stays on serial (same reasoning as the batched
+            // kernel — per-node showdown work too small for within-node
+            // parallelism to win).
+            let num_opp = np - 1;
+            let use_tg_parallel = num_opp >= 2
+                && std::env::var_os("SOLVER_DISABLE_TG_PARALLEL").is_none();
+            let pipeline = if use_tg_parallel {
+                &self.bottom_up_tg_parallel_pipeline
+            } else {
+                &self.bottom_up_pipeline
+            };
+            enc.set_compute_pipeline_state(pipeline);
             enc.set_buffer(0, Some(ln.as_ref()), 0);
             let bp_bytes = &bp as *const BuParams as *const std::ffi::c_void;
             enc.set_bytes(1, std::mem::size_of::<BuParams>() as u64, bp_bytes);
@@ -1789,8 +1806,15 @@ impl MetalFlopStartSolver {
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
             enc.set_buffer(18, Some(self.d_rake_marker.as_ref()), 0);
 
-            let tg_width: u64 = 32;
-            let n_groups: u64 = (count as u64 + tg_width - 1) / tg_width;
+            let (n_groups, tg_width): (u64, u64) = if use_tg_parallel {
+                // 1 threadgroup per node.
+                let max_tpg = pipeline.max_total_threads_per_threadgroup() as u64;
+                let w = max_tpg.min(64).max(32);
+                (count as u64, w)
+            } else {
+                let w: u64 = 32;
+                ((count as u64 + w - 1) / w, w)
+            };
             let grid_size = metal::MTLSize { width: n_groups, height: 1, depth: 1 };
             let tg_size = metal::MTLSize { width: tg_width, height: 1, depth: 1 };
             enc.dispatch_thread_groups(grid_size, tg_size);
