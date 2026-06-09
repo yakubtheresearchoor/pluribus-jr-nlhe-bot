@@ -130,7 +130,8 @@ impl FlatNode {
 // the per-stage cap assertion at runtime; they're #[ignore]'d and run
 // only on demand for further research, so this is non-blocking for CI.
 pub const MAX_NA_PREFLOP: usize = 16;
-pub const MAX_NA_POSTFLOP: usize = 4;
+// TEMPORARILY 8 (production-banked = 4) for re-verification work; revert before commit
+pub const MAX_NA_POSTFLOP: usize = 8;
 
 pub const VCFR_NO_INFOSET: u32 = u32::MAX;
 

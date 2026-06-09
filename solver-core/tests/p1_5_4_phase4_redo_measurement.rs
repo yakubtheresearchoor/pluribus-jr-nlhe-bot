@@ -752,6 +752,125 @@ fn dump_lifted_strategy_at_root(
     }
 }
 
+/// Focused dominant-bet-distinguishing test (item 2 of the post-bank
+/// dot-the-i list): build a rich-bet set that EXCLUDES bet 0.33p so that
+/// rich's "smallest meaningfully-used bet" must be at least 0.5p. Then
+/// observe rich's σ at root to find the dominant bet size, and run a
+/// shape sweep with single-bet shapes at SMALLEST vs DOMINANT vs other.
+///
+/// If lean with [smallest]+[rich raises] is safer than lean with
+/// [dominant]+[rich raises], the rule is "include smallest" (config-
+/// invariant). If the opposite, the rule is "include dominant" (which
+/// was the working hypothesis). If both safe, the bet-side clause is
+/// looser than either and just "include any reasonable bet" suffices
+/// once defense-completeness on raises is satisfied.
+#[test]
+#[ignore = "Phase 4 redo: dominant-bet distinguishing test (~20 min)"]
+fn phase4_redo_dominant_bet_distinguishing() {
+    assert_harness_prereqs();
+    eprintln!("\n=== Phase 4 REDO: dominant≠smallest bet rule distinguishing (rich = [0.5, 1.0, 1.5, 2.0]+[1.0, 2.0]) ===");
+    eprintln!("Goal: find rich's σ-dominant bet, test if it == smallest, then sweep shapes.");
+
+    // Custom rich set that excludes 0.33p — smallest is 0.5p.
+    let alt_rich_bets = vec![
+        BetSize::PotRelative(0.5),
+        BetSize::PotRelative(1.0),
+        BetSize::PotRelative(1.5),
+        BetSize::PotRelative(2.0),
+    ];
+    let alt_rich_raises = vec![
+        BetSize::PotRelative(1.0),
+        BetSize::PotRelative(2.0),
+    ];
+
+    let table = build_chance_table();
+    let rich_tree = build_tree_with_stacks(STACKS, alt_rich_bets.clone(), alt_rich_raises.clone());
+    eprintln!("Rich tree (custom bets): {} nodes, {} infosets",
+        rich_tree.num_nodes(), rich_tree.num_infosets);
+
+    let rich_game = FlopStartGame::new(table);
+    let t0 = Instant::now();
+    let (rich_cpu, rich_iters, rich_pct) = solve_lean_to_floor(&rich_tree, &rich_game);
+    eprintln!("Rich solve: {} iters, {:.1}s; rich self-expl: {:.4}% pot",
+        rich_iters, t0.elapsed().as_secs_f32(), rich_pct);
+
+    dump_lifted_strategy_at_root(&rich_cpu, &rich_tree,
+        "RICH baseline (custom bets — no 0.33p)");
+
+    // Test 3 shape variants:
+    //   shape A: [0.5]+[1.0, 2.0]  — smallest single bet
+    //   shape B: [1.0]+[1.0, 2.0]  — mid-size single bet
+    //   shape C: [2.0]+[1.0, 2.0]  — largest single bet
+    //   shape D: full rich identity for sanity check
+    let configs: Vec<(usize, Vec<BetSize>, Vec<BetSize>, &str)> = vec![
+        (1, vec![BetSize::PotRelative(0.5)],
+            alt_rich_raises.clone(),
+            "shape A: smallest [0.5]+[1.0, 2.0]"),
+        (2, vec![BetSize::PotRelative(1.0)],
+            alt_rich_raises.clone(),
+            "shape B: mid [1.0]+[1.0, 2.0]"),
+        (3, vec![BetSize::PotRelative(2.0)],
+            alt_rich_raises.clone(),
+            "shape C: largest [2.0]+[1.0, 2.0]"),
+        (4, alt_rich_bets.clone(),
+            alt_rich_raises.clone(),
+            "shape D: K_FULL identity"),
+    ];
+
+    let mut results: Vec<(usize, &str, f32)> = Vec::new();
+    for (k, lean_bets, lean_raises, label) in configs {
+        eprintln!("\n── config {}: {} ──", k, label);
+        let lean_tree = build_tree_with_stacks(STACKS, lean_bets.clone(), lean_raises.clone());
+        eprintln!("  Lean tree: {} nodes, {} infosets ({:.2}× rich)",
+            lean_tree.num_nodes(), lean_tree.num_infosets,
+            lean_tree.num_nodes() as f32 / rich_tree.num_nodes() as f32);
+
+        let t_lean = Instant::now();
+        let table_lean = build_chance_table();
+        let lean_game = FlopStartGame::new(table_lean);
+        let (lean_cpu, lean_iters, lean_self_pct) = solve_lean_to_floor(&lean_tree, &lean_game);
+        eprintln!("  Lean solve: {} iters, {:.1}s; lean self-expl: {:.4}% pot",
+            lean_iters, t_lean.elapsed().as_secs_f32(), lean_self_pct);
+
+        let table_lift = build_chance_table();
+        let rich_game_lift = FlopStartGame::new(table_lift);
+        let mut rich_cpu_lifted = FlopStartVectorCfr::new(&rich_tree, &rich_game_lift.table());
+        let ph_map = build_pseudo_harmonic_map(&rich_tree, &lean_tree);
+        lift_into_rich_solver_pseudo_harmonic(&rich_tree, &lean_tree, &ph_map, &lean_cpu, &mut rich_cpu_lifted);
+        let xt_pct = measure_rich_exploitability_pct(&rich_cpu_lifted, &rich_tree, &rich_game_lift);
+        eprintln!("  xt (pseudo-harmonic): {:.4}% pot", xt_pct);
+
+        dump_lifted_strategy_at_root(&rich_cpu_lifted, &rich_tree,
+            &format!("config {} lifted", k));
+
+        results.push((k, label, xt_pct));
+    }
+
+    eprintln!("\n=== Phase 4 REDO dominant-bet test verdict ===");
+    eprintln!("Rich self-expl: {:.4}% pot", rich_pct);
+    eprintln!("\n{:>3} {:>45} {:>10}", "cfg", "shape", "xt %");
+    for (k, label, xt) in &results {
+        eprintln!("{:>3} {:>45} {:>9.4}%", k, label, xt);
+    }
+    eprintln!();
+    let smallest = results[0].2;
+    let mid = results[1].2;
+    let largest = results[2].2;
+    let identity = results[3].2;
+    eprintln!("Identity sanity: shape D xt = {:.4}% (should ≈ rich self-expl {:.4}%)", identity, rich_pct);
+    eprintln!("smallest [0.5]: {:.4}%   mid [1.0]: {:.4}%   largest [2.0]: {:.4}%",
+        smallest, mid, largest);
+    if smallest < 1.0 && mid < 1.0 && largest < 1.0 {
+        eprintln!("\nAll three single-bet shapes pass loose target — bet-side clause is LOOSER than 'include smallest' or 'include dominant'; defense-completeness on raises is the only invariant.");
+    } else if smallest < mid && smallest < largest {
+        eprintln!("\nSmallest wins — rule = 'include smallest'. Banked shape uses smallest 0.33p, generalizes.");
+    } else if smallest > largest {
+        eprintln!("\nLargest wins — rule = 'include largest' or 'include dominant if dominant=largest'. Banked shape with 0.33p may be wrong at configs where smallest≠dominant.");
+    } else {
+        eprintln!("\nMixed signal — review per-config numbers.");
+    }
+}
+
 /// Focused third-config test: shape rule generalization at DRY BOARD.
 /// Uses K-7-2 rainbow (canonical dry, no straights or flushes) with deep
 /// stacks (same as the main test). Tests whether the defense-completeness
