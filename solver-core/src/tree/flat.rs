@@ -129,9 +129,18 @@ impl FlatNode {
 // rich K=5 = 4 bets + 2 raises config in the measurement file) will hit
 // the per-stage cap assertion at runtime; they're #[ignore]'d and run
 // only on demand for further research, so this is non-blocking for CI.
+// MAX_NA_PREFLOP — set by reference to Pluribus (up to 14 raise sizes + fold +
+// call), STRUCTURAL CAPACITY confirmed (see p1_5_4_phase4_redo_preflop_capacity.rs:
+// a 14-raise preflop tree builds cleanly), but the EMPIRICAL bootstrap analogous
+// to Phase 4 postflop is DEFERRED. The deferred work: solve the rich preflop game
+// to convergence, observe σ at preflop infosets, see which raise sizes are
+// actually used. If many sizes go unused, MAX_NA could shrink. If 14 are
+// saturated, bump and re-test for the "too lean" boundary. Preflop is CPU-only
+// and over-provisioning is cheap, so 16 is a safe conservative bank; the open
+// question is whether 16 is also TIGHT (could be smaller) — which we don't know
+// without the deferred bootstrap. See the file docstring for the concrete plan.
 pub const MAX_NA_PREFLOP: usize = 16;
-// TEMPORARILY 8 (production-banked = 4) for re-verification work; revert before commit
-pub const MAX_NA_POSTFLOP: usize = 8;
+pub const MAX_NA_POSTFLOP: usize = 4;
 
 pub const VCFR_NO_INFOSET: u32 = u32::MAX;
 
