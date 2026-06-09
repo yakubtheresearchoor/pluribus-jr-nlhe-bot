@@ -275,6 +275,285 @@ fn solve(tree: &FlatTree, game: &FlopStartGame, n_iters: u32) -> FlopStartVector
     cpu
 }
 
+/// Walk rich tree's PLAYER nodes; for each with a single PH-map entry
+/// (weight 1.0), compare lifted cum_strategy slot to lean's source slot
+/// for every action with a corresponding lean action. Reports the count
+/// of mismatches (should be 0 for a correct lift) and the worst-case
+/// absolute diff. Bounded sample-size early-stop keeps cost low.
+fn diagnose_single_entry_lift_fidelity(
+    rich_tree: &FlatTree,
+    lean_tree: &FlatTree,
+    ph_map: &solver_core::solver::cross_tree::PseudoHarmonicCrossTreeMap,
+    lean_cpu: &FlopStartVectorCfr,
+    rich_cpu_lifted: &FlopStartVectorCfr,
+) {
+    use solver_core::tree::flat::{
+        MAX_NA_POSTFLOP, ACTION_LABEL_BET, ACTION_LABEL_RAISE,
+    };
+    let nh = lean_cpu.num_hands();
+    let lean_zones = lean_cpu.zones();
+    let rich_zones = rich_cpu_lifted.zones();
+    let lean_flop_local = lean_cpu.flop_local_offset();
+    let rich_flop_local = rich_cpu_lifted.flop_local_offset();
+
+    // Helper to compute pot-fraction for a rich/lean action.
+    let pf = |tree: &FlatTree, parent: usize, child: usize, player: usize| -> f64 {
+        let np = tree.num_players as usize;
+        let pot_p: i64 = (0..np).map(|p| tree.contributions[parent * np + p] as i64).sum();
+        if pot_p <= 0 { return 0.0; }
+        let pc = tree.contributions[parent * np + player] as i64;
+        let cc = tree.contributions[child * np + player] as i64;
+        (cc - pc) as f64 / pot_p as f64
+    };
+
+    let mut single_entry_nodes = 0usize;
+    let mut mismatches = 0usize;
+    let mut max_abs = 0.0f32;
+    let mut sample_mismatch_subtree: Option<(usize, &'static str)> = None;
+    let _ = sample_mismatch_subtree;
+
+    let mut first_mismatch: Option<(usize, usize, u8, f32, f32)> = None;
+
+    let lean_csf = lean_cpu.cum_strategy_flop();
+    let lean_cst = lean_cpu.cum_strategy_turn();
+    let lean_csr = lean_cpu.cum_strategy_river();
+    let rich_csf_lifted = rich_cpu_lifted.cum_strategy_flop();
+    let rich_cst_lifted = rich_cpu_lifted.cum_strategy_turn();
+    let rich_csr_lifted = rich_cpu_lifted.cum_strategy_river();
+
+    let lean_turn_local = lean_cpu.turn_local_offset();
+    let rich_turn_local = rich_cpu_lifted.turn_local_offset();
+    let lean_river_local = lean_cpu.river_local_offset();
+    let rich_river_local = rich_cpu_lifted.river_local_offset();
+    let lean_turn_stride = lean_cpu.turn_stride();
+    let rich_turn_stride = rich_cpu_lifted.turn_stride();
+    let lean_river_stride = lean_cpu.river_stride();
+    let rich_river_stride = rich_cpu_lifted.river_stride();
+    let lean_n_turn = if lean_turn_stride > 0 { lean_cst.len() / lean_turn_stride } else { 0 };
+    let lean_max_n_river = if lean_river_stride > 0 && lean_n_turn > 0 {
+        lean_csr.len() / (lean_n_turn * lean_river_stride)
+    } else { 0 };
+    let rich_max_n_river = if rich_river_stride > 0 && lean_n_turn > 0 {
+        rich_csr_lifted.len() / (lean_n_turn * rich_river_stride)
+    } else { 0 };
+
+    // Per-zone fidelity check. Compares lifted slot to lean source slot
+    // for every action with an exact (label, pot-fraction) match, for
+    // single-entry-weight-1.0 PH map nodes only (where lifted = lean copy
+    // is the expected invariant).
+    let mut check_zone = |zone: solver_core::solver::flop_start_vector_cfr::Zone,
+                          stride_iters: Box<dyn Fn() -> Box<dyn Iterator<Item = (usize, usize)>>>| {
+        let _ = (zone, stride_iters);
+    };
+    let _ = check_zone;
+
+    // FLOP zone
+    for &nid in &rich_tree.decision_node_ids {
+        let r_idx = nid as usize;
+        if !matches!(rich_zones[r_idx],
+            solver_core::solver::flop_start_vector_cfr::Zone::Flop) { continue; }
+        let entries = &ph_map.rich_to_lean_nodes[r_idx];
+        if entries.len() != 1 { continue; }
+        let (l_idx, w) = entries[0];
+        if (w - 1.0).abs() > 1e-6 { continue; }
+        if !matches!(lean_zones[l_idx],
+            solver_core::solver::flop_start_vector_cfr::Zone::Flop) { continue; }
+        let r_local = rich_flop_local[r_idx];
+        let l_local = lean_flop_local[l_idx];
+        if r_local == usize::MAX || l_local == usize::MAX { continue; }
+        single_entry_nodes += 1;
+        let r_base = r_local * MAX_NA_POSTFLOP * nh;
+        let l_base = l_local * MAX_NA_POSTFLOP * nh;
+        let r_children = rich_tree.node_children(r_idx);
+        let l_children = lean_tree.node_children(l_idx);
+        let r_player = rich_tree.nodes[r_idx].player_id as usize;
+        let l_player = lean_tree.nodes[l_idx].player_id as usize;
+        let mut used = vec![false; l_children.len()];
+        for (a_r, &rc) in r_children.iter().enumerate() {
+            let rc_node = &rich_tree.nodes[rc as usize];
+            let label = rc_node.action_label;
+            let a_l = find_exact_match(
+                rich_tree, lean_tree, r_idx, l_idx, rc as usize, l_children, r_player, l_player, label, &mut used, pf,
+            );
+            let a_l = match a_l { Some(i) => i, None => continue };
+            for h in 0..nh {
+                let lifted_v = rich_csf_lifted[r_base + a_r * nh + h];
+                let source_v = lean_csf[l_base + a_l * nh + h];
+                let d = (lifted_v - source_v).abs();
+                if d > max_abs { max_abs = d; }
+                if d > 1e-6 {
+                    mismatches += 1;
+                    if first_mismatch.is_none() {
+                        first_mismatch = Some((r_idx, l_idx, label, lifted_v, source_v));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "  Lift fidelity (flop, single-entry only):  {:>5} nodes checked, {:>5} mismatches, max_abs={:.3e}",
+        single_entry_nodes, mismatches, max_abs);
+    if let Some((r, l, lbl, lv, sv)) = first_mismatch {
+        eprintln!("    First mismatch (flop): r_idx={} l_idx={} label={} lifted={:.3e} source={:.3e}", r, l, lbl, lv, sv);
+    }
+
+    // TURN zone — sum across tc since the per-(tc) breakdown isn't useful here
+    let mut turn_nodes = 0usize;
+    let mut turn_mism = 0usize;
+    let mut turn_max = 0.0f32;
+    for &nid in &rich_tree.decision_node_ids {
+        let r_idx = nid as usize;
+        if !matches!(rich_zones[r_idx],
+            solver_core::solver::flop_start_vector_cfr::Zone::Turn) { continue; }
+        let entries = &ph_map.rich_to_lean_nodes[r_idx];
+        if entries.len() != 1 { continue; }
+        let (l_idx, w) = entries[0];
+        if (w - 1.0).abs() > 1e-6 { continue; }
+        if !matches!(lean_zones[l_idx],
+            solver_core::solver::flop_start_vector_cfr::Zone::Turn) { continue; }
+        let r_local = rich_turn_local[r_idx];
+        let l_local = lean_turn_local[l_idx];
+        if r_local == usize::MAX || l_local == usize::MAX { continue; }
+        turn_nodes += 1;
+        let r_children = rich_tree.node_children(r_idx);
+        let l_children = lean_tree.node_children(l_idx);
+        let r_player = rich_tree.nodes[r_idx].player_id as usize;
+        let l_player = lean_tree.nodes[l_idx].player_id as usize;
+        for tc in 0..lean_n_turn {
+            let r_base = tc * rich_turn_stride + r_local * MAX_NA_POSTFLOP * nh;
+            let l_base = tc * lean_turn_stride + l_local * MAX_NA_POSTFLOP * nh;
+            let mut used = vec![false; l_children.len()];
+            for (a_r, &rc) in r_children.iter().enumerate() {
+                let rc_node = &rich_tree.nodes[rc as usize];
+                let label = rc_node.action_label;
+                let a_l = find_exact_match(
+                    rich_tree, lean_tree, r_idx, l_idx, rc as usize, l_children, r_player, l_player, label, &mut used, pf,
+                );
+                let a_l = match a_l { Some(i) => i, None => continue };
+                for h in 0..nh {
+                    let lifted_v = rich_cst_lifted[r_base + a_r * nh + h];
+                    let source_v = lean_cst[l_base + a_l * nh + h];
+                    let d = (lifted_v - source_v).abs();
+                    if d > turn_max { turn_max = d; }
+                    if d > 1e-6 { turn_mism += 1; }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "  Lift fidelity (turn, single-entry only):  {:>5} nodes checked, {:>5} mismatches, max_abs={:.3e}",
+        turn_nodes, turn_mism, turn_max);
+
+    // RIVER zone
+    let mut river_nodes = 0usize;
+    let mut river_mism = 0usize;
+    let mut river_max = 0.0f32;
+    for &nid in &rich_tree.decision_node_ids {
+        let r_idx = nid as usize;
+        if !matches!(rich_zones[r_idx],
+            solver_core::solver::flop_start_vector_cfr::Zone::River) { continue; }
+        let entries = &ph_map.rich_to_lean_nodes[r_idx];
+        if entries.len() != 1 { continue; }
+        let (l_idx, w) = entries[0];
+        if (w - 1.0).abs() > 1e-6 { continue; }
+        if !matches!(lean_zones[l_idx],
+            solver_core::solver::flop_start_vector_cfr::Zone::River) { continue; }
+        let r_local = rich_river_local[r_idx];
+        let l_local = lean_river_local[l_idx];
+        if r_local == usize::MAX || l_local == usize::MAX { continue; }
+        river_nodes += 1;
+        let r_children = rich_tree.node_children(r_idx);
+        let l_children = lean_tree.node_children(l_idx);
+        let r_player = rich_tree.nodes[r_idx].player_id as usize;
+        let l_player = lean_tree.nodes[l_idx].player_id as usize;
+        for tc in 0..lean_n_turn {
+            for rc_idx in 0..lean_max_n_river {
+                let r_base = (tc * rich_max_n_river + rc_idx) * rich_river_stride
+                             + r_local * MAX_NA_POSTFLOP * nh;
+                let l_base = (tc * lean_max_n_river + rc_idx) * lean_river_stride
+                             + l_local * MAX_NA_POSTFLOP * nh;
+                let mut used = vec![false; l_children.len()];
+                for (a_r, &rc) in r_children.iter().enumerate() {
+                    let rc_node = &rich_tree.nodes[rc as usize];
+                    let label = rc_node.action_label;
+                    let a_l = find_exact_match(
+                        rich_tree, lean_tree, r_idx, l_idx, rc as usize, l_children, r_player, l_player, label, &mut used, pf,
+                    );
+                    let a_l = match a_l { Some(i) => i, None => continue };
+                    for h in 0..nh {
+                        let lifted_v = rich_csr_lifted[r_base + a_r * nh + h];
+                        let source_v = lean_csr[l_base + a_l * nh + h];
+                        let d = (lifted_v - source_v).abs();
+                        if d > river_max { river_max = d; }
+                        if d > 1e-6 { river_mism += 1; }
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "  Lift fidelity (river, single-entry only): {:>5} nodes checked, {:>5} mismatches, max_abs={:.3e}",
+        river_nodes, river_mism, river_max);
+
+    // Also count UNPAIRED nodes per zone (rich nodes with empty PH map).
+    let mut unpaired_flop = 0usize;
+    let mut unpaired_turn = 0usize;
+    let mut unpaired_river = 0usize;
+    for &nid in &rich_tree.decision_node_ids {
+        let r_idx = nid as usize;
+        if !ph_map.rich_to_lean_nodes[r_idx].is_empty() { continue; }
+        match rich_zones[r_idx] {
+            solver_core::solver::flop_start_vector_cfr::Zone::Flop => unpaired_flop += 1,
+            solver_core::solver::flop_start_vector_cfr::Zone::Turn => unpaired_turn += 1,
+            solver_core::solver::flop_start_vector_cfr::Zone::River => unpaired_river += 1,
+            _ => {}
+        }
+    }
+    eprintln!(
+        "  Unpaired rich PLAYER nodes (uniform-default in lift): flop={}  turn={}  river={}",
+        unpaired_flop, unpaired_turn, unpaired_river);
+}
+
+fn find_exact_match<F>(
+    rich_tree: &FlatTree,
+    lean_tree: &FlatTree,
+    r_parent: usize,
+    l_parent: usize,
+    r_child: usize,
+    l_children: &[u32],
+    r_player: usize,
+    l_player: usize,
+    label: u8,
+    used: &mut [bool],
+    pf: F,
+) -> Option<usize>
+where F: Fn(&FlatTree, usize, usize, usize) -> f64 + Copy,
+{
+    use solver_core::tree::flat::{ACTION_LABEL_BET, ACTION_LABEL_RAISE};
+    if label != ACTION_LABEL_BET && label != ACTION_LABEL_RAISE {
+        for (a_l, &lc) in l_children.iter().enumerate() {
+            if used[a_l] { continue; }
+            if lean_tree.nodes[lc as usize].action_label == label {
+                used[a_l] = true;
+                return Some(a_l);
+            }
+        }
+        return None;
+    }
+    let pf_r = pf(rich_tree, r_parent, r_child, r_player);
+    for (a_l, &lc) in l_children.iter().enumerate() {
+        if used[a_l] { continue; }
+        let lc_node = &lean_tree.nodes[lc as usize];
+        if lc_node.action_label != label { continue; }
+        let pf_l = pf(lean_tree, l_parent, lc as usize, l_player);
+        if (pf_l - pf_r).abs() < 1e-3 {
+            used[a_l] = true;
+            return Some(a_l);
+        }
+    }
+    None
+}
+
 /// Solve lean to a self-expl floor instead of a fixed iter count. K=3
 /// in the first-pass sweep was less converged than K=4 (0.0279% vs 0.0018%)
 /// because of variation in how fast different action abstractions reach
@@ -343,18 +622,23 @@ fn phase4_redo_measurement() {
     eprintln!("\nRich tree: {} nodes, {} infosets",
         rich_tree.num_nodes(), rich_tree.num_infosets);
 
-    // ── Solve rich ──
-    eprintln!("\n── Solve RICH ({} iters) ──", N_ITERS);
+    // ── Solve rich to the SAME self-expl floor as lean. The first-pass
+    // measurement ran rich for a fixed 50 iters (self-expl 0.13%) while
+    // lean was run to a floor of 0.005%, so the lifted-lean strategies
+    // could appear more converged than rich itself, producing negative
+    // costs at the identity boundary (K_FULL lifted-rich showed xt = 0%
+    // but rich_self_expl = 0.13%, giving cost = −0.13% which is
+    // measurement noise, not a real result). Running rich to the same
+    // floor drives the identity boundary to exactly 0%.
+    eprintln!("\n── Solve RICH (to self-expl floor < {:.4}%) ──", LEAN_SELF_EXPL_FLOOR_PCT);
     let t0 = Instant::now();
     let rich_game = FlopStartGame::new(table);
-    let rich_cpu = solve(&rich_tree, &rich_game, N_ITERS);
-    eprintln!("Rich solve wall: {:.1}s", t0.elapsed().as_secs_f32());
-
-    // Rich exploitability via solver-internal API (same-action-space).
-    let rich_pct = measure_rich_exploitability_pct(&rich_cpu, &rich_tree, &rich_game);
-    eprintln!("Rich self-exploitability: {:.4}% pot", rich_pct);
-    assert!(rich_pct > 0.1,
-        "P0 gate violated: rich expl {:.4}% pot below 0.1% — comparison is vacuous", rich_pct);
+    let (rich_cpu, rich_iters, rich_pct) = solve_lean_to_floor(&rich_tree, &rich_game);
+    eprintln!("Rich solve: {} iters, {:.1}s; rich self-expl: {:.4}% pot",
+        rich_iters, t0.elapsed().as_secs_f32(), rich_pct);
+    assert!(rich_pct < LEAN_SELF_EXPL_FLOOR_PCT * 5.0,
+        "Rich didn't converge to a comparable floor: {:.4}% vs lean target {:.4}%",
+        rich_pct, LEAN_SELF_EXPL_FLOOR_PCT);
 
     // Sanity check: lift rich's strategy back into a fresh rich solver and
     // measure exploit. Should equal rich_pct because rich → rich is identity
@@ -541,6 +825,17 @@ fn phase4_redo_measurement() {
             ph_map.total_entries());
         lift_into_rich_solver_pseudo_harmonic(
             &rich_tree, &lean_tree, &ph_map, &lean_cpu, &mut rich_cpu_lifted_ph);
+
+        // ── Bug-hunt diagnostic: for every rich PLAYER node whose PH map
+        // has a single entry (weight 1.0), the lifted cum_strategy slot
+        // values should be bit-exact equal to lean's source slot values
+        // for actions that exact-match between the trees. Divergence here
+        // localizes a lift bug to the affected subtree (e.g. K=3 vs K=4
+        // inversion's residual-bug-at-bet-1.5p-subtree hypothesis). ──
+        diagnose_single_entry_lift_fidelity(
+            &rich_tree, &lean_tree, &ph_map, &lean_cpu, &rich_cpu_lifted_ph,
+        );
+
         let xt_ph_pct = measure_rich_exploitability_pct(&rich_cpu_lifted_ph, &rich_tree, &rich_game_lift_ph);
         eprintln!("  xt (pseudo-harmonic): {:.4}% pot", xt_ph_pct);
 
