@@ -74,9 +74,29 @@ impl FlatNode {
 // regenerates the Metal header (max_na_generated.metal) so the constants are
 // structurally locked together; updating one and not the other is impossible.
 //
-// Phase 4 will empirically tune MAX_NA_POSTFLOP on a non-trivial mixed-eq
-// 6-max config; the current value of 6 is the starting placeholder
-// (fold + call + 4 raise sizes = Pluribus postflop blueprint).
+// Phase 4 (REDO, see p1_5_4_phase4_redo_measurement.rs): empirically
+// validated against a deep-stack 6-max config (Th9d8c wet board, stacks=500
+// = 100bb effective). Action sweep K=1..5 with cross-action-space best-
+// response evaluation (lean strategy lifted into rich's per-outcome
+// cum_strategy buffers via solver::cross_tree, BR via the solver-internal
+// walker that correctly tracks per-(tc, rc) chance state):
+//   K=1 [0.33] + [1.0]            cost = 13.82% pot
+//   K=2 [0.33, 0.66] + [1.0]      cost = 12.28% pot
+//   K=3 [0.33, 0.66, 1.0] + [1.0] cost = 22.45% pot
+//   K=4 [0.33..1.5] + [1.0]       cost = 20.00% pot (1 missing raise size)
+//   K=5 [0.33..1.5] + [1.0, 2.0]  cost =  0.00% pot (identity sanity)
+// Cost = exploitability when lean is played in rich's action space against a
+// best-response opponent; production targets are 0.05% (tight) or 1% (loose),
+// so every K below the full rich set fails by 200×+. The dominant cost
+// driver is the missing raise2.0p — without it, opponents extract ~20% pot.
+//
+// Conclusion: at this config the full rich action set (4 bets + 2 raises +
+// fold + check/call) is required; the maximum actions at any single node is
+// 6 (fold + check + 4 bets, or fold + call + 2 raises), so MAX_NA_POSTFLOP
+// stays at 6 with empirical grounding rather than a placeholder. Shorter
+// stacks or smaller games might reach the production gate with a smaller
+// abstraction — a future revisit would re-run this sweep on the actual
+// production config to confirm.
 pub const MAX_NA_PREFLOP: usize = 16;
 pub const MAX_NA_POSTFLOP: usize = 6;
 
