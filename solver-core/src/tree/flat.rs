@@ -74,29 +74,36 @@ impl FlatNode {
 // regenerates the Metal header (max_na_generated.metal) so the constants are
 // structurally locked together; updating one and not the other is impossible.
 //
-// Phase 4 (REDO, see p1_5_4_phase4_redo_measurement.rs): empirically
-// validated against a deep-stack 6-max config (Th9d8c wet board, stacks=500
-// = 100bb effective). Action sweep K=1..5 with cross-action-space best-
-// response evaluation (lean strategy lifted into rich's per-outcome
-// cum_strategy buffers via solver::cross_tree, BR via the solver-internal
-// walker that correctly tracks per-(tc, rc) chance state):
-//   K=1 [0.33] + [1.0]            cost = 13.82% pot
-//   K=2 [0.33, 0.66] + [1.0]      cost = 12.28% pot
-//   K=3 [0.33, 0.66, 1.0] + [1.0] cost = 22.45% pot
-//   K=4 [0.33..1.5] + [1.0]       cost = 20.00% pot (1 missing raise size)
-//   K=5 [0.33..1.5] + [1.0, 2.0]  cost =  0.00% pot (identity sanity)
-// Cost = exploitability when lean is played in rich's action space against a
-// best-response opponent; production targets are 0.05% (tight) or 1% (loose),
-// so every K below the full rich set fails by 200×+. The dominant cost
-// driver is the missing raise2.0p — without it, opponents extract ~20% pot.
+// Phase 4 (REDO IN PROGRESS, see p1_5_4_phase4_redo_measurement.rs): the
+// cross-action-space measurement framework is built and verified (identity-
+// lift sanity bit-exact, K_FULL identity gives 0% cost). The first K-sweep
+// at deep-stack 6-max (Th9d8c wet, stacks=500=100bb, iter 50) showed
+// non-trivial costs for every K below the full rich set — but the verdict
+// is NOT YET BANKED for three reasons:
 //
-// Conclusion: at this config the full rich action set (4 bets + 2 raises +
-// fold + check/call) is required; the maximum actions at any single node is
-// 6 (fold + check + 4 bets, or fold + call + 2 raises), so MAX_NA_POSTFLOP
-// stays at 6 with empirical grounding rather than a placeholder. Shorter
-// stacks or smaller games might reach the production gate with a smaller
-// abstraction — a future revisit would re-run this sweep on the actual
-// production config to confirm.
+//   (1) Translation confound. The lift uses nearest-amount action
+//       translation, which is a hard mapping; the agent's own data shows
+//       the K=1→K=5 cost gradient is ~14% pot, so the cost-of-leaning
+//       attribution between translation error and structural shortfall is
+//       confounded by a translation policy that admits drift. Pseudo-
+//       harmonic translation (Ganzfried-Sandholm 2013, the Pluribus
+//       mapping) needs to land before the structural cost claim is solid.
+//   (2) Non-monotonic sweep. K=3 cost (22.45%) > K=4 cost (20.00%),
+//       internally inconsistent — adding a bet size shouldn't increase
+//       cost. K=3's lean self-expl was 0.0279% vs K=4's 0.0018%, so K=3
+//       was less converged when measured. Need a self-expl-floor gate on
+//       lean solve before lifting, not a fixed iter count.
+//   (3) Wrong-metric question. The measurement is "blueprint played
+//       directly against rich-BR" — i.e. worst-case blueprint without
+//       search. Production deployments (Pluribus) use depth-limited search
+//       on top of the blueprint and refine at runtime, so "blueprint
+//       standalone exploit" overstates the cost of a smaller MAX_NA. If
+//       search is in the picture, the metric should be "blueprint quality
+//       as a search prior", which is structurally different.
+//
+// Until all three are addressed, MAX_NA_POSTFLOP = 6 stays as a Pluribus-
+// blueprint-shaped placeholder (fold + call + 4 raise sizes), NOT a banked
+// empirical finding.
 pub const MAX_NA_PREFLOP: usize = 16;
 pub const MAX_NA_POSTFLOP: usize = 6;
 

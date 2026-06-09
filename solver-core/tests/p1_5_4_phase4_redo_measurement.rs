@@ -33,7 +33,10 @@
 use solver_core::card::{card_from_str, index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use solver_core::gpu_metal::context::MetalContext;
 use solver_core::gpu_metal::flop_solver::MetalFlopStartSolver;
-use solver_core::solver::cross_tree::{build_action_map, lift_into_rich_solver_with_lean};
+use solver_core::solver::cross_tree::{
+    build_action_map, build_pseudo_harmonic_map, lift_into_rich_solver_with_lean,
+    lift_into_rich_solver_pseudo_harmonic,
+};
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
@@ -51,7 +54,14 @@ const STARTING_POT: i32 = 30;
 const STARTING_CONTRIB: i32 = 5;
 const NH: usize = 6;
 const NP: u8 = 6;
-const N_ITERS: u32 = 50; // longer than P0 probe — give all K levels time to converge in lean game
+const N_ITERS: u32 = 50; // baseline iters for rich (always run to this)
+// Lean is run until self-expl drops below this threshold, or LEAN_MAX_ITERS,
+// whichever comes first. Eliminates the "K=3 noise spike" problem in the
+// first-pass measurement where K=3's lean self-expl was 0.0279% vs K=4's
+// 0.0018% at iter 50, producing a non-monotonic sweep (K=3 cost > K=4 cost).
+const LEAN_SELF_EXPL_FLOOR_PCT: f32 = 0.005;
+const LEAN_MAX_ITERS: u32 = 300;
+const LEAN_ITER_CHUNK: u32 = 25;
 
 // Min chip increment to count a bet as a "real" size choice. Drops tiny
 // bets that would otherwise top the conditional-mass ranking and trigger
@@ -265,6 +275,39 @@ fn solve(tree: &FlatTree, game: &FlopStartGame, n_iters: u32) -> FlopStartVector
     cpu
 }
 
+/// Solve lean to a self-expl floor instead of a fixed iter count. K=3
+/// in the first-pass sweep was less converged than K=4 (0.0279% vs 0.0018%)
+/// because of variation in how fast different action abstractions reach
+/// equilibrium; running to a common self-expl threshold normalizes the
+/// comparison.
+fn solve_lean_to_floor(
+    tree: &FlatTree,
+    game: &FlopStartGame,
+) -> (FlopStartVectorCfr, u32, f32) {
+    let np = tree.num_players as usize;
+    let mut cpu = FlopStartVectorCfr::new(tree, &game.table());
+    let ctx = MetalContext::new().expect("Metal");
+    let mut gpu = MetalFlopStartSolver::new(&ctx, tree, game, &cpu);
+    let mut total_iters = 0u32;
+    let mut last_pct = f32::INFINITY;
+    while total_iters < LEAN_MAX_ITERS {
+        gpu.run(&ctx, tree, game, LEAN_ITER_CHUNK);
+        cpu.run(tree, game, LEAN_ITER_CHUNK);
+        total_iters += LEAN_ITER_CHUNK;
+        let mut total = 0.0f32;
+        for p in 0..np {
+            let br = cpu.best_response_value_debug(tree, game, p as u8);
+            let sv = cpu.strategy_value_debug(tree, game, p as u8);
+            for h in 0..br.len().min(sv.len()) {
+                total += (br[h] - sv[h]).max(0.0);
+            }
+        }
+        last_pct = total / STARTING_POT as f32 * 100.0;
+        if last_pct < LEAN_SELF_EXPL_FLOOR_PCT { break; }
+    }
+    (cpu, total_iters, last_pct)
+}
+
 /// Read flattened cum_strategy from a solved cpu (for the bet-size observer only).
 fn get_flattened(cpu: &FlopStartVectorCfr, tree: &FlatTree) -> (Vec<f32>, Vec<usize>) {
     cpu.flattened_cum_strategy(tree)
@@ -475,25 +518,44 @@ fn phase4_redo_measurement() {
         eprintln!("  Cross-tree pair: {}/{} rich PLAYER nodes paired with a lean node",
             lean_paired, rich_tree.decision_node_ids.len());
 
-        // Solve lean.
+        // Solve lean to a self-expl FLOOR (not fixed iter count) so every K
+        // is compared at the same convergence quality.
         let t_lean = Instant::now();
         let table_lean = build_chance_table();
         let lean_game = FlopStartGame::new(table_lean);
-        let lean_cpu = solve(&lean_tree, &lean_game, N_ITERS);
+        let (lean_cpu, lean_iters, lean_self_pct) = solve_lean_to_floor(&lean_tree, &lean_game);
         let lean_wall = t_lean.elapsed().as_secs_f32();
-        let lean_self_pct = measure_rich_exploitability_pct(&lean_cpu, &lean_tree, &lean_game);
-        eprintln!("  Lean solve: {:.1}s; lean self-expl (lean-space): {:.4}% pot",
-            lean_wall, lean_self_pct);
+        eprintln!("  Lean solve: {} iters, {:.1}s; lean self-expl (lean-space): {:.4}% pot",
+            lean_iters, lean_wall, lean_self_pct);
 
-        // Lift lean's per-outcome cum_strategy → rich-solver's per-outcome
-        // buffers, then use rich's internal BR walker (which correctly
-        // tracks tc/rc — the public best_response.rs walker can't).
-        let table_lift = build_chance_table();
-        let rich_game_lift = FlopStartGame::new(table_lift);
-        let mut rich_cpu_lifted = FlopStartVectorCfr::new(&rich_tree, &rich_game_lift.table());
-        lift_into_rich_solver_with_lean(&rich_tree, &lean_tree, &map, &lean_cpu, &mut rich_cpu_lifted);
-        let xt_pct = measure_rich_exploitability_pct(&rich_cpu_lifted, &rich_tree, &rich_game_lift);
-        let cost_pct = xt_pct - rich_pct;
+        // ── Cross-action-space cost with PSEUDO-HARMONIC translation (Pluribus
+        // mapping, Ganzfried-Sandholm 2013). Pot-fraction matching at every
+        // node + probabilistic split at unmatched bets/raises. ──
+        let table_lift_ph = build_chance_table();
+        let rich_game_lift_ph = FlopStartGame::new(table_lift_ph);
+        let mut rich_cpu_lifted_ph = FlopStartVectorCfr::new(&rich_tree, &rich_game_lift_ph.table());
+        let ph_map = build_pseudo_harmonic_map(&rich_tree, &lean_tree);
+        eprintln!("  PH map: {} paired rich PLAYER nodes, max {} entries/node, {} total entries",
+            ph_map.paired_player_count(&rich_tree),
+            ph_map.max_entries_per_node(),
+            ph_map.total_entries());
+        lift_into_rich_solver_pseudo_harmonic(
+            &rich_tree, &lean_tree, &ph_map, &lean_cpu, &mut rich_cpu_lifted_ph);
+        let xt_ph_pct = measure_rich_exploitability_pct(&rich_cpu_lifted_ph, &rich_tree, &rich_game_lift_ph);
+        eprintln!("  xt (pseudo-harmonic): {:.4}% pot", xt_ph_pct);
+
+        // ── Compare to NEAREST translation (the previous baseline, kept for
+        // separating translation-error attribution from structural cost). ──
+        let table_lift_n = build_chance_table();
+        let rich_game_lift_n = FlopStartGame::new(table_lift_n);
+        let mut rich_cpu_lifted_n = FlopStartVectorCfr::new(&rich_tree, &rich_game_lift_n.table());
+        lift_into_rich_solver_with_lean(&rich_tree, &lean_tree, &map, &lean_cpu, &mut rich_cpu_lifted_n);
+        let xt_pct = measure_rich_exploitability_pct(&rich_cpu_lifted_n, &rich_tree, &rich_game_lift_n);
+        eprintln!("  xt (nearest):         {:.4}% pot", xt_pct);
+
+        // Cost-of-leaning uses the pseudo-harmonic number (production-grade
+        // action translation) as the canonical bank.
+        let cost_pct = xt_ph_pct - rich_pct;
         eprintln!("  Cross-action-space expl (lifted lean in RICH): {:.4}% pot", xt_pct);
         eprintln!("  COST of leaning = xt - rich = {:.4}% pot", cost_pct);
 
