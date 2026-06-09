@@ -86,8 +86,30 @@ fn rich_raise_sizes() -> Vec<BetSize> {
 }
 
 fn build_chance_table() -> FlopChanceTable {
-    let board: Vec<Card> = ["Th", "9d", "8c"]
-        .iter().map(|s| card_from_str(s).unwrap()).collect();
+    build_chance_table_for_board(
+        &["Th", "9d", "8c"],
+        &["2c", "Jd"],
+        &[&["4s", "7h"], &["3s", "Qc"]],
+    )
+}
+
+/// Dry-rainbow board variant — no straight or flush draws (K-7-2 rainbow).
+/// Used to test whether the defense-completeness rule generalizes across
+/// board textures (wet → dry).
+fn build_chance_table_dry() -> FlopChanceTable {
+    build_chance_table_for_board(
+        &["Ks", "7d", "2h"],   // K-7-2 rainbow (canonical dry)
+        &["Jc", "5d"],         // diverse turns
+        &[&["4s", "Th"], &["3s", "Ac"]], // diverse rivers per turn
+    )
+}
+
+fn build_chance_table_for_board(
+    board_strs: &[&str; 3],
+    turn_strs: &[&str],
+    river_strs_per_turn: &[&[&str]],
+) -> FlopChanceTable {
+    let board: Vec<Card> = board_strs.iter().map(|s| card_from_str(s).unwrap()).collect();
     let board_mask: u64 = board.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
     let mut all_valid: Vec<u16> = Vec::new();
     for idx in 0..NUM_POSSIBLE_HANDS {
@@ -106,13 +128,13 @@ fn build_chance_table() -> FlopChanceTable {
             ranges[p][pair_idx] = 1.0;
         }
     }
-    let turn_cards: Vec<u8> = ["2c", "Jd"].iter()
+    let turn_cards: Vec<u8> = turn_strs.iter()
         .map(|s| card_from_str(s).unwrap() as u8).collect();
     let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
-    river_decks[turn_cards[0] as usize] = ["4s", "7h"].iter()
-        .map(|s| card_from_str(s).unwrap() as u8).collect();
-    river_decks[turn_cards[1] as usize] = ["3s", "Qc"].iter()
-        .map(|s| card_from_str(s).unwrap() as u8).collect();
+    for (ti, &tc) in turn_cards.iter().enumerate() {
+        river_decks[tc as usize] = river_strs_per_turn[ti].iter()
+            .map(|s| card_from_str(s).unwrap() as u8).collect();
+    }
     FlopChanceTable::compute_flop_start_subset_with_decks(
         &board, &ranges, NP, &chosen, &turn_cards, &river_decks,
     )
@@ -700,6 +722,106 @@ fn dump_lifted_strategy_at_root(
         let pf = if pot > 0 { (cchip - pc) as f32 / pot as f32 } else { 0.0 };
         eprintln!("    a={} {:>5} pf={:>5.2}  σ={:.4}",
             a, label_str, pf, avg[a]);
+    }
+}
+
+/// Focused third-config test: shape rule generalization at DRY BOARD.
+/// Uses K-7-2 rainbow (canonical dry, no straights or flushes) with deep
+/// stacks (same as the main test). Tests whether the defense-completeness
+/// rule that held across pot geometries (wet-deep + wet-short) also holds
+/// across board textures (wet-deep + dry-deep).
+///
+/// Runs the same 6 rule-test configs from the short-stack variant for
+/// direct comparison. ~15-25 min total runtime.
+#[test]
+#[ignore = "Phase 4 redo: shape rule generalization at dry board (~20 min)"]
+fn phase4_redo_shape_rule_at_dry_board() {
+    eprintln!("\n=== Phase 4 REDO: shape rule generalization (DRY BOARD K-7-2 rainbow, deep stacks) ===");
+    eprintln!("Hypothesis: defense-completeness rule (lean must include all rich raise sizes)");
+    eprintln!("           is invariant to board texture as well as pot geometry.");
+
+    let table = build_chance_table_dry();
+    let rich_tree = build_tree_with_stacks(STACKS, rich_bet_sizes(), rich_raise_sizes());
+    eprintln!("Rich tree (dry board, {}bb): {} nodes, {} infosets",
+        STACKS * 5 / STARTING_POT, rich_tree.num_nodes(), rich_tree.num_infosets);
+
+    let rich_game = FlopStartGame::new(table);
+    let t0 = Instant::now();
+    let (rich_cpu, rich_iters, rich_pct) = solve_lean_to_floor(&rich_tree, &rich_game);
+    eprintln!("Rich solve: {} iters, {:.1}s; rich self-expl: {:.4}% pot",
+        rich_iters, t0.elapsed().as_secs_f32(), rich_pct);
+
+    dump_lifted_strategy_at_root(&rich_cpu, &rich_tree, "RICH baseline (dry board)");
+
+    let configs: Vec<(usize, Vec<BetSize>, Vec<BetSize>, &str)> = vec![
+        (1, vec![BetSize::PotRelative(0.33)],
+            vec![BetSize::PotRelative(1.0)],
+            "safe-at-wet-deep [0.33]+[1.0] (no bet-1.5, no raise-2.0)"),
+        (2, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0)],
+            "anti-pattern [0.33, 1.5]+[1.0]"),
+        (3, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "defended anti-pattern [0.33, 1.5]+[1.0, 2.0]"),
+        (4, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(0.66),
+                 BetSize::PotRelative(1.0), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "K_FULL identity"),
+        (5, vec![BetSize::PotRelative(0.33)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "min-shape-w-full-raises [0.33]+[1.0, 2.0]"),
+        (6, vec![BetSize::PotRelative(0.66)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "alt-bet-w-full-raises [0.66]+[1.0, 2.0]"),
+    ];
+
+    let mut results: Vec<(usize, &str, f32, f32)> = Vec::new();
+    for (k, lean_bets, lean_raises, label) in configs {
+        eprintln!("\n── config {}: {} ──", k, label);
+        let lean_tree = build_tree_with_stacks(STACKS, lean_bets.clone(), lean_raises.clone());
+        eprintln!("  Lean tree: {} nodes, {} infosets ({:.2}× rich)",
+            lean_tree.num_nodes(), lean_tree.num_infosets,
+            lean_tree.num_nodes() as f32 / rich_tree.num_nodes() as f32);
+
+        let t_lean = Instant::now();
+        let table_lean = build_chance_table_dry();
+        let lean_game = FlopStartGame::new(table_lean);
+        let (lean_cpu, lean_iters, lean_self_pct) = solve_lean_to_floor(&lean_tree, &lean_game);
+        eprintln!("  Lean solve: {} iters, {:.1}s; lean self-expl: {:.4}% pot",
+            lean_iters, t_lean.elapsed().as_secs_f32(), lean_self_pct);
+
+        let table_lift = build_chance_table_dry();
+        let rich_game_lift = FlopStartGame::new(table_lift);
+        let mut rich_cpu_lifted = FlopStartVectorCfr::new(&rich_tree, &rich_game_lift.table());
+        let ph_map = build_pseudo_harmonic_map(&rich_tree, &lean_tree);
+        lift_into_rich_solver_pseudo_harmonic(&rich_tree, &lean_tree, &ph_map, &lean_cpu, &mut rich_cpu_lifted);
+        let xt_pct = measure_rich_exploitability_pct(&rich_cpu_lifted, &rich_tree, &rich_game_lift);
+        let cost_pct = xt_pct - rich_pct;
+        eprintln!("  xt (pseudo-harmonic): {:.4}% pot   cost = {:.4}% pot", xt_pct, cost_pct);
+
+        dump_lifted_strategy_at_root(&rich_cpu_lifted, &rich_tree,
+            &format!("config {} lifted (dry)", k));
+
+        results.push((k, label, xt_pct, cost_pct));
+    }
+
+    eprintln!("\n=== Phase 4 REDO dry-board rule test ===");
+    eprintln!("Rich self-expl at dry board: {:.4}% pot", rich_pct);
+    eprintln!("\n{:>3} {:>60} {:>12} {:>12}", "cfg", "shape", "xt %", "cost %");
+    for (k, label, xt, cost) in &results {
+        eprintln!("{:>3} {:>60} {:>11.4}% {:>11.4}%", k, label, xt, cost);
+    }
+    eprintln!();
+    let raise_complete_safe = results[2].2 < 2.0 && results[3].2 < 2.0 && results[4].2 < 2.0 && results[5].2 < 2.0;
+    let any_incomplete_unsafe = results[0].2 > 2.0 || results[1].2 > 2.0;
+    if raise_complete_safe && any_incomplete_unsafe {
+        eprintln!("DEFENSE-COMPLETENESS RULE GENERALIZES TO DRY BOARD: every config with all rich raises is safe (<2%);");
+        eprintln!("at least one missing-raise-2.0 config is unsafe (>2%). Rule is config-invariant.");
+    } else if !any_incomplete_unsafe {
+        eprintln!("On this DRY board, even configs missing raise 2.0p are safe (<2%). Texture matters: dry board doesn't trigger the catastrophe.");
+        eprintln!("Rule is wet-board-specific OR texture-dependent. Reconsider banking strategy.");
+    } else {
+        eprintln!("Mixed signal — review per-config numbers.");
     }
 }
 
