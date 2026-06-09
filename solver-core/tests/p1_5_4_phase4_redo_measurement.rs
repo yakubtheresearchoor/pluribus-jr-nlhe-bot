@@ -857,25 +857,48 @@ fn phase4_redo_measurement() {
     }
     eprintln!("\nRanked rich bet sizes by observed usage: {:?}", ranked_sizes);
 
-    // ── P3: K sweep ──
-    eprintln!("\n── P3: K sweep (each K builds + solves a lean tree, then lifts + BRs in rich) ──");
-    eprintln!("Lean set always includes raise [1.0]; bet sizes = top-K of ranked_sizes.\n");
-
-    let max_k = ranked_sizes.len().min(4);
-    let mut k_results: Vec<(usize, Vec<f32>, f32, f32, f32, usize)> = Vec::new(); // (K, sizes, lean_self_pct, xt_pct, cost_pct, nodes)
-    // K_FULL = K=4 with both raises [1.0, 2.0] — should give ~0% cost (lean
-    // is effectively rich); sanity check that the measurement converges at
-    // the identity boundary.
-    let configs: Vec<(usize, Vec<BetSize>, Vec<BetSize>, &str)> = (1..=max_k).map(|k| {
-        let bets: Vec<BetSize> = ranked_sizes[..k].iter().map(|&f| BetSize::PotRelative(f as f64)).collect();
-        let raises = vec![BetSize::PotRelative(1.0)];
-        (k, bets, raises, "1 raise")
-    }).chain(std::iter::once((
-        max_k + 1,
-        ranked_sizes[..max_k].iter().map(|&f| BetSize::PotRelative(f as f64)).collect(),
-        vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
-        "K_FULL (rich raises)",
-    ))).collect();
+    // ── P3: Non-prefix sweep that tests the bet-1.5p-without-raise-2.0p
+    // hypothesis directly. The previous prefix sweep (lean = top-K smallest
+    // bets) confounded bet COUNT with bet SHAPE. This sweep varies which
+    // sizes are present at constant count, plus adds raise-set variations,
+    // to test whether the K=4 catastrophe is specifically about
+    // (bet 1.5p present) + (raise 2.0p missing) or about the bet count.
+    //
+    // Predictions if the (bet 1.5p + missing raise 2.0p) hypothesis holds:
+    //   - Configs WITH bet 1.5p AND only raise 1.0p → catastrophic (>10%)
+    //   - Configs WITHOUT bet 1.5p AND only raise 1.0p → small (<2%)
+    //   - Configs WITH bet 1.5p AND raise 2.0p → small (raise 2.0p neutralizes)
+    eprintln!("\n── P3: non-prefix sweep (test bet-1.5/raise-2.0 hypothesis) ──");
+    let _ = ranked_sizes; // observation is informative but sweep is hand-designed
+    let mut k_results: Vec<(usize, Vec<f32>, f32, f32, f32, usize)> = Vec::new();
+    let configs: Vec<(usize, Vec<BetSize>, Vec<BetSize>, &str)> = vec![
+        // Prefix baselines (from previous sweep, kept for cross-check).
+        (1, vec![BetSize::PotRelative(0.33)],
+            vec![BetSize::PotRelative(1.0)], "prefix K=1 [0.33] + [1.0]"),
+        (2, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(0.66)],
+            vec![BetSize::PotRelative(1.0)], "prefix K=2 [0.33, 0.66] + [1.0]"),
+        // Non-prefix 2-bet configurations (gap or shifted-window in the ladder).
+        (3, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0)], "shape K=2 [0.33, 1.5] + [1.0]  (HAS bet-1.5)"),
+        (4, vec![BetSize::PotRelative(0.66), BetSize::PotRelative(1.0)],
+            vec![BetSize::PotRelative(1.0)], "shape K=2 [0.66, 1.0] + [1.0]"),
+        // 3-bet configurations.
+        (5, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(0.66), BetSize::PotRelative(1.0)],
+            vec![BetSize::PotRelative(1.0)], "prefix K=3 [0.33, 0.66, 1.0] + [1.0]"),
+        (6, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(0.66), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0)], "shape K=3 [0.33, 0.66, 1.5] + [1.0]  (HAS bet-1.5)"),
+        // 4-bet (= full rich bets) + 1 raise → K=4 baseline.
+        (7, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(0.66), BetSize::PotRelative(1.0), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0)], "prefix K=4 [0.33..1.5] + [1.0]  (the bad shape)"),
+        // Raise-2.0p neutralization tests: include the bad bet (1.5p) but
+        // also include raise 2.0p.
+        (8, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "shape-with-2.0-raise [0.33, 1.5] + [1.0, 2.0]"),
+        (9, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(0.66), BetSize::PotRelative(1.0), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "K_FULL identity = rich"),
+    ];
 
     for (k, lean_bets, lean_raises, raise_label) in configs {
         eprintln!("── K={}: bets={:?} raises={} ──", k, lean_bets, raise_label);
