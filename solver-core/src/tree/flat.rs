@@ -115,6 +115,14 @@ impl FlatNode {
 // conservative upper bound, and the with-search MAX_NA could be smaller).
 // Requires implementing depth-limited search to measure.
 //
+// MAX_NA_POSTFLOP = 4 is THE CONSERVATIVE BOUND, NOT THE FINAL VALUE.
+// The final value lands when search is implemented and a with-search
+// measurement of cost-of-leaning replaces the standalone-blueprint
+// number. Until then, banking 4 is the right choice (passes ≤ 0.001%
+// standalone cost on the verified shape across 3 configs), but treat
+// "MAX_NA_POSTFLOP = 4 is final" as an open question that closes only
+// after search is in the deployment pipeline.
+//
 // The previous placeholder (MAX_NA_POSTFLOP = 6 = fold + call + 4 raise
 // sizes Pluribus-style) is now superseded by this empirical bank. Existing
 // research tests that build trees with > 4 actions at a node (e.g. the

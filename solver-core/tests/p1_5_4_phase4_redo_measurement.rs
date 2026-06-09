@@ -42,8 +42,35 @@ use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
 use solver_core::tree::flat::{
-    FlatTree, ACTION_LABEL_BET, ACTION_LABEL_RAISE,
+    FlatTree, ACTION_LABEL_BET, ACTION_LABEL_RAISE, MAX_NA_POSTFLOP,
 };
+
+/// Minimum MAX_NA_POSTFLOP this harness needs to build the rich reference
+/// tree (4 bets + 2 raises → 5 actions at root: check + 4 bets).
+///
+/// PRODUCTION BANKED VALUE is 4 (sized for lean = [0.33]+[1.0, 2.0]).
+/// To re-run THIS harness you must temporarily bump
+/// solver-core/src/tree/flat.rs's MAX_NA_POSTFLOP to ≥ 5 (or 8 for
+/// the full Pluribus rich set) and rebuild. The build.rs codegen
+/// regenerates the Metal header automatically.
+///
+/// The asserts at the top of each #[test] fail loudly with this message
+/// rather than silently building a malformed tree.
+const HARNESS_MIN_MAX_NA_POSTFLOP: usize = 5;
+
+fn assert_harness_prereqs() {
+    assert!(
+        MAX_NA_POSTFLOP >= HARNESS_MIN_MAX_NA_POSTFLOP,
+        "\n\n   Phase 4 measurement harness requires MAX_NA_POSTFLOP >= {} \n   \
+         (rich reference tree has 5 actions at root: check + 4 bets).\n   \
+         Current value in solver-core/src/tree/flat.rs is {}.\n   \
+         The production bank value (= 4) is sized for blueprint deployment\n   \
+         only; re-running this harness requires temporarily bumping to ≥ 5\n   \
+         (suggested: 8 for the full Pluribus rich set) and `cargo build`.\n   \
+         Restore to 4 before committing.\n",
+        HARNESS_MIN_MAX_NA_POSTFLOP, MAX_NA_POSTFLOP,
+    );
+}
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -736,6 +763,7 @@ fn dump_lifted_strategy_at_root(
 #[test]
 #[ignore = "Phase 4 redo: shape rule generalization at dry board (~20 min)"]
 fn phase4_redo_shape_rule_at_dry_board() {
+    assert_harness_prereqs();
     eprintln!("\n=== Phase 4 REDO: shape rule generalization (DRY BOARD K-7-2 rainbow, deep stacks) ===");
     eprintln!("Hypothesis: defense-completeness rule (lean must include all rich raise sizes)");
     eprintln!("           is invariant to board texture as well as pot geometry.");
@@ -838,6 +866,7 @@ fn phase4_redo_shape_rule_at_dry_board() {
 #[test]
 #[ignore = "Phase 4 redo: shape rule generalization at shorter stacks (~15 min)"]
 fn phase4_redo_shape_rule_at_short_stacks() {
+    assert_harness_prereqs();
     let alt_stacks: i32 = 200; // 40bb effective with starting_pot=30
     eprintln!("\n=== Phase 4 REDO: shape rule generalization (stacks={}={}bb effective) ===",
         alt_stacks, alt_stacks * 5 / STARTING_POT);
@@ -971,6 +1000,7 @@ fn phase4_redo_shape_rule_at_short_stacks() {
 #[test]
 #[ignore = "Phase 4 redo measurement — solves rich + lean, lifts, computes cross-action-space exploit (~30 min)"]
 fn phase4_redo_measurement() {
+    assert_harness_prereqs();
     eprintln!("\n=== Phase 4 REDO measurement ===");
     eprintln!("Config: deep wet stacks={} board=Th9d8c chance=2x2 nh={} np={} iters={}",
         STACKS, NH, NP, N_ITERS);
