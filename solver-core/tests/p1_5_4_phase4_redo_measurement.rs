@@ -609,6 +609,96 @@ fn measure_rich_exploitability_pct(
     total / STARTING_POT as f32 * 100.0
 }
 
+/// Per-player BR-SV exploit. Used to identify which BR target captures
+/// the dominant share of the cross-action-space cost.
+fn measure_per_player_exploit_pct(
+    cpu: &FlopStartVectorCfr,
+    tree: &FlatTree,
+    game: &FlopStartGame,
+) -> Vec<f32> {
+    let np = tree.num_players as usize;
+    let mut per_p = Vec::with_capacity(np);
+    for p in 0..np {
+        let br = cpu.best_response_value_debug(tree, game, p as u8);
+        let sv = cpu.strategy_value_debug(tree, game, p as u8);
+        let mut total = 0.0f32;
+        for h in 0..br.len().min(sv.len()) {
+            total += (br[h] - sv[h]).max(0.0);
+        }
+        per_p.push(total / STARTING_POT as f32 * 100.0);
+    }
+    per_p
+}
+
+/// Dump the normalized cum_strategy at the rich tree's root (root is a
+/// PLAYER node — the first player's decision). Reports per-action mean
+/// probability across all hands. Used to identify whether K=4 over-uses
+/// bet 1.5p vs K=3 (which can't bet 1.5p in lean) or vs rich's reference.
+fn dump_lifted_strategy_at_root(
+    cpu: &FlopStartVectorCfr,
+    tree: &FlatTree,
+    label: &str,
+) {
+    use solver_core::tree::flat::{MAX_NA_POSTFLOP, ACTION_LABEL_FOLD, ACTION_LABEL_CHECK,
+        ACTION_LABEL_CALL, ACTION_LABEL_BET, ACTION_LABEL_RAISE, ACTION_LABEL_ALLIN};
+    let root = &tree.nodes[0];
+    if !root.is_player() {
+        eprintln!("  σ at root [{}]: root is not a PLAYER node", label);
+        return;
+    }
+    let na = root.num_children as usize;
+    let nh = cpu.num_hands();
+    let root_local = cpu.flop_local_offset()[0];
+    if root_local == usize::MAX {
+        eprintln!("  σ at root [{}]: root has no flop local offset", label);
+        return;
+    }
+    let csf = cpu.cum_strategy_flop();
+    let off = root_local * MAX_NA_POSTFLOP * nh;
+    let mut avg = vec![0.0f32; na];
+    let mut valid_hands = 0;
+    for h in 0..nh {
+        let mut total = 0.0f32;
+        for a in 0..na {
+            total += csf[off + a * nh + h];
+        }
+        if total > 0.0 {
+            for a in 0..na {
+                avg[a] += csf[off + a * nh + h] / total;
+            }
+            valid_hands += 1;
+        }
+    }
+    if valid_hands > 0 {
+        for a in 0..na {
+            avg[a] /= valid_hands as f32;
+        }
+    }
+    eprintln!("  σ at root for [{}] (mean across {} hands):", label, valid_hands);
+    let np = tree.num_players as usize;
+    let pot: i64 = (0..np).map(|p| tree.contributions[0 * np + p] as i64).sum();
+    let root_player = root.player_id as usize;
+    let children = tree.node_children(0);
+    for a in 0..na {
+        let cc = &tree.nodes[children[a] as usize];
+        let label_str = match cc.action_label {
+            x if x == ACTION_LABEL_FOLD => "fold",
+            x if x == ACTION_LABEL_CHECK => "check",
+            x if x == ACTION_LABEL_CALL => "call",
+            x if x == ACTION_LABEL_BET => "bet",
+            x if x == ACTION_LABEL_RAISE => "raise",
+            x if x == ACTION_LABEL_ALLIN => "allin",
+            _ => "?",
+        };
+        // Compute pot-fraction of this action.
+        let pc = tree.contributions[0 * np + root_player] as i64;
+        let cchip = tree.contributions[children[a] as usize * np + root_player] as i64;
+        let pf = if pot > 0 { (cchip - pc) as f32 / pot as f32 } else { 0.0 };
+        eprintln!("    a={} {:>5} pf={:>5.2}  σ={:.4}",
+            a, label_str, pf, avg[a]);
+    }
+}
+
 #[test]
 #[ignore = "Phase 4 redo measurement — solves rich + lean, lifts, computes cross-action-space exploit (~30 min)"]
 fn phase4_redo_measurement() {
@@ -636,6 +726,10 @@ fn phase4_redo_measurement() {
     let (rich_cpu, rich_iters, rich_pct) = solve_lean_to_floor(&rich_tree, &rich_game);
     eprintln!("Rich solve: {} iters, {:.1}s; rich self-expl: {:.4}% pot",
         rich_iters, t0.elapsed().as_secs_f32(), rich_pct);
+
+    // σ at root for RICH as reference baseline. Comparing each K's lifted
+    // σ to this reveals which actions the lifted strategy over/under-uses.
+    dump_lifted_strategy_at_root(&rich_cpu, &rich_tree, "RICH baseline");
     assert!(rich_pct < LEAN_SELF_EXPL_FLOOR_PCT * 5.0,
         "Rich didn't converge to a comparable floor: {:.4}% vs lean target {:.4}%",
         rich_pct, LEAN_SELF_EXPL_FLOOR_PCT);
@@ -838,6 +932,19 @@ fn phase4_redo_measurement() {
 
         let xt_ph_pct = measure_rich_exploitability_pct(&rich_cpu_lifted_ph, &rich_tree, &rich_game_lift_ph);
         eprintln!("  xt (pseudo-harmonic): {:.4}% pot", xt_ph_pct);
+
+        // Per-player breakdown of the BR-SV exploit gap.
+        let per_p = measure_per_player_exploit_pct(&rich_cpu_lifted_ph, &rich_tree, &rich_game_lift_ph);
+        let total_check: f32 = per_p.iter().sum();
+        eprintln!("  Per-player exploit (sum={:.4}% pot):", total_check);
+        for (p, e) in per_p.iter().enumerate() {
+            eprintln!("    player {}: {:.4}% pot", p, e);
+        }
+
+        // σ_lifted at root for this K (rich tree's root — which is a PLAYER
+        // node, the first decision).
+        dump_lifted_strategy_at_root(&rich_cpu_lifted_ph, &rich_tree,
+            &format!("K={} lifted", k));
 
         // ── Compare to NEAREST translation (the previous baseline, kept for
         // separating translation-error attribution from structural cost). ──
