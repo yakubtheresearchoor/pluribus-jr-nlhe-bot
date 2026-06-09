@@ -74,38 +74,55 @@ impl FlatNode {
 // regenerates the Metal header (max_na_generated.metal) so the constants are
 // structurally locked together; updating one and not the other is impossible.
 //
-// Phase 4 (REDO IN PROGRESS, see p1_5_4_phase4_redo_measurement.rs): the
-// cross-action-space measurement framework is built and verified (identity-
-// lift sanity bit-exact, K_FULL identity gives 0% cost). The first K-sweep
-// at deep-stack 6-max (Th9d8c wet, stacks=500=100bb, iter 50) showed
-// non-trivial costs for every K below the full rich set — but the verdict
-// is NOT YET BANKED for three reasons:
+// Phase 4 redo — BANKED on a VERIFIED SHAPE, not on a fully-established rule.
 //
-//   (1) Translation confound. The lift uses nearest-amount action
-//       translation, which is a hard mapping; the agent's own data shows
-//       the K=1→K=5 cost gradient is ~14% pot, so the cost-of-leaning
-//       attribution between translation error and structural shortfall is
-//       confounded by a translation policy that admits drift. Pseudo-
-//       harmonic translation (Ganzfried-Sandholm 2013, the Pluribus
-//       mapping) needs to land before the structural cost claim is solid.
-//   (2) Non-monotonic sweep. K=3 cost (22.45%) > K=4 cost (20.00%),
-//       internally inconsistent — adding a bet size shouldn't increase
-//       cost. K=3's lean self-expl was 0.0279% vs K=4's 0.0018%, so K=3
-//       was less converged when measured. Need a self-expl-floor gate on
-//       lean solve before lifting, not a fixed iter count.
-//   (3) Wrong-metric question. The measurement is "blueprint played
-//       directly against rich-BR" — i.e. worst-case blueprint without
-//       search. Production deployments (Pluribus) use depth-limited search
-//       on top of the blueprint and refine at runtime, so "blueprint
-//       standalone exploit" overstates the cost of a smaller MAX_NA. If
-//       search is in the picture, the metric should be "blueprint quality
-//       as a search prior", which is structurally different.
+// See p1_5_4_phase4_redo_measurement.rs (commits 239be58 → 3ee750e). The
+// cross-action-space measurement framework was built, verified
+// bit-exact (identity-lift fidelity per zone, K_FULL identity = 0% cost),
+// extended with pseudo-harmonic Pluribus-style translation
+// (Ganzfried-Sandholm 2013), a self-expl convergence floor (0.005% pot),
+// and pot-fraction action matching. Three distinct configs measured:
 //
-// Until all three are addressed, MAX_NA_POSTFLOP = 6 stays as a Pluribus-
-// blueprint-shaped placeholder (fold + call + 4 raise sizes), NOT a banked
-// empirical finding.
+//   wet-deep Th9d8c, stacks=500 (~100bb effective)
+//   wet-short Th9d8c, stacks=200 (~33bb effective)
+//   dry-deep Ks7d2h rainbow, stacks=500
+//
+// Empirical finding — VERIFIED SHAPE for blueprint-only deployment:
+//   lean = [0.33] + [1.0, 2.0]  (1 bet, both rich raise sizes)
+//   measured cost ≤ 0.001% pot across all three configs
+//   max actions at any single node = max(check + 1 bet, fold + call + 2 raises) = 4
+//   ⇒ MAX_NA_POSTFLOP = 4
+//
+// Established rule (verified across all 3 configs, 21+ measurements):
+//   DEFENSE-COMPLETENESS ON RAISES — lean's raise set must include all
+//   rich raise sizes. Configs missing a rich raise size are catastrophic
+//   (60-128% pot exploit) somewhere in the stack-depth × board-texture
+//   product. Configs with all rich raises are uniformly safe.
+//
+// Provisional rule (one config, NOT verified as invariant):
+//   INCLUDE RICH'S DOMINANT BET SIZE — lean's bet set should contain the
+//   most-used bet size in rich's equilibrium (bet 0.33p in our configs).
+//   Config 6 [0.66] + [1.0, 2.0] was borderline-exploitable (3.34%) on
+//   the dry board despite having all rich raises; the mechanism is
+//   over-translation of rich's frequent 0.33p bets onto lean's 0.66p.
+//   This clause is FITTED to the single config that broke it, not
+//   independently verified — a config where the dominant bet size isn't
+//   0.33p would distinguish "include 0.33p" (config-specific) from
+//   "include the dominant size" (general). Treat as provisional.
+//
+// Deferred: MAX_NA_WITH_SEARCH (depth-limited subgame search at runtime
+// refines the blueprint; the cross-action-space metric is then a
+// conservative upper bound, and the with-search MAX_NA could be smaller).
+// Requires implementing depth-limited search to measure.
+//
+// The previous placeholder (MAX_NA_POSTFLOP = 6 = fold + call + 4 raise
+// sizes Pluribus-style) is now superseded by this empirical bank. Existing
+// research tests that build trees with > 4 actions at a node (e.g. the
+// rich K=5 = 4 bets + 2 raises config in the measurement file) will hit
+// the per-stage cap assertion at runtime; they're #[ignore]'d and run
+// only on demand for further research, so this is non-blocking for CI.
 pub const MAX_NA_PREFLOP: usize = 16;
-pub const MAX_NA_POSTFLOP: usize = 6;
+pub const MAX_NA_POSTFLOP: usize = 4;
 
 pub const VCFR_NO_INFOSET: u32 = u32::MAX;
 
