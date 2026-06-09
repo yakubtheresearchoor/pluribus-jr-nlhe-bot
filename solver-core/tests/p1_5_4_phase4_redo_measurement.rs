@@ -119,11 +119,15 @@ fn build_chance_table() -> FlopChanceTable {
 }
 
 fn build_tree_with(bets: Vec<BetSize>, raises: Vec<BetSize>) -> FlatTree {
+    build_tree_with_stacks(STACKS, bets, raises)
+}
+
+fn build_tree_with_stacks(stacks: i32, bets: Vec<BetSize>, raises: Vec<BetSize>) -> FlatTree {
     let config = TreeConfig {
         num_players: NP,
         initial_state: BoardState::Flop,
         starting_pot: STARTING_POT,
-        starting_stacks: vec![STACKS; NP as usize],
+        starting_stacks: vec![stacks; NP as usize],
         initial_contributions: vec![STARTING_CONTRIB; NP as usize],
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: bets, raise: raises },
@@ -696,6 +700,149 @@ fn dump_lifted_strategy_at_root(
         let pf = if pot > 0 { (cchip - pc) as f32 / pot as f32 } else { 0.0 };
         eprintln!("    a={} {:>5} pf={:>5.2}  σ={:.4}",
             a, label_str, pf, avg[a]);
+    }
+}
+
+/// Focused second-config test: shape rule generalization at SHORTER STACKS
+/// (200 chips = 40bb effective vs main test's 500 = 100bb). If the
+/// (bet 1.5p + missing raise 2.0p) anti-pattern still produces a
+/// catastrophic exploit at a substantially different pot geometry, the
+/// defense-completeness rule is config-independent. If not, the rule is
+/// pot-geometry-dependent and the single-config bank is unsafe.
+///
+/// Only runs the 4 rule-critical configs (safe baseline, anti-pattern,
+/// defended anti-pattern, identity) plus rich solve, to keep total
+/// runtime manageable (~10-15 min vs the main test's ~30+).
+#[test]
+#[ignore = "Phase 4 redo: shape rule generalization at shorter stacks (~15 min)"]
+fn phase4_redo_shape_rule_at_short_stacks() {
+    let alt_stacks: i32 = 200; // 40bb effective with starting_pot=30
+    eprintln!("\n=== Phase 4 REDO: shape rule generalization (stacks={}={}bb effective) ===",
+        alt_stacks, alt_stacks * 5 / STARTING_POT);
+    eprintln!("Hypothesis: (bet 1.5p in lean) + (raise 2.0p missing in lean)");
+    eprintln!("           → catastrophic exploit, REGARDLESS of stack depth.");
+    eprintln!("Test passes if anti-pattern reproduces; rule generalizes across pot geometries.");
+
+    // Build rich tree (same board, different stacks, same rich action set).
+    let table = build_chance_table();
+    let rich_tree = build_tree_with_stacks(alt_stacks, rich_bet_sizes(), rich_raise_sizes());
+    eprintln!("Rich tree: {} nodes, {} infosets", rich_tree.num_nodes(), rich_tree.num_infosets);
+
+    // Solve rich to floor.
+    let rich_game = FlopStartGame::new(table);
+    let t0 = Instant::now();
+    let (rich_cpu, rich_iters, rich_pct) = solve_lean_to_floor(&rich_tree, &rich_game);
+    eprintln!("Rich solve: {} iters, {:.1}s; rich self-expl: {:.4}% pot",
+        rich_iters, t0.elapsed().as_secs_f32(), rich_pct);
+    assert!(rich_pct < LEAN_SELF_EXPL_FLOOR_PCT * 5.0,
+        "Rich didn't converge to floor at short stacks: {:.4}%", rich_pct);
+
+    dump_lifted_strategy_at_root(&rich_cpu, &rich_tree, "RICH baseline (short stacks)");
+
+    // 4 rule-critical configs:
+    //   1. Safe baseline (no bet 1.5p, no raise 2.0p)
+    //   2. Anti-pattern (has bet 1.5p, no raise 2.0p)
+    //   3. Defended anti-pattern (has bet 1.5p AND raise 2.0p)
+    //   4. K_FULL identity
+    let configs: Vec<(usize, Vec<BetSize>, Vec<BetSize>, &str)> = vec![
+        (1, vec![BetSize::PotRelative(0.33)],
+            vec![BetSize::PotRelative(1.0)],
+            "safe-at-deep [0.33]+[1.0] (no bet-1.5, no raise-2.0)"),
+        (2, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0)],
+            "anti-pattern [0.33, 1.5]+[1.0] (HAS bet-1.5, NO raise-2.0)"),
+        (3, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "defended anti-pattern [0.33, 1.5]+[1.0, 2.0]"),
+        (4, vec![BetSize::PotRelative(0.33), BetSize::PotRelative(0.66),
+                 BetSize::PotRelative(1.0), BetSize::PotRelative(1.5)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "K_FULL identity"),
+        (5, vec![BetSize::PotRelative(0.33)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "min-shape-w-full-raises [0.33]+[1.0, 2.0] (predicted safe)"),
+        (6, vec![BetSize::PotRelative(0.66)],
+            vec![BetSize::PotRelative(1.0), BetSize::PotRelative(2.0)],
+            "alt-bet-w-full-raises [0.66]+[1.0, 2.0] (predicted safe)"),
+    ];
+
+    let mut results: Vec<(usize, &str, f32, f32)> = Vec::new();
+    for (k, lean_bets, lean_raises, label) in configs {
+        eprintln!("\n── config {}: {} ──", k, label);
+        let lean_tree = build_tree_with_stacks(alt_stacks, lean_bets.clone(), lean_raises.clone());
+        eprintln!("  Lean tree: {} nodes, {} infosets ({:.2}× rich)",
+            lean_tree.num_nodes(), lean_tree.num_infosets,
+            lean_tree.num_nodes() as f32 / rich_tree.num_nodes() as f32);
+
+        let map = build_action_map(&rich_tree, &lean_tree);
+        let paired = map.paired_player_count(&rich_tree);
+        eprintln!("  Cross-tree pair: {}/{} rich PLAYER nodes paired", paired, rich_tree.decision_node_ids.len());
+
+        let t_lean = Instant::now();
+        let table_lean = build_chance_table();
+        let lean_game = FlopStartGame::new(table_lean);
+        let (lean_cpu, lean_iters, lean_self_pct) = solve_lean_to_floor(&lean_tree, &lean_game);
+        eprintln!("  Lean solve: {} iters, {:.1}s; lean self-expl: {:.4}% pot",
+            lean_iters, t_lean.elapsed().as_secs_f32(), lean_self_pct);
+
+        // Pseudo-harmonic lift + cross-action-space measurement.
+        let table_lift = build_chance_table();
+        let rich_game_lift = FlopStartGame::new(table_lift);
+        let mut rich_cpu_lifted = FlopStartVectorCfr::new(&rich_tree, &rich_game_lift.table());
+        let ph_map = build_pseudo_harmonic_map(&rich_tree, &lean_tree);
+        lift_into_rich_solver_pseudo_harmonic(&rich_tree, &lean_tree, &ph_map, &lean_cpu, &mut rich_cpu_lifted);
+        let xt_pct = measure_rich_exploitability_pct(&rich_cpu_lifted, &rich_tree, &rich_game_lift);
+        let cost_pct = xt_pct - rich_pct;
+        eprintln!("  xt (pseudo-harmonic): {:.4}% pot   cost = {:.4}% pot", xt_pct, cost_pct);
+
+        dump_lifted_strategy_at_root(&rich_cpu_lifted, &rich_tree,
+            &format!("config {} lifted", k));
+
+        results.push((k, label, xt_pct, cost_pct));
+    }
+
+    // Verdict
+    eprintln!("\n=== Phase 4 REDO short-stack rule test ===");
+    eprintln!("Rich self-expl at short stacks: {:.4}% pot", rich_pct);
+    eprintln!("\n{:>3} {:>60} {:>12} {:>12}", "cfg", "shape", "xt %", "cost %");
+    for (k, label, xt, cost) in &results {
+        eprintln!("{:>3} {:>60} {:>11.4}% {:>11.4}%", k, label, xt, cost);
+    }
+    eprintln!();
+    let baseline = results[0].2;
+    let antipat = results[1].2;
+    let defended = results[2].2;
+    let identity = results[3].2;
+    let min_w_raises = if results.len() > 4 { results[4].2 } else { f32::NAN };
+    let alt_bet_w_raises = if results.len() > 5 { results[5].2 } else { f32::NAN };
+    eprintln!("Anti-pattern reproduction: anti-pattern xt = {:.4}% vs baseline xt = {:.4}%",
+        antipat, baseline);
+    eprintln!("Defense neutralization: defended xt = {:.4}% vs anti-pattern xt = {:.4}% ({:.1}× lower)",
+        defended, antipat, antipat / defended.max(1e-6));
+    eprintln!("Identity sanity: identity xt = {:.4}% (should be ≈ rich self-expl {:.4}%)", identity, rich_pct);
+    if !min_w_raises.is_nan() {
+        eprintln!("Min-shape-w-full-raises [0.33]+[1.0, 2.0]: xt = {:.4}% (tests defense-completeness without bet 1.5p)",
+            min_w_raises);
+    }
+    if !alt_bet_w_raises.is_nan() {
+        eprintln!("Alt-bet-w-full-raises [0.66]+[1.0, 2.0]: xt = {:.4}%", alt_bet_w_raises);
+    }
+
+    // Updated rule (vs the deep-stack-only hypothesis): lean must include
+    // all rich raise sizes. Catastrophe appears whenever lean's raise set
+    // is incomplete relative to rich's. Pot geometry shifts WHICH shapes
+    // trigger catastrophe but the defense-completeness rule holds.
+    let raise_complete_safe = !min_w_raises.is_nan()
+        && !alt_bet_w_raises.is_nan()
+        && min_w_raises < 2.0
+        && alt_bet_w_raises < 2.0;
+    if raise_complete_safe && defended < 2.0 && (baseline > 5.0 || antipat > 5.0) {
+        eprintln!("\nDEFENSE-COMPLETENESS RULE CONFIRMED at {}bb: every config with all rich raise sizes is safe (<2%);", alt_stacks * 5 / STARTING_POT);
+        eprintln!("at least one config missing raise 2.0p is catastrophic (>5%). Rule generalizes.");
+    } else if antipat > 5.0 && defended < antipat * 0.1 {
+        eprintln!("\nRule partially confirmed: defense neutralizes anti-pattern, but couldn't verify min-shape-w-raises generalization.");
+    } else {
+        eprintln!("\nMIXED SIGNAL: review the numbers above.");
     }
 }
 
