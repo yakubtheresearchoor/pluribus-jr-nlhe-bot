@@ -195,7 +195,7 @@ pub struct FlopStartVectorCfr {
     vanilla_mode: bool,  // If true, use alpha=beta=gamma=1
 }
 
-fn mark_descendants(tree: &FlatTree, node_idx: usize, below: &mut [bool]) {
+pub(crate) fn mark_descendants(tree: &FlatTree, node_idx: usize, below: &mut [bool]) {
     below[node_idx] = true;
     for &child in tree.node_children(node_idx) {
         mark_descendants(tree, child as usize, below);
@@ -2107,7 +2107,7 @@ fn normalize_cum_into_strategy(cum: &[f32], na: usize, nh: usize, strategy: &mut
     }
 }
 
-fn regret_matching_into(regrets: &[f32], na: usize, nh: usize, strategy: &mut [f32]) {
+pub(crate) fn regret_matching_into(regrets: &[f32], na: usize, nh: usize, strategy: &mut [f32]) {
     for h in 0..nh {
         let mut pos_sum = 0.0f32;
         for a in 0..na {
@@ -2130,7 +2130,7 @@ fn regret_matching_into(regrets: &[f32], na: usize, nh: usize, strategy: &mut [f
 
 /// Collect nodes in a specific zone that are descendants of a given root,
 /// stopping at chance nodes that lead into a different zone.
-fn collect_zone_nodes(
+pub(crate) fn collect_zone_nodes(
     tree: &FlatTree, node_idx: usize,
     zones: &[Zone], zone: Zone,
     nodes: &mut Vec<u32>,
