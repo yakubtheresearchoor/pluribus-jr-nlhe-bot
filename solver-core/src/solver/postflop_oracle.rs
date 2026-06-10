@@ -1,0 +1,229 @@
+// Postflop value oracle: the seam between preflop CFR and the postflop
+// layer. Per the lead's directive (2026-06-04): design this seam BEFORE
+// building n-player composition across it, because abstraction (#42) is
+// load-bearing for 6-max feasibility, not late-stage polish. Building
+// composition against a concrete unabstracted solver would mean reworking
+// composition when abstraction lands; building against the trait means
+// abstraction is a drop-in.
+//
+// The seam:
+//
+//   The preflop engine asks: "at canonical flop F, given per-player
+//   combo ranges (per-combo reach at the flop start), what is the per-
+//   combo CFV at the flop root for traverser?" The implementation
+//   decides how to answer.
+//
+// Implementations:
+//
+//   - `UnabstractedPostflopOracle`: runs converged postflop CFR per
+//     call. The slow ground-truth reference. Maintains per-canonical
+//     persistent CFR state for warm-start across preflop iterations
+//     (Fix B's outer/inner cadence). Used directly for validation and
+//     as the ground-truth anchor that any abstraction is checked
+//     against.
+//
+//   - `BucketedPostflopOracle` (future, satisfies #42): uses postflop
+//     hand-strength bucketing for speed. Per-combo CFV is a bucket-
+//     membership lookup plus low-dim solve. Lossy; the lossy-ness is
+//     characterized against UnabstractedPostflopOracle as ground truth.
+//
+//   - `ClosureOracle`: thin compatibility shim that wraps an FnMut
+//     closure satisfying the same signature. Used by Slice A's
+//     synthetic-callback unit tests (where the per-flop CFV semantics
+//     don't matter — only the composition wiring does). Keeps the
+//     engine API as the trait (single path) rather than dual-pathing
+//     trait-and-closure.
+//
+// Hook design (begin/end_preflop_iter):
+//
+//   Per the lead: include now (not after Fix B lands) because Fix B is
+//   mandatory at 6-max, not speculative. Defined with the warm-start
+//   oracle's usage in mind, not blank no-ops:
+//
+//     - `begin_preflop_iter(iter)`: called by the engine before its
+//       per-traverser loop. Lets the oracle decide refresh cadence:
+//       full re-converge (outer cycle) vs warm-start-only (inner
+//       cycles). The simple oracle ignores; the warm-start oracle uses
+//       this to schedule outer vs inner iterations.
+//
+//     - `end_preflop_iter(iter)`: called after the traverser loop.
+//       Lets the oracle commit per-canonical state, log convergence
+//       metrics, decide if next iter is an outer or inner cycle, etc.
+
+use crate::card::Card;
+use crate::tree::flat::FlatTree;
+
+/// The interface between the preflop engine and the postflop layer.
+///
+/// The preflop engine asks for per-combo CFV at the flop root for one
+/// traverser, given per-player combo-level reaches at the flop start.
+/// Implementations decide whether to compute fresh, warm-start from
+/// persisted state, return cached values, or do a bucketed lookup.
+///
+/// Combo indexing convention: the returned `Vec<f32>` is in
+/// `flop_combo_layout(canonical_flop)` order. Oracle implementations
+/// that use a different internal layout (e.g., `FlopChanceTable`'s
+/// `hand_cards`) must re-order before returning.
+///
+/// Stateful: implementations may maintain state across calls. The
+/// engine doesn't dictate caching, warm-start, or refresh policy;
+/// those decisions live inside the oracle. The engine signals
+/// iteration boundaries via `begin_preflop_iter` / `end_preflop_iter`
+/// so stateful oracles can act on cadence.
+pub trait PostflopValueOracle {
+    /// Compute per-combo CFV at the flop root for `traverser`, given
+    /// per-player combo-level reaches at the flop start.
+    ///
+    /// `canonical_flop`: the canonical flop board.
+    /// `combo_ranges`: `[num_players]` × `[layout_size]` per-player
+    ///   per-combo reach at the flop start. Layout matches
+    ///   `flop_combo_layout(canonical_flop)`.
+    /// `traverser`: which player's CFV to return.
+    ///
+    /// Returns: `Vec<f32>` of length `layout_size`, per-combo CFV at
+    /// the flop root for traverser, indexed in `flop_combo_layout`
+    /// order.
+    fn flop_root_cfv(
+        &mut self,
+        canonical_flop: [Card; 3],
+        combo_ranges: &[Vec<f32>],
+        traverser: u8,
+    ) -> Vec<f32>;
+
+    /// Called by the engine BEFORE its per-traverser loop at preflop
+    /// iteration `iter`.
+    ///
+    /// Stateful oracles use this to decide refresh cadence:
+    ///   - Simple unabstracted (no warm-start): ignore (default no-op).
+    ///   - Warm-start unabstracted: decide whether this iter is an
+    ///     OUTER cycle (full re-converge of all canonicals' postflop
+    ///     CFR from current ranges) or an INNER cycle (just warm-start
+    ///     a few iters per canonical from persisted state). Refresh
+    ///     cadence is the oracle's call, not the engine's.
+    ///   - Bucketed: may trigger periodic bucket-value refresh based
+    ///     on whether preflop ranges have shifted enough.
+    ///
+    /// Default no-op for implementations that don't need iter
+    /// boundaries.
+    fn begin_preflop_iter(&mut self, _iter: u32) {}
+
+    /// Called by the engine AFTER its per-traverser loop at preflop
+    /// iteration `iter`.
+    ///
+    /// Stateful oracles use this to:
+    ///   - Commit per-canonical CFR state changes (warm-start oracle).
+    ///   - Log convergence metrics per canonical (sum of regrets,
+    ///     cum_strategy delta, etc.) for diagnostics.
+    ///   - Decide whether the next iter is an outer or inner cycle
+    ///     based on observed range shifts since the last outer cycle.
+    ///
+    /// Default no-op.
+    fn end_preflop_iter(&mut self, _iter: u32) {}
+}
+
+/// Compatibility adapter that wraps an `FnMut` closure satisfying the
+/// same call signature into a `PostflopValueOracle`.
+///
+/// Used by Slice A's synthetic-callback unit tests, where the per-flop
+/// CFV's semantics (iter-0 vs converged vs synthetic constant) don't
+/// matter and the test wants to drive the composition with a
+/// hand-written closure. The engine API stays as the trait; this
+/// adapter keeps tests on the same code path without forcing them to
+/// declare a full oracle type.
+///
+/// Iteration hooks are no-ops: synthetic-callback tests don't have
+/// state to manage across iterations.
+pub struct ClosureOracle<F>
+where
+    F: FnMut([Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
+{
+    f: F,
+}
+
+impl<F> ClosureOracle<F>
+where
+    F: FnMut([Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
+{
+    pub fn new(f: F) -> Self { Self { f } }
+}
+
+impl<F> PostflopValueOracle for ClosureOracle<F>
+where
+    F: FnMut([Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
+{
+    fn flop_root_cfv(
+        &mut self,
+        canonical_flop: [Card; 3],
+        combo_ranges: &[Vec<f32>],
+        traverser: u8,
+    ) -> Vec<f32> {
+        (self.f)(canonical_flop, combo_ranges, traverser)
+    }
+}
+
+/// Unabstracted postflop oracle: the slow ground-truth reference.
+///
+/// SIMPLE VERSION (v1): every call runs a fresh converged postflop
+/// CFR. No warm-start, no persistent per-canonical state. This is the
+/// stateless replacement for `make_per_flop_solver_converged` and
+/// gives identical results (same DCFR, same num_postflop_iters, same
+/// freeze_average_strategy + final pass).
+///
+/// WARM-START VERSION (Fix B, future): will maintain per-canonical
+/// `(FlopChanceTable, FlopStartVectorCfr)` pairs persistent across
+/// preflop iterations, with `begin_preflop_iter` deciding outer
+/// (full re-converge) vs inner (warm-start few iters) cadence. The
+/// trait stays the same; the implementation behind the trait
+/// changes.
+pub struct UnabstractedPostflopOracle<'a> {
+    flop_tree: &'a FlatTree,
+    num_postflop_iters: u32,
+}
+
+impl<'a> UnabstractedPostflopOracle<'a> {
+    pub fn new(flop_tree: &'a FlatTree, num_postflop_iters: u32) -> Self {
+        Self { flop_tree, num_postflop_iters }
+    }
+}
+
+impl<'a> PostflopValueOracle for UnabstractedPostflopOracle<'a> {
+    fn flop_root_cfv(
+        &mut self,
+        canonical_flop: [Card; 3],
+        combo_ranges: &[Vec<f32>],
+        traverser: u8,
+    ) -> Vec<f32> {
+        use crate::card::{card_pair_to_index, NUM_POSSIBLE_HANDS};
+        use crate::solver::preflop_start_game::{
+            compute_v_flop_at_root_converged, flop_combo_layout,
+        };
+        let layout_engine = flop_combo_layout(canonical_flop);
+        let np = combo_ranges.len();
+        assert!(np >= 2);
+        let mut combo_ranges_full: Vec<Vec<f32>> =
+            vec![vec![0.0_f32; NUM_POSSIBLE_HANDS]; np];
+        for p in 0..np {
+            assert_eq!(combo_ranges[p].len(), layout_engine.len());
+            for (li, &(c1, c2)) in layout_engine.iter().enumerate() {
+                combo_ranges_full[p][card_pair_to_index(c1, c2)] = combo_ranges[p][li];
+            }
+        }
+        let (v_table_order, layout_table) = compute_v_flop_at_root_converged(
+            canonical_flop, self.flop_tree, &combo_ranges_full, traverser,
+            self.num_postflop_iters,
+        );
+        assert_eq!(layout_engine.len(), layout_table.len());
+        let mut v_engine_order = Vec::with_capacity(layout_engine.len());
+        for &combo in &layout_engine {
+            let pos = layout_table.iter().position(|&c| c == combo)
+                .unwrap_or_else(|| panic!(
+                    "combo {:?} not in table layout for canonical {:?}",
+                    combo, canonical_flop));
+            v_engine_order.push(v_table_order[pos]);
+        }
+        v_engine_order
+    }
+
+    // begin/end_preflop_iter: no-ops in v1 (stateless). Fix B's warm-
+    // start version will use them to decide outer/inner cadence.
+}
