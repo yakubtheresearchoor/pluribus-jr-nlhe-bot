@@ -36,7 +36,9 @@
 
 use crate::abstraction::postflop_buckets::compute_wtl_for_runout;
 use crate::card::Card;
-use crate::solver::bucketed_showdown::{bucketed_showdown_cfv, BucketedRunoutTables};
+use crate::solver::bucketed_showdown::{
+    bucketed_showdown_cfv, bucketed_showdown_cfv_factored, BucketedRunoutTables,
+};
 use crate::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use crate::solver::game::GameSpec;
 use crate::solver::flop_start_vector_cfr::{
@@ -46,6 +48,24 @@ use crate::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
 
 const UNUSED: usize = usize::MAX;
 pub const NO_BUCKET: u16 = u16::MAX;
+
+/// Which bucketed terminal the walk dispatches to.
+///
+/// Two-link validation chain (mirrors the GPU arc's architecture):
+///   - `Design1Brute` is anchored to the EXACT evaluator by the
+///     bit-exact identity gate (B = nh). Permanent in-tree anchor —
+///     never delete: any future Design-2 anomaly is disambiguated by
+///     running Design 1 at small B and asking which link broke.
+///   - `Design2Factored` is anchored to Design 1 by a MEASURED-
+///     tolerance parity gate (the factorization error exists even at
+///     B = nh) plus the equilibrium A/B through the exact-game quality
+///     gate. Production candidate after the B4 step-1 cost gate
+///     (Design 1 measured 563× over budget at production nh).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TerminalDesign {
+    Design1Brute,
+    Design2Factored,
+}
 
 /// Per-flop bucketing consumed by the walk: hand→bucket maps per street
 /// and per chance outcome (aligned with `table.remaining_deck` /
@@ -333,6 +353,7 @@ pub struct BucketedFlopCfr {
 
     iteration: u32,
     regret_floor: f32,
+    terminal_design: TerminalDesign,
 }
 
 impl BucketedFlopCfr {
@@ -467,7 +488,15 @@ impl BucketedFlopCfr {
             river_deck_sizes,
             iteration: 0,
             regret_floor: -1e30,
+            terminal_design: TerminalDesign::Design1Brute,
         }
+    }
+
+    /// Select the bucketed terminal. Default is `Design1Brute` (the
+    /// bit-exact anchor); production at real nh uses `Design2Factored`
+    /// (cost gate: Design 1 is 563× over budget there).
+    pub fn set_terminal_design(&mut self, d: TerminalDesign) {
+        self.terminal_design = d;
     }
 
     // ── Strategy computation (same regret_matching_into, nb-wide) ──
@@ -894,7 +923,11 @@ impl BucketedFlopCfr {
                         .map(|p| tree.get_contribution(idx, p as u8))
                         .collect();
 
-                    let cfv_out = bucketed_showdown_cfv(
+                    let terminal_fn = match self.terminal_design {
+                        TerminalDesign::Design1Brute => bucketed_showdown_cfv,
+                        TerminalDesign::Design2Factored => bucketed_showdown_cfv_factored,
+                    };
+                    let cfv_out = terminal_fn(
                         &bucket_views,
                         tables,
                         &contributions,

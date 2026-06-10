@@ -253,6 +253,20 @@ pub fn bucketed_showdown_cfv(
         .map(|&p| fold_mask & (1u16 << p) != 0)
         .collect();
 
+    let ctx = Arm2Ctx {
+        levels,
+        np,
+        contributions: contributions.to_vec(),
+        starting_pot,
+        main_pot_rake,
+        traverser_stake,
+        traverser_folded,
+        c_t,
+        opp_contrib,
+        opp_folded,
+        traverser,
+    };
+
     let mut prefix = vec![0u16; num_opp];
     let mut rel = vec![0u8; num_opp];
     for bt in 0..nb {
@@ -267,95 +281,425 @@ pub fn bucketed_showdown_cfv(
             &mut rel,
             bucket_reach,
             tables,
-            &opp_folded,
+            &ctx.opp_folded,
             &mut |weight: f32, rel: &[u8]| {
-                // Per-scenario cash walk — verbatim mirror of the exact
-                // closure (showdown.rs:1248-1318), with strength
-                // comparisons replaced by the relation codes (the cash
-                // depends on opponents' strengths ONLY through their
-                // trinary relation to the traverser hand).
-                let mut cash: f32 = 0.0;
-                let mut prev_l = 0i32;
-                for (li, &lev) in levels.iter().enumerate() {
-                    let pc = lev - prev_l;
-                    let num_contrib = (0..np).filter(|&p| contributions[p] >= lev).count();
-                    let mut pot_l = (pc * num_contrib as i32) as f32;
-                    if li == 0 {
-                        pot_l += starting_pot as f32;
-                    }
-                    if pot_l == 0.0 {
-                        prev_l = lev;
-                        continue;
-                    }
-
-                    let trav_elig = !traverser_folded && c_t >= lev;
-
-                    let mut elig_count: u32 = trav_elig as u32;
-                    let mut opp_beats = false;
-                    for oi in 0..num_opp {
-                        if opp_folded[oi] {
-                            continue;
-                        }
-                        if opp_contrib[oi] < lev {
-                            continue;
-                        }
-                        elig_count += 1;
-                        if rel[oi] == REL_LOSE {
-                            opp_beats = true;
-                        }
-                    }
-
-                    if elig_count == 0 {
-                        if contributions[traverser] >= lev {
-                            let trav_contrib_at_lev = pc as f32
-                                + if li == 0 {
-                                    starting_pot as f32 / np as f32
-                                } else {
-                                    0.0
-                                };
-                            cash += trav_contrib_at_lev;
-                        }
-                        prev_l = lev;
-                        continue;
-                    }
-
-                    if !trav_elig {
-                        prev_l = lev;
-                        continue;
-                    }
-
-                    if !opp_beats {
-                        // Traverser is at the eligible max. Tie count =
-                        // self + eligible opponents tying the traverser
-                        // (exact code: tied = [h==max] + Σ [g==max]).
-                        let mut tied: u32 = 1;
-                        for oi in 0..num_opp {
-                            if opp_folded[oi] {
-                                continue;
-                            }
-                            if opp_contrib[oi] < lev {
-                                continue;
-                            }
-                            if rel[oi] == REL_TIE {
-                                tied += 1;
-                            }
-                        }
-                        let pot_after_rake = if li == 0 {
-                            pot_l - main_pot_rake
-                        } else {
-                            pot_l
-                        };
-                        cash += pot_after_rake / tied as f32;
-                    }
-                    prev_l = lev;
-                }
-                let net = cash - traverser_stake;
-                accum += weight * net;
+                accum += weight * ctx.net(rel);
             },
         );
         cfv[bt] = accum;
     }
     cfv
+}
+
+/// Shared arm-2 per-scenario payoff context. `net(rel)` is the verbatim
+/// mirror of the exact per-level closure (showdown.rs:1248-1318), with
+/// strength comparisons replaced by relation codes (the cash depends on
+/// opponents' strengths ONLY through their trinary relation to the
+/// traverser hand). Both Design 1 (brute-over-buckets) and Design 2
+/// (factored-over-buckets) call THIS function — the designs differ only
+/// in how scenario probabilities are enumerated, never in payoff
+/// arithmetic, so payoff drift between designs is impossible by
+/// construction. Extracted 2026-06-10 for the Design-2 fork; the
+/// singleton bit-exact gate re-verifies Design 1 through the extraction.
+struct Arm2Ctx {
+    levels: Vec<i32>,
+    np: usize,
+    contributions: Vec<i32>,
+    starting_pot: i32,
+    main_pot_rake: f32,
+    traverser_stake: f32,
+    traverser_folded: bool,
+    c_t: i32,
+    opp_contrib: Vec<i32>,
+    opp_folded: Vec<bool>,
+    traverser: usize,
+}
+
+impl Arm2Ctx {
+    fn net(&self, rel: &[u8]) -> f32 {
+        let num_opp = self.opp_folded.len();
+        let mut cash: f32 = 0.0;
+        let mut prev_l = 0i32;
+        for (li, &lev) in self.levels.iter().enumerate() {
+            let pc = lev - prev_l;
+            let num_contrib = (0..self.np)
+                .filter(|&p| self.contributions[p] >= lev)
+                .count();
+            let mut pot_l = (pc * num_contrib as i32) as f32;
+            if li == 0 {
+                pot_l += self.starting_pot as f32;
+            }
+            if pot_l == 0.0 {
+                prev_l = lev;
+                continue;
+            }
+
+            let trav_elig = !self.traverser_folded && self.c_t >= lev;
+
+            let mut elig_count: u32 = trav_elig as u32;
+            let mut opp_beats = false;
+            for oi in 0..num_opp {
+                if self.opp_folded[oi] {
+                    continue;
+                }
+                if self.opp_contrib[oi] < lev {
+                    continue;
+                }
+                elig_count += 1;
+                if rel[oi] == REL_LOSE {
+                    opp_beats = true;
+                }
+            }
+
+            if elig_count == 0 {
+                if self.contributions[self.traverser] >= lev {
+                    let trav_contrib_at_lev = pc as f32
+                        + if li == 0 {
+                            self.starting_pot as f32 / self.np as f32
+                        } else {
+                            0.0
+                        };
+                    cash += trav_contrib_at_lev;
+                }
+                prev_l = lev;
+                continue;
+            }
+
+            if !trav_elig {
+                prev_l = lev;
+                continue;
+            }
+
+            if !opp_beats {
+                // Traverser is at the eligible max. Tie count = self +
+                // eligible opponents tying the traverser (exact code:
+                // tied = [h==max] + Σ [g==max]).
+                let mut tied: u32 = 1;
+                for oi in 0..num_opp {
+                    if self.opp_folded[oi] {
+                        continue;
+                    }
+                    if self.opp_contrib[oi] < lev {
+                        continue;
+                    }
+                    if rel[oi] == REL_TIE {
+                        tied += 1;
+                    }
+                }
+                let pot_after_rake = if li == 0 {
+                    pot_l - self.main_pot_rake
+                } else {
+                    pot_l
+                };
+                cash += pot_after_rake / tied as f32;
+            }
+            prev_l = lev;
+        }
+        cash - self.traverser_stake
+    }
+}
+
+/// ═══ Design 2 — factored-over-buckets, O(K·B²) per terminal ═══
+///
+/// The B1-logged "road past the M4 ceiling", promoted to the production
+/// candidate by the B4 step-1 cost gate (Design 1 measured 563× over
+/// the everything-at-B prediction at nh=1176, B=15: bucket-tuple
+/// enumeration loses all conflict/zero-reach pruning, and arm 2 pays a
+/// ~3^K_active relation-branching multiplier).
+///
+/// Factorization: opponents are treated as INDEPENDENT given the
+/// traverser bucket. Per opponent slot, one matvec over the fraction
+/// tables collapses its bucket distribution to scalars
+///   w_i = Σ_bo r_i[bo]·f_w[bt][bo]   (traverser beats opp i, compat)
+///   t_i, l_i analogous; n_i = Σ_bo r_i[bo]·f_n[bt][bo]  (compat mass)
+/// Arm 1 then runs the same (beaten, tie-count) DP over opponents with
+/// scalars (O(K²)); arm 2 enumerates relation vectors with scalar
+/// branch weights (O(3^K_active), ≤243 at 6-max) and calls the SAME
+/// Arm2Ctx::net payoff.
+///
+/// === Named approximation (the Design-2 error) — two layers ===
+///
+/// Layer 1 (raw factorization): dropping the opp-opp prefix product
+/// Π f_n(b_j, b_i) OVER-COUNTS scenario mass (f_n ≤ 1) — same
+/// direction as the preflop pairwise precedent
+/// (`preflop_fold_terminal_cfv_multiway_pairwise`). Measured: the
+/// over-count is ~Π_{i<j} f̄_n ≈ a per-(terminal, bucket) SCALE on
+/// cfv (parity fixture: raw deviation ≈ 1490%, within-terminal shape
+/// after per-bucket scale removal 0.2-0.5%). The scale VARIES across
+/// terminals/buckets/traversers with the reach distribution, and that
+/// variance is what the regret loop amplifies: the raw factored
+/// terminal measured +4.89% pot equilibrium cost in the B=4 wet-deep
+/// A/B — REJECTED at the 0.25% acceptance line.
+///
+/// Layer 2 (pairwise mass renormalization, applied below): cfv[bt] is
+/// multiplied by C(bt) = Π_{i<j} ĉ_ij(bt), where ĉ_ij is the
+/// reach-weighted mean opp-opp compat fraction
+///   ĉ_ij(bt) = Σ_{bi,bj} r̂_i(bi)·r̂_j(bj)·f_n(bi,bj),
+///   r̂_i(bi) ∝ r_i(bi)·f_n(bt,bi)  (traverser-conditioned reach)
+/// — O(K²·B²) per bucket, still microseconds. This restores the
+/// per-bucket mass scale up to PAIR-INDEPENDENCE (treating opp-opp
+/// blocking events as independent across pairs — the residual is
+/// triplet+ blocking correlation, the AA-AA-AA error class proper).
+/// The renormalized residual is pinned by the parity test; the
+/// equilibrium verdict is the A/B.
+#[allow(clippy::too_many_arguments)]
+pub fn bucketed_showdown_cfv_factored(
+    bucket_reach: &[&[f32]],
+    tables: &BucketedRunoutTables,
+    contributions: &[i32],
+    fold_mask: u16,
+    traverser: usize,
+    num_players: u8,
+    starting_pot: i32,
+    rake_rate: f32,
+    rake_cap: f32,
+    flop_seen: bool,
+) -> Vec<f32> {
+    let nb = tables.nb;
+    let num_opp = bucket_reach.len();
+    let np = num_players as usize;
+    let c_t = contributions[traverser];
+    let mut cfv = vec![0.0f32; nb];
+
+    assert!(np >= 4, "bucketed_showdown_cfv_factored: np ≥ 4 only (same scope as Design 1)");
+    assert!(num_opp == np - 1);
+    assert!(num_opp <= MAX_OPP);
+
+    let (eff_rake_rate, eff_rake_cap) = if flop_seen {
+        (rake_rate, rake_cap)
+    } else {
+        (0.0, 0.0)
+    };
+
+    // Dispatch mirror — identical to Design 1.
+    let mut all_active_equal = true;
+    let mut ref_contrib: Option<i32> = None;
+    for p in 0..np {
+        if fold_mask & (1u16 << p) != 0 {
+            continue;
+        }
+        let cp = contributions[p];
+        if let Some(r) = ref_contrib {
+            if cp != r {
+                all_active_equal = false;
+                break;
+            }
+        } else {
+            ref_contrib = Some(cp);
+        }
+    }
+
+    // Per-(bt, oi) scalar collapse: one matvec per opponent.
+    // probs[oi] = [w, t, l, n] given traverser bucket bt.
+    let collapse = |bt: usize| -> Vec<[f32; 4]> {
+        (0..num_opp)
+            .map(|oi| {
+                let mut acc = [0.0f32; 4];
+                for bo in 0..nb {
+                    let r = bucket_reach[oi][bo];
+                    if r == 0.0 {
+                        continue;
+                    }
+                    let i = bt * nb + bo;
+                    acc[0] += r * tables.f_w[i];
+                    acc[1] += r * tables.f_t[i];
+                    acc[2] += r * tables.f_l[i];
+                    acc[3] += r * tables.f_n[i];
+                }
+                acc
+            })
+            .collect()
+    };
+
+    // Layer-2 pairwise mass renormalization: C(bt) = Π_{i<j} ĉ_ij(bt),
+    // the reach-weighted mean opp-opp compat fraction per opponent
+    // pair, conditioned on the traverser bucket. f64 accumulation (the
+    // product spans C(K,2) = 10 factors at 6-max).
+    let renorm = |bt: usize, probs: &[[f32; 4]]| -> f32 {
+        let mut c = 1.0f64;
+        for i in 0..num_opp {
+            let ni = probs[i][3] as f64;
+            if ni == 0.0 {
+                continue; // zero compat mass → cfv[bt] is zero anyway
+            }
+            for j in (i + 1)..num_opp {
+                let nj = probs[j][3] as f64;
+                if nj == 0.0 {
+                    continue;
+                }
+                let mut s = 0.0f64;
+                for bi in 0..nb {
+                    let wi =
+                        bucket_reach[i][bi] as f64 * tables.f_n[bt * nb + bi] as f64;
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    for bj in 0..nb {
+                        let wj =
+                            bucket_reach[j][bj] as f64 * tables.f_n[bt * nb + bj] as f64;
+                        if wj == 0.0 {
+                            continue;
+                        }
+                        s += wi * wj * tables.f_n[bi * nb + bj] as f64;
+                    }
+                }
+                c *= s / (ni * nj);
+            }
+        }
+        c as f32
+    };
+
+    if all_active_equal && fold_mask == 0 {
+        // ── Arm 1: (beaten, tie-count) DP with scalars ──
+        let k = num_opp as f32;
+        let half_pot = starting_pot as f32 / np as f32 + c_t as f32;
+        let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+        let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
+        let rake_per_unit_stake = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
+
+        for bt in 0..nb {
+            let probs = collapse(bt);
+            let c_bt = renorm(bt, &probs);
+            let mut state = [0.0f32; MAX_OPP + 2];
+            state[1] = 1.0;
+            for (oi, p) in probs.iter().enumerate() {
+                let [w, t, l, n] = *p;
+                let mut new_state = [0.0f32; MAX_OPP + 2];
+                if state[0] != 0.0 {
+                    new_state[0] += state[0] * n;
+                }
+                for j in 0..=oi {
+                    let s = state[1 + j];
+                    if s == 0.0 {
+                        continue;
+                    }
+                    new_state[0] += s * l;
+                    new_state[1 + j + 1] += s * t;
+                    new_state[1 + j] += s * w;
+                }
+                state = new_state;
+            }
+            // Leaf payoffs — same constants as Design 1's arm-1 leaf.
+            let mut accum = 0.0f32;
+            if state[0] != 0.0 {
+                accum += state[0] * -1.0;
+            }
+            for j in 0..=num_opp {
+                let s = state[1 + j];
+                if s == 0.0 {
+                    continue;
+                }
+                let net_unit: f32 = if j == 0 {
+                    k - rake_per_unit_stake
+                } else {
+                    let t_f = (j + 1) as f32;
+                    (k + 1.0 - t_f) / t_f - rake_per_unit_stake / t_f
+                };
+                accum += s * net_unit;
+            }
+            cfv[bt] = half_pot * accum * c_bt;
+        }
+        return cfv;
+    }
+
+    // ── Arm 2: relation-vector enumeration with scalar weights ──
+    let mut levels: Vec<i32> = (0..np).map(|p| contributions[p]).collect();
+    levels.sort();
+    levels.dedup();
+    let main_pot_amount: i32 = if levels.is_empty() {
+        starting_pot
+    } else {
+        let num_main_contributors = (0..np)
+            .filter(|&p| contributions[p] >= levels[0])
+            .count();
+        levels[0] * num_main_contributors as i32 + starting_pot
+    };
+    let main_pot_rake: f32 = (main_pot_amount as f32 * eff_rake_rate)
+        .min(eff_rake_cap)
+        .max(0.0);
+    let traverser_stake = starting_pot as f32 / np as f32 + c_t as f32;
+    let traverser_folded = fold_mask & (1u16 << traverser) != 0;
+    let opp_player: Vec<usize> = (0..num_opp)
+        .map(|oi| if oi < traverser { oi } else { oi + 1 })
+        .collect();
+    let opp_contrib: Vec<i32> = opp_player.iter().map(|&p| contributions[p]).collect();
+    let opp_folded: Vec<bool> = opp_player
+        .iter()
+        .map(|&p| fold_mask & (1u16 << p) != 0)
+        .collect();
+
+    let ctx = Arm2Ctx {
+        levels,
+        np,
+        contributions: contributions.to_vec(),
+        starting_pot,
+        main_pot_rake,
+        traverser_stake,
+        traverser_folded,
+        c_t,
+        opp_contrib,
+        opp_folded: opp_folded.clone(),
+        traverser,
+    };
+
+    let mut rel = vec![0u8; num_opp];
+    for bt in 0..nb {
+        let probs = collapse(bt);
+        let c_bt = renorm(bt, &probs);
+        let mut accum = 0.0f32;
+        recurse_rel_scalars(
+            0,
+            num_opp,
+            1.0,
+            &mut rel,
+            &probs,
+            &opp_folded,
+            &mut |weight: f32, rel: &[u8]| {
+                accum += weight * ctx.net(rel);
+            },
+        );
+        cfv[bt] = accum * c_bt;
+    }
+    cfv
+}
+
+/// Design-2 arm-2 recursion: per-opponent scalar branch weights, no
+/// bucket loops, no prefix blocking (the dropped factor IS the named
+/// approximation). Folded opponents contribute their compatible mass
+/// as a scalar multiplier; active opponents branch 3 ways.
+fn recurse_rel_scalars(
+    oi: usize,
+    num_opp: usize,
+    weight: f32,
+    rel: &mut [u8],
+    probs: &[[f32; 4]],
+    opp_folded: &[bool],
+    leaf: &mut dyn FnMut(f32, &[u8]),
+) {
+    if oi == num_opp {
+        leaf(weight, rel);
+        return;
+    }
+    if opp_folded[oi] {
+        let n = probs[oi][3];
+        if n == 0.0 {
+            return;
+        }
+        rel[oi] = REL_FOLDED;
+        recurse_rel_scalars(oi + 1, num_opp, weight * n, rel, probs, opp_folded, leaf);
+    } else {
+        for (code, p) in [
+            (REL_WIN, probs[oi][0]),
+            (REL_TIE, probs[oi][1]),
+            (REL_LOSE, probs[oi][2]),
+        ] {
+            if p == 0.0 {
+                continue;
+            }
+            rel[oi] = code;
+            recurse_rel_scalars(oi + 1, num_opp, weight * p, rel, probs, opp_folded, leaf);
+        }
+    }
 }
 
 /// Arm-1 recursion: bucket-tuple enumeration (same index order as the

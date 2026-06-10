@@ -70,8 +70,10 @@
 
 use solver_core::card::{card_from_str, index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use solver_core::hand::eval::Hand;
-use solver_core::solver::bucketed_flop_cfr::{BucketedFlopCfr, FlopBucketing, NO_BUCKET};
-use solver_core::solver::bucketed_showdown::bucketed_showdown_cfv;
+use solver_core::solver::bucketed_flop_cfr::{
+    BucketedFlopCfr, FlopBucketing, TerminalDesign, NO_BUCKET,
+};
+use solver_core::solver::bucketed_showdown::{bucketed_showdown_cfv, bucketed_showdown_cfv_factored};
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::{DcfrParams, FlopStartVectorCfr, Zone};
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
@@ -542,4 +544,69 @@ fn b4_cost_measurement_production_nh() {
     eprintln!("  hybrid / everything-at-B (device-free): {:.1}×", ratio_devicefree);
     eprintln!("  hybrid / M4 GPU formula at B={B}:        {:.1}×", ratio_formula);
     eprintln!("  (decision rule: > ~2× on the device-free ratio triggers the design fork)");
+}
+
+/// Design-2 production cost: full bucketed iteration at nh=1176, B=15
+/// with the factored terminal, vs the M4 everything-at-B prediction
+/// (7.0 s/iter) — including the explicit GPU-port-mootness check: if
+/// the CPU-only Design-2 iteration lands at or under the prediction,
+/// the carried GPU-bucketed-port item may be DELETABLE (removing an
+/// entire desync-surface class and its parity gates), not deferred.
+///
+/// NOTE: Design 2's equilibrium-quality gate is OPEN at this writing
+/// (A/B failures, see p1_5_4_bucketing_b4_design2_equilibrium_ab) —
+/// this measurement prices the candidate, it does not bless it.
+///
+/// ═══ MEASURED 2026-06-10 ═══
+///   Design-2 unit probes (B=15): arm-1 63.8 µs, arm-2 5-active
+///   137.3 µs, arm-2 4-folded 44.4 µs (vs Design 1's 0.128 s /
+///   0.716 s / 0.288 s — 3-4 orders of magnitude).
+///   Full CPU iteration (nh=1176, B=15, M2 tree): 0.30 s
+///   vs M4 prediction 7.0 s → 0.04× — 23× UNDER, CPU-only.
+///   GPU-mootness: HOLDS decisively on this tree. To be re-confirmed
+///   at the production tree shape before deleting the port item.
+#[test]
+#[ignore = "B4 Design-2 cost measurement (~minutes); run with --ignored --nocapture"]
+fn b4_cost_measurement_design2() {
+    let m4_pred_ms = 335.0 * (B as f64 / 8.0).powf(4.84);
+    eprintln!("\n════ B4: Design-2 (factored) cost at production nh ════");
+    eprintln!("M4 prediction at B={B}: {:.1} s/iter", m4_pred_ms / 1000.0);
+
+    let tree = build_m2_tree();
+    let table = build_m2_table(usize::MAX);
+    let nh = table.num_valid;
+    let (fm, tm, rm) = quantile_maps(&table, B);
+    let game = FlopStartGame::new(table);
+    let bk = FlopBucketing::from_maps(game.table(), B, B, B, fm, tm, rm);
+    let mut bucketed = BucketedFlopCfr::new(&tree, game.table(), &bk);
+    bucketed.set_terminal_design(TerminalDesign::Design2Factored);
+
+    // Unit probes (same scenarios as the Design-1 gate).
+    let uniform_reach: Vec<Vec<f32>> = (0..5).map(|_| vec![1.0 / B as f32; B]).collect();
+    let views: Vec<&[f32]> = uniform_reach.iter().map(|v| v.as_slice()).collect();
+    for (name, contribs, fold_mask) in [
+        ("arm-1 (equal, no folds)", [20i32; 6].to_vec(), 0u16),
+        ("arm-2 (unequal, 5 active)", vec![10, 20, 30, 30, 20, 10], 0),
+        ("arm-2 (4 folded, 1 active)", vec![10, 20, 5, 5, 5, 5], 0b111100),
+    ] {
+        // Warm + time over many reps (single call is sub-µs-noisy).
+        let reps = 200u32;
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            let _ = bucketed_showdown_cfv_factored(
+                &views, &bk.flop_tables, &contribs, fold_mask, 0, NP, 30, 0.0, 0.0, true,
+            );
+        }
+        let per = t0.elapsed().as_secs_f64() / reps as f64;
+        eprintln!("D2 {name}: {:.1} µs/terminal", per * 1e6);
+    }
+
+    // Full iteration, timed.
+    let t0 = Instant::now();
+    bucketed.run(&tree, &game, &bk, 1);
+    let iter_s = t0.elapsed().as_secs_f64();
+    eprintln!("\n══ Design-2 full CPU iteration at nh={nh}, B={B}: {:.2}s ══", iter_s);
+    eprintln!("  vs M4 prediction {:.1}s → {:.2}×", m4_pred_ms / 1000.0, iter_s / (m4_pred_ms / 1000.0));
+    eprintln!("  GPU-mootness check: CPU-only {} the everything-at-B prediction on this tree",
+        if iter_s <= m4_pred_ms / 1000.0 { "is AT/UNDER" } else { "EXCEEDS" });
 }
