@@ -23,3 +23,5 @@
 
 pub mod flop_isomorphism;
 pub mod preflop_class;
+
+pub mod postflop_buckets;
