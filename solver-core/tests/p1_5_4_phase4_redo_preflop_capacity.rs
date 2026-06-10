@@ -127,6 +127,7 @@ fn phase4_redo_preflop_structural_capacity_smoke() {
         }
     }
     eprintln!("\nThis is a STRUCTURAL CAPACITY check only.");
-    eprintln!("Full empirical preflop bootstrap is documented as DEFERRED in the file docstring.");
-    eprintln!("The question 'is MAX_NA_PREFLOP = 16 sufficient (not too LEAN)' is OPEN.");
+    eprintln!("The empirical bootstrap CLOSED 2026-06-10 — see");
+    eprintln!("p1_5_4_phase4_redo_preflop_bootstrap.rs: 4-5 of 14 sizes carry ~98% of");
+    eprintln!("raise mass at both fidelities → MAX_NA_PREFLOP = 16 is NOT too lean.");
 }

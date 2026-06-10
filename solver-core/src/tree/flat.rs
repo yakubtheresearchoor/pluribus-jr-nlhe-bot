@@ -129,16 +129,24 @@ impl FlatNode {
 // rich K=5 = 4 bets + 2 raises config in the measurement file) will hit
 // the per-stage cap assertion at runtime; they're #[ignore]'d and run
 // only on demand for further research, so this is non-blocking for CI.
-// MAX_NA_PREFLOP — set by reference to Pluribus (up to 14 raise sizes + fold +
-// call), STRUCTURAL CAPACITY confirmed (see p1_5_4_phase4_redo_preflop_capacity.rs:
-// a 14-raise preflop tree builds cleanly), but the EMPIRICAL bootstrap analogous
-// to Phase 4 postflop is DEFERRED. The deferred work: solve the rich preflop game
-// to convergence, observe σ at preflop infosets, see which raise sizes are
-// actually used. If many sizes go unused, MAX_NA could shrink. If 14 are
-// saturated, bump and re-test for the "too lean" boundary. Preflop is CPU-only
-// and over-provisioning is cheap, so 16 is a safe conservative bank; the open
-// question is whether 16 is also TIGHT (could be smaller) — which we don't know
-// without the deferred bootstrap. See the file docstring for the concrete plan.
+// MAX_NA_PREFLOP — EMPIRICALLY BOOTSTRAPPED 2026-06-10 (see
+// p1_5_4_phase4_redo_preflop_bootstrap.rs, two-fidelity frozen-CFV
+// measurement). A rich 14-raise 6-max preflop tree (menu 0.5×p..7.0×p,
+// 239k nodes) was solved 80 iterations at two fidelities (nh=12 fully-
+// shared CFVs / nh=14 pot-bucketed CFVs); reach-weighted σ_avg raise-size
+// usage, stable across both (band-robust check):
+//
+//   0.5×p ≈ 76-79%   1.0×p ≈ 13-14%   1.5×p ≈ 3.6-4.9%   2.0×p ≈ 1.7-2.9%
+//   2.5×p ≈ 0.9-1.1% (marginal)        3.0×p..7.0×p all < 0.5%, mostly ≈ 0
+//
+// VERDICT: NOT TOO LEAN — the equilibrium concentrates ~98% of raise mass
+// in 4-5 of the 14 available sizes; 9-10 slots are dead. 16 is over-
+// provisioned ~2× (could shrink to ~8 = 5-6 used sizes + fold + call if
+// preflop memory ever mattered), which at preflop's CPU-only cost is free
+// and is the safe direction. Caveats: bootstrap-grade approximations
+// (pairwise fold-terminal blocking, sampled+shared+frozen postflop CFVs —
+// see the bootstrap file docstring); menu floor is 0.5×p, so sub-0.5×p
+// raise demand is unobserved.
 pub const MAX_NA_PREFLOP: usize = 16;
 pub const MAX_NA_POSTFLOP: usize = 4;
 

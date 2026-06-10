@@ -533,10 +533,12 @@ pub fn compute_v_flop_at_root_iter0(
     // the lower-level path (compute reach + bottom_up_zone) once for
     // the specified traverser.
     //
-    // At iter-0, compute_all_strategies initializes strategies to
-    // uniform, then compute_reach + bottom_up_zone gives the per-
-    // traverser CFV at the root.
-    solver.compute_all_strategies(flop_tree);
+    // At iter-0, regrets are all zero, so regret_matching produces uniform
+    // strategy. Uniform is identical across all (tc, rc) boards, so the
+    // per-pair compute is also called inline below (matching the converged
+    // variant's pattern) to make this independent of the iter-0-uniform
+    // coincidence: any future regret state would be picked up correctly.
+    solver.compute_flop_strategy(flop_tree);
     let reach = solver.compute_reach_flop(flop_tree, &game);
 
     let nn = flop_tree.num_nodes();
@@ -547,28 +549,25 @@ pub fn compute_v_flop_at_root_iter0(
     // determinism.
     let params = crate::solver::flop_start_vector_cfr::DcfrParams::new(0);
 
-    // Bottom-up order matches the existing solver's pattern:
-    // River first, then Turn, then Flop. For each preceding zone,
-    // bottom_up_zone needs the relevant chance card indices; we run
-    // it across all chance card indices (the solver loops them
-    // internally via its tc/rc Option parameters).
     let table_ref = game.table();
     let turn_deck = table_ref.remaining_deck.clone();
 
     use crate::solver::flop_start_vector_cfr::Zone;
 
-    // River: for each (turn, river) pair, run bottom_up_zone(River).
+    // River: per-pair strategy compute + bottom_up_zone(River).
     for (ti, &tc_card) in turn_deck.iter().enumerate() {
         let river_deck = &table_ref.river_decks[tc_card as usize];
         for ri in 0..river_deck.len() {
+            solver.compute_river_strategy_for_pair(flop_tree, ti, ri);
             solver.bottom_up_zone(
                 flop_tree, table_ref, traverser, &reach, &mut cfv,
                 Zone::River, Some(ti), Some(ri), &params,
             );
         }
     }
-    // Turn: for each turn card, run bottom_up_zone(Turn).
+    // Turn: per-tc strategy compute + bottom_up_zone(Turn).
     for ti in 0..turn_deck.len() {
+        solver.compute_turn_strategy_for_tc(flop_tree, ti);
         solver.bottom_up_zone(
             flop_tree, table_ref, traverser, &reach, &mut cfv,
             Zone::Turn, Some(ti), None, &params,
@@ -581,6 +580,222 @@ pub fn compute_v_flop_at_root_iter0(
     );
 
     // Root CFV is at cfv[0..nh].
+    let root_cfv = cfv[0..nh].to_vec();
+    (root_cfv, layout)
+}
+
+/// Per the lead's directive (2026-06-04): the engine's per_flop_solver
+/// MUST use converged postflop, not iter-0. Iter-0 postflop means the
+/// engine is solving "preflop CFR with fixed uniform postflop", a
+/// game that isn't NLHE — and a faithful GPU reproduction of an
+/// iter-0-postflop engine is a faithful reproduction of a strategy
+/// you can't play. The fix is localized to the per_flop_solver
+/// boundary; the P5a/b/c composition anchoring is unchanged because
+/// it validated the composition, not the postflop source.
+///
+/// `num_postflop_iters`: how many CFR iterations to run on the per-
+/// flop subgame before reading the converged CFV. Convergence rate
+/// depends on per-flop nh and tree complexity; the convergence_audit
+/// reference uses 100 iters at nh=4 reaching 0.37% pot exploitability.
+/// At production nh=1176, more iters are needed; the CPU cost scales
+/// accordingly (each per-flop solve becomes a 100+ iter postflop CFR
+/// run instead of a single iter-0 pass — order-of-magnitude increase,
+/// which is the expensive thing the GPU exists to make feasible).
+///
+/// Returns `(root_cfv, layout)` matching `compute_v_flop_at_root_iter0`'s
+/// signature for drop-in API compatibility; semantics differ in that
+/// the CFV is computed under the time-averaged Nash-converging
+/// strategy rather than uniform iter-0.
+pub fn compute_v_flop_at_root_converged(
+    canonical_flop: [Card; 3],
+    flop_tree: &FlatTree,
+    combo_ranges_per_player: &[Vec<f32>],
+    traverser: u8,
+    num_postflop_iters: u32,
+) -> (Vec<f32>, Vec<(Card, Card)>) {
+    let num_players = combo_ranges_per_player.len() as u8;
+    assert!(num_players >= 2);
+    for (p, r) in combo_ranges_per_player.iter().enumerate() {
+        assert_eq!(r.len(), crate::card::NUM_POSSIBLE_HANDS,
+            "combo_ranges_per_player[{}] length {} != NUM_POSSIBLE_HANDS",
+            p, r.len());
+    }
+
+    let board: Vec<Card> = canonical_flop.iter().copied().collect();
+    let table = FlopChanceTable::compute_flop_start(
+        &board, combo_ranges_per_player, num_players,
+    );
+    compute_v_flop_at_root_converged_with_table(table, flop_tree, traverser, num_postflop_iters)
+}
+
+/// Table-generic variant of `compute_v_flop_at_root_converged`: same
+/// solve-freeze-extract pipeline, but the caller provides the
+/// `FlopChanceTable` directly. This is the seam that lets cheap
+/// SAMPLED tables (built via `compute_flop_start_subset_with_decks`
+/// with a small `chosen` hand set and sampled turn/river decks) run
+/// through the SAME post-#105 extraction code instead of reimplementing
+/// it. Motivating use: the preflop bootstrap's oracle (P8) — the
+/// full-range path (nh ≈ 1176, 47×46 runouts) measured ≥ 42 min per
+/// call, while sampled tables solve in ms-to-seconds.
+pub fn compute_v_flop_at_root_converged_with_table(
+    table: FlopChanceTable,
+    flop_tree: &FlatTree,
+    traverser: u8,
+    num_postflop_iters: u32,
+) -> (Vec<f32>, Vec<(Card, Card)>) {
+    let nh = table.num_valid;
+    let layout: Vec<(Card, Card)> = (0..nh)
+        .map(|i| (table.hand_cards[i * 2], table.hand_cards[i * 2 + 1]))
+        .collect();
+
+    let game = FlopStartGame::new(table);
+    let mut solver = FlopStartVectorCfr::new(flop_tree, game.table());
+
+    // CFR convergence run on the postflop subgame.
+    //
+    // DCFR (not vanilla): use the production solver's discount schedule
+    // for faster convergence. The convergence_audit measured 0.37% pot
+    // at 100 iters on nh=4, so 100+ iters is a reasonable starting
+    // budget; caller picks `num_postflop_iters` based on the desired
+    // convergence depth.
+    let _ = solver.run(flop_tree, &game, num_postflop_iters);
+
+    // Freeze the time-averaged FLOP strategy (small, fully materialized).
+    // Turn/river freezes happen per-outcome just before they're read,
+    // because strategy_turn/river are SCRATCH (one outcome's worth each)
+    // post the 2026-06-05 streaming-strategy refactor.
+    solver.freeze_average_strategy_flop(flop_tree);
+
+    // BUGFIX 2026-06-07 (#105): the prior implementation called
+    // compute_reach_flop ONCE and passed that flop_reach buffer to
+    // bottom_up_zone for all three zones. compute_reach_flop only fills
+    // Flop-zone reach (plus turn-chance-children at the flop/turn
+    // boundary); turn-zone and river-zone player/terminal nodes had
+    // reach = 0 in the buffer. bottom_up_zone reads opp_reach from this
+    // buffer at terminals, so river/turn terminals received opp_reach = 0
+    // → showdown CFV = 0 → only flop-fold terminals contributed to v_root.
+    //
+    // The CFR run() loop (FlopStartVectorCfr::run) does this correctly:
+    // per (tc, ri) it computes turn_reach + river_reach explicitly,
+    // weights child CFVs by chance_probability_turn/river when bubbling
+    // up, and uses separate accumulator buffers per zone. This rewrite
+    // mirrors run()'s structure but with FROZEN averaged strategies
+    // instead of regret-matched current strategies.
+    //
+    // Anchor: tests/p1_5_4_step2d14_freeze_extract_anchor.rs builds an
+    // independent walker (top-down/bottom-up + standing showdown oracle)
+    // and a fixed extraction (this code's shape); both produce the same
+    // CFV bit-exactly at K=1 on a tiny config, and both satisfy the
+    // card-conflict game-theory invariant (v[weak_hand] < 0 < v[strong_hand]).
+    // The pre-fix output was constant per hand, violating that invariant.
+    //
+    // Impact: UnabstractedPostflopOracle (production blueprint pipeline)
+    // calls this function. Pre-fix, the unified preflop+postflop loop has
+    // been optimizing preflop against postflop CFVs missing the showdown
+    // contribution. The bug was hidden by the same degenerate showdown
+    // (mutually-blocking pick_subset) that hid bug 2 in #104.
+    let nn = flop_tree.num_nodes();
+    let table_ref = game.table();
+    let turn_deck = table_ref.remaining_deck.clone();
+    let params = crate::solver::flop_start_vector_cfr::DcfrParams::new(0);
+
+    use crate::solver::flop_start_vector_cfr::Zone;
+
+    // Flop reach (frozen strategy_flop populated by freeze above).
+    let flop_reach = solver.compute_reach_flop(flop_tree, &game);
+
+    // Buffers — mirror run()'s zone-separated accumulator pattern.
+    let mut cfv = vec![0.0f32; nn * nh];
+    let mut river_cfv_accum = vec![0.0f32; nn * nh];
+    let mut turn_cfv = vec![0.0f32; nn * nh];
+    let mut flop_cfv = vec![0.0f32; nn * nh];
+
+    // Reset flop_cfv at turn-chance-children before per-tc accumulation.
+    for &child_id in solver.turn_chance_children() {
+        let off = child_id as usize * nh;
+        for h in 0..nh { flop_cfv[off + h] = 0.0; }
+    }
+
+    for (ti, &tc_card) in turn_deck.iter().enumerate() {
+        // STREAMING-FREEZE: populate turn scratch with the time-averaged
+        // strategy for THIS ti before compute_reach_turn / bottom_up_zone(Turn) read it.
+        solver.freeze_average_strategy_for_turn(flop_tree, ti);
+        // Compute turn-zone reach using the FROZEN strategy_turn.
+        let turn_reach = solver.compute_reach_turn(flop_tree, ti, &flop_reach);
+        let river_deck = &table_ref.river_decks[tc_card as usize];
+
+        // Reset river accumulator slots for this turn.
+        for &child_id in solver.river_chance_children() {
+            let off = child_id as usize * nh;
+            for h in 0..nh { river_cfv_accum[off + h] = 0.0; }
+        }
+
+        for ri in 0..river_deck.len() {
+            // HYBRID A: load this pair's persistent regrets+cum_strategy from
+            // disk (no-op in InMemory mode).
+            solver.load_river_pair(ti, ri)
+                .expect("load_river_pair failed (DiskBacked I/O) in compute_v_flop_at_root_converged");
+            // STREAMING-FREEZE: populate river scratch with the time-averaged
+            // strategy for THIS (ti, ri) before compute_reach_river / bottom_up_zone(River) read it.
+            solver.freeze_average_strategy_for_river_pair(flop_tree, ti, ri);
+            // Compute river-zone reach using the FROZEN strategy_river.
+            let river_reach = solver.compute_reach_river(flop_tree, ti, ri, &turn_reach);
+
+            solver.bottom_up_zone(
+                flop_tree, table_ref, traverser, &river_reach, &mut cfv,
+                Zone::River, Some(ti), Some(ri), &params,
+            );
+
+            // bottom_up_zone(River) mutates regrets+cum_strategy in the traverser
+            // branch (DCFR update). Save to keep disk in sync.
+            solver.save_river_pair(ti, ri)
+                .expect("save_river_pair failed (DiskBacked I/O) in compute_v_flop_at_root_converged");
+
+            // Weight river-chance-children CFVs by chance_probability_river, accumulate.
+            for &child_id in solver.river_chance_children() {
+                for h in 0..nh {
+                    let cp = table_ref.chance_probability_river(tc_card, ri, h);
+                    river_cfv_accum[child_id as usize * nh + h] +=
+                        cp * cfv[child_id as usize * nh + h];
+                }
+            }
+        }
+
+        // Seed turn_cfv at river-chance-children from river accumulator.
+        for &child_id in solver.river_chance_children() {
+            for h in 0..nh {
+                turn_cfv[child_id as usize * nh + h] =
+                    river_cfv_accum[child_id as usize * nh + h];
+            }
+        }
+
+        solver.bottom_up_zone(
+            flop_tree, table_ref, traverser, &turn_reach, &mut turn_cfv,
+            Zone::Turn, Some(ti), None, &params,
+        );
+
+        // Weight turn-chance-children CFVs by chance_probability_turn, accumulate.
+        for &child_id in solver.turn_chance_children() {
+            for h in 0..nh {
+                let cp = table_ref.chance_probability_turn(ti, h);
+                flop_cfv[child_id as usize * nh + h] +=
+                    cp * turn_cfv[child_id as usize * nh + h];
+            }
+        }
+    }
+
+    // Seed cfv at turn-chance-children from flop accumulator.
+    for &child_id in solver.turn_chance_children() {
+        for h in 0..nh {
+            cfv[child_id as usize * nh + h] = flop_cfv[child_id as usize * nh + h];
+        }
+    }
+
+    solver.bottom_up_zone(
+        flop_tree, table_ref, traverser, &flop_reach, &mut cfv,
+        Zone::Flop, None, None, &params,
+    );
+
     let root_cfv = cfv[0..nh].to_vec();
     (root_cfv, layout)
 }
@@ -968,6 +1183,8 @@ mod tests {
             add_allin_threshold: 1.0,
             force_allin_threshold: 1.0,
             merging_threshold: 0.0,
+        button_player: None,
+
         };
         let tree = build_tree(&cfg).expect("preflop tree builds");
 
