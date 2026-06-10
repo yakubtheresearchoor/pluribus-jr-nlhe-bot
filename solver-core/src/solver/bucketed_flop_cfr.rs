@@ -83,68 +83,208 @@ impl FlopBucketing {
     /// terminal consumes; weights are unit.
     pub fn identity(table: &FlopChanceTable) -> Self {
         let nh = table.num_valid;
+        let id_map: Vec<u16> = (0..nh as u16).collect();
+        let n_turn = table.remaining_deck.len();
+        let turn_maps: Vec<Vec<u16>> = (0..n_turn).map(|_| id_map.clone()).collect();
+        let river_maps: Vec<Vec<Vec<u16>>> = table
+            .remaining_deck
+            .iter()
+            .map(|&tc| {
+                (0..table.river_decks[tc as usize].len())
+                    .map(|_| id_map.clone())
+                    .collect()
+            })
+            .collect();
+        Self::from_maps(table, nh, nh, nh, id_map, turn_maps, river_maps)
+    }
+
+    /// General constructor: caller supplies the per-street, per-outcome
+    /// hand→bucket maps (NO_BUCKET for runout-conflicting hands at
+    /// B < nh); unit initial weights. Builds the per-runout Design-1
+    /// fraction tables from the SAME sorted strength arrays the exact
+    /// terminal consumes, and ω̂ = 1/|bucket| within-bucket weights.
+    ///
+    /// At singleton maps this reproduces `identity` exactly (1.0/1.0
+    /// omegas, unit weight sums) — the identity gate runs through this
+    /// same code path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_maps(
+        table: &FlopChanceTable,
+        nb_flop: usize,
+        nb_turn: usize,
+        nb_river: usize,
+        flop_map: Vec<u16>,
+        turn_map: Vec<Vec<u16>>,
+        river_map: Vec<Vec<Vec<u16>>>,
+    ) -> Self {
+        let nh = table.num_valid;
         let hands: Vec<(Card, Card)> = (0..nh)
             .map(|h| (table.hand_cards[h * 2], table.hand_cards[h * 2 + 1]))
             .collect();
-        let id_map: Vec<u16> = (0..nh as u16).collect();
         let unit_w = vec![1.0f64; nh];
-        let unit_sums = vec![1.0f64; nh];
 
-        let tables_for = |pl_str: &[u16], pl_idx: &[u16]| -> BucketedRunoutTables {
+        let tables_for = |pl_str: &[u16], pl_idx: &[u16], map: &[u16], nb: usize| {
             // Rebuild hand_strength exactly as the exact terminal does.
-            let mut strength = vec![0i32; nh];
+            let mut strength = vec![i32::MIN; nh];
             for si in 0..nh {
                 strength[pl_idx[si] as usize] = pl_str[si] as i32;
             }
-            let wtl = compute_wtl_for_runout(&hands, &strength, &unit_w, &id_map, nh);
-            BucketedRunoutTables::from_wtl(&wtl, &unit_sums)
+            let wtl = compute_wtl_for_runout(&hands, &strength, &unit_w, map, nb);
+            let mut sums = vec![0.0f64; nb];
+            for h in 0..nh {
+                if map[h] != NO_BUCKET {
+                    sums[map[h] as usize] += 1.0;
+                }
+            }
+            BucketedRunoutTables::from_wtl(&wtl, &sums)
+        };
+        let omega_for = |map: &[u16], nb: usize| -> Vec<f32> {
+            let mut counts = vec![0.0f32; nb];
+            for h in 0..nh {
+                if map[h] != NO_BUCKET {
+                    counts[map[h] as usize] += 1.0;
+                }
+            }
+            (0..nh)
+                .map(|h| {
+                    if map[h] == NO_BUCKET { 0.0 } else { 1.0 / counts[map[h] as usize] }
+                })
+                .collect()
         };
 
         let (_, _, base_ps, base_pi, _) = table.sorted_opp_arrays_base();
-        let flop_tables = tables_for(&base_ps[..nh], &base_pi[..nh]);
+        let flop_tables = tables_for(&base_ps[..nh], &base_pi[..nh], &flop_map, nb_flop);
+        let flop_omega = omega_for(&flop_map, nb_flop);
 
         let n_turn = table.remaining_deck.len();
         let mut turn_tables = Vec::with_capacity(n_turn);
         let mut river_tables = Vec::with_capacity(n_turn);
-        let mut turn_map = Vec::with_capacity(n_turn);
-        let mut river_map = Vec::with_capacity(n_turn);
         let mut turn_omega = Vec::with_capacity(n_turn);
         let mut river_omega = Vec::with_capacity(n_turn);
-        for &tc_card in &table.remaining_deck {
+        for (ti, &tc_card) in table.remaining_deck.iter().enumerate() {
             let (_, _, ps, pi) = table.turn_sorted_arrays(tc_card);
-            turn_tables.push(tables_for(&ps[..nh], &pi[..nh]));
-            turn_map.push(id_map.clone());
-            turn_omega.push(vec![1.0f32; nh]);
+            turn_tables.push(tables_for(&ps[..nh], &pi[..nh], &turn_map[ti], nb_turn));
+            turn_omega.push(omega_for(&turn_map[ti], nb_turn));
 
             let river_deck = &table.river_decks[tc_card as usize];
             let mut rt = Vec::with_capacity(river_deck.len());
-            let mut rm = Vec::with_capacity(river_deck.len());
             let mut ro = Vec::with_capacity(river_deck.len());
-            for &rc_card in river_deck {
+            for (ri, &rc_card) in river_deck.iter().enumerate() {
                 let (_, _, ps, pi) = table.river_sorted_arrays(tc_card, rc_card);
-                rt.push(tables_for(&ps[..nh], &pi[..nh]));
-                rm.push(id_map.clone());
-                ro.push(vec![1.0f32; nh]);
+                rt.push(tables_for(&ps[..nh], &pi[..nh], &river_map[ti][ri], nb_river));
+                ro.push(omega_for(&river_map[ti][ri], nb_river));
             }
             river_tables.push(rt);
-            river_map.push(rm);
             river_omega.push(ro);
         }
 
         FlopBucketing {
             nh,
-            nb_flop: nh,
-            nb_turn: nh,
-            nb_river: nh,
-            flop_map: id_map,
+            nb_flop,
+            nb_turn,
+            nb_river,
+            flop_map,
             turn_map,
             river_map,
-            flop_omega: vec![1.0f32; nh],
+            flop_omega,
             turn_omega,
             river_omega,
             flop_tables,
             turn_tables,
             river_tables,
+        }
+    }
+}
+
+/// Lift a bucketed solve's cumulative (average) strategy to per-hand
+/// granularity inside an EXACT solver's cum_strategy buffers, so the
+/// abstraction is scored in the unbucketed game with the exact terminal
+/// (the cross_tree lift precedent at hand granularity instead of action
+/// granularity). Per-hand σ_avg is the hand's bucket's σ_avg; cum rows
+/// are copied unnormalized (normalization happens at readout, and a
+/// bucket row normalizes to the same σ_avg as its copies).
+///
+/// Runout-conflicting hands (NO_BUCKET) get zero rows → uniform σ at
+/// readout; they have zero chance probability, so this is invisible to
+/// best response.
+pub fn lift_cum_to_exact(
+    tree: &FlatTree,
+    bucketed: &BucketedFlopCfr,
+    bk: &FlopBucketing,
+    exact: &mut crate::solver::flop_start_vector_cfr::FlopStartVectorCfr,
+) {
+    let nh = bk.nh;
+    let n_turn = bk.turn_map.len();
+    let max_n_river = bucketed.max_river_outcomes();
+    assert_eq!(max_n_river, exact.max_river_outcomes());
+
+    for &nid in &tree.decision_node_ids {
+        let idx = nid as usize;
+        let na = tree.nodes[idx].num_children as usize;
+
+        if let (Some(lb), Some(le)) =
+            (bucketed.flop_local_offset_at(idx), exact.flop_local_offset_at(idx))
+        {
+            let nb = bk.nb_flop;
+            let off_b = lb * MAX_NA_POSTFLOP * nb;
+            let off_e = le * MAX_NA_POSTFLOP * nh;
+            let src = bucketed.cum_strategy_flop();
+            for a in 0..na {
+                for h in 0..nh {
+                    let b = bk.flop_map[h];
+                    exact.cum_strategy_flop_mut()[off_e + a * nh + h] = if b == NO_BUCKET {
+                        0.0
+                    } else {
+                        src[off_b + a * nb + b as usize]
+                    };
+                }
+            }
+        }
+
+        if let (Some(lb), Some(le)) =
+            (bucketed.turn_local_offset_at(idx), exact.turn_local_offset_at(idx))
+        {
+            let nb = bk.nb_turn;
+            for ti in 0..n_turn {
+                let off_b = ti * bucketed.turn_stride() + lb * MAX_NA_POSTFLOP * nb;
+                let off_e = ti * exact.turn_stride() + le * MAX_NA_POSTFLOP * nh;
+                for a in 0..na {
+                    for h in 0..nh {
+                        let b = bk.turn_map[ti][h];
+                        let v = if b == NO_BUCKET {
+                            0.0
+                        } else {
+                            bucketed.cum_strategy_turn()[off_b + a * nb + b as usize]
+                        };
+                        exact.cum_strategy_turn_mut()[off_e + a * nh + h] = v;
+                    }
+                }
+            }
+        }
+
+        if let (Some(lb), Some(le)) =
+            (bucketed.river_local_offset_at(idx), exact.river_local_offset_at(idx))
+        {
+            let nb = bk.nb_river;
+            for ti in 0..n_turn {
+                for ri in 0..bk.river_map[ti].len() {
+                    let off_b = (ti * max_n_river + ri) * bucketed.river_stride()
+                        + lb * MAX_NA_POSTFLOP * nb;
+                    let off_e = (ti * max_n_river + ri) * exact.river_stride()
+                        + le * MAX_NA_POSTFLOP * nh;
+                    for a in 0..na {
+                        for h in 0..nh {
+                            let b = bk.river_map[ti][ri][h];
+                            let v = if b == NO_BUCKET {
+                                0.0
+                            } else {
+                                bucketed.cum_strategy_river()[off_b + a * nb + b as usize]
+                            };
+                            exact.cum_strategy_river_mut()[off_e + a * nh + h] = v;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -908,6 +1048,7 @@ impl BucketedFlopCfr {
     pub fn flop_stride(&self) -> usize { self.flop_stride }
     pub fn turn_stride(&self) -> usize { self.turn_stride }
     pub fn river_stride(&self) -> usize { self.river_stride }
+    pub fn max_river_outcomes(&self) -> usize { self.max_n_river }
     pub fn regrets_flop(&self) -> &[f32] { &self.regrets_flop }
     pub fn cum_strategy_flop(&self) -> &[f32] { &self.cum_strategy_flop }
     pub fn regrets_turn(&self) -> &[f32] { &self.regrets_turn }
