@@ -328,9 +328,17 @@ impl FlopStartVectorCfr {
             .max()
             .unwrap_or(0);
 
-        let flop_stride = flop_count * MAX_NA_POSTFLOP * nh;
-        let turn_stride = turn_count * MAX_NA_POSTFLOP * nh;
-        let river_stride = river_count * MAX_NA_POSTFLOP * nh;
+        // Strides sourced from ZoneDims — the single stride/offset source
+        // shared with the GPU side (Phase B3 dims-threading). Uniform nh
+        // here reproduces the pre-bucketing formulas exactly (pinned by
+        // zone_dims unit tests).
+        let stride_dims = crate::solver::zone_dims::ZoneDims::uniform(
+            MAX_NA_POSTFLOP, nh, flop_count, turn_count, river_count,
+            n_turn, max_n_river,
+        );
+        let flop_stride = stride_dims.flop_stride();
+        let turn_stride = stride_dims.turn_stride();
+        let river_stride = stride_dims.river_stride();
 
         let mut river_deck_sizes = vec![0usize; 52];
         for &tc in &table.remaining_deck {

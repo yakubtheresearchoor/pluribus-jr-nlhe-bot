@@ -364,7 +364,14 @@ pub struct MetalFlopStartSolver {
     river_cc_count: usize,
     turn_cc_count: usize,
 
-    // Strides for per-outcome dimensional layout
+    // Strides for per-outcome dimensional layout.
+    // INVARIANT: these fields are populated FROM `dims` at construction
+    // and must stay equal to it — `dims` (ZoneDims) is the single source
+    // of stride/offset math shared with the CPU side (Phase B3). The
+    // offset helper delegates to `dims`; the offset_helper test
+    // cross-checks field values against an independently-constructed
+    // ZoneDims.
+    dims: crate::solver::zone_dims::ZoneDims,
     flop_stride: usize,
     turn_stride: usize,
     river_stride: usize,
@@ -424,18 +431,25 @@ impl MetalFlopStartSolver {
         let max_depth = tree.max_depth as usize;
         let num_opp = (np - 1) as usize;
 
-        // Layout dimensions
+        // Layout dimensions — sourced from ZoneDims (the single source
+        // both CPU and GPU consume; Phase B3 dims-threading step). At
+        // uniform nh this reproduces the pre-bucketing formulas exactly
+        // (pinned by zone_dims::tests::uniform_matches_prebucketing_formulas).
         let flop_infosets = cpu_solver.flop_infosets();
         let turn_infosets = cpu_solver.turn_infosets();
         let river_infosets = cpu_solver.river_infosets();
-        let flop_stride = flop_infosets * MAX_NA_POSTFLOP * nh;
-        let turn_stride = turn_infosets * MAX_NA_POSTFLOP * nh;
-        let river_stride = river_infosets * MAX_NA_POSTFLOP * nh;
-        let turn_total = n_turn * turn_stride;
-        let river_total = n_turn * max_river * river_stride;
-        let flop_offset = 0;
-        let turn_offset = flop_stride;
-        let river_offset = flop_stride + turn_total;
+        let dims = crate::solver::zone_dims::ZoneDims::uniform(
+            MAX_NA_POSTFLOP, nh, flop_infosets, turn_infosets, river_infosets,
+            n_turn, max_river,
+        );
+        let flop_stride = dims.flop_stride();
+        let turn_stride = dims.turn_stride();
+        let river_stride = dims.river_stride();
+        let turn_total = dims.turn_total();
+        let river_total = dims.river_total();
+        let flop_offset = dims.flop_offset();
+        let turn_offset = dims.turn_offset();
+        let river_offset = dims.river_offset();
 
         // Load pipelines
         let strategies_pipeline = ctx.create_pipeline("vcfr_compute_strategies").expect("strategies");
@@ -586,6 +600,7 @@ impl MetalFlopStartSolver {
         let d_params_buf = std::cell::UnsafeCell::new(MetalBuffer::zeros(device, 256));
 
         Self {
+            dims,
             strategies_pipeline,
             strategies_batched_pipeline,
             init_reach_pipeline,
@@ -729,13 +744,16 @@ impl MetalFlopStartSolver {
     /// Centralizing into this helper + unit testing it per zone is the
     /// disambiguator.
     pub fn infoset_float_offset(&self, zone: BufferZone) -> usize {
-        match zone {
-            BufferZone::Flop => self.flop_offset,
-            BufferZone::Turn { ti } => self.turn_offset + ti * self.turn_stride,
+        // Delegates to ZoneDims (single source, Phase B3). BufferZone ↔
+        // ZoneRef is a 1:1 rename.
+        let zr = match zone {
+            BufferZone::Flop => crate::solver::zone_dims::ZoneRef::Flop,
+            BufferZone::Turn { ti } => crate::solver::zone_dims::ZoneRef::Turn { ti },
             BufferZone::River { outcome_idx } => {
-                self.river_offset + outcome_idx * self.river_stride
+                crate::solver::zone_dims::ZoneRef::River { outcome_idx }
             }
-        }
+        };
+        self.dims.zone_float_offset(zr)
     }
 
     /// Byte offset (suitable for set_buffer offset args). Equals

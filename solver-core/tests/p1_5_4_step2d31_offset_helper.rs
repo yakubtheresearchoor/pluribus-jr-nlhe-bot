@@ -193,6 +193,47 @@ fn offset_helper_river_matches_hand_computation() {
     let _ = max_river;
 }
 
+/// Phase B3 cross-source check: the GPU solver's offsets must agree with
+/// an INDEPENDENTLY-constructed ZoneDims built from the same logical
+/// inputs. The solver's helper now delegates to its internal ZoneDims;
+/// this test rebuilds the dims from scratch (different code route to the
+/// same numbers) so a constructor-wiring bug can't self-certify.
+#[test]
+fn offset_helper_matches_independent_zone_dims() {
+    use solver_core::solver::zone_dims::{ZoneDims, ZoneRef};
+    use solver_core::tree::flat::MAX_NA_POSTFLOP;
+
+    let (tree, table) = build_6p_table(8);
+    let game = FlopStartGame::new(table);
+    let cpu = FlopStartVectorCfr::new(&tree, &game.table());
+    let ctx = MetalContext::new().expect("Metal");
+    let gpu = MetalFlopStartSolver::new(&ctx, &tree, &game, &cpu);
+
+    let dims = ZoneDims::uniform(
+        MAX_NA_POSTFLOP,
+        cpu.num_hands(),
+        cpu.flop_infosets(),
+        cpu.turn_infosets(),
+        cpu.river_infosets(),
+        gpu.n_turn(),
+        gpu.max_river(),
+    );
+
+    assert_eq!(gpu.infoset_float_offset(BufferZone::Flop),
+        dims.zone_float_offset(ZoneRef::Flop));
+    for ti in 0..gpu.n_turn() {
+        assert_eq!(gpu.infoset_float_offset(BufferZone::Turn { ti }),
+            dims.zone_float_offset(ZoneRef::Turn { ti }),
+            "turn ti={ti} offset diverges from independent ZoneDims");
+    }
+    for o in 0..gpu.n_turn() * gpu.max_river() {
+        assert_eq!(gpu.infoset_float_offset(BufferZone::River { outcome_idx: o }),
+            dims.zone_float_offset(ZoneRef::River { outcome_idx: o }),
+            "river outcome={o} offset diverges from independent ZoneDims");
+    }
+    assert_eq!(gpu.turn_stride(), dims.turn_stride());
+}
+
 #[test]
 fn offset_helper_zones_are_strictly_ordered() {
     // Cross-stage gate: Flop < Turn < River and Turn outcomes lie strictly
