@@ -610,3 +610,70 @@ fn b4_cost_measurement_design2() {
     eprintln!("  GPU-mootness check: CPU-only {} the everything-at-B prediction on this tree",
         if iter_s <= m4_pred_ms / 1000.0 { "is AT/UNDER" } else { "EXCEEDS" });
 }
+
+/// Design-1-COLLAPSED production cost ladder + the B4 wall-clock
+/// projection, with the GPU-port-vs-flop-sampling fork priced
+/// EXPLICITLY (not assumed). All numbers below are measured on this
+/// machine (M4 Max, single core); the projection arithmetic is printed
+/// so the fork can be re-priced as inputs change.
+///
+/// MEASUREMENT IN PROGRESS 2026-06-10: the ladder run (B up to 25 at
+/// nh=1176) takes hours at the top points — that cost is itself the
+/// calibration pricing. Numbers are pinned here when the run lands;
+/// until then this header carries NO numbers (invented figures marked
+/// "measured" are the failure mode this project's discipline exists
+/// to prevent). The projection table printed by the test is the
+/// deliverable: per-B iteration cost × 34 iters × {1755, 100} flops
+/// ÷ 16 cores, with the GPU-port-vs-flop-sampling fork priced from
+/// those rows rather than assumed.
+#[test]
+#[ignore = "B4 collapsed cost ladder (~10 min at the B=25 point); run with --ignored --nocapture"]
+fn b4_cost_ladder_design1_collapsed() {
+    use solver_core::solver::bucketed_showdown::bucketed_showdown_cfv_design1_collapsed;
+
+    eprintln!("\n════ B4: Design-1-collapsed cost ladder at production nh ════");
+    let tree = build_m2_tree();
+    let table = build_m2_table(usize::MAX);
+    let nh = table.num_valid;
+    let game = FlopStartGame::new(table);
+
+    let mut iter_costs: Vec<(usize, f64)> = Vec::new();
+    for b in [5usize, 8, 10, 15, 20, 25] {
+        let (fm, tm, rm) = quantile_maps(game.table(), b);
+        let bk = FlopBucketing::from_maps(game.table(), b, b, b, fm, tm, rm);
+
+        // Per-terminal probe (arm-2 worst case: unequal, 5 active).
+        let ur: Vec<Vec<f32>> = (0..5).map(|_| vec![1.0 / b as f32; b]).collect();
+        let views: Vec<&[f32]> = ur.iter().map(|v| v.as_slice()).collect();
+        let reps = if b <= 10 { 50u32 } else { 5 };
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            let _ = bucketed_showdown_cfv_design1_collapsed(
+                &views, &bk.flop_tables, &[10, 20, 30, 30, 20, 10], 0, 0, NP, 30, 0.0, 0.0,
+                true,
+            );
+        }
+        let per_term = t0.elapsed().as_secs_f64() / reps as f64;
+
+        let mut bucketed = BucketedFlopCfr::new(&tree, game.table(), &bk);
+        bucketed.set_terminal_design(TerminalDesign::Design1Collapsed);
+        let t0 = Instant::now();
+        bucketed.run(&tree, &game, &bk, 1);
+        let iter_s = t0.elapsed().as_secs_f64();
+        iter_costs.push((b, iter_s));
+        eprintln!("B={b:>2}: iter {iter_s:>8.2}s | arm-2 terminal {:.2}ms", per_term * 1e3);
+    }
+
+    eprintln!("\n── projection: 34 iters (1% pot target), 16-way flop parallelism ──");
+    eprintln!("{:>4} | {:>14} | {:>14}", "B", "1755 flops", "100 flops");
+    for &(b, s) in &iter_costs {
+        let full = s * 34.0 * 1755.0 / 16.0 / 3600.0;
+        let sampled = s * 34.0 * 100.0 / 16.0 / 3600.0;
+        eprintln!("{b:>4} | {full:>12.2} h | {sampled:>12.2} h");
+    }
+    eprintln!("\nFork pricing (24h budget): GPU port needed only where the CPU");
+    eprintln!("row exceeds 24h at the chosen flop set; flop sampling trades a");
+    eprintln!("measurable quality cost (harness can score sampled-set configs).");
+    eprintln!("Clustering adds 36.4s/flop single-core (B2 measurement), fully");
+    eprintln!("pipelineable against solves (~17.8h/1755 unpipelined, ~1h/100).");
+}

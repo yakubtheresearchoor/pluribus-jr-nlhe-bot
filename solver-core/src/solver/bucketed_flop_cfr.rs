@@ -37,7 +37,8 @@
 use crate::abstraction::postflop_buckets::compute_wtl_for_runout;
 use crate::card::Card;
 use crate::solver::bucketed_showdown::{
-    bucketed_showdown_cfv, bucketed_showdown_cfv_factored, BucketedRunoutTables,
+    bucketed_showdown_cfv, bucketed_showdown_cfv_design1_collapsed,
+    bucketed_showdown_cfv_factored, BucketedRunoutTables,
 };
 use crate::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use crate::solver::game::GameSpec;
@@ -64,6 +65,13 @@ pub const NO_BUCKET: u16 = u16::MAX;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TerminalDesign {
     Design1Brute,
+    /// Design 1 with the 3^K relation enumeration collapsed to a
+    /// per-level tie-count DP — control flow, not approximation; same
+    /// B^K tuple enumeration with pairwise conflict fractions.
+    /// Production candidate after Design 2's equilibrium rejection.
+    Design1Collapsed,
+    /// REJECTED by the equilibrium A/B (+4.89% raw / +13.75% renorm vs
+    /// the 0.25% line); kept in-tree behind its failing #[ignore]d gate.
     Design2Factored,
 }
 
@@ -925,6 +933,9 @@ impl BucketedFlopCfr {
 
                     let terminal_fn = match self.terminal_design {
                         TerminalDesign::Design1Brute => bucketed_showdown_cfv,
+                        TerminalDesign::Design1Collapsed => {
+                            bucketed_showdown_cfv_design1_collapsed
+                        }
                         TerminalDesign::Design2Factored => bucketed_showdown_cfv_factored,
                     };
                     let cfv_out = terminal_fn(

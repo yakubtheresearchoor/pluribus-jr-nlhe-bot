@@ -399,6 +399,337 @@ impl Arm2Ctx {
     }
 }
 
+impl Arm2Ctx {
+    /// Expected net over the relation distribution of ONE bucket tuple,
+    /// given per-opponent branch scalars `sc[oi] = [w, t, l, n]` (active
+    /// opponents: relation branch weights from the tuple's bucket pair;
+    /// folded opponents: only `[3] = f_n` is read). This is the 3^K
+    /// collapse — control flow, NOT an approximation: by linearity of
+    /// expectation over pot levels, E[cash_lev] needs only
+    /// P(no eligible lose, j eligible ties), a tie-count DP per level,
+    /// O(K²) instead of 3^K leaf visits. The level-walk float ops
+    /// (pot_l, eligibility, pot_after_rake, divisions) are verbatim
+    /// from `net()`; at singletons every probability is binary, the DP
+    /// is point-mass selection, all extra multiplies are ×1.0 — so the
+    /// collapsed arm is BIT-EXACT to the enumerated arm there. At
+    /// general B the same quantity is summed in a different order
+    /// (float non-associativity ⇒ ulp-scale drift, pinned by the
+    /// collapse gate).
+    fn net_expected(&self, sc: &[[f32; 4]]) -> f32 {
+        let num_opp = self.opp_folded.len();
+
+        // S_total = Π active (w+t+l) × Π folded n, in opponent order.
+        // Branch-skip in the tuple recursion guarantees every factor
+        // is nonzero (binary 1.0 at singletons).
+        let mut s_total = 1.0f32;
+        for oi in 0..num_opp {
+            if self.opp_folded[oi] {
+                s_total *= sc[oi][3];
+            } else {
+                s_total *= sc[oi][0] + sc[oi][1] + sc[oi][2];
+            }
+        }
+
+        let mut cash: f32 = 0.0;
+        let mut dp = [0.0f32; MAX_OPP + 1];
+        let mut prev_l = 0i32;
+        for (li, &lev) in self.levels.iter().enumerate() {
+            let pc = lev - prev_l;
+            let num_contrib = (0..self.np)
+                .filter(|&p| self.contributions[p] >= lev)
+                .count();
+            let mut pot_l = (pc * num_contrib as i32) as f32;
+            if li == 0 {
+                pot_l += self.starting_pot as f32;
+            }
+            if pot_l == 0.0 {
+                prev_l = lev;
+                continue;
+            }
+
+            let trav_elig = !self.traverser_folded && self.c_t >= lev;
+            let mut elig_count: u32 = trav_elig as u32;
+            for oi in 0..num_opp {
+                if self.opp_folded[oi] {
+                    continue;
+                }
+                if self.opp_contrib[oi] < lev {
+                    continue;
+                }
+                elig_count += 1;
+            }
+
+            if elig_count == 0 {
+                if self.contributions[self.traverser] >= lev {
+                    let trav_contrib_at_lev = pc as f32
+                        + if li == 0 {
+                            self.starting_pot as f32 / self.np as f32
+                        } else {
+                            0.0
+                        };
+                    // Relation-independent: contributes × total mass.
+                    cash += trav_contrib_at_lev * s_total;
+                }
+                prev_l = lev;
+                continue;
+            }
+
+            if !trav_elig {
+                prev_l = lev;
+                continue;
+            }
+
+            // m_out = mass of relation branches that do NOT affect this
+            // level: active non-eligible opponents (their three branches
+            // sum out) and folded opponents (compat mass). Opponent order.
+            let mut m_out = 1.0f32;
+            for oi in 0..num_opp {
+                if self.opp_folded[oi] {
+                    m_out *= sc[oi][3];
+                    continue;
+                }
+                if self.opp_contrib[oi] < lev {
+                    m_out *= sc[oi][0] + sc[oi][1] + sc[oi][2];
+                }
+            }
+
+            // dp[j] = P(no lose among eligible processed so far, j ties).
+            // In-place descending-j update; skip-on-zero mirrors the
+            // enumerated arm's branch skips (and keeps singleton adds
+            // as 0.0 + x).
+            dp[0] = 1.0;
+            let mut ne = 0usize;
+            for oi in 0..num_opp {
+                if self.opp_folded[oi] || self.opp_contrib[oi] < lev {
+                    continue;
+                }
+                let w = sc[oi][0];
+                let t = sc[oi][1];
+                dp[ne + 1] = 0.0;
+                for j in (0..=ne).rev() {
+                    let d = dp[j];
+                    if d != 0.0 && t != 0.0 {
+                        dp[j + 1] += d * t;
+                    }
+                    dp[j] = if d != 0.0 && w != 0.0 { d * w } else { 0.0 };
+                }
+                ne += 1;
+            }
+
+            let pot_after_rake = if li == 0 {
+                pot_l - self.main_pot_rake
+            } else {
+                pot_l
+            };
+            for (j, &d) in dp.iter().enumerate().take(ne + 1) {
+                if d == 0.0 {
+                    continue;
+                }
+                let tied = (j + 1) as u32;
+                cash += m_out * d * (pot_after_rake / tied as f32);
+            }
+            prev_l = lev;
+        }
+        cash - self.traverser_stake * s_total
+    }
+}
+
+/// Design 1, arm-2 COLLAPSED: identical dispatch and identical B^K
+/// bucket-tuple enumeration with pairwise conflict fractions (it IS
+/// Design 1 semantically); the per-tuple 3^K_active relation
+/// enumeration is replaced by `Arm2Ctx::net_expected`'s per-level
+/// tie-count DP. Cost: B^K × levels × K² instead of B^K × 3^K × levels.
+///
+/// Gate chain: bit-exact vs the enumerated arm AND the exact CPU
+/// evaluator at singletons (where the computation graphs coincide);
+/// measured ulp-scale drift at general B (float reordering — pinned,
+/// not negotiated); full identity walk bit-exact at B = nh.
+#[allow(clippy::too_many_arguments)]
+pub fn bucketed_showdown_cfv_design1_collapsed(
+    bucket_reach: &[&[f32]],
+    tables: &BucketedRunoutTables,
+    contributions: &[i32],
+    fold_mask: u16,
+    traverser: usize,
+    num_players: u8,
+    starting_pot: i32,
+    rake_rate: f32,
+    rake_cap: f32,
+    flop_seen: bool,
+) -> Vec<f32> {
+    let nb = tables.nb;
+    let num_opp = bucket_reach.len();
+    let np = num_players as usize;
+    let c_t = contributions[traverser];
+    let mut cfv = vec![0.0f32; nb];
+
+    assert!(np >= 4, "design1_collapsed: np ≥ 4 only (same scope as Design 1)");
+    assert!(num_opp == np - 1);
+    assert!(num_opp <= MAX_OPP);
+
+    let (eff_rake_rate, eff_rake_cap) = if flop_seen {
+        (rake_rate, rake_cap)
+    } else {
+        (0.0, 0.0)
+    };
+
+    let mut all_active_equal = true;
+    let mut ref_contrib: Option<i32> = None;
+    for p in 0..np {
+        if fold_mask & (1u16 << p) != 0 {
+            continue;
+        }
+        let cp = contributions[p];
+        if let Some(r) = ref_contrib {
+            if cp != r {
+                all_active_equal = false;
+                break;
+            }
+        } else {
+            ref_contrib = Some(cp);
+        }
+    }
+
+    if all_active_equal && fold_mask == 0 {
+        // Arm 1 is ALREADY collapsed (state-carrying DP) — shared code,
+        // bit-identical to bucketed_showdown_cfv's arm 1.
+        let k = num_opp as f32;
+        let half_pot = starting_pot as f32 / np as f32 + c_t as f32;
+        let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+        let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
+        let rake_per_unit_stake = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
+
+        let mut prefix = vec![0u16; num_opp];
+        for bt in 0..nb {
+            let mut accum = 0.0f32;
+            let mut state = [0.0f32; MAX_OPP + 2];
+            state[1] = 1.0;
+            recurse_eq_buckets(
+                0, num_opp, nb, bt, &state, &mut prefix,
+                bucket_reach, tables, k, rake_per_unit_stake, &mut accum,
+            );
+            cfv[bt] = half_pot * accum;
+        }
+        return cfv;
+    }
+
+    // Arm 2 collapsed — same Arm2Ctx precompute as the enumerated arm.
+    let mut levels: Vec<i32> = (0..np).map(|p| contributions[p]).collect();
+    levels.sort();
+    levels.dedup();
+    let main_pot_amount: i32 = if levels.is_empty() {
+        starting_pot
+    } else {
+        let num_main_contributors = (0..np)
+            .filter(|&p| contributions[p] >= levels[0])
+            .count();
+        levels[0] * num_main_contributors as i32 + starting_pot
+    };
+    let main_pot_rake: f32 = (main_pot_amount as f32 * eff_rake_rate)
+        .min(eff_rake_cap)
+        .max(0.0);
+    let traverser_stake = starting_pot as f32 / np as f32 + c_t as f32;
+    let traverser_folded = fold_mask & (1u16 << traverser) != 0;
+    let opp_player: Vec<usize> = (0..num_opp)
+        .map(|oi| if oi < traverser { oi } else { oi + 1 })
+        .collect();
+    let opp_contrib: Vec<i32> = opp_player.iter().map(|&p| contributions[p]).collect();
+    let opp_folded: Vec<bool> = opp_player
+        .iter()
+        .map(|&p| fold_mask & (1u16 << p) != 0)
+        .collect();
+
+    let ctx = Arm2Ctx {
+        levels,
+        np,
+        contributions: contributions.to_vec(),
+        starting_pot,
+        main_pot_rake,
+        traverser_stake,
+        traverser_folded,
+        c_t,
+        opp_contrib,
+        opp_folded,
+        traverser,
+    };
+
+    let mut prefix = vec![0u16; num_opp];
+    let mut sc = vec![[0.0f32; 4]; num_opp];
+    for bt in 0..nb {
+        let mut accum = 0.0f32;
+        recurse_tuples_collapsed(
+            0, num_opp, nb, bt, 1.0, &mut prefix, &mut sc,
+            bucket_reach, tables, &ctx, &mut accum,
+        );
+        cfv[bt] = accum;
+    }
+    cfv
+}
+
+/// Collapsed arm-2 tuple recursion: IDENTICAL weight chain (r, then
+/// prefix f_n products in order) and skip conditions to
+/// `recurse_levels_buckets`; relation branch factors move into the
+/// leaf's `net_expected` (×1.0-equivalent repositioning at singletons).
+#[allow(clippy::too_many_arguments)]
+fn recurse_tuples_collapsed(
+    oi: usize,
+    num_opp: usize,
+    nb: usize,
+    bt: usize,
+    weight: f32,
+    prefix: &mut [u16],
+    sc: &mut [[f32; 4]],
+    bucket_reach: &[&[f32]],
+    tables: &BucketedRunoutTables,
+    ctx: &Arm2Ctx,
+    accum: &mut f32,
+) {
+    if oi == num_opp {
+        *accum += weight * ctx.net_expected(sc);
+        return;
+    }
+    for bo in 0..nb {
+        let r = bucket_reach[oi][bo];
+        if r == 0.0 {
+            continue;
+        }
+        let mut base = weight * r;
+        let mut blocked = false;
+        for &pb in prefix[..oi].iter() {
+            let f = tables.f_n[pb as usize * nb + bo];
+            if f == 0.0 {
+                blocked = true;
+                break;
+            }
+            base *= f;
+        }
+        if blocked {
+            continue;
+        }
+        let i = bt * nb + bo;
+        if ctx.opp_folded[oi] {
+            let n = tables.f_n[i];
+            if n == 0.0 {
+                continue; // same skip as the enumerated arm's folded branch
+            }
+            sc[oi] = [0.0, 0.0, 0.0, n];
+        } else {
+            let w = tables.f_w[i];
+            let t = tables.f_t[i];
+            let l = tables.f_l[i];
+            if w == 0.0 && t == 0.0 && l == 0.0 {
+                continue; // all three branches would be skipped
+            }
+            sc[oi] = [w, t, l, 0.0];
+        }
+        prefix[oi] = bo as u16;
+        recurse_tuples_collapsed(
+            oi + 1, num_opp, nb, bt, base, prefix, sc,
+            bucket_reach, tables, ctx, accum,
+        );
+    }
+}
+
 /// ═══ Design 2 — factored-over-buckets, O(K·B²) per terminal ═══
 ///
 /// The B1-logged "road past the M4 ceiling", promoted to the production

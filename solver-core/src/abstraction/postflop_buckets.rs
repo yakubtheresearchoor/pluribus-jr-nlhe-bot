@@ -71,6 +71,33 @@
 //! Cost discipline (B1 note 3): the W/T/L precompute is a COST CLAIM
 //! until measured. The timing test below produces the per-flop number at
 //! production nh; the B4 blueprint projection must include it.
+//!
+//! === NAMED LIMITATIONS (logged 2026-06-10, B4 fork arc — log, not
+//! fix; recorded here so neither gets rediscovered) ===
+//!
+//! 1. INSTRUMENT WALL: the equilibrium-quality verdict (lifted
+//!    exploitability in the exact game) requires the exact best-response
+//!    scorer, which is O(nh^(K+1)) — usable only to research scale
+//!    (nh ≈ 16-24 at 6-max). Production-scale quality is therefore
+//!    confirmed only STRUCTURALLY. Under the production terminal
+//!    (Design 1 collapsed — exact, control-flow-only collapse) this is
+//!    acceptable: there is no approximation whose production-regime
+//!    behavior needs verifying; the residual unknown is how abstraction
+//!    loss itself scales with nh — the same residual every bucketed
+//!    solver in the literature carries. Any future APPROXIMATE terminal
+//!    re-opens this wall (see limitation 2).
+//!
+//! 2. RELATION-BLOCKING CORRELATION (why Design 2 died): opponents who
+//!    beat the traverser hold similar hands that block EACH OTHER. Any
+//!    per-opponent factorization drops exactly that coupling, and no
+//!    mass-scale correction can restore it (pairwise renormalization
+//!    improved CFV parity ~3000× and TRIPLED equilibrium damage:
+//!    +4.89% → +13.75% pot at the B=4 wet-deep A/B; factorization
+//!    alone at B=nh identity maps cost 14.87% pot). The regret loop
+//!    amplifies precisely the component terminal-level parity metrics
+//!    do not see — CFV parity is a PROXY; the equilibrium A/B
+//!    (p1_5_4_bucketing_b4_design2_equilibrium_ab, kept #[ignore]d) is
+//!    the verdict any future factored variant must pass.
 
 use crate::card::{card_pair_to_index, index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use crate::hand::eval::Hand;
@@ -495,7 +522,39 @@ pub fn build_postflop_bucketing(
     restarts: usize,
     seed: u64,
 ) -> PostflopBucketing {
-    let hands = enumerate_valid_hands(flop);
+    build_postflop_bucketing_for_hands(
+        enumerate_valid_hands(flop),
+        flop,
+        turn_cards,
+        river_cards_per_turn,
+        n_flop_buckets,
+        n_turn_buckets,
+        n_river_buckets,
+        restarts,
+        seed,
+    )
+}
+
+/// Same verbatim GS14 pipeline, fit to a CALLER-SUPPLIED hand universe.
+/// Production uses the full `enumerate_valid_hands` list (wrapper
+/// above); research harnesses pass their sampled subset so the
+/// abstraction is fit to the game actually being solved. (B4 sweep
+/// finding 2026-06-10: maps fit on the full universe and RESTRICTED to
+/// a small subset are effectively far coarser than nominal B — e.g. a
+/// board-straight runout collapses the subset to one chop cluster —
+/// so restriction measures a different, blunter abstraction.)
+#[allow(clippy::too_many_arguments)]
+pub fn build_postflop_bucketing_for_hands(
+    hands: Vec<(Card, Card)>,
+    flop: &[Card; 3],
+    turn_cards: &[Card],
+    river_cards_per_turn: &[Vec<Card>],
+    n_flop_buckets: usize,
+    n_turn_buckets: usize,
+    n_river_buckets: usize,
+    restarts: usize,
+    seed: u64,
+) -> PostflopBucketing {
     let nh = hands.len();
     let n_turn = turn_cards.len();
 

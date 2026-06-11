@@ -140,6 +140,17 @@ fn identity_gate_wet_deep_bit_exact() {
     let mut bucketed = BucketedFlopCfr::new(&tree, game_b.table(), &bk);
     let root_bucketed = bucketed.run(&tree, &game_b, &bk, ITERS);
 
+    // Design1Collapsed through the SAME walk: at singletons the
+    // collapsed arm-2's DP is point-mass selection, so the full walk
+    // must also be bit-exact (the B4 collapse gate's walk-level link).
+    let game_c = FlopStartGame::new(build_wet_deep_table());
+    let bk_c = FlopBucketing::identity(game_c.table());
+    let mut collapsed = BucketedFlopCfr::new(&tree, game_c.table(), &bk_c);
+    collapsed.set_terminal_design(
+        solver_core::solver::bucketed_flop_cfr::TerminalDesign::Design1Collapsed,
+    );
+    let root_collapsed = collapsed.run(&tree, &game_c, &bk_c, ITERS);
+
     // Stride sanity: at B = nh the bucketed strides must equal the
     // exact solver's (same infoset counts, same nh).
     assert_eq!(bucketed.flop_stride() * 1, exact.regrets_flop().len());
@@ -164,6 +175,39 @@ fn identity_gate_wet_deep_bit_exact() {
         "cum_strategy_river",
         exact.cum_strategy_river(),
         bucketed.cum_strategy_river(),
+    );
+
+    // Collapsed terminal, same standard.
+    assert_buffers_bit_exact("collapsed root_cfv", &root_exact, &root_collapsed);
+    assert_buffers_bit_exact(
+        "collapsed regrets_flop",
+        exact.regrets_flop(),
+        collapsed.regrets_flop(),
+    );
+    assert_buffers_bit_exact(
+        "collapsed cum_strategy_flop",
+        exact.cum_strategy_flop(),
+        collapsed.cum_strategy_flop(),
+    );
+    assert_buffers_bit_exact(
+        "collapsed regrets_turn",
+        exact.regrets_turn(),
+        collapsed.regrets_turn(),
+    );
+    assert_buffers_bit_exact(
+        "collapsed cum_strategy_turn",
+        exact.cum_strategy_turn(),
+        collapsed.cum_strategy_turn(),
+    );
+    assert_buffers_bit_exact(
+        "collapsed regrets_river",
+        exact.regrets_river(),
+        collapsed.regrets_river(),
+    );
+    assert_buffers_bit_exact(
+        "collapsed cum_strategy_river",
+        exact.cum_strategy_river(),
+        collapsed.cum_strategy_river(),
     );
 
     eprintln!(
