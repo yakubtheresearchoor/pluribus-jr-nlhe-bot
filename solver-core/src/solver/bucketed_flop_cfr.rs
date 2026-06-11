@@ -317,6 +317,56 @@ pub fn lift_cum_to_exact(
     }
 }
 
+/// GPU buffer layout for the bucketed solve. Produced ONLY by
+/// `BucketedFlopCfr::gpu_layout` (single source); the offset gate
+/// (p1_5_4_gpu_bucketed_g2_offset_gate) pins it against from-scratch
+/// recomputation at DIVERGENT per-street bucket counts before any
+/// kernel exists.
+pub struct BucketedGpuLayout {
+    pub dims: crate::solver::zone_dims::ZoneDims,
+    /// Zone-relative float base per node (`local · MAX_NA · nb_zone`);
+    /// u32::MAX for non-decision/foreign nodes.
+    pub node_local_base: Vec<u32>,
+    zones: Vec<Zone>,
+}
+
+impl BucketedGpuLayout {
+    /// The flat index into the concatenated persistent buffer for
+    /// (node, outcome, action, bucket) — EXACTLY what the kernel will
+    /// compute as `params.zone_outcome_base + node_local_base[node] +
+    /// a·nb + b`. This Rust mirror is the gate's subject.
+    pub fn flat_index(
+        &self,
+        node: usize,
+        ti: Option<usize>,
+        ri: Option<usize>,
+        a: usize,
+        b: usize,
+    ) -> usize {
+        use crate::solver::zone_dims::ZoneRef;
+        let (zone_ref, nb) = match self.zones[node] {
+            Zone::Flop => (ZoneRef::Flop, self.dims.nh_flop),
+            Zone::Turn => (ZoneRef::Turn { ti: ti.unwrap() }, self.dims.nh_turn),
+            Zone::River => (
+                ZoneRef::River {
+                    outcome_idx: ti.unwrap() * self.dims.max_river + ri.unwrap(),
+                },
+                self.dims.nh_river,
+            ),
+            Zone::Preflop => unreachable!(),
+        };
+        debug_assert!(a < self.dims.max_na && b < nb);
+        self.dims.zone_float_offset(zone_ref)
+            + self.node_local_base[node] as usize
+            + a * nb
+            + b
+    }
+
+    pub fn zone_of(&self, node: usize) -> Zone {
+        self.zones[node]
+    }
+}
+
 /// The bucketed walk. Field-by-field mirror of `FlopStartVectorCfr`
 /// with bucket-granularity storage (InMemory river only).
 pub struct BucketedFlopCfr {
@@ -1099,6 +1149,40 @@ impl BucketedFlopCfr {
     pub fn cum_strategy_turn(&self) -> &[f32] { &self.cum_strategy_turn }
     pub fn regrets_river(&self) -> &[f32] { &self.regrets_river }
     pub fn cum_strategy_river(&self) -> &[f32] { &self.cum_strategy_river }
+    /// GPU-facing layout for the bucketed solve (G2 step 1 — built and
+    /// gated BEFORE any kernel consumes it). Kernel-side index math is
+    /// reduced to `zone_outcome_base + node_local_base[node] + a·nb + b`;
+    /// zone/outcome bases and the per-node bases are precomputed HERE,
+    /// from the same ZoneDims source as every CPU stride, so the only
+    /// formula a shader carries is `a·nb + b`.
+    pub fn gpu_layout(&self, bk: &FlopBucketing) -> BucketedGpuLayout {
+        let dims = crate::solver::zone_dims::ZoneDims {
+            max_na: MAX_NA_POSTFLOP,
+            nh_flop: bk.nb_flop,
+            nh_turn: bk.nb_turn,
+            nh_river: bk.nb_river,
+            flop_infosets: self.flop_infoset_count,
+            turn_infosets: self.turn_infoset_count,
+            river_infosets: self.river_infoset_count,
+            n_turn: bk.turn_map.len(),
+            max_river: self.max_n_river,
+        };
+        let nn = self.zones.len();
+        let mut node_local_base = vec![u32::MAX; nn];
+        for idx in 0..nn {
+            let (local, nb) = match self.zones[idx] {
+                Zone::Flop => (self.flop_local_offset[idx], bk.nb_flop),
+                Zone::Turn => (self.turn_local_offset[idx], bk.nb_turn),
+                Zone::River => (self.river_local_offset[idx], bk.nb_river),
+                Zone::Preflop => (UNUSED, 0),
+            };
+            if local != UNUSED {
+                node_local_base[idx] = (local * MAX_NA_POSTFLOP * nb) as u32;
+            }
+        }
+        BucketedGpuLayout { dims, node_local_base, zones: self.zones.clone() }
+    }
+
     pub fn flop_local_offset_at(&self, idx: usize) -> Option<usize> {
         let v = self.flop_local_offset[idx];
         if v == UNUSED { None } else { Some(v) }
