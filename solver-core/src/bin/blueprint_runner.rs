@@ -1,0 +1,246 @@
+//! Blueprint production runner — cell A baseline: 1755 canonical flops
+//! × 1×1 seeded runout, quantile B=8 maps, Design1Collapsed, 34 DCFR
+//! iters (the 1%-pot target), banked to disk per flop.
+//!
+//! Priced by the B4 ladder at ~10.5h (16-way). RESUMABLE: per-flop
+//! output files, written to .tmp then renamed; existing files skipped,
+//! so the run survives interruption and re-launch.
+//!
+//! Banking format (version 1, fidelity-agnostic — the GPU blueprint
+//! drops into the same slot): per flop `flop_NNNN.bp`:
+//!   magic "SSBP1\n"
+//!   one JSON header line (flop cards, B per street, runout cards,
+//!     iters, tree config summary, nh, solve seconds)
+//!   then named sections: name '\n' u64-LE byte length, raw bytes.
+//!   Sections: cum_flop / cum_turn / cum_river (f32-LE), map_flop
+//!   (u16-LE), map_turn (u16-LE, concatenated per ti), map_river
+//!   (u16-LE, concatenated per (ti, ri)).
+//!
+//! Config notes (named, deliberate):
+//!   - Tree: the preflop-bootstrap ORACLE shape (1 bet 1.0×pot, no
+//!     raises, stacks 94, pot 12, contribs 0) — the seam-consistent
+//!     single-pot-context family the frozen oracle keys on. The lean
+//!     MAX_NA=4 action set re-prices the ladder (~terminal-count
+//!     linear) and gets its own row before anyone banks it.
+//!   - Runout: 1×1 per cell A, drawn per-flop by seeded splitmix
+//!     (seed = flop index) so the ensemble isn't position-biased and
+//!     the artifact is regenerable from pinned seeds.
+//!   - Maps: quantile B=8 (the shipped family; GS14 is the in-tree
+//!     challenger for the head-to-head A/B).
+//!
+//! Env: BP_OUT (default blueprint_out/), BP_THREADS (default 14),
+//! BP_ITERS (34), BP_B (8), BP_START / BP_END (flop index range).
+
+use solver_core::card::Card;
+use solver_core::solver::bucketed_flop_cfr::{
+    BucketedFlopCfr, FlopBucketing, TerminalDesign, NO_BUCKET,
+};
+use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
+use solver_core::solver::preflop_start_game::PreflopChanceTable;
+use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
+use solver_core::tree::builder::build_tree;
+use solver_core::tree::flat::FlatTree;
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+const N_CLASSES: usize = 169;
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+fn build_oracle_tree() -> FlatTree {
+    let cfg = TreeConfig {
+        num_players: 6,
+        initial_state: BoardState::Flop,
+        starting_pot: 12,
+        starting_stacks: vec![94; 6],
+        initial_contributions: vec![0; 6],
+        rake_rate: 0.0,
+        rake_cap: 0.0,
+        bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
+        add_allin_threshold: 1.0,
+        force_allin_threshold: 1.0,
+        merging_threshold: 0.0,
+        button_player: None,
+    };
+    build_tree(&cfg).expect("oracle tree builds")
+}
+
+fn quantile_maps(
+    table: &FlopChanceTable,
+    nb: usize,
+) -> (Vec<u16>, Vec<Vec<u16>>, Vec<Vec<Vec<u16>>>) {
+    let nh = table.num_valid;
+    let conflicts = |h: usize, cards: &[u8]| -> bool {
+        let c1 = table.hand_cards[h * 2];
+        let c2 = table.hand_cards[h * 2 + 1];
+        cards.iter().any(|&bc| bc == c1 || bc == c2)
+    };
+    let map_for = |pl_idx: &[u16], dead: &[u8]| -> Vec<u16> {
+        let alive: Vec<usize> = pl_idx[..nh]
+            .iter()
+            .map(|&i| i as usize)
+            .filter(|&h| !conflicts(h, dead))
+            .collect();
+        let n = alive.len();
+        assert!(n >= nb);
+        let mut map = vec![NO_BUCKET; nh];
+        for (pos, &h) in alive.iter().enumerate() {
+            map[h] = ((pos * nb) / n) as u16;
+        }
+        map
+    };
+    let (_, _, _, base_pi, _) = table.sorted_opp_arrays_base();
+    let flop_map = map_for(&base_pi, &[]);
+    let mut turn_maps = Vec::new();
+    let mut river_maps = Vec::new();
+    for &tc_card in &table.remaining_deck {
+        let (_, _, _, pi) = table.turn_sorted_arrays(tc_card);
+        turn_maps.push(map_for(pi, &[tc_card]));
+        let mut rms = Vec::new();
+        for &rc_card in &table.river_decks[tc_card as usize] {
+            let (_, _, _, pi) = table.river_sorted_arrays(tc_card, rc_card);
+            rms.push(map_for(pi, &[tc_card, rc_card]));
+        }
+        river_maps.push(rms);
+    }
+    (flop_map, turn_maps, river_maps)
+}
+
+fn write_section(out: &mut impl Write, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    writeln!(out, "{name}")?;
+    out.write_all(&(bytes.len() as u64).to_le_bytes())?;
+    out.write_all(bytes)
+}
+
+fn f32s(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+fn u16s(v: &[u16]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_and_bank(
+    fi: usize,
+    flop: [Card; 3],
+    tree: &FlatTree,
+    nb: usize,
+    iters: u32,
+    out_dir: &str,
+) -> std::io::Result<f64> {
+    // Seeded 1×1 runout draw.
+    let board_mask: u64 = flop.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
+    let deck: Vec<u8> = (0..52u8).filter(|c| board_mask & (1u64 << c) == 0).collect();
+    let tpos = (splitmix64(fi as u64) % deck.len() as u64) as usize;
+    let tc = deck[tpos];
+    let rdeck: Vec<u8> = deck.iter().copied().filter(|&c| c != tc).collect();
+    let rpos = (splitmix64(fi as u64 ^ 0xDEAD_BEEF) % rdeck.len() as u64) as usize;
+    let rc = rdeck[rpos];
+    let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+    river_decks[tc as usize] = vec![rc];
+
+    let t0 = Instant::now();
+    let table = FlopChanceTable::build_full_nh_sampled(flop, 6, &[tc], &river_decks);
+    let (fm, tm, rm) = quantile_maps(&table, nb);
+    let game = FlopStartGame::new(table);
+    let bk = FlopBucketing::from_maps(game.table(), nb, nb, nb, fm, tm, rm);
+    let mut solver = BucketedFlopCfr::new(tree, game.table(), &bk);
+    solver.set_terminal_design(TerminalDesign::Design1Collapsed);
+    solver.run(tree, &game, &bk, iters);
+    let secs = t0.elapsed().as_secs_f64();
+
+    let path = format!("{out_dir}/flop_{fi:04}.bp");
+    let tmp = format!("{path}.tmp");
+    {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        f.write_all(b"SSBP1\n")?;
+        writeln!(
+            f,
+            "{{\"flop\":[{},{},{}],\"b\":[{nb},{nb},{nb}],\"turn\":[{tc}],\"rivers\":[[{rc}]],\
+             \"iters\":{iters},\"tree\":\"oracle-1bet-94-12\",\"nh\":{},\"terminal\":\"design1_collapsed\",\
+             \"maps\":\"quantile\",\"secs\":{secs:.1},\"format\":1}}",
+            flop[0], flop[1], flop[2],
+            game.table().num_valid,
+        )?;
+        write_section(&mut f, "cum_flop", &f32s(solver.cum_strategy_flop()))?;
+        write_section(&mut f, "cum_turn", &f32s(solver.cum_strategy_turn()))?;
+        write_section(&mut f, "cum_river", &f32s(solver.cum_strategy_river()))?;
+        write_section(&mut f, "map_flop", &u16s(&bk.flop_map))?;
+        let turn_cat: Vec<u16> = bk.turn_map.iter().flatten().copied().collect();
+        write_section(&mut f, "map_turn", &u16s(&turn_cat))?;
+        let river_cat: Vec<u16> =
+            bk.river_map.iter().flatten().flatten().copied().collect();
+        write_section(&mut f, "map_river", &u16s(&river_cat))?;
+        f.flush()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(secs)
+}
+
+fn main() {
+    let out_dir = std::env::var("BP_OUT").unwrap_or_else(|_| "blueprint_out".into());
+    let threads: usize =
+        std::env::var("BP_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(14);
+    let iters: u32 = std::env::var("BP_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(34);
+    let nb: usize = std::env::var("BP_B").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let start: usize = std::env::var("BP_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    std::fs::create_dir_all(&out_dir).expect("create out dir");
+
+    eprintln!("blueprint_runner: cell A baseline (B={nb}, {iters} iters, 1×1 seeded runouts)");
+    let ranges: Vec<Vec<f32>> =
+        (0..6).map(|_| vec![1.0 / N_CLASSES as f32; N_CLASSES]).collect();
+    let ptable = PreflopChanceTable::new(6, ranges);
+    let canon = ptable.canonical_flops.clone();
+    let end: usize =
+        std::env::var("BP_END").ok().and_then(|s| s.parse().ok()).unwrap_or(canon.len());
+    let tree = build_oracle_tree();
+    eprintln!(
+        "{} canonical flops [{start}..{end}), tree {} nodes, {} threads, out={out_dir}",
+        canon.len(),
+        tree.num_nodes(),
+        threads
+    );
+
+    let todo: Vec<usize> = (start..end)
+        .filter(|fi| !std::path::Path::new(&format!("{out_dir}/flop_{fi:04}.bp")).exists())
+        .collect();
+    eprintln!("{} flops to solve ({} already banked)", todo.len(), (end - start) - todo.len());
+
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let t_all = Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(todo.len()) {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= todo.len() {
+                    break;
+                }
+                let fi = todo[k];
+                match solve_and_bank(fi, canon[fi], &tree, nb, iters, &out_dir) {
+                    Ok(secs) => {
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if d % 25 == 0 || d == todo.len() {
+                            let el = t_all.elapsed().as_secs_f64();
+                            eprintln!(
+                                "[{d}/{}] flop {fi} done in {secs:.0}s | elapsed {:.1}h | ETA {:.1}h",
+                                todo.len(),
+                                el / 3600.0,
+                                el / d as f64 * (todo.len() - d) as f64 / 3600.0
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("flop {fi} FAILED: {e}"),
+                }
+            });
+        }
+    });
+    eprintln!("all done in {:.1}h", t_all.elapsed().as_secs_f64() / 3600.0);
+}
