@@ -645,16 +645,17 @@ fn b4_cost_measurement_design2() {
 ///      open cost flag on this line.
 ///   3. W/T/L precompute: 0.1 s/flop (B2 measured) → ~11 s total at
 ///      1755/16. Negligible.
-///   4. Preflop layer: frozen-CFV oracle design means postflop solves
-///      are NOT multiplied by preflop iterations (cached per flop ×
-///      traverser); the preflop walk + pairwise terminals add a line
-///      that is measured only at research scale — production preflop
-///      wall-clock is the named UNPRICED line item.
-///   5. Runout-sampling caveat: rows are per-flop at the M2 1×1
-///      sampled-chance shape (same as the M4 formula). The blueprint's
-///      runout-sampling policy multiplies the postflop line linearly
-///      in sampled (n_turn × n_river) — a design input, priced when
-///      chosen, not assumed here.
+///   4. Preflop layer: PRICED 2026-06-10
+///      (p1_5_4_blueprint_preflop_cost): 3.4s/iter single core via the
+///      shared-chance collapse (gated bit-exact; 897.1s uncollapsed).
+///      NEGLIGIBLE — even 1,000 preflop iterations < 1h.
+///   5. Runout policy: PRICED 2026-06-10
+///      (p1_5_4_blueprint_runout_policy): linear multiplier on rows
+///      above. B=8 full-set/1%: 1×1 10.5h fits, 2×2 42h breaks, 4×4
+///      168h; at 100 flops all fit (0.6/2.4/9.6h). Quality: flop-σ
+///      two-fidelity stability — 1×1 mean |Δσ| 0.105 vs 4×4; 2×2
+///      0.034 (3× stabler, not yet converged). Runout fidelity is the
+///      budget governor at full canonicals.
 ///
 /// ═══ FORK PRICING (signed-off wording) ═══
 ///   GPU bucketed port: MOOT at B=8 full-canonical/1%-pot (10.5h CPU);

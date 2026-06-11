@@ -744,6 +744,78 @@ impl PreflopVectorCfr {
         self.iteration += 1;
     }
 
+    /// `run_one_iteration` with the chance-node CFV computed ONCE per
+    /// (chance_key, traverser) and broadcast to every chance node
+    /// sharing that key — the frozen-oracle collapse (B5 preflop
+    /// pricing, 2026-06-10).
+    ///
+    /// WHY THIS IS EXACT (not an approximation), given a reach-
+    /// independent oracle: `compute_chance_node_cfv_with_expansion`'s
+    /// output flows reach ONLY into the oracle call's `combo_reaches`;
+    /// `reduce_cfv_combo_to_class` is an unweighted per-class average
+    /// of `v_combo` and `aggregate_preflop_chance` weights only by
+    /// chance probability. A frozen oracle (CFVs cached per (flop,
+    /// traverser), ignoring reach) therefore yields BIT-IDENTICAL
+    /// v_class at every chance node with the same key — the per-node
+    /// recomputation is pure control flow, same species as the 3^K
+    /// collapse. Measured: 897.1s/iter → collapse target ~3s (1493
+    /// chance nodes × 6 traversers × 1755 canonicals of redundant
+    /// expand/lookup/reduce removed).
+    ///
+    /// `chance_key(chance_idx)`: epoch-sharing key. Constant for a
+    /// fully reach-independent frozen oracle; pot-bucket id for a
+    /// pot-bucketed frozen oracle. CALLER CONTRACT: the oracle's
+    /// answer must depend only on (canonical_flop, traverser, key) —
+    /// an oracle that reads `combo_ranges` voids the collapse (use
+    /// `run_one_iteration`). Gated bit-exact vs `run_one_iteration`
+    /// by p1_5_4_blueprint_preflop_cost.
+    pub fn run_one_iteration_shared_chance(
+        &mut self,
+        tree: &FlatTree,
+        table: &PreflopChanceTable,
+        oracle: &mut impl PostflopValueOracle,
+        terminal_value_fn: impl Fn(usize, u8, &[Vec<f32>]) -> Vec<f32>,
+        chance_key: impl Fn(usize) -> u64,
+    ) {
+        let n_classes = NUM_PREFLOP_CLASSES;
+        let nn = tree.num_nodes();
+        let np = self.num_players;
+
+        self.compute_preflop_strategy(tree);
+        let reach = self.compute_preflop_reach(tree, None);
+        let chance_nodes = self.preflop_chance_node_indices(tree);
+        let params = DcfrParams::new(self.iteration);
+
+        oracle.begin_preflop_iter(self.iteration);
+
+        for t in 0..np {
+            let mut cfv: Vec<Vec<f32>> = vec![vec![0.0_f32; n_classes]; nn];
+            let mut by_key: std::collections::HashMap<u64, Vec<f32>> =
+                std::collections::HashMap::new();
+            for &chance_idx in &chance_nodes {
+                let key = chance_key(chance_idx);
+                let v = match by_key.get(&key) {
+                    Some(v) => v.clone(),
+                    None => {
+                        let v = self.compute_chance_node_cfv_with_expansion(
+                            chance_idx, t, &reach, table, oracle,
+                        );
+                        by_key.insert(key, v.clone());
+                        v
+                    }
+                };
+                cfv[chance_idx] = v;
+            }
+
+            self.bottom_up_preflop_for_traverser(
+                tree, t, &chance_nodes, &reach, &terminal_value_fn, &mut cfv, &params,
+            );
+        }
+
+        oracle.end_preflop_iter(self.iteration);
+        self.iteration += 1;
+    }
+
     /// Helper: propagate reach from `node_idx` to its children, then
     /// recurse. Stops propagation if a child is NOT in the preflop zone
     /// (zone boundary is the preflop→flop chance edge; children of that
