@@ -69,7 +69,11 @@ pub struct BucketedTerminalGpu {
     river_term_ids: Vec<u32>,
     nh: usize,
     np: usize,
-    nb: usize,
+    nb_flop: usize,
+    nb_turn: usize,
+    nb_river: usize,
+    /// Per-runout float offsets into `fractions` (runout-indexed).
+    table_offs: Vec<u32>,
     n_turn: usize,
     max_river: usize,
     remaining_deck: Vec<u8>,
@@ -118,11 +122,14 @@ impl BucketedTerminalGpu {
         stripes: u32,
     ) -> MetalResult<Self> {
         assert!(tree.num_players >= 4, "bucketed terminal: np ≥ 4 only");
-        assert_eq!(bk.nb_flop, bk.nb_turn, "v1: uniform B across streets");
-        assert_eq!(bk.nb_turn, bk.nb_river, "v1: uniform B across streets");
-        let nb = bk.nb_flop;
-        assert!(nb <= MAX_BUCKETS_GPU, "B > MAX_BUCKETS_GPU stays CPU-only");
-        assert!(stripes >= 1 && (32 / nb as u32) >= stripes, "stripes × nb ≤ 32");
+        for nb in [bk.nb_flop, bk.nb_turn, bk.nb_river] {
+            assert!(nb <= MAX_BUCKETS_GPU, "B > MAX_BUCKETS_GPU stays CPU-only");
+        }
+        let nb_max = bk.nb_flop.max(bk.nb_turn).max(bk.nb_river);
+        assert!(
+            stripes >= 1 && (32 / nb_max as u32) >= stripes,
+            "stripes × max(nb) ≤ 32"
+        );
 
         let nh = table.num_valid;
         let np = tree.num_players as usize;
@@ -137,29 +144,41 @@ impl BucketedTerminalGpu {
 
         let pipeline = ctx.create_pipeline("bucketed_terminal_collapsed")?;
 
-        // ── Concatenated fraction tables + maps, runout-indexed ──
+        // ── Concatenated fraction tables + maps, runout-indexed.
+        //    Per-runout table size is 4·nb_zone² (divergent per-street
+        //    B is the layout's reason for existing); offsets accumulate. ──
         let n_runouts = 1 + n_turn + n_turn * max_river;
-        let mut fractions = vec![0.0f32; n_runouts * 4 * nb * nb];
+        let mut fractions: Vec<f32> = Vec::new();
+        let mut table_offs = vec![0u32; n_runouts];
         let mut maps = vec![u16::MAX; n_runouts * nh];
         {
             let mut put = |ridx: usize,
+                           nb: usize,
                            t: &crate::solver::bucketed_showdown::BucketedRunoutTables,
-                           m: &[u16]| {
-                let fo = ridx * 4 * nb * nb;
-                fractions[fo..fo + nb * nb].copy_from_slice(&t.f_w);
-                fractions[fo + nb * nb..fo + 2 * nb * nb].copy_from_slice(&t.f_t);
-                fractions[fo + 2 * nb * nb..fo + 3 * nb * nb].copy_from_slice(&t.f_l);
-                fractions[fo + 3 * nb * nb..fo + 4 * nb * nb].copy_from_slice(&t.f_n);
+                           m: &[u16],
+                           fractions: &mut Vec<f32>,
+                           table_offs: &mut Vec<u32>,
+                           maps: &mut Vec<u16>| {
+                assert_eq!(t.nb, nb);
+                table_offs[ridx] = fractions.len() as u32;
+                fractions.extend_from_slice(&t.f_w);
+                fractions.extend_from_slice(&t.f_t);
+                fractions.extend_from_slice(&t.f_l);
+                fractions.extend_from_slice(&t.f_n);
                 maps[ridx * nh..(ridx + 1) * nh].copy_from_slice(m);
             };
-            put(0, &bk.flop_tables, &bk.flop_map);
+            put(0, bk.nb_flop, &bk.flop_tables, &bk.flop_map, &mut fractions, &mut table_offs, &mut maps);
             for ti in 0..n_turn {
-                put(1 + ti, &bk.turn_tables[ti], &bk.turn_map[ti]);
+                put(1 + ti, bk.nb_turn, &bk.turn_tables[ti], &bk.turn_map[ti], &mut fractions, &mut table_offs, &mut maps);
                 for ri in 0..bk.river_map[ti].len() {
                     put(
                         1 + n_turn + ti * max_river + ri,
+                        bk.nb_river,
                         &bk.river_tables[ti][ri],
                         &bk.river_map[ti][ri],
+                        &mut fractions,
+                        &mut table_offs,
+                        &mut maps,
                     );
                 }
             }
@@ -218,7 +237,10 @@ impl BucketedTerminalGpu {
             river_term_ids: r_ids,
             nh,
             np,
-            nb,
+            nb_flop: bk.nb_flop,
+            nb_turn: bk.nb_turn,
+            nb_river: bk.nb_river,
+            table_offs,
             n_turn,
             max_river,
             remaining_deck: table.remaining_deck.clone(),
@@ -263,17 +285,27 @@ impl BucketedTerminalGpu {
             Zone::Preflop => unreachable!(),
         };
         let ridx = self.runout_index(zone, tc, rc);
+        let nb_zone = match zone {
+            Zone::Flop => self.nb_flop,
+            Zone::Turn => self.nb_turn,
+            Zone::River => self.nb_river,
+            Zone::Preflop => unreachable!(),
+        };
+        // Per-zone stripes: as wide as the lane budget allows, capped
+        // at the requested production setting (1 = unstriped reference
+        // everywhere — the gate config).
+        let stripes_zone = self.stripes.min(32 / nb_zone as u32).max(1);
         let params = BucketedTermParams {
             num_terminals: terms.count,
             np: self.np as u32,
             nh: self.nh as u32,
-            nb: self.nb as u32,
+            nb: nb_zone as u32,
             num_opp: (self.np - 1) as u32,
-            stripes: self.stripes,
+            stripes: stripes_zone,
             traverser: traverser as u32,
             board0,
             board1,
-            table_off: (ridx * 4 * self.nb * self.nb) as u32,
+            table_off: self.table_offs[ridx],
             map_off: (ridx * self.nh) as u32,
             nc: self.nc,
             starting_pot: self.starting_pot,
