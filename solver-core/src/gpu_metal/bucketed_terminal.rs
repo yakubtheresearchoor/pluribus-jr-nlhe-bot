@@ -17,6 +17,7 @@ use crate::solver::flop_start_game::FlopChanceTable;
 use crate::solver::flop_start_vector_cfr::Zone;
 use crate::tree::flat::FlatTree;
 use metal::{Buffer, CommandQueue, ComputePipelineState, MTLResourceOptions, MTLSize};
+use std::collections::HashMap;
 
 use super::context::{MetalContext, MetalResult};
 
@@ -44,6 +45,43 @@ struct BucketedTermParams {
     rake_cap: f32,
     _pad: u32,
 }
+
+/// Field-for-field mirror of Metal `BucketedWalkDesc`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WalkDescGpu {
+    reach_off: u32,
+    cfv_off: u32,
+    contrib_off: u32,
+    fold_off: u32,
+    table_off: u32,
+    map_off: u32,
+    board0: u32,
+    board1: u32,
+    nb: u32,
+    stripes: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// Field-for-field mirror of Metal `BucketedBatchedParams`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BatchedParamsGpu {
+    num_jobs: u32,
+    np: u32,
+    nh: u32,
+    num_opp: u32,
+    traverser: u32,
+    nc: f32,
+    starting_pot: i32,
+    rake_rate: f32,
+    rake_cap: f32,
+    _pad: u32,
+}
+
+/// Walk identity for the batched cache.
+pub type WalkKey = (Zone, Option<usize>, Option<usize>);
 
 struct ZoneTerminals {
     node_ids: Buffer,
@@ -84,6 +122,26 @@ pub struct BucketedTerminalGpu {
     rake_cap: f32,
     stripes: u32,
     gpu_busy_s: f64,
+    // ── Batched path (G4 step 3) ──
+    batched_pipeline: ComputePipelineState,
+    /// Concatenated [flop | turn | river] zone contribs / fold masks
+    /// (i32 / u32), with per-zone element offsets.
+    contribs_all: Buffer,
+    folds_all: Buffer,
+    zone_contrib_off: [u32; 3], // int offset per zone (flop, turn, river)
+    zone_fold_off: [u32; 3],
+    /// Per-walk packed terminal cfv, filled by `fill_walks`, drained by
+    /// `fill_terminals` (cache-first).
+    cache: HashMap<(u8, usize, usize, u8), Vec<f32>>,
+}
+
+fn zone_code(z: Zone) -> u8 {
+    match z {
+        Zone::Flop => 0,
+        Zone::Turn => 1,
+        Zone::River => 2,
+        Zone::Preflop => unreachable!(),
+    }
 }
 
 fn buf_from<T: Copy>(ctx: &MetalContext, data: &[T]) -> Buffer {
@@ -144,6 +202,7 @@ impl BucketedTerminalGpu {
             .unwrap_or(0);
 
         let pipeline = ctx.create_pipeline("bucketed_terminal_collapsed")?;
+        let batched_pipeline = ctx.create_pipeline("bucketed_terminal_collapsed_batched")?;
 
         // ── Concatenated fraction tables + maps, runout-indexed.
         //    Per-runout table size is 4·nb_zone² (divergent per-street
@@ -214,6 +273,20 @@ impl BucketedTerminalGpu {
             count: ids.len() as u32,
         };
 
+        // Concatenated zone contribs/folds for the batched kernel.
+        let mut contribs_cat: Vec<i32> = Vec::new();
+        let mut folds_cat: Vec<u32> = Vec::new();
+        let mut zone_contrib_off = [0u32; 3];
+        let mut zone_fold_off = [0u32; 3];
+        for (zi, (c, m)) in [(&f_c, &f_m), (&t_c, &t_m), (&r_c, &r_m)].iter().enumerate() {
+            zone_contrib_off[zi] = contribs_cat.len() as u32;
+            zone_fold_off[zi] = folds_cat.len() as u32;
+            contribs_cat.extend_from_slice(c);
+            folds_cat.extend_from_slice(m);
+        }
+        let contribs_all = buf_from(ctx, &contribs_cat);
+        let folds_all = buf_from(ctx, &folds_cat);
+
         let reach_buf = ctx.device().new_buffer(
             (nn * np * nh * 4) as u64,
             MTLResourceOptions::StorageModeShared,
@@ -252,6 +325,12 @@ impl BucketedTerminalGpu {
             rake_cap: tree.rake_cap as f32,
             stripes,
             gpu_busy_s: 0.0,
+            batched_pipeline,
+            contribs_all,
+            folds_all,
+            zone_contrib_off,
+            zone_fold_off,
+            cache: HashMap::new(),
         })
     }
 
@@ -266,6 +345,22 @@ impl BucketedTerminalGpu {
         reach: &[f32],
         cfv: &mut [f32],
     ) -> bool {
+        // Batched cache: if fill_walks already computed this walk, drain it.
+        let key = (zone_code(zone), tc.unwrap_or(usize::MAX), rc.unwrap_or(usize::MAX), traverser);
+        if let Some(packed) = self.cache.remove(&key) {
+            let ids: &[u32] = match zone {
+                Zone::Flop => &self.flop_term_ids,
+                Zone::Turn => &self.turn_term_ids,
+                Zone::River => &self.river_term_ids,
+                Zone::Preflop => unreachable!(),
+            };
+            for (lt, &nid) in ids.iter().enumerate() {
+                let dst = nid as usize * self.nh;
+                cfv[dst..dst + self.nh]
+                    .copy_from_slice(&packed[lt * self.nh..(lt + 1) * self.nh]);
+            }
+            return true;
+        }
         let (terms, ids): (&ZoneTerminals, &[u32]) = match zone {
             Zone::Flop => (&self.flop_terms, &self.flop_term_ids),
             Zone::Turn => (&self.turn_terms, &self.turn_term_ids),
@@ -386,6 +481,196 @@ impl BucketedTerminalGpu {
     /// serialization; with HIGH busy-fraction = chip saturation.
     pub fn gpu_busy_seconds(&self) -> f64 {
         self.gpu_busy_s
+    }
+
+    /// G4 step 3: compute ALL walks' terminals in ONE dispatch (the
+    /// occupancy fix — ~1k-3.3k threadgroups vs 100-550 per-walk).
+    /// Results land in the cache, drained by `fill_terminals` as the
+    /// CPU walk reaches each (zone, outcome). `reaches[w]` is the full
+    /// [nn × np × nh] reach for walk w (the prepass keeps them).
+    pub fn fill_walks(
+        &mut self,
+        walks: &[WalkKey],
+        traverser: u8,
+        reaches: &[&[f32]],
+    ) -> () {
+        assert_eq!(walks.len(), reaches.len());
+        let nh = self.nh;
+        let np = self.np;
+
+        // Build jobs + descs + packed reach.
+        let mut jobs: Vec<[u32; 2]> = Vec::new();
+        let mut descs: Vec<WalkDescGpu> = Vec::with_capacity(walks.len());
+        let mut reach_packed: Vec<f32> = Vec::new();
+        let mut cfv_off = 0u32;
+        let mut cfv_total = 0usize;
+        for (w, &(zone, tc, rc)) in walks.iter().enumerate() {
+            let (ids, zi): (&[u32], usize) = match zone {
+                Zone::Flop => (&self.flop_term_ids, 0),
+                Zone::Turn => (&self.turn_term_ids, 1),
+                Zone::River => (&self.river_term_ids, 2),
+                Zone::Preflop => unreachable!(),
+            };
+            let nb_zone = match zone {
+                Zone::Flop => self.nb_flop,
+                Zone::Turn => self.nb_turn,
+                Zone::River => self.nb_river,
+                Zone::Preflop => unreachable!(),
+            };
+            let stripes_zone = self.stripes.min(32 / nb_zone as u32).max(1);
+            let (board0, board1) = match zone {
+                Zone::Flop => (0xFFFFu32, 0xFFFFu32),
+                Zone::Turn => (self.remaining_deck[tc.unwrap()] as u32, 0xFFFF),
+                Zone::River => {
+                    let tcc = self.remaining_deck[tc.unwrap()];
+                    let rcc = self.river_decks[tcc as usize][rc.unwrap()];
+                    (tcc as u32, rcc as u32)
+                }
+                Zone::Preflop => unreachable!(),
+            };
+            let ridx = self.runout_index(zone, tc, rc);
+            let reach_off = reach_packed.len() as u32;
+            let reach = reaches[w];
+            for &nid in ids {
+                let base = nid as usize * np * nh;
+                reach_packed.extend_from_slice(&reach[base..base + np * nh]);
+            }
+            descs.push(WalkDescGpu {
+                reach_off,
+                cfv_off,
+                contrib_off: self.zone_contrib_off[zi],
+                fold_off: self.zone_fold_off[zi],
+                table_off: self.table_offs[ridx],
+                map_off: (ridx * nh) as u32,
+                board0,
+                board1,
+                nb: nb_zone as u32,
+                stripes: stripes_zone,
+                _pad0: 0,
+                _pad1: 0,
+            });
+            for lt in 0..ids.len() {
+                jobs.push([w as u32, lt as u32]);
+            }
+            cfv_off += (ids.len() * nh) as u32;
+            cfv_total += ids.len() * nh;
+        }
+        if jobs.is_empty() {
+            return;
+        }
+
+        let params = BatchedParamsGpu {
+            num_jobs: jobs.len() as u32,
+            np: np as u32,
+            nh: nh as u32,
+            num_opp: (np - 1) as u32,
+            traverser: traverser as u32,
+            nc: self.nc,
+            starting_pot: self.starting_pot,
+            rake_rate: self.rake_rate,
+            rake_cap: self.rake_cap,
+            _pad: 0,
+        };
+
+        // Per-call buffers (job/desc small; reach the big one).
+        let jobs_buf = {
+            let flat: Vec<u32> = jobs.iter().flatten().copied().collect();
+            let b = self
+                .queue
+                .device()
+                .new_buffer((flat.len() * 4).max(4) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(flat.as_ptr(), b.contents() as *mut u32, flat.len());
+            }
+            b
+        };
+        let descs_buf = {
+            let bytes = std::mem::size_of::<WalkDescGpu>() * descs.len();
+            let b = self
+                .queue
+                .device()
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    descs.as_ptr() as *const u8,
+                    b.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            b
+        };
+        let reach_pk_buf = {
+            let b = self.queue.device().new_buffer(
+                (reach_packed.len() * 4).max(4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    reach_packed.as_ptr(),
+                    b.contents() as *mut f32,
+                    reach_packed.len(),
+                );
+            }
+            b
+        };
+        let cfv_pk_buf = self
+            .queue
+            .device()
+            .new_buffer((cfv_total * 4).max(4) as u64, MTLResourceOptions::StorageModeShared);
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.batched_pipeline);
+        enc.set_bytes(
+            0,
+            std::mem::size_of::<BatchedParamsGpu>() as u64,
+            &params as *const _ as *const std::ffi::c_void,
+        );
+        enc.set_buffer(1, Some(&jobs_buf), 0);
+        enc.set_buffer(2, Some(&descs_buf), 0);
+        enc.set_buffer(3, Some(&self.contribs_all), 0);
+        enc.set_buffer(4, Some(&self.folds_all), 0);
+        enc.set_buffer(5, Some(&reach_pk_buf), 0);
+        enc.set_buffer(6, Some(&self.fractions), 0);
+        enc.set_buffer(7, Some(&self.maps), 0);
+        enc.set_buffer(8, Some(&self.hand_cards), 0);
+        enc.set_buffer(9, Some(&cfv_pk_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize { width: jobs.len() as u64, height: 1, depth: 1 },
+            MTLSize { width: 32, height: 1, depth: 1 },
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        unsafe {
+            use objc::{msg_send, sel, sel_impl};
+            let start: f64 = msg_send![cmd, GPUStartTime];
+            let end: f64 = msg_send![cmd, GPUEndTime];
+            if end > start {
+                self.gpu_busy_s += end - start;
+            }
+        }
+
+        // Slice packed cfv into per-walk cache entries.
+        let out = unsafe {
+            std::slice::from_raw_parts(cfv_pk_buf.contents() as *const f32, cfv_total)
+        };
+        for (w, &(zone, tc, rc)) in walks.iter().enumerate() {
+            let n_terms = match zone {
+                Zone::Flop => self.flop_term_ids.len(),
+                Zone::Turn => self.turn_term_ids.len(),
+                Zone::River => self.river_term_ids.len(),
+                Zone::Preflop => unreachable!(),
+            };
+            let off = descs[w].cfv_off as usize;
+            let key = (
+                zone_code(zone),
+                tc.unwrap_or(usize::MAX),
+                rc.unwrap_or(usize::MAX),
+                traverser,
+            );
+            self.cache.insert(key, out[off..off + n_terms * nh].to_vec());
+        }
     }
 
     /// Consume self into a `BucketedFlopCfr` terminal offload hook.

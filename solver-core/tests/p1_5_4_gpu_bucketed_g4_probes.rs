@@ -226,3 +226,52 @@ fn g4_unit_probes() {
         );
     }
 }
+
+/// G4 step 3 probe: batched-dispatch hybrid iteration vs the per-walk
+/// path at production nh — did lifting the dispatch from ~100-550 to
+/// ~1000+ threadgroups buy the occupancy the concurrency probe said
+/// was binding?
+#[test]
+#[ignore = "G4 batched probe (~minutes); run with --ignored --nocapture"]
+fn g4_batched_iteration_probe() {
+    use std::sync::{Arc, Mutex};
+    eprintln!("\n════ G4 step 3: batched hybrid iteration at production nh ════");
+    let ctx = MetalContext::new().expect("Metal");
+    let tree = build_m2_tree();
+
+    for nb in [8usize, 10] {
+        let table = build_table_1x1();
+        let (fm, tm, rm) = quantile_maps(&table, nb);
+        let game = FlopStartGame::new(table);
+        let bk = FlopBucketing::from_maps(game.table(), nb, nb, nb, fm, tm, rm);
+        let mut solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
+        solver.set_terminal_design(TerminalDesign::Design1Collapsed);
+        let gpu = Arc::new(Mutex::new(
+            BucketedTerminalGpu::new(&ctx, &tree, game.table(), &bk, &solver, (32 / nb) as u32)
+                .expect("gpu"),
+        ));
+        let gpu_h = gpu.clone();
+        solver.set_terminal_offload_hook(Some(Box::new(
+            move |zone, tc, rc, trav, reach: &[f32], cfv: &mut [f32]| {
+                gpu_h.lock().unwrap().fill_terminals(zone, tc, rc, trav, reach, cfv)
+            },
+        )));
+        let gpu_f = gpu.clone();
+        let mut batched_fill =
+            move |walks: &[(Zone, Option<usize>, Option<usize>)], trav: u8, reaches: &[&[f32]]| {
+                gpu_f.lock().unwrap().fill_walks(walks, trav, reaches);
+            };
+        // Warm.
+        solver.run_batched(&tree, &game, &bk, 1, &mut batched_fill);
+        let busy0 = gpu.lock().unwrap().gpu_busy_seconds();
+        let t0 = Instant::now();
+        solver.run_batched(&tree, &game, &bk, 1, &mut batched_fill);
+        let iter_s = t0.elapsed().as_secs_f64();
+        let busy = gpu.lock().unwrap().gpu_busy_seconds() - busy0;
+        eprintln!(
+            "B={nb} batched hybrid iteration: {iter_s:.2}s | GPU busy {busy:.2}s = {:.0}% \
+             (per-walk path was: B=8 0.68s, B=10 2.48s)",
+            100.0 * busy / iter_s
+        );
+    }
+}

@@ -484,3 +484,279 @@ kernel void bucketed_terminal_collapsed(
         out[h] = v;
     }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Batched variant (G4 step 3 — occupancy fix): one dispatch covers ALL
+// (zone, outcome) terminal walks of one traverser pass. Same phases,
+// same arithmetic as bucketed_terminal_collapsed; only the indexing
+// changes: per-threadgroup job → walk descriptor → packed reach/cfv.
+// The occupancy probe measured ~100-550 threadgroups/dispatch as the
+// binding constraint (kernels overlap across queues but don't stack);
+// this lifts a dispatch to ~1k-3.3k threadgroups.
+// ════════════════════════════════════════════════════════════════════
+
+struct BucketedWalkDesc {
+    uint reach_off;    // float offset: packed per-terminal reach rows
+    uint cfv_off;      // float offset: packed per-terminal cfv out
+    uint contrib_off;  // int offset into concatenated zone contribs
+    uint fold_off;     // uint offset into concatenated zone fold masks
+    uint table_off;    // float offset of runout fraction block
+    uint map_off;      // u16 offset of runout bucket map
+    uint board0;
+    uint board1;
+    uint nb;
+    uint stripes;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct BucketedBatchedParams {
+    uint num_jobs;
+    uint np;
+    uint nh;
+    uint num_opp;
+    uint traverser;
+    float nc;
+    int starting_pot;
+    float rake_rate;
+    float rake_cap;
+    uint _pad;
+};
+
+kernel void bucketed_terminal_collapsed_batched(
+    constant BucketedBatchedParams& params   [[buffer(0)]],
+    const device uint2*    jobs              [[buffer(1)]],  // (walk, local_term)
+    const device BucketedWalkDesc* walks     [[buffer(2)]],
+    const device int*      contribs_all      [[buffer(3)]],
+    const device uint*     folds_all         [[buffer(4)]],
+    const device float*    reach_packed      [[buffer(5)]],
+    const device float*    fractions         [[buffer(6)]],
+    const device ushort*   bucket_map        [[buffer(7)]],
+    const device uchar*    hand_cards        [[buffer(8)]],
+    device float*          cfv_packed        [[buffer(9)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    if (tgid >= params.num_jobs) return;
+    const uint2 job = jobs[tgid];
+    const BucketedWalkDesc desc = walks[job.x];
+    const uint lt = job.y;
+    const uint np = params.np;
+    const uint nh = params.nh;
+    const uint nb = desc.nb;
+    const uint num_opp = params.num_opp;
+    const uint S = desc.stripes;
+    const uint trav = params.traverser;
+
+    threadgroup float bucket_reach_tg[MAX_OPP_BUCKETED * MAX_BUCKETS_GPU];
+    threadgroup float fw_tg[MAX_BUCKETS_GPU * MAX_BUCKETS_GPU];
+    threadgroup float ft_tg[MAX_BUCKETS_GPU * MAX_BUCKETS_GPU];
+    threadgroup float fl_tg[MAX_BUCKETS_GPU * MAX_BUCKETS_GPU];
+    threadgroup float fn_tg[MAX_BUCKETS_GPU * MAX_BUCKETS_GPU];
+    threadgroup float partials[32];
+    threadgroup float cfv_bucket_tg[MAX_BUCKETS_GPU];
+
+    const device float* tab = fractions + desc.table_off;
+    for (uint i = tid; i < nb * nb; i += tg_size) {
+        fw_tg[i] = tab[i];
+        ft_tg[i] = tab[nb * nb + i];
+        fl_tg[i] = tab[2 * nb * nb + i];
+        fn_tg[i] = tab[3 * nb * nb + i];
+    }
+    const device ushort* map = bucket_map + desc.map_off;
+    const device float* reach_term = reach_packed + desc.reach_off + ulong(lt) * np * nh;
+    if (tid < num_opp) {
+        uint oi = tid;
+        uint p = (oi < trav) ? oi : oi + 1;
+        const device float* r_p = reach_term + p * nh;
+        for (uint b = 0; b < nb; b++) bucket_reach_tg[oi * nb + b] = 0.0f;
+        for (uint h = 0; h < nh; h++) {
+            float r = r_p[h];
+            if (r != 0.0f) {
+                uint c1 = hand_cards[h * 2];
+                uint c2 = hand_cards[h * 2 + 1];
+                if (c1 == desc.board0 || c2 == desc.board0 ||
+                    c1 == desc.board1 || c2 == desc.board1) {
+                    r = 0.0f;
+                }
+            }
+            ushort b = map[h];
+            if (b == NO_BUCKET_GPU) continue;
+            bucket_reach_tg[oi * nb + b] += r;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int contribs[8];
+    for (uint p = 0; p < np; p++) contribs[p] = contribs_all[desc.contrib_off + lt * np + p];
+    uint fold_mask = folds_all[desc.fold_off + lt];
+    int c_t = contribs[trav];
+    float eff_rake_rate = params.rake_rate;
+    float eff_rake_cap = params.rake_cap;
+
+    bool all_active_equal = true;
+    {
+        bool have_ref = false;
+        int ref = 0;
+        for (uint p = 0; p < np; p++) {
+            if (fold_mask & (1u << p)) continue;
+            if (!have_ref) { ref = contribs[p]; have_ref = true; }
+            else if (contribs[p] != ref) { all_active_equal = false; break; }
+        }
+    }
+    bool arm1 = all_active_equal && fold_mask == 0;
+
+    bool opp_folded[MAX_OPP_BUCKETED];
+    int opp_contrib[MAX_OPP_BUCKETED];
+    for (uint oi = 0; oi < num_opp; oi++) {
+        uint p = (oi < trav) ? oi : oi + 1;
+        opp_folded[oi] = (fold_mask & (1u << p)) != 0;
+        opp_contrib[oi] = contribs[p];
+    }
+
+    uint lanes_used = nb * S;
+    float accum = 0.0f;
+    bool lane_active = tid < lanes_used;
+    uint bt = lane_active ? tid / S : 0;
+    uint stripe = lane_active ? tid % S : 0;
+    uint lo0 = stripe * nb / S;
+    uint hi0 = (stripe + 1) * nb / S;
+
+    if (lane_active && arm1) {
+        float k = float(num_opp);
+        float half_pot = float(params.starting_pot) / float(np) + float(c_t);
+        int total_pot = params.starting_pot;
+        for (uint p = 0; p < np; p++) total_pot += contribs[p];
+        float rake = max(min(float(total_pot) * eff_rake_rate, eff_rake_cap), 0.0f);
+        float rpus = half_pot > 0.0f ? rake / half_pot : 0.0f;
+
+        int bo[MAX_OPP_BUCKETED];
+        float s_stack[(MAX_OPP_BUCKETED + 1) * STATE_LEN];
+        for (int i = 0; i < STATE_LEN; i++) s_stack[i] = 0.0f;
+        s_stack[1] = 1.0f;
+        int d = 0;
+        bo[0] = int(lo0) - 1;
+        while (true) {
+            bo[d]++;
+            uint hi = (d == 0) ? hi0 : nb;
+            if (bo[d] >= int(hi)) {
+                if (d == 0) break;
+                d--;
+                continue;
+            }
+            uint b = uint(bo[d]);
+            float r = bucket_reach_tg[uint(d) * nb + b];
+            if (r == 0.0f) continue;
+            float m = r;
+            bool blocked = false;
+            for (int j = 0; j < d; j++) {
+                float f = fn_tg[uint(bo[j]) * nb + b];
+                if (f == 0.0f) { blocked = true; break; }
+                m *= f;
+            }
+            if (blocked) continue;
+            uint idx = bt * nb + b;
+            float fn_ = fn_tg[idx];
+            if (fn_ == 0.0f) continue;
+            float fw = fw_tg[idx];
+            float ft = ft_tg[idx];
+            float fl = fl_tg[idx];
+            thread float* s_in = s_stack + d * STATE_LEN;
+            thread float* s_out = s_stack + (d + 1) * STATE_LEN;
+            for (int i = 0; i < STATE_LEN; i++) s_out[i] = 0.0f;
+            if (s_in[0] != 0.0f) s_out[0] += s_in[0] * (m * fn_);
+            for (int j = 0; j <= d; j++) {
+                float s = s_in[1 + j];
+                if (s == 0.0f) continue;
+                if (fl != 0.0f) s_out[0] += s * (m * fl);
+                if (ft != 0.0f) s_out[1 + j + 1] += s * (m * ft);
+                if (fw != 0.0f) s_out[1 + j] += s * (m * fw);
+            }
+            if (uint(d + 1) == num_opp) {
+                accum += arm1_leaf(s_out, num_opp, k, rpus);
+            } else {
+                d++;
+                bo[d] = -1;
+            }
+        }
+        accum = half_pot * accum;
+    } else if (lane_active) {
+        bool traverser_folded = (fold_mask & (1u << trav)) != 0;
+        LevelBlock lb = build_level_block(
+            contribs, np, trav, num_opp, opp_folded, opp_contrib,
+            params.starting_pot, eff_rake_rate, eff_rake_cap, traverser_folded);
+        int bo[MAX_OPP_BUCKETED];
+        float w_chain[MAX_OPP_BUCKETED + 1];
+        float sc[MAX_OPP_BUCKETED][4];
+        w_chain[0] = 1.0f;
+        int d = 0;
+        bo[0] = int(lo0) - 1;
+        while (true) {
+            bo[d]++;
+            uint hi = (d == 0) ? hi0 : nb;
+            if (bo[d] >= int(hi)) {
+                if (d == 0) break;
+                d--;
+                continue;
+            }
+            uint b = uint(bo[d]);
+            float r = bucket_reach_tg[uint(d) * nb + b];
+            if (r == 0.0f) continue;
+            float base = w_chain[d] * r;
+            bool blocked = false;
+            for (int j = 0; j < d; j++) {
+                float f = fn_tg[uint(bo[j]) * nb + b];
+                if (f == 0.0f) { blocked = true; break; }
+                base *= f;
+            }
+            if (blocked) continue;
+            uint idx = bt * nb + b;
+            if (opp_folded[uint(d)]) {
+                float n = fn_tg[idx];
+                if (n == 0.0f) continue;
+                sc[d][0] = 0.0f; sc[d][1] = 0.0f; sc[d][2] = 0.0f; sc[d][3] = n;
+            } else {
+                float fw = fw_tg[idx];
+                float ft = ft_tg[idx];
+                float fl = fl_tg[idx];
+                if (fw == 0.0f && ft == 0.0f && fl == 0.0f) continue;
+                sc[d][0] = fw; sc[d][1] = ft; sc[d][2] = fl; sc[d][3] = 0.0f;
+            }
+            if (uint(d + 1) == num_opp) {
+                w_chain[d + 1] = base;
+                accum += w_chain[d + 1] * net_expected(lb, sc, num_opp, opp_folded);
+            } else {
+                w_chain[d + 1] = base;
+                d++;
+                bo[d] = -1;
+            }
+        }
+    }
+
+    partials[tid] = accum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane_active && stripe == 0) {
+        float total = partials[tid];
+        for (uint s = 1; s < S; s++) {
+            total += partials[tid + s];
+        }
+        cfv_bucket_tg[bt] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float* out = cfv_packed + desc.cfv_off + ulong(lt) * nh;
+    float nc = params.nc;
+    for (uint h = tid; h < nh; h += tg_size) {
+        ushort b = map[h];
+        float v;
+        if (b == NO_BUCKET_GPU) {
+            v = 0.0f;
+        } else if (nc > 0.0f) {
+            v = cfv_bucket_tg[b] / nc;
+        } else {
+            v = cfv_bucket_tg[b];
+        }
+        out[h] = v;
+    }
+}

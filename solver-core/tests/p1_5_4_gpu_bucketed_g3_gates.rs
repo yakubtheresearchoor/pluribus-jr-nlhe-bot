@@ -246,3 +246,63 @@ fn gate2_striped_general_b_drift_pinned() {
         "striped drift {max_drift:.2e} beyond accumulated-rounding scale — breakage"
     );
 }
+
+/// G4 step 3 gate: the BATCHED path (run_batched + fill_walks, one
+/// dispatch covering all walks of a traverser pass) must be bit-exact
+/// vs the pure-CPU walk at identity, exactly like the per-walk path
+/// (gate 1) — the prepass reorders nothing (reaches depend only on
+/// strategies, fixed within a pass) and the batched kernel is the same
+/// arithmetic behind job/desc indexing.
+#[test]
+fn gate1b_batched_identity_walk_bit_exact() {
+    use std::sync::{Arc, Mutex};
+    let ctx = MetalContext::new().expect("Metal");
+    let tree = build_gate_tree();
+
+    // Batched GPU arm (unstriped: stripes = 1).
+    let game_a = FlopStartGame::new(build_wet_deep_table());
+    let bk_a = FlopBucketing::identity(game_a.table());
+    let mut gpu_arm = BucketedFlopCfr::new(&tree, game_a.table(), &bk_a);
+    gpu_arm.set_terminal_design(TerminalDesign::Design1Collapsed);
+    let gpu = Arc::new(Mutex::new(
+        BucketedTerminalGpu::new(&ctx, &tree, game_a.table(), &bk_a, &gpu_arm, 1)
+            .expect("gpu"),
+    ));
+    let gpu_for_hook = gpu.clone();
+    gpu_arm.set_terminal_offload_hook(Some(Box::new(
+        move |zone, tc, rc, trav, reach: &[f32], cfv: &mut [f32]| {
+            gpu_for_hook.lock().unwrap().fill_terminals(zone, tc, rc, trav, reach, cfv)
+        },
+    )));
+    let gpu_for_fill = gpu.clone();
+    let mut batched_fill =
+        move |walks: &[(solver_core::solver::flop_start_vector_cfr::Zone, Option<usize>, Option<usize>)],
+              trav: u8,
+              reaches: &[&[f32]]| {
+            gpu_for_fill.lock().unwrap().fill_walks(walks, trav, reaches);
+        };
+    let root_gpu = gpu_arm.run_batched(&tree, &game_a, &bk_a, ITERS, &mut batched_fill);
+
+    // Pure-CPU arm.
+    let game_b = FlopStartGame::new(build_wet_deep_table());
+    let bk_b = FlopBucketing::identity(game_b.table());
+    let mut cpu_arm = BucketedFlopCfr::new(&tree, game_b.table(), &bk_b);
+    cpu_arm.set_terminal_design(TerminalDesign::Design1Collapsed);
+    let root_cpu = cpu_arm.run(&tree, &game_b, &bk_b, ITERS);
+
+    for (a, b) in root_gpu.iter().zip(&root_cpu) {
+        assert_eq!(a.to_bits(), b.to_bits(), "batched root cfv: gpu {a} vs cpu {b}");
+    }
+    for ((label, ga), (_, ca)) in buffers(&gpu_arm).iter().zip(buffers(&cpu_arm).iter()) {
+        for i in 0..ga.len() {
+            assert_eq!(
+                ga[i].to_bits(),
+                ca[i].to_bits(),
+                "batched {label}[{i}]: gpu {} vs cpu {}",
+                ga[i],
+                ca[i]
+            );
+        }
+    }
+    eprintln!("gate 1b PASSED: batched path bit-exact at identity ({ITERS} iters)");
+}
