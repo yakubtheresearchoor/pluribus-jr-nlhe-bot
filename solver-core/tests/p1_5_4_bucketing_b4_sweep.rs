@@ -48,8 +48,19 @@
 //!   dry-16  |  7.79  |  7.70  |  7.02  | 40.61 / 74.77 /  4.87
 //!   The quantile curve is FLAT-ISH from B=5→10 at ~7-10% pot at this
 //!   research scale; non-monotonicity (wet B=10 > B=8) reported, not
-//!   smoothed. Production count selection from this scale is NOT
-//!   banked — see the session report for the instrument-wall framing.
+//!   smoothed.
+//!
+//! DELIVERABLE FRAMING (signed off 2026-06-10): the flat curve sits in
+//! a regime whose compression ratio is two orders of magnitude off
+//! production (B=10 of ~14 alive hands ≈ lossless; B=10 of 1176 ≈
+//! 117:1), so it is WEAK supporting evidence that nothing catastrophic
+//! happens across B=5..10 — not a transferable quality ranking. The
+//! count decision is COST-driven (measured ladder,
+//! p1_5_4_bucketing_b4_cost_measurement). Map family: ship QUANTILE
+//! (stable, rankable here); GS14 stays in-tree as the production
+//! challenger. Both the family A/B and the count confirmation move to
+//! the head-to-head duplicate-play instrument (GS14's own verdict
+//! instrument) — see postflop_buckets.rs named limitation 1.
 
 use solver_core::abstraction::postflop_buckets::{
     build_postflop_bucketing, build_postflop_bucketing_for_hands,
@@ -287,18 +298,41 @@ fn b4_sweep_counts() {
 }
 
 #[test]
-#[ignore = "B4 calibration: NH=32, B∈{10,20} + baseline (~30-60 min); run with --ignored --nocapture"]
+#[ignore = "B4 calibration: NH=32, B∈{10,20}, no exact baseline (~30-60 min); run with --ignored --nocapture"]
 fn b4_calibration_nh32() {
     const NH: usize = 32;
     let cfg = &WET;
     let tree = build_lean_tree(cfg.stacks);
     eprintln!("\n=== calibration {} NH={NH} === ({} nodes, {ITERS} iters)", cfg.name, tree.num_nodes());
-    let base = baseline(cfg, &tree, NH);
+    // NO exact baseline at NH=32: the exact CFR solve is ~20 min/iter
+    // (the same O(nh^(K+1)) wall, hit from the solve side — first
+    // launch sat in baseline() for 16+ min before being killed).
+    // Baselines measured ≤ 0.81% pot at every affordable scale, so
+    // ABSOLUTE lifted exploitability is reported; the calibration's
+    // questions (curve shape above the research ceiling; the
+    // B=10-at-NH=16-vs-NH=32 nh-scaling pair) don't need the
+    // subtraction.
+    // QUANTILE arms are the calibration rung proper (the count curve is
+    // quantile — the shipped family); GS14 arms are finding-B trend
+    // data (seed-noise at subset scale), informational only.
+    for nb in [10usize, 20] {
+        let game = FlopStartGame::new(build_table(cfg, NH));
+        let (fm, tm, rm) = quantile_maps_ctl(game.table(), nb);
+        let bk = FlopBucketing::from_maps(game.table(), nb, nb, nb, fm, tm, rm);
+        let mut bucketed = BucketedFlopCfr::new(&tree, game.table(), &bk);
+        bucketed.set_terminal_design(TerminalDesign::Design1Collapsed);
+        bucketed.run(&tree, &game, &bk, ITERS);
+        let game_score = FlopStartGame::new(build_table(cfg, NH));
+        let mut scorer = FlopStartVectorCfr::new(&tree, game_score.table());
+        lift_cum_to_exact(&tree, &bucketed, &bk, &mut scorer);
+        let e = expl_pct(&scorer, &tree, &game_score);
+        eprintln!("  calibration QUANTILE B={nb}: lifted {e:.4}% pot (absolute; no baseline)");
+    }
     for nb in [10usize, 20] {
         let (e, _) = sweep_point(cfg, &tree, NH, nb);
-        eprintln!("  calibration B={nb}: cost over baseline {:+.4}% pot", e - base);
+        eprintln!("  calibration GS14 B={nb}: lifted {e:.4}% pot (finding-B trend data)");
     }
-    eprintln!("  (B=10 here vs B=10 at NH=16 in the sweep = the nh-scaling pair");
+    eprintln!("  (quantile B=10 here vs B=10 at NH=16 in the sweep = the nh-scaling pair");
     eprintln!("   for named-limitation 1 — directional only, never extrapolated)");
 }
 

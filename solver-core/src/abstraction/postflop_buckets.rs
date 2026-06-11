@@ -75,17 +75,39 @@
 //! === NAMED LIMITATIONS (logged 2026-06-10, B4 fork arc — log, not
 //! fix; recorded here so neither gets rediscovered) ===
 //!
-//! 1. INSTRUMENT WALL: the equilibrium-quality verdict (lifted
-//!    exploitability in the exact game) requires the exact best-response
-//!    scorer, which is O(nh^(K+1)) — usable only to research scale
-//!    (nh ≈ 16-24 at 6-max). Production-scale quality is therefore
-//!    confirmed only STRUCTURALLY. Under the production terminal
-//!    (Design 1 collapsed — exact, control-flow-only collapse) this is
-//!    acceptable: there is no approximation whose production-regime
-//!    behavior needs verifying; the residual unknown is how abstraction
-//!    loss itself scales with nh — the same residual every bucketed
-//!    solver in the literature carries. Any future APPROXIMATE terminal
-//!    re-opens this wall (see limitation 2).
+//! 1. INSTRUMENT WALL — AND ITS LITERATURE-STANDARD SUCCESSOR: the
+//!    equilibrium-quality verdict (lifted exploitability in the exact
+//!    game) requires the exact best-response scorer, O(nh^(K+1)) —
+//!    usable only to research scale (nh ≈ 16-24 at 6-max).
+//!    Production-scale quality is NOT "unmeasurable"; it moves to the
+//!    instrument the field itself used for this exact problem:
+//!    HEAD-TO-HEAD DUPLICATE PLAY with variance reduction (GS14's own
+//!    verdict was 20k duplicate matches, not exploitability — nobody
+//!    can score production-scale exploitability, including the
+//!    original authors). The bot integration needs that harness
+//!    anyway. Consequences, signed off 2026-06-10:
+//!      - bucket COUNTS and COST are decided now (measured ladder +
+//!        research-scale curve as weak supporting evidence);
+//!      - map FAMILY (GS14 vs quantile) is a deferred A/B in the play
+//!        harness: ship QUANTILE (the stable family the research
+//!        harness can actually rank), keep GS14 in-tree as the
+//!        production challenger — neither crowned nor deleted on
+//!        research-scale noise;
+//!      - count CONFIRMATION (e.g. B=8 vs B=10) also belongs to the
+//!        head-to-head instrument.
+//!    Under the production terminal (Design 1 collapsed — exact,
+//!    control-flow-only collapse) the residual unknown is only how
+//!    abstraction loss scales with nh — the same residual every
+//!    bucketed solver in the literature carries. Any future
+//!    APPROXIMATE terminal re-opens this wall (see limitation 2).
+//!
+//!    COMPRESSION-RATIO CAUTION attached to the research count curve:
+//!    at NH=16 (~14 alive hands), B=10 is near-lossless granularity;
+//!    at production, B=10 is ~117:1 compression. A flat research curve
+//!    from B=5→10 is consistent with "count barely matters when there
+//!    is almost nothing to compress" — it is weak evidence that
+//!    nothing catastrophic happens across the range, NOT a transferable
+//!    quality ranking. The count decision is therefore COST-driven.
 //!
 //! 2. RELATION-BLOCKING CORRELATION (why Design 2 died): opponents who
 //!    beat the traverser hold similar hands that block EACH OTHER. Any
