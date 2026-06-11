@@ -83,6 +83,7 @@ pub struct BucketedTerminalGpu {
     rake_rate: f32,
     rake_cap: f32,
     stripes: u32,
+    gpu_busy_s: f64,
 }
 
 fn buf_from<T: Copy>(ctx: &MetalContext, data: &[T]) -> Buffer {
@@ -250,6 +251,7 @@ impl BucketedTerminalGpu {
             rake_rate: tree.rake_rate as f32,
             rake_cap: tree.rake_cap as f32,
             stripes,
+            gpu_busy_s: 0.0,
         })
     }
 
@@ -347,6 +349,17 @@ impl BucketedTerminalGpu {
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
+        // GPU-busy attribution: per-command-buffer GPU timestamps.
+        // metal-0.33 doesn't expose GPUStartTime/GPUEndTime; raw objc
+        // selectors (return CFTimeInterval seconds, valid post-completion).
+        unsafe {
+            use objc::{msg_send, sel, sel_impl};
+            let start: f64 = msg_send![cmd, GPUStartTime];
+            let end: f64 = msg_send![cmd, GPUEndTime];
+            if end > start {
+                self.gpu_busy_s += end - start;
+            }
+        }
 
         // Read back only the terminal slices.
         let out = unsafe {
@@ -357,6 +370,22 @@ impl BucketedTerminalGpu {
             cfv[base..base + self.nh].copy_from_slice(&out[base..base + self.nh]);
         }
         true
+    }
+
+    /// Replace the command queue (G4 multi-flop concurrency: one
+    /// INDEPENDENT queue per concurrent flop, so cross-flop submission
+    /// is parallel by construction — the orchestration-serialization
+    /// failure mode designed out before it is measured).
+    pub fn set_queue(&mut self, queue: CommandQueue) {
+        self.queue = queue;
+    }
+
+    /// Cumulative GPU-busy seconds across this object's dispatches
+    /// (per-command-buffer GPU timestamps). The attribution channel:
+    /// wall-clock ratio ≈ 1 with LOW busy-fraction = orchestration
+    /// serialization; with HIGH busy-fraction = chip saturation.
+    pub fn gpu_busy_seconds(&self) -> f64 {
+        self.gpu_busy_s
     }
 
     /// Consume self into a `BucketedFlopCfr` terminal offload hook.
