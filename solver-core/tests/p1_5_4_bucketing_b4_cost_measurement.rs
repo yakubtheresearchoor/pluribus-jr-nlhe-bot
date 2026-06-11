@@ -617,15 +617,52 @@ fn b4_cost_measurement_design2() {
 /// machine (M4 Max, single core); the projection arithmetic is printed
 /// so the fork can be re-priced as inputs change.
 ///
-/// MEASUREMENT IN PROGRESS 2026-06-10: the ladder run (B up to 25 at
-/// nh=1176) takes hours at the top points — that cost is itself the
-/// calibration pricing. Numbers are pinned here when the run lands;
-/// until then this header carries NO numbers (invented figures marked
-/// "measured" are the failure mode this project's discipline exists
-/// to prevent). The projection table printed by the test is the
-/// deliverable: per-B iteration cost × 34 iters × {1755, 100} flops
-/// ÷ 16 cores, with the GPU-port-vs-flop-sampling fork priced from
-/// those rows rather than assumed.
+/// ═══ MEASURED 2026-06-10 (M2 tree shape: 109 terminals, 1×1 sampled
+/// chance — the SAME shape the M4 formula was fit on; nh=1176, single
+/// core, Design1Collapsed) ═══
+///
+///   B  | s/iter   | 34 iters (1% pot) ×1755 flops ÷16 | ×100 flops
+///    5 |    0.85  |   0.88 h                          |  0.05 h
+///    8 |   10.14  |  10.50 h  ← fits 24h CPU-only     |  0.60 h
+///   10 |   37.94  |  39.30 h  ← does NOT fit          |  2.24 h
+///   15 |  399.66  | 414 h                             | 23.6 h
+///   20 | 2195.21  | 2274 h                            | 130 h
+///   25 | 8453.34  | 8757 h                            | 499 h
+///   (0.1%-pot target = 158 iters = ×4.65: B=8 full-set 48.8h does
+///    NOT fit; B=8 @100 flops 2.8h fits; B=5 full-set 4.1h fits.)
+///
+/// The 18× line item: the unpinned B=10 guess was 2.1 s/iter; the
+/// measurement says 37.94 — the multiplication beat the estimate
+/// twice this arc, which is why no rung was extrapolated.
+///
+/// ═══ END-TO-END BLUEPRINT PROJECTION (the 24h budget governs the
+/// whole loop, not the per-flop solve) ═══
+///   1. Postflop solves: the table above — the dominant line.
+///   2. Clustering: 36.4 s/flop single-core (B2 measured), pipelined
+///      against solves: hidden whenever 34·iter_s ≥ 36.4s (true for
+///      B ≥ 8; at B=5 clustering IS the bottleneck, adding ≤ 0.4h at
+///      1755/16). Parallel-contention wall-clock UNMEASURED — the one
+///      open cost flag on this line.
+///   3. W/T/L precompute: 0.1 s/flop (B2 measured) → ~11 s total at
+///      1755/16. Negligible.
+///   4. Preflop layer: frozen-CFV oracle design means postflop solves
+///      are NOT multiplied by preflop iterations (cached per flop ×
+///      traverser); the preflop walk + pairwise terminals add a line
+///      that is measured only at research scale — production preflop
+///      wall-clock is the named UNPRICED line item.
+///   5. Runout-sampling caveat: rows are per-flop at the M2 1×1
+///      sampled-chance shape (same as the M4 formula). The blueprint's
+///      runout-sampling policy multiplies the postflop line linearly
+///      in sampled (n_turn × n_river) — a design input, priced when
+///      chosen, not assumed here.
+///
+/// ═══ FORK PRICING (signed-off wording) ═══
+///   GPU bucketed port: MOOT at B=8 full-canonical/1%-pot (10.5h CPU);
+///   the UNLOCK for B=10+ at full canonicals (39.3h → est. ~8h at an
+///   unmeasured ~5×) or for 0.1%-pot targets; one of two priced
+///   options against flop sampling (100-flop set: B=10 2.2h, B=15
+///   23.6h — sampling's quality cost is measurable by the harness).
+///   B ≥ 20 is calibration-only territory on any path.
 #[test]
 #[ignore = "B4 collapsed cost ladder (~10 min at the B=25 point); run with --ignored --nocapture"]
 fn b4_cost_ladder_design1_collapsed() {

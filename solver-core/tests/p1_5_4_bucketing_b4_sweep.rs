@@ -17,10 +17,15 @@
 //! abstraction loss scales with nh. Each point measured independently;
 //! non-monotonicity reported, never smoothed.
 //!
-//! Calibration (separate #[ignore] test): NH=32, B ∈ {10, 20} + exact
-//! baseline — one point above the research ceiling for curve shape,
-//! plus an nh-scaling pair (B=10 at NH=16 vs NH=32) that probes the
-//! named-limitation residual directionally.
+//! Calibration (separate #[ignore] test, NH=32, no exact baseline —
+//! the exact solve is ~20 min/iter there; baselines ≤ 0.81% measured
+//! at every affordable scale). MEASURED 2026-06-10, absolute lifted:
+//!   QUANTILE (the calibration rung proper — the curve's family):
+//!     B=10: 3.7761% | B=20: 2.1075% pot
+//!   GS14 (finding-B trend data, seed 42): B=10: 44.91% | B=20: 18.86%
+//! nh-scaling pair (quantile B=10): NH=16 → 8.41%, NH=32 → 3.78% —
+//! directional only, never extrapolated. The quantile/GS14 gap at
+//! NH=32 (3.8 vs 44.9 at B=10) confirms finding B at a second scale.
 //!
 //! ═══ MEASURED 2026-06-10 — TWO FINDINGS, ONE USABLE CURVE ═══
 //!
