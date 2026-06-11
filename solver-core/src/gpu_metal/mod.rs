@@ -8,3 +8,4 @@ pub use context::{MetalContext, MetalError, MetalResult};
 pub use solver::MetalVectorCfr;
 pub use flop_solver::MetalFlopStartSolver;
 pub use flop_solver::DcfrParams as GpuDcfrParams;
+pub mod bucketed_terminal;

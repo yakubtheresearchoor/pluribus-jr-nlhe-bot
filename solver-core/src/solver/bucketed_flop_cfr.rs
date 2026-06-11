@@ -412,7 +412,18 @@ pub struct BucketedFlopCfr {
     iteration: u32,
     regret_floor: f32,
     terminal_design: TerminalDesign,
+    /// G2 terminal offload: called once per bottom_up_zone invocation
+    /// BEFORE the level walk with (zone, tc, rc, traverser, reach, cfv).
+    /// Returns true if every terminal cfv slice of this zone walk was
+    /// filled (the walk then skips terminal nodes). None ⇒ the CPU
+    /// terminal path runs unchanged — every existing gate is untouched
+    /// by construction.
+    terminal_hook: Option<TerminalOffloadHook>,
 }
+
+/// See `BucketedFlopCfr::set_terminal_offload_hook`.
+pub type TerminalOffloadHook =
+    Box<dyn FnMut(Zone, Option<usize>, Option<usize>, u8, &[f32], &mut [f32]) -> bool>;
 
 impl BucketedFlopCfr {
     pub fn new(tree: &FlatTree, table: &FlopChanceTable, bucketing: &FlopBucketing) -> Self {
@@ -547,6 +558,7 @@ impl BucketedFlopCfr {
             iteration: 0,
             regret_floor: -1e30,
             terminal_design: TerminalDesign::Design1Brute,
+            terminal_hook: None,
         }
     }
 
@@ -555,6 +567,12 @@ impl BucketedFlopCfr {
     /// (cost gate: Design 1 is 563× over budget there).
     pub fn set_terminal_design(&mut self, d: TerminalDesign) {
         self.terminal_design = d;
+    }
+
+    /// Install the GPU terminal offload hook (G2). The hook owns the
+    /// GPU state; passing None restores the pure-CPU path.
+    pub fn set_terminal_offload_hook(&mut self, h: Option<TerminalOffloadHook>) {
+        self.terminal_hook = h;
     }
 
     // ── Strategy computation (same regret_matching_into, nb-wide) ──
@@ -891,6 +909,15 @@ impl BucketedFlopCfr {
         };
         let regret_floor = self.regret_floor;
 
+        // G2 terminal offload: one hook call per zone walk, before the
+        // level loop (terminal cfvs depend only on reach, which is
+        // complete here — the prepass is valid by construction).
+        let terminals_offloaded = if let Some(hook) = self.terminal_hook.as_mut() {
+            hook(zone, tc, rc, traverser, reach, cfv)
+        } else {
+            false
+        };
+
         // Zone-wide bucketing selectors.
         let (map, omega, tables, nb): (&[u16], &[f32], &BucketedRunoutTables, usize) = match zone {
             Zone::Flop => (&bk.flop_map, &bk.flop_omega, &bk.flop_tables, bk.nb_flop),
@@ -917,6 +944,9 @@ impl BucketedFlopCfr {
                 let node = &tree.nodes[idx];
 
                 if node.is_terminal() {
+                    if terminals_offloaded {
+                        continue; // cfv slice already filled by the hook
+                    }
                     let node_reach_base = idx * np * nh;
                     let fold_mask = tree.get_folded_mask(idx);
 
