@@ -112,15 +112,30 @@ impl BucketedRunoutTables {
     }
 }
 
-/// Relation codes carried by the per-level arm.
-const REL_WIN: u8 = 0; // traverser beats this opponent
-const REL_TIE: u8 = 1;
-const REL_LOSE: u8 = 2; // this opponent beats the traverser
-const REL_FOLDED: u8 = 3; // relation never read (blocking only)
+// ═══ Constants mirrored into Metal by build.rs codegen (G2 step 2) ═══
+// build.rs parses these EXACT declarations (panic-guarded, same
+// mechanism as MAX_NA_*) into bucketed_generated.metal. Changing a
+// value here regenerates the header; changing the DECLARATION FORM
+// breaks the build loudly (the desync guard).
+
+/// Relation codes carried by the per-level arm. Shared with Metal via
+/// codegen — the kernel's relation encoding cannot drift from these.
+pub const REL_WIN: u8 = 0; // traverser beats this opponent
+pub const REL_TIE: u8 = 1;
+pub const REL_LOSE: u8 = 2; // this opponent beats the traverser
+pub const REL_FOLDED: u8 = 3; // relation never read (blocking only)
 
 /// Maximum opponents supported by the fixed-size state vector
-/// (state = beaten + tie-counts 0..=num_opp).
-const MAX_OPP: usize = 9;
+/// (state = beaten + tie-counts 0..=num_opp → length MAX_OPP + 2).
+pub const MAX_OPP: usize = 9;
+
+/// GPU bucket-count cap. SIZED, not arbitrary: the terminal kernel
+/// holds all four fraction tables in threadgroup memory
+/// (4 × B² × 4 bytes = 4 KB at B=16) alongside the per-hand opp-reach
+/// block (23.5 KB at nh=1176) and the bucket map (2.4 KB) — 30.5 KB
+/// against the 32 KB threadgroup budget. B > 16 (calibration
+/// territory) stays on the CPU path, where it already lived.
+pub const MAX_BUCKETS_GPU: usize = 16;
 
 /// Design-1 bucketed mirror of `side_pot_showdown_cfv_with_rake` for
 /// np ≥ 4. Returns per-traverser-bucket CFVs.
