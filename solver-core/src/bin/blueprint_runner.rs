@@ -113,6 +113,30 @@ fn quantile_maps(
     (flop_map, turn_maps, river_maps)
 }
 
+/// Normalized flop-zone sigma_avg rows, flat — the convergence-stat basis.
+fn normalized_flop_sigma(solver: &BucketedFlopCfr, tree: &FlatTree, bk: &FlopBucketing) -> Vec<f32> {
+    use solver_core::tree::flat::MAX_NA_POSTFLOP;
+    let nb = bk.nb_flop;
+    let cum = solver.cum_strategy_flop();
+    let mut out = Vec::new();
+    for &nid in &tree.decision_node_ids {
+        let idx = nid as usize;
+        let Some(local) = solver.flop_local_offset_at(idx) else { continue };
+        let na = tree.nodes[idx].num_children as usize;
+        let off = local * MAX_NA_POSTFLOP * nb;
+        for b in 0..nb {
+            let mut sum = 0.0f32;
+            for a in 0..na {
+                sum += cum[off + a * nb + b];
+            }
+            for a in 0..na {
+                out.push(if sum > 0.0 { cum[off + a * nb + b] / sum } else { 1.0 / na as f32 });
+            }
+        }
+    }
+    out
+}
+
 fn write_section(out: &mut impl Write, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     writeln!(out, "{name}")?;
     out.write_all(&(bytes.len() as u64).to_le_bytes())?;
@@ -153,7 +177,19 @@ fn solve_and_bank(
     let bk = FlopBucketing::from_maps(game.table(), nb, nb, nb, fm, tm, rm);
     let mut solver = BucketedFlopCfr::new(tree, game.table(), &bk);
     solver.set_terminal_design(TerminalDesign::Design1Collapsed);
-    solver.run(tree, &game, &bk, iters);
+    // Convergence stat: mean |delta sigma_flop| between the last two
+    // iterations (normalized rows) — the per-flop "convergence reached"
+    // number the harness reads without re-solving.
+    assert!(iters >= 2);
+    solver.run(tree, &game, &bk, iters - 1);
+    let sigma_before = normalized_flop_sigma(&solver, tree, &bk);
+    solver.run(tree, &game, &bk, 1);
+    let sigma_after = normalized_flop_sigma(&solver, tree, &bk);
+    let conv: f64 = {
+        let n = sigma_before.len().max(1);
+        sigma_before.iter().zip(&sigma_after).map(|(a, b)| (a - b).abs() as f64).sum::<f64>()
+            / n as f64
+    };
     let secs = t0.elapsed().as_secs_f64();
 
     let path = format!("{out_dir}/flop_{fi:04}.bp");
@@ -161,11 +197,17 @@ fn solve_and_bank(
     {
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         f.write_all(b"SSBP1\n")?;
+        let code = std::env::var("BP_GIT").unwrap_or_else(|_| "unknown".into());
         writeln!(
             f,
-            "{{\"flop\":[{},{},{}],\"b\":[{nb},{nb},{nb}],\"turn\":[{tc}],\"rivers\":[[{rc}]],\
-             \"iters\":{iters},\"tree\":\"oracle-1bet-94-12\",\"nh\":{},\"terminal\":\"design1_collapsed\",\
-             \"maps\":\"quantile\",\"secs\":{secs:.1},\"format\":1}}",
+            "{{\"role\":\"bootstrap-config-baseline (oracle-shape tree; NOT the production blueprint)\",\
+             \"format\":1,\"fi\":{fi},\"flop\":[{},{},{}],\"b\":[{nb},{nb},{nb}],\
+             \"turn\":[{tc}],\"rivers\":[[{rc}]],\
+             \"runout_seed\":\"splitmix64(fi); turn=s%deck; river=(s^0xDEADBEEF)%rdeck\",\
+             \"iters\":{iters},\"conv_mean_dsigma_last_iter\":{conv:.6},\
+             \"tree\":{{\"np\":6,\"pot\":12,\"stacks\":94,\"contribs\":0,\"bets\":[1.0],\"raises\":[]}},\
+             \"nh\":{},\"terminal\":\"design1_collapsed\",\"maps\":\"quantile-strength\",\
+             \"code\":\"{code}\",\"secs\":{secs:.1}}}",
             flop[0], flop[1], flop[2],
             game.table().num_valid,
         )?;
@@ -192,6 +234,21 @@ fn main() {
     let nb: usize = std::env::var("BP_B").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
     let start: usize = std::env::var("BP_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     std::fs::create_dir_all(&out_dir).expect("create out dir");
+    // Run-level manifest: the artifact set is self-describing as a whole.
+    {
+        let code = std::env::var("BP_GIT").unwrap_or_else(|_| "unknown".into());
+        let mut mf = std::fs::File::create(format!("{out_dir}/manifest.json")).expect("manifest");
+        writeln!(
+            mf,
+            "{{\"role\":\"bootstrap-config-baseline (oracle-shape tree; NOT the production blueprint)\",\
+             \"cell\":\"A: 1755 x seeded 1x1\",\"b\":{nb},\"iters\":{iters},\
+             \"tree\":{{\"np\":6,\"pot\":12,\"stacks\":94,\"contribs\":0,\"bets\":[1.0],\"raises\":[]}},\
+             \"terminal\":\"design1_collapsed\",\"maps\":\"quantile-strength\",\
+             \"runout_seed\":\"splitmix64(fi); turn=s%deck; river=(s^0xDEADBEEF)%rdeck\",\
+             \"code\":\"{code}\",\"format\":1}}"
+        )
+        .expect("manifest write");
+    }
 
     eprintln!("blueprint_runner: cell A baseline (B={nb}, {iters} iters, 1×1 seeded runouts)");
     let ranges: Vec<Vec<f32>> =

@@ -648,3 +648,82 @@ fn cell_probe_integration() {
         max_d
     );
 }
+
+/// 6×-surprise characterization (standing rule: convenient-direction
+/// surprises get their mechanism confirmed before banking). The B4
+/// ladder row (B=8: 10.14s/iter) was an ITERATION-1 measurement with
+/// dense uniform reaches; the runner measures 60-95s per 34-iter
+/// solve (~1.8-2.8s/iter average). Hypothesis: reaches sparsify as
+/// CFR converges (folded-out buckets → zero reach → terminal skips),
+/// so iter-1 is expensive and later iters cheap. Counter-hypotheses
+/// to rule out: tree-shape difference (oracle tree 4161 nodes, equal
+/// contribs → arm-1-heavy census vs M2's asymmetric-contrib arm-2-
+/// heavy census), early convergence cutoff (none exists), terminal
+/// K lower than expected.
+///
+/// Probe: one canonical flop on the RUNNER's exact config, run(1)×34
+/// with per-iteration wall-clock (parameter-equivalent to run(34):
+/// DcfrParams reads the persisted iteration counter). PLUS the same
+/// curve on the M2-shaped ladder tree, so the tree-shape factor and
+/// the sparsification factor separate.
+#[test]
+#[ignore = "6x-surprise characterization (~10 min); run with --ignored --nocapture"]
+fn characterize_runner_cost_curve() {
+    use solver_core::solver::flop_start_game::FlopChanceTable as FCT;
+    let ranges: Vec<Vec<f32>> = (0..NP).map(|_| vec![1.0 / N_CLASSES as f32; N_CLASSES]).collect();
+    let ptable = PreflopChanceTable::new(NP, ranges);
+    let flop = ptable.canonical_flops[0];
+
+    // Runner-config tree (oracle shape: 1-bet, stacks 94, pot 12).
+    let oracle_tree = {
+        let cfg = TreeConfig {
+            num_players: NP,
+            initial_state: BoardState::Flop,
+            starting_pot: 12,
+            starting_stacks: vec![94; 6],
+            initial_contributions: vec![0; 6],
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+            bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
+            add_allin_threshold: 1.0,
+            force_allin_threshold: 1.0,
+            merging_threshold: 0.0,
+            button_player: None,
+        };
+        build_tree(&cfg).unwrap()
+    };
+    // Ladder-config tree (M2 shape: asymmetric contribs).
+    let m2_tree = build_probe_tree();
+
+    for (name, tree) in [("oracle/runner", &oracle_tree), ("M2/ladder", &m2_tree)] {
+        // Same runout draw scheme as the runner (fi=0).
+        let board_mask: u64 = flop.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
+        let deck: Vec<u8> = (0..52u8).filter(|c| board_mask & (1u64 << c) == 0).collect();
+        let tc = deck[19 % deck.len()];
+        let rdeck: Vec<u8> = deck.iter().copied().filter(|&c| c != tc).collect();
+        let rc = rdeck[10 % rdeck.len()];
+        let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+        river_decks[tc as usize] = vec![rc];
+        let table = FCT::build_full_nh_sampled(flop, 6, &[tc], &river_decks);
+        let (fm, tm, rm) = quantile_maps(&table, NB);
+        let game = FlopStartGame::new(table);
+        let bk = FlopBucketing::from_maps(game.table(), NB, NB, NB, fm, tm, rm);
+        let mut solver = BucketedFlopCfr::new(tree, game.table(), &bk);
+        solver.set_terminal_design(TerminalDesign::Design1Collapsed);
+        let mut times = Vec::new();
+        for _ in 0..34 {
+            let t0 = std::time::Instant::now();
+            solver.run(tree, &game, &bk, 1);
+            times.push(t0.elapsed().as_secs_f64());
+        }
+        let total: f64 = times.iter().sum();
+        eprintln!(
+            "{name} ({} nodes): total {total:.1}s | iters 1-5: {:.2} {:.2} {:.2} {:.2} {:.2} | \
+             10: {:.2} | 20: {:.2} | 34: {:.2} | iter1/iter34 ratio {:.1}×",
+            tree.num_nodes(),
+            times[0], times[1], times[2], times[3], times[4],
+            times[9], times[19], times[33],
+            times[0] / times[33]
+        );
+    }
+}
