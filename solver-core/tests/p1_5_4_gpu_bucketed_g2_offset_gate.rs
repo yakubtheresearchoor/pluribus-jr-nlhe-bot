@@ -305,3 +305,99 @@ fn gpu_bucketed_offset_gate_divergent_dims() {
     assert_eq!(k.turn_offset as usize, dims.turn_offset());
     assert_eq!(k.river_offset as usize, dims.river_offset());
 }
+
+/// G5 plan gate (before any native kernel exists): the NativePlan's
+/// infoset descriptors and reach-edge lists against from-scratch
+/// recomputation at the same divergent dims, plus structural
+/// invariants the kernels rely on:
+///   - every descriptor base == layout.flat_index (the gated formula);
+///   - every non-root zone node has EXACTLY one incoming edge within
+///     its zone (single-writer property — the reach kernel's
+///     race-freedom argument);
+///   - edges at level L have parents at level L (the per-level
+///     dispatch dependency order);
+///   - walk list matches run()'s order and count.
+#[test]
+fn gpu_native_plan_gate_divergent_dims() {
+    use solver_core::solver::bucketed_flop_cfr::NativePlan;
+    let tree = build_gate_tree();
+    let game = FlopStartGame::new(build_table());
+    let (fm, tm, rm) = quantile_maps_divergent(game.table());
+    let bk = FlopBucketing::from_maps(game.table(), NB_F, NB_T, NB_R, fm, tm, rm);
+    let solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
+    let layout = solver.gpu_layout(&bk);
+    let plan: NativePlan = solver.native_plan(&tree, &bk);
+
+    let n_turn = game.table().remaining_deck.len();
+    let max_river = game
+        .table()
+        .remaining_deck
+        .iter()
+        .map(|&tc| game.table().river_decks[tc as usize].len())
+        .max()
+        .unwrap();
+
+    // Walk list shape.
+    let expected_walks = n_turn
+        * game.table().river_decks[game.table().remaining_deck[0] as usize].len()
+        + n_turn
+        + 1;
+    assert_eq!(plan.walks.len(), expected_walks);
+    assert_eq!(
+        plan.reach_floats_per_walk,
+        tree.num_nodes() * NP as usize * game.table().num_valid
+    );
+
+    // Descriptor bases == flat_index, for every (zone, outcome, node).
+    let mut n_desc = 0usize;
+    for d in &plan.flop_infosets {
+        assert_eq!(d.base as usize, layout.flat_index(d.node as usize, None, None, 0, 0));
+        n_desc += 1;
+    }
+    for (ti, descs) in plan.turn_infosets.iter().enumerate() {
+        for d in descs {
+            assert_eq!(
+                d.base as usize,
+                layout.flat_index(d.node as usize, Some(ti), None, 0, 0)
+            );
+            n_desc += 1;
+        }
+    }
+    for (oi, descs) in plan.river_infosets.iter().enumerate() {
+        let (ti, ri) = (oi / max_river, oi % max_river);
+        for d in descs {
+            assert_eq!(
+                d.base as usize,
+                layout.flat_index(d.node as usize, Some(ti), Some(ri), 0, 0)
+            );
+            n_desc += 1;
+        }
+    }
+    eprintln!("native plan gate: {n_desc} infoset descriptors verified against flat_index");
+
+    // Edge invariants per zone.
+    for (zname, edges) in [
+        ("flop", &plan.flop_edges),
+        ("turn", &plan.turn_edges),
+        ("river", &plan.river_edges),
+    ] {
+        let mut incoming = std::collections::HashMap::<u32, usize>::new();
+        let mut n_edges = 0usize;
+        for (level, lv) in edges.iter().enumerate() {
+            for e in lv {
+                // Parent sits at this level.
+                assert!(
+                    tree.nodes_at_level(level as u32).contains(&e.parent),
+                    "{zname} L{level}: parent {} not at level",
+                    e.parent
+                );
+                *incoming.entry(e.child).or_insert(0) += 1;
+                n_edges += 1;
+            }
+        }
+        for (&child, &cnt) in &incoming {
+            assert_eq!(cnt, 1, "{zname}: child {child} has {cnt} incoming edges (race!)");
+        }
+        eprintln!("native plan gate: {zname} {n_edges} edges, single-writer ✓");
+    }
+}

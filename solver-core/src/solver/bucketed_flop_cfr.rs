@@ -367,6 +367,65 @@ impl BucketedGpuLayout {
     }
 }
 
+// ═══ G5: GPU-native iteration plan (host-side, pure math) ═══
+//
+// Everything a fully GPU-resident bucketed iteration needs to encode
+// kernels without computing a single stride shader-side or touching
+// the CPU walk: infoset descriptors (strategy + regret kernels),
+// per-(zone, level) edge lists (reach propagation, mirroring the CPU
+// walk's exact level loop), the walk list with reach mega-buffer
+// offsets, and chance-seeding row lists. Built ONCE per (tree,
+// bucketing); gated by the G5 offset/order test BEFORE any kernel
+// consumes it (the established discipline).
+
+/// One decision infoset instance at a concrete (zone, outcome):
+/// everything the strategy / regret kernels need, precomputed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InfosetDesc {
+    /// Float base into the concatenated bucket-granular buffers
+    /// (== BucketedGpuLayout::flat_index(node, ti, ri, 0, 0)).
+    pub base: u32,
+    pub na: u32,
+    pub owner: u32,
+    pub node: u32,
+}
+
+/// One reach-propagation edge (parent → child via action a), in the
+/// CPU walk's exact iteration order within its (zone, level).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReachEdge {
+    pub parent: u32,
+    pub child: u32,
+    /// Action index at a player parent; u32::MAX for chance parents
+    /// (pass-through copy).
+    pub action: u32,
+    /// Acting player at a player parent; u32::MAX for chance parents.
+    pub owner: u32,
+}
+
+/// The full GPU-native iteration plan.
+pub struct NativePlan {
+    /// Walk list in run()'s order: rivers (ti-major, ri-minor), then
+    /// turns, then flop. reach mega-buffer offset (floats) per walk =
+    /// walk_index × nn × np × nh.
+    pub walks: Vec<(Zone, Option<usize>, Option<usize>)>,
+    pub reach_floats_per_walk: usize,
+    /// Per (zone, outcome): infoset descriptors in decision-node order.
+    /// Outcome flattening: Flop → [0]; Turn → [ti]; River →
+    /// [ti × max_river + ri].
+    pub flop_infosets: Vec<InfosetDesc>,
+    pub turn_infosets: Vec<Vec<InfosetDesc>>,
+    pub river_infosets: Vec<Vec<InfosetDesc>>,
+    /// Per (zone, level): reach edges in the CPU walk's order.
+    pub flop_edges: Vec<Vec<ReachEdge>>,
+    pub turn_edges: Vec<Vec<ReachEdge>>,
+    pub river_edges: Vec<Vec<ReachEdge>>,
+    /// Zone-boundary seeding rows (node ids whose reach rows copy from
+    /// the parent walk's buffer).
+    pub turn_seed_nodes: Vec<u32>,
+    pub river_seed_nodes: Vec<u32>,
+}
+
 /// The bucketed walk. Field-by-field mirror of `FlopStartVectorCfr`
 /// with bucket-granularity storage (InMemory river only).
 pub struct BucketedFlopCfr {
@@ -573,6 +632,140 @@ impl BucketedFlopCfr {
     /// GPU state; passing None restores the pure-CPU path.
     pub fn set_terminal_offload_hook(&mut self, h: Option<TerminalOffloadHook>) {
         self.terminal_hook = h;
+    }
+
+    /// Build the GPU-native iteration plan (G5). Pure host math, from
+    /// the same zone classification and ZoneDims layout every other
+    /// consumer uses; gated by the G5 offset/order test before any
+    /// kernel reads it.
+    pub fn native_plan(&self, tree: &FlatTree, bk: &FlopBucketing) -> NativePlan {
+        let layout = self.gpu_layout(bk);
+        let nn = tree.num_nodes();
+        let np = self.num_players as usize;
+        let nh = self.nh;
+        let n_turn = bk.turn_map.len();
+        let max_depth = tree.max_depth as usize;
+
+        // Walks in run()'s order.
+        let mut walks: Vec<(Zone, Option<usize>, Option<usize>)> = Vec::new();
+        for ti in 0..n_turn {
+            for ri in 0..bk.river_map[ti].len() {
+                walks.push((Zone::River, Some(ti), Some(ri)));
+            }
+        }
+        for ti in 0..n_turn {
+            walks.push((Zone::Turn, Some(ti), None));
+        }
+        walks.push((Zone::Flop, None, None));
+
+        // Infoset descriptors per (zone, outcome), decision-node order
+        // (the CPU's compute_*_strategy iteration order).
+        let descs_for = |zone: Zone, ti: Option<usize>, ri: Option<usize>| -> Vec<InfosetDesc> {
+            let mut out = Vec::new();
+            for &nid in &tree.decision_node_ids {
+                let idx = nid as usize;
+                if self.zones[idx] != zone {
+                    continue;
+                }
+                let local = match zone {
+                    Zone::Flop => self.flop_local_offset[idx],
+                    Zone::Turn => self.turn_local_offset[idx],
+                    Zone::River => self.river_local_offset[idx],
+                    Zone::Preflop => unreachable!(),
+                };
+                if local == UNUSED {
+                    continue;
+                }
+                out.push(InfosetDesc {
+                    base: layout.flat_index(idx, ti, ri, 0, 0) as u32,
+                    na: tree.nodes[idx].num_children as u32,
+                    owner: tree.nodes[idx].player_id as u32,
+                    node: nid,
+                });
+            }
+            out
+        };
+        let flop_infosets = descs_for(Zone::Flop, None, None);
+        let turn_infosets: Vec<Vec<InfosetDesc>> =
+            (0..n_turn).map(|ti| descs_for(Zone::Turn, Some(ti), None)).collect();
+        let river_infosets: Vec<Vec<InfosetDesc>> = (0..n_turn)
+            .flat_map(|ti| {
+                (0..self.max_n_river).map(move |ri| (ti, ri))
+            })
+            .map(|(ti, ri)| {
+                if ri < bk.river_map[ti].len() {
+                    descs_for(Zone::River, Some(ti), Some(ri))
+                } else {
+                    Vec::new() // ragged river decks: empty outcome slot
+                }
+            })
+            .collect();
+
+        // Per-(zone, level) reach edges — the CPU walk's exact loop:
+        // ascending levels, nodes_at_level order, children in order.
+        let edges_for = |zone: Zone| -> Vec<Vec<ReachEdge>> {
+            let mut levels = Vec::with_capacity(max_depth + 1);
+            for level in 0..=max_depth {
+                let mut edges = Vec::new();
+                for &nid in tree.nodes_at_level(level as u32) {
+                    let idx = nid as usize;
+                    if self.zones[idx] != zone {
+                        continue;
+                    }
+                    let node = &tree.nodes[idx];
+                    if node.is_player() {
+                        // CPU skips player nodes with UNUSED offsets
+                        // entirely (continue before propagation).
+                        let local = match zone {
+                            Zone::Flop => self.flop_local_offset[idx],
+                            Zone::Turn => self.turn_local_offset[idx],
+                            Zone::River => self.river_local_offset[idx],
+                            Zone::Preflop => unreachable!(),
+                        };
+                        if local == UNUSED {
+                            continue;
+                        }
+                        for (a, &child) in tree.node_children(idx).iter().enumerate() {
+                            edges.push(ReachEdge {
+                                parent: nid,
+                                child,
+                                action: a as u32,
+                                owner: node.player_id as u32,
+                            });
+                        }
+                    } else if node.is_chance() {
+                        // River zone's CPU walk has no chance handling;
+                        // flop/turn propagate pass-through.
+                        if zone == Zone::River {
+                            continue;
+                        }
+                        for &child in tree.node_children(idx) {
+                            edges.push(ReachEdge {
+                                parent: nid,
+                                child,
+                                action: u32::MAX,
+                                owner: u32::MAX,
+                            });
+                        }
+                    }
+                }
+                levels.push(edges);
+            }
+            levels
+        };
+
+        NativePlan {
+            walks,
+            reach_floats_per_walk: nn * np * nh,
+            flop_infosets,
+            turn_infosets,
+            river_infosets,
+            flop_edges: edges_for(Zone::Flop),
+            turn_edges: edges_for(Zone::Turn),
+            river_edges: edges_for(Zone::River),
+            turn_seed_nodes: self.turn_chance_children.clone(),
+            river_seed_nodes: self.river_chance_children.clone(),
+        }
     }
 
     // ── Strategy computation (same regret_matching_into, nb-wide) ──
