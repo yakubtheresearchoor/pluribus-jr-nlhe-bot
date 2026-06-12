@@ -121,10 +121,12 @@ fn v1_cell_pricing_hybrid_live6() {
 
 /// GPU-native pricing for the monster cells (live ≥ 4 limp/raised
 /// families — the only families where CPU s/iter is prohibitive).
-/// KNOWN-OPEN (2026-06-12): SIGSEGV on the live-6 cells (45k+ node
-/// trees) — the native orchestrator was built and gated on the 1.4k-
-/// node oracle shape; some capacity assumption breaks at this scale.
-/// live-4/5 prices measured fine (0.100 / 1.006 s/iter).
+/// 2026-06-12: the live-6 SIGSEGV is FIXED-to-fail-cleanly — the
+/// mega-buffer layout (n_walks × nn absolute node indexing) caps at
+/// 4 Gi floats per buffer (u32 walk offsets) and device
+/// max_buffer_length; oversized trees now get a CapacityExceeded Err
+/// (this test prints it and skips). Zone-local indexing is the named
+/// unlock; the hybrid path covers those cells meanwhile (611/778h).
 #[cfg(feature = "metal")]
 #[test]
 #[ignore = "v1 GPU cell pricing; run with --ignored --nocapture --release --features metal"]
@@ -146,15 +148,26 @@ fn v1_cell_pricing_gpu() {
     for &(live, commit, pot, label) in cells {
         let cfg = spec.flop_seam_config(live, commit, pot, flop_bets.clone());
         let tree = build_tree(&cfg).expect("seam tree");
+        eprintln!("[{label}] tree built: {} nodes", tree.nodes.len());
         let table = build_table(live);
         let (fm, tm, rm) = quantile_maps(&table, NB);
         let game = FlopStartGame::new(table);
         let bk = FlopBucketing::from_maps(game.table(), NB, NB, NB, fm, tm, rm);
         let mut solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
         solver.set_terminal_design(TerminalDesign::Design1Collapsed);
-        let mut native =
-            BucketedNativeGpu::new(&ctx, &tree, game.table(), &bk, &solver, (32 / NB) as u32)
-                .expect("native gpu");
+        eprintln!("[{label}] solver constructed; building native…");
+        let mut native = match BucketedNativeGpu::new(
+            &ctx, &tree, game.table(), &bk, &solver, (32 / NB) as u32,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!(
+                    "GPU live {live} commit {commit:>3} pot {pot:>4} ({label}): \
+                     SKIP — {e} (hybrid path covers this cell)"
+                );
+                continue;
+            }
+        };
         native.run(1); // warm
         let t0 = Instant::now();
         native.run(3);
@@ -166,6 +179,50 @@ fn v1_cell_pricing_gpu() {
             per_iter * 34.0 * 1755.0 / 3600.0
         );
         let _ = game;
+    }
+}
+
+/// STANDING GATE (2026-06-12, regression for the live-6 SIGSEGV):
+/// constructing the native orchestrator on a tree whose mega-buffers
+/// overflow the u32 walk-offset layout must return a clean
+/// CapacityExceeded error — never a nil-buffer write (the original
+/// failure: 27 GB reach_mega → nil → bzero through NULL).
+#[cfg(feature = "metal")]
+#[test]
+fn native_gpu_capacity_pre_flight_gate() {
+    use solver_core::gpu_metal::bucketed_native::BucketedNativeGpu;
+    use solver_core::gpu_metal::context::MetalContext;
+    let ctx = MetalContext::new().expect("Metal");
+    let spec = production_game_v1();
+    let flop_bets =
+        BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    const NB: usize = 8;
+    // The live-6 limp cell: 45,711 nodes → reach_mega 6.77e9 floats,
+    // beyond both the u32 float-offset cap (4 Gi) and the device
+    // buffer limit.
+    let cfg = spec.flop_seam_config(6, 2, 12, flop_bets);
+    let tree = build_tree(&cfg).expect("seam tree");
+    assert!(tree.nodes.len() > 40_000, "repro tree must stay oversized");
+    let table = build_table(6);
+    let (fm, tm, rm) = quantile_maps(&table, NB);
+    let game = FlopStartGame::new(table);
+    let bk = FlopBucketing::from_maps(game.table(), NB, NB, NB, fm, tm, rm);
+    let mut solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
+    solver.set_terminal_design(TerminalDesign::Design1Collapsed);
+    let r = BucketedNativeGpu::new(&ctx, &tree, game.table(), &bk, &solver, (32 / NB) as u32);
+    match r {
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("capacity") || msg.contains("Capacity") || msg.contains("overflow"),
+                "expected a capacity error, got: {msg}"
+            );
+            eprintln!("pre-flight gate: clean rejection — {msg}");
+        }
+        Ok(_) => panic!(
+            "native construction unexpectedly succeeded on the oversized tree — \
+             if zone-local indexing landed, update this gate to a larger repro"
+        ),
     }
 }
 

@@ -15,6 +15,10 @@ pub enum MetalError {
     FunctionNotFound(String),
     PipelineCreation(String),
     ShaderFileNotFound(String),
+    /// Buffer allocation failed or would exceed a device / layout
+    /// limit. Carries a human-readable capacity breakdown so callers
+    /// can report it and fall back (e.g. native → hybrid path).
+    CapacityExceeded(String),
 }
 
 impl std::fmt::Display for MetalError {
@@ -25,6 +29,7 @@ impl std::fmt::Display for MetalError {
             MetalError::FunctionNotFound(name) => write!(f, "Kernel function '{}' not found", name),
             MetalError::PipelineCreation(msg) => write!(f, "Pipeline creation failed: {}", msg),
             MetalError::ShaderFileNotFound(path) => write!(f, "Shader file not found: {}", path),
+            MetalError::CapacityExceeded(msg) => write!(f, "GPU capacity exceeded: {}", msg),
         }
     }
 }

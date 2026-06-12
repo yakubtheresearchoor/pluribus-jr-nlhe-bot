@@ -31,7 +31,7 @@ use metal::{
 };
 
 use super::bucketed_terminal::{BucketedTerminalGpu, WalkKey};
-use super::context::{MetalContext, MetalResult};
+use super::context::{MetalContext, MetalError, MetalResult};
 
 /// Field-for-field mirror of Metal `NativeWalkParams`.
 #[repr(C)]
@@ -51,30 +51,43 @@ struct WalkParamsGpu {
     _pad: u32,
 }
 
-fn buf_from<T: Copy>(ctx: &MetalContext, data: &[T]) -> Buffer {
-    let bytes = std::mem::size_of_val(data).max(4);
+/// Nil-checked allocation. Metal's `new_buffer` returns a NIL object
+/// when the allocation fails (too large / out of memory); writing
+/// through its `contents()` (NULL) was the SIGSEGV the v1 live-6 cell
+/// pricing hit 2026-06-12 (45,711-node tree → 27 GB reach_mega).
+fn alloc_buf(ctx: &MetalContext, bytes: usize, what: &str) -> MetalResult<Buffer> {
+    let max = ctx.device().max_buffer_length() as usize;
+    if bytes > max {
+        return Err(MetalError::CapacityExceeded(format!(
+            "{what}: {bytes} bytes exceeds device max_buffer_length {max}"
+        )));
+    }
     let buf = ctx
         .device()
-        .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            data.as_ptr() as *const u8,
-            buf.contents() as *mut u8,
-            std::mem::size_of_val(data),
-        );
+        .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+    if buf.contents().is_null() {
+        return Err(MetalError::CapacityExceeded(format!(
+            "{what}: allocation of {bytes} bytes returned nil (out of GPU memory)"
+        )));
     }
-    buf
+    Ok(buf)
 }
 
-fn zeros_buf(ctx: &MetalContext, floats: usize) -> Buffer {
-    let buf = ctx.device().new_buffer(
-        (floats * 4).max(4) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+fn buf_from<T: Copy>(ctx: &MetalContext, data: &[T]) -> MetalResult<Buffer> {
+    let bytes = std::mem::size_of_val(data);
+    let buf = alloc_buf(ctx, bytes, std::any::type_name::<T>())?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, buf.contents() as *mut u8, bytes);
+    }
+    Ok(buf)
+}
+
+fn zeros_buf(ctx: &MetalContext, floats: usize, what: &str) -> MetalResult<Buffer> {
+    let buf = alloc_buf(ctx, floats * 4, what)?;
     unsafe {
         std::ptr::write_bytes(buf.contents() as *mut u8, 0, floats * 4);
     }
-    buf
+    Ok(buf)
 }
 
 /// (element offset, count) ranges into a concatenated upload buffer.
@@ -216,6 +229,33 @@ impl BucketedNativeGpu {
         assert_eq!(plan.walks.len(), n_walks);
         let reach_per_walk = nn * np * nh;
         let cfv_per_walk = nn * nh;
+
+        // ── CAPACITY PRE-FLIGHT (2026-06-12, after the v1 live-6 cell
+        // SIGSEGV: 45,711-node tree → 27 GB reach_mega → nil buffer →
+        // bzero through NULL). Two independent limits, both checked
+        // here with the numbers in the error:
+        //   1. Walk offsets are u32 FLOAT indices in the GPU
+        //      descriptors (WalkDescGpu.reach_off) — the layout caps at
+        //      4 Gi floats (16 GiB) per mega-buffer REGARDLESS of
+        //      device memory. Overflow would silently corrupt, which is
+        //      worse than the crash.
+        //   2. Per-buffer device limit (max_buffer_length), enforced in
+        //      alloc_buf at every allocation.
+        // The mega-buffer layout allocates nn-sized reach/cfv per walk
+        // (absolute node indexing); the NAMED UNLOCK for big trees is
+        // zone-local indexing (Σ zone sizes ≈ nn instead of n_walks ×
+        // nn). Until then, callers get a clean Err and fall back to the
+        // hybrid path (CPU walk + GPU striped terminals).
+        let reach_floats = n_walks as u64 * reach_per_walk as u64;
+        let cfv_floats = n_walks as u64 * cfv_per_walk as u64;
+        if reach_floats > u32::MAX as u64 || cfv_floats > u32::MAX as u64 {
+            return Err(MetalError::CapacityExceeded(format!(
+                "walk-offset u32 overflow: reach_mega {reach_floats} floats / cfv_mega \
+                 {cfv_floats} floats exceed 4 Gi (nn {nn} × np {np} × nh {nh} × walks \
+                 {n_walks}); tree too large for the absolute-node-indexed mega-buffer \
+                 layout — use the hybrid path (zone-local indexing is the named unlock)"
+            )));
+        }
         let reach_offs: Vec<u32> =
             (0..n_walks).map(|w| (w * reach_per_walk) as u32).collect();
         let cfv_offs: Vec<u32> = (0..n_walks).map(|w| (w * cfv_per_walk) as u32).collect();
@@ -238,7 +278,7 @@ impl BucketedNativeGpu {
             all_descs.extend_from_slice(&plan.river_infosets[o]);
         }
         let river_desc_all: Range = (river_start, all_descs.len() - river_start);
-        let descs_buf = buf_from(ctx, &all_descs);
+        let descs_buf = buf_from(ctx, &all_descs)?;
 
         // ── Reach edges per (zone, level), concatenated ──
         let mut all_edges: Vec<ReachEdge> = Vec::new();
@@ -255,7 +295,7 @@ impl BucketedNativeGpu {
         let flop_edge_lv = edge_ranges(&plan.flop_edges);
         let turn_edge_lv = edge_ranges(&plan.turn_edges);
         let river_edge_lv = edge_ranges(&plan.river_edges);
-        let edges_buf = buf_from(ctx, &all_edges);
+        let edges_buf = buf_from(ctx, &all_edges)?;
 
         // ── Bottom-up descriptors per (zone, outcome, level) ──
         let mut all_bu: Vec<BuDesc> = Vec::new();
@@ -274,11 +314,11 @@ impl BucketedNativeGpu {
             plan.turn_bu.iter().map(|lv| bu_ranges(lv)).collect();
         let river_bu_lv: Vec<Vec<Range>> =
             plan.river_bu.iter().map(|lv| bu_ranges(lv)).collect();
-        let bu_buf = buf_from(ctx, &all_bu);
+        let bu_buf = buf_from(ctx, &all_bu)?;
 
-        let children_buf = buf_from(ctx, &plan.children_flat);
-        let node_child_off_buf = buf_from(ctx, &plan.node_child_off);
-        let node_local_base_buf = buf_from(ctx, &layout.node_local_base);
+        let children_buf = buf_from(ctx, &plan.children_flat)?;
+        let node_child_off_buf = buf_from(ctx, &plan.node_child_off)?;
+        let node_local_base_buf = buf_from(ctx, &layout.node_local_base)?;
 
         // ── Maps + omegas, runout-indexed (ridx·nh) ──
         let n_runouts = 1 + n_turn + n_turn * max_river;
@@ -296,10 +336,10 @@ impl BucketedNativeGpu {
                 omegas[r * nh..(r + 1) * nh].copy_from_slice(&bk.river_omega[ti][ri]);
             }
         }
-        let maps_buf = buf_from(ctx, &maps);
-        let omegas_buf = buf_from(ctx, &omegas);
+        let maps_buf = buf_from(ctx, &maps)?;
+        let omegas_buf = buf_from(ctx, &omegas)?;
 
-        let weights_buf = buf_from(ctx, &table.initial_weight_flat());
+        let weights_buf = buf_from(ctx, &table.initial_weight_flat())?;
 
         // ── Chance probabilities (identical call chain to the CPU run) ──
         let mut cp_turn = vec![0.0f32; n_turn * nh];
@@ -308,7 +348,7 @@ impl BucketedNativeGpu {
                 cp_turn[ti * nh + h] = table.chance_probability_turn(ti, h);
             }
         }
-        let cp_turn_buf = buf_from(ctx, &cp_turn);
+        let cp_turn_buf = buf_from(ctx, &cp_turn)?;
         let mut cp_river: Vec<f32> = Vec::new();
         let mut cp_river_off = vec![0usize; n_turn];
         for ti in 0..n_turn {
@@ -320,12 +360,12 @@ impl BucketedNativeGpu {
                 }
             }
         }
-        let cp_river_buf = buf_from(ctx, &cp_river);
+        let cp_river_buf = buf_from(ctx, &cp_river)?;
 
         let ts_count = plan.turn_seed_nodes.len();
         let rs_count = plan.river_seed_nodes.len();
-        let turn_seed_buf = buf_from(ctx, &plan.turn_seed_nodes);
-        let river_seed_buf = buf_from(ctx, &plan.river_seed_nodes);
+        let turn_seed_buf = buf_from(ctx, &plan.turn_seed_nodes)?;
+        let river_seed_buf = buf_from(ctx, &plan.river_seed_nodes)?;
 
         // ── cfv-offset lists for the chance accumulations ──
         let mut river_offs: Vec<u32> = Vec::with_capacity(total_rivers);
@@ -336,10 +376,10 @@ impl BucketedNativeGpu {
                 river_offs.push(cfv_offs[river_walk_base[ti] + ri]);
             }
         }
-        let river_cfv_offs_buf = buf_from(ctx, &river_offs);
+        let river_cfv_offs_buf = buf_from(ctx, &river_offs)?;
         let turn_offs: Vec<u32> =
             (0..n_turn).map(|ti| cfv_offs[total_rivers + ti]).collect();
-        let turn_cfv_offs_buf = buf_from(ctx, &turn_offs);
+        let turn_cfv_offs_buf = buf_from(ctx, &turn_offs)?;
 
         Ok(Self {
             queue: ctx.queue().to_owned(),
@@ -353,9 +393,9 @@ impl BucketedNativeGpu {
             p_chance: ctx.create_pipeline("bucketed_native_chance_accum")?,
             p_root_accum: ctx.create_pipeline("bucketed_native_root_accum")?,
             term,
-            regrets: zeros_buf(ctx, dims.total_floats()),
-            cum: zeros_buf(ctx, dims.total_floats()),
-            strategy: zeros_buf(ctx, dims.total_floats()),
+            regrets: zeros_buf(ctx, dims.total_floats(), "regrets")?,
+            cum: zeros_buf(ctx, dims.total_floats(), "cum")?,
+            strategy: zeros_buf(ctx, dims.total_floats(), "strategy")?,
             flop_stride: dims.flop_stride(),
             turn_total: dims.turn_total(),
             river_total: dims.river_total(),
@@ -363,9 +403,9 @@ impl BucketedNativeGpu {
             river_offset_f: dims.river_offset(),
             turn_stride: dims.turn_stride(),
             river_stride: dims.river_stride(),
-            reach_mega: zeros_buf(ctx, n_walks * reach_per_walk),
-            cfv_mega: zeros_buf(ctx, n_walks * cfv_per_walk),
-            root_cfv: zeros_buf(ctx, nh),
+            reach_mega: zeros_buf(ctx, n_walks * reach_per_walk, "reach_mega")?,
+            cfv_mega: zeros_buf(ctx, n_walks * cfv_per_walk, "cfv_mega")?,
+            root_cfv: zeros_buf(ctx, nh, "root_cfv")?,
             descs_buf,
             flop_desc,
             turn_desc_all,
