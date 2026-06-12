@@ -17,6 +17,23 @@
 //!   (identity = uniform dims); gate 2 / N2 drift unchanged (N2
 //!   divergent dims exercises the generic fallback).
 //!
+//! Lever 4 (cross-walk batched reach) — DISCARDED 2026-06-11. Two
+//! multi-walk kernels (seed + reach level, per-walk offsets via
+//! descriptor) cut the reach stage's dispatch count ~8× (≈170 →
+//! ≈20/pass): 34-avg 0.354→0.350 (B=8 4×4) and 0.971→0.966 (B=10
+//! 4×4) — 1.01×, noise. FINDING: the flat 0.083s reach stage is
+//! BANDWIDTH-bound (mega-zero + per-edge row traffic is real work),
+//! not dispatch-serialization-bound. Remaining reach headroom =
+//! traffic reduction (zero-skip / row-sparse propagation), ceiling
+//! ~15% of the B=8 cell, semantics-risky — not taken. Reverted.
+//!
+//! G6 CLOSE: kept = lever 1 only. Final 34-avg: B=8 4×4 0.355 s/iter
+//! (full set 5.9h GPU-only; GPU+CPU split ≈ 4.0h), B=10 4×4 0.969
+//! (16.1h). The native path is now within noise of its measured
+//! structural floors on every axis we probed: odometer latency-bound
+//! (FMA 1.00×), reach bandwidth-bound (batching 1.01×), enumeration
+//! already sparse (compaction −9%), occupancy saturated (wall=busy).
+//!
 //! Lever 2 (FMA contraction) — DISCARDED 2026-06-11. Mechanism: the
 //! batched kernel stamped twice in one TU via a body include, _fma
 //! copy under `#pragma METAL fp contract(fast)`. Measured: contraction
