@@ -1642,6 +1642,15 @@ impl BucketedFlopCfr {
     pub fn cum_strategy_turn(&self) -> &[f32] { &self.cum_strategy_turn }
     pub fn regrets_river(&self) -> &[f32] { &self.regrets_river }
     pub fn cum_strategy_river(&self) -> &[f32] { &self.cum_strategy_river }
+    // Warm-start injection (2026-06-12, fidelity lever L7): seed a
+    // solve from a neighbor flop's converged state. Layouts are
+    // identical for the same (tree, B) regardless of flop.
+    pub fn regrets_flop_mut(&mut self) -> &mut [f32] { &mut self.regrets_flop }
+    pub fn cum_strategy_flop_mut(&mut self) -> &mut [f32] { &mut self.cum_strategy_flop }
+    pub fn regrets_turn_mut(&mut self) -> &mut [f32] { &mut self.regrets_turn }
+    pub fn cum_strategy_turn_mut(&mut self) -> &mut [f32] { &mut self.cum_strategy_turn }
+    pub fn regrets_river_mut(&mut self) -> &mut [f32] { &mut self.regrets_river }
+    pub fn cum_strategy_river_mut(&mut self) -> &mut [f32] { &mut self.cum_strategy_river }
     /// GPU-facing layout for the bucketed solve (G2 step 1 — built and
     /// gated BEFORE any kernel consumes it). Kernel-side index math is
     /// reduced to `zone_outcome_base + node_local_base[node] + a·nb + b`;
