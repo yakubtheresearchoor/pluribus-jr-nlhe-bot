@@ -16,6 +16,16 @@
 //!   Gates: N1 + 1b bit-exact THROUGH the specialized pipeline
 //!   (identity = uniform dims); gate 2 / N2 drift unchanged (N2
 //!   divergent dims exercises the generic fallback).
+//!
+//! Lever 2 (FMA contraction) — DISCARDED 2026-06-11. Mechanism: the
+//! batched kernel stamped twice in one TU via a body include, _fma
+//! copy under `#pragma METAL fp contract(fast)`. Measured: contraction
+//! ACTIVE (4148/105984 river-regret bits diverged from the exact arm
+//! at 3 iters), trajectory gate clean (2.2e-6..9.3e-6, root 7.6e-7,
+//! 8 iters vs CPU) — and gain 1.00×/1.01× at both cells. The odometer
+//! is LATENCY/DIVERGENCE-bound, not FP-throughput-bound; contraction
+//! buys nothing and costs the exact-arithmetic property. Reverted
+//! (host plumbing + body include removed; this header is the record).
 
 #![cfg(feature = "metal")]
 

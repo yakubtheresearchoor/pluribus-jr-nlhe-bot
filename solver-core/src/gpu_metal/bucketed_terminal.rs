@@ -218,15 +218,21 @@ impl BucketedTerminalGpu {
             ctx.create_pipeline_with_constants("bucketed_terminal_collapsed_batched", &[])?;
         // Specialized variant: only when per-street B is uniform (the
         // production config) — per-zone stripes are then uniform too.
+        // Specialized variant: only when per-street B is uniform (the
+        // production config) — per-zone stripes are then uniform too.
+        // (G6 lever 2, FMA contraction, was built on top of this and
+        // DISCARDED: contraction measured ACTIVE by bit-divergence yet
+        // 1.00× — the odometer is latency/divergence-bound, not
+        // FP-throughput-bound. See p1_5_4_gpu_bucketed_g6_levers.rs.)
         let batched_pipeline_spec = if bk.nb_flop == bk.nb_turn && bk.nb_turn == bk.nb_river {
             let s_uniform = stripes.min(32 / bk.nb_flop as u32).max(1);
             Some(ctx.create_pipeline_with_constants(
                 "bucketed_terminal_collapsed_batched",
                 &[
-                    (0, bk.nb_flop as u32),            // FC_NB
-                    (1, tree.num_players as u32),      // FC_NP
+                    (0, bk.nb_flop as u32),             // FC_NB
+                    (1, tree.num_players as u32),       // FC_NP
                     (2, (tree.num_players - 1) as u32), // FC_NUM_OPP
-                    (3, s_uniform),                    // FC_STRIPES
+                    (3, s_uniform),                     // FC_STRIPES
                 ],
             )?)
         } else {
