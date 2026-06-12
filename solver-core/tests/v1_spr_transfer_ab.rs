@@ -39,6 +39,14 @@
 //! shape-split (→ ~125 solves). NAMED approximation, residual
 //! measured here at HU research scale; production confirmation rides
 //! the harness head-to-head like every other A/B.
+//!
+//! RESIDUAL RISK (user-flagged 2026-06-12): these are HU numbers, and
+//! the families the policy most needs to hold for are live-5/6 (96%
+//! of the GPU bill) — multiway pots have more future betting
+//! structure, so within-bucket transfer is most likely to be looser
+//! exactly where solve cost concentrates. THE HARNESS CONFIRMATION
+//! MUST BE STRATIFIED BY FAMILY: a transfer that is free HU and loose
+//! at live-6 would be invisible in a pooled number.
 
 use solver_core::card::{card_from_str, index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
