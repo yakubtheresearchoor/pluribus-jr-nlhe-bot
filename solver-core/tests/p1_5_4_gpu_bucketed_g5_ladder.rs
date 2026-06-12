@@ -36,6 +36,14 @@
 //!     1/12.0 + 1/12.4 ⇒ ≈ 6.1h full set — the production run halves.
 //!   - Remaining headroom is GPU-work reduction only (sparsity
 //!     compaction, function constants), not orchestration.
+//!
+//!   ERRATUM (same day — see p1_5_4_gpu_bucketed_g5_sparsity_decay):
+//!   these rows are DENSE-ITERATION costs (iters 2-4), not flat
+//!   per-iter costs. The native path decays 3.8-6.8× to a converged
+//!   plateau by ~iter 5 (the odometer's r==0 skip always pruned).
+//!   True 34-avg full-set hours: B=8 4×4 7.0h, B=10 2×2 16.4h,
+//!   B=10 4×4 21.1h. The compaction lever itself measured a ~9%
+//!   regression and was reverted.
 
 #![cfg(feature = "metal")]
 
