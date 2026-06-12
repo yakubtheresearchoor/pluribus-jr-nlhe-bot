@@ -1,0 +1,844 @@
+//! G5: fully GPU-native bucketed iteration — the Fix-C async
+//! orchestrator. One command buffer per traverser pass; one encoder per
+//! dispatch; ordering comes from Metal hazard tracking on the shared
+//! buffers (the same pattern that took the exact-solver pipeline to
+//! zero intermediate waits); commit without wait, single flush at
+//! readback. No reach prepass on the CPU, no packing, no per-walk
+//! readbacks — the G5-1 eliminable budget (reach prepass 8.6 GB/iter +
+//! packing 2.0 GB/iter at 4×4) is gone by construction.
+//!
+//! Bit-exactness design (the standard every prior link met): each
+//! output element is written by exactly one thread; inner loops run in
+//! the CPU walk's iteration order; walk-vs-walk reordering touches only
+//! independent buffers; chance accumulation preserves the CPU's
+//! outcome-ascending sum. The identity gate (G5-3) holds this to
+//! bit-exact at B = nh through full DCFR iterations.
+//!
+//! State lives GPU-resident in the ZoneDims-concatenated layout
+//! ([flop | turn ti-major | river outcome-major] — identical to the
+//! CPU solver's per-zone buffers laid end to end), so gate readback is
+//! a direct slice comparison.
+
+use crate::solver::bucketed_flop_cfr::{
+    BucketedFlopCfr, BuDesc, FlopBucketing, InfosetDesc, ReachEdge,
+};
+use crate::solver::flop_start_game::FlopChanceTable;
+use crate::solver::flop_start_vector_cfr::{DcfrParams, Zone};
+use crate::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
+use metal::{
+    Buffer, CommandBuffer, CommandQueue, ComputeCommandEncoderRef,
+    ComputePipelineState, MTLResourceOptions, MTLSize,
+};
+
+use super::bucketed_terminal::{BucketedTerminalGpu, WalkKey};
+use super::context::{MetalContext, MetalResult};
+
+/// Field-for-field mirror of Metal `NativeWalkParams`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WalkParamsGpu {
+    count: u32,
+    np: u32,
+    nh: u32,
+    nb: u32,
+    map_off: u32,
+    omega_off: u32,
+    traverser: u32,
+    alpha_t: f32,
+    beta_t: f32,
+    gamma_t: f32,
+    regret_floor: f32,
+    _pad: u32,
+}
+
+fn buf_from<T: Copy>(ctx: &MetalContext, data: &[T]) -> Buffer {
+    let bytes = std::mem::size_of_val(data).max(4);
+    let buf = ctx
+        .device()
+        .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr() as *const u8,
+            buf.contents() as *mut u8,
+            std::mem::size_of_val(data),
+        );
+    }
+    buf
+}
+
+fn zeros_buf(ctx: &MetalContext, floats: usize) -> Buffer {
+    let buf = ctx.device().new_buffer(
+        (floats * 4).max(4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    unsafe {
+        std::ptr::write_bytes(buf.contents() as *mut u8, 0, floats * 4);
+    }
+    buf
+}
+
+/// (element offset, count) ranges into a concatenated upload buffer.
+type Range = (usize, usize);
+
+pub struct BucketedNativeGpu {
+    queue: CommandQueue,
+    p_strat: ComputePipelineState,
+    p_zero: ComputePipelineState,
+    p_root_init: ComputePipelineState,
+    p_seed: ComputePipelineState,
+    p_reach: ComputePipelineState,
+    p_cfv: ComputePipelineState,
+    p_regret: ComputePipelineState,
+    p_chance: ComputePipelineState,
+    p_root_accum: ComputePipelineState,
+    /// Terminal resources + the batched collapsed kernel (resident
+    /// mode); single-source with the G3-gated hybrid path.
+    term: BucketedTerminalGpu,
+
+    // ── Persistent state (ZoneDims concatenated) ──
+    regrets: Buffer,
+    cum: Buffer,
+    strategy: Buffer,
+    flop_stride: usize,
+    turn_total: usize,
+    river_total: usize,
+    turn_offset_f: usize,
+    river_offset_f: usize,
+    turn_stride: usize,
+    river_stride: usize,
+
+    // ── Per-pass scratch (resident) ──
+    reach_mega: Buffer,
+    cfv_mega: Buffer,
+    root_cfv: Buffer,
+
+    // ── Plan-derived (uploaded once) ──
+    descs_buf: Buffer,
+    flop_desc: Range,
+    turn_desc_all: Range,
+    river_desc_all: Range,
+    turn_desc: Vec<Range>,  // per ti
+    river_desc: Vec<Range>, // per outcome (ti·max_river + ri)
+    edges_buf: Buffer,
+    flop_edge_lv: Vec<Range>,
+    turn_edge_lv: Vec<Range>,
+    river_edge_lv: Vec<Range>,
+    bu_buf: Buffer,
+    flop_bu_lv: Vec<Range>,
+    turn_bu_lv: Vec<Vec<Range>>,  // [ti][level]
+    river_bu_lv: Vec<Vec<Range>>, // [outcome][level]
+    children_buf: Buffer,
+    node_child_off_buf: Buffer,
+    node_local_base_buf: Buffer,
+    maps_buf: Buffer,   // ridx·nh scheme (same as the terminal's)
+    omegas_buf: Buffer, // ridx·nh scheme
+    weights_buf: Buffer,
+    cp_turn_buf: Buffer,
+    cp_river_buf: Buffer,
+    cp_river_off: Vec<usize>, // float offset per ti
+    turn_seed_buf: Buffer,
+    ts_count: usize,
+    river_seed_buf: Buffer,
+    rs_count: usize,
+    /// cfv float offsets of river walks, ti-grouped (chance accum).
+    river_cfv_offs_buf: Buffer,
+    river_offs_off: Vec<usize>, // element offset per ti
+    /// cfv float offsets of turn walks (flop chance accum).
+    turn_cfv_offs_buf: Buffer,
+
+    walks: Vec<WalkKey>,
+    reach_offs: Vec<u32>, // float offset per walk
+    cfv_offs: Vec<u32>,
+    n_rivers: Vec<usize>,
+    river_walk_base: Vec<usize>,
+    total_rivers: usize,
+
+    np: usize,
+    nh: usize,
+    n_turn: usize,
+    max_river: usize,
+    nb_flop: usize,
+    nb_turn: usize,
+    nb_river: usize,
+    reach_per_walk: usize,
+
+    iteration: u32,
+    regret_floor: f32,
+    inflight: Vec<CommandBuffer>,
+    gpu_busy_s: f64,
+}
+
+impl BucketedNativeGpu {
+    /// Runout index in the concatenated map/omega buffers — the SAME
+    /// flattening the terminal uses (flop 0; turn 1+ti; river
+    /// 1+n_turn+ti·max_river+ri).
+    fn runout_index(&self, zone: Zone, tc: Option<usize>, rc: Option<usize>) -> usize {
+        match zone {
+            Zone::Flop => 0,
+            Zone::Turn => 1 + tc.unwrap(),
+            Zone::River => 1 + self.n_turn + tc.unwrap() * self.max_river + rc.unwrap(),
+            Zone::Preflop => unreachable!(),
+        }
+    }
+
+    pub fn new(
+        ctx: &MetalContext,
+        tree: &FlatTree,
+        table: &FlopChanceTable,
+        bk: &FlopBucketing,
+        solver: &BucketedFlopCfr,
+        stripes: u32,
+    ) -> MetalResult<Self> {
+        let plan = solver.native_plan(tree, bk);
+        let layout = solver.gpu_layout(bk);
+        let dims = layout.dims;
+        let term = BucketedTerminalGpu::new(ctx, tree, table, bk, solver, stripes)?;
+
+        let nn = tree.num_nodes();
+        let np = tree.num_players as usize;
+        let nh = table.num_valid;
+        let n_turn = table.remaining_deck.len();
+        let max_river = dims.max_river;
+        // ── Walk bookkeeping (plan order: rivers, turns, flop) ──
+        let n_rivers: Vec<usize> = (0..n_turn).map(|ti| bk.river_map[ti].len()).collect();
+        let mut river_walk_base = vec![0usize; n_turn];
+        let mut acc = 0usize;
+        for ti in 0..n_turn {
+            river_walk_base[ti] = acc;
+            acc += n_rivers[ti];
+        }
+        let total_rivers = acc;
+        let n_walks = total_rivers + n_turn + 1;
+        assert_eq!(plan.walks.len(), n_walks);
+        let reach_per_walk = nn * np * nh;
+        let cfv_per_walk = nn * nh;
+        let reach_offs: Vec<u32> =
+            (0..n_walks).map(|w| (w * reach_per_walk) as u32).collect();
+        let cfv_offs: Vec<u32> = (0..n_walks).map(|w| (w * cfv_per_walk) as u32).collect();
+
+        // ── Infoset descriptors: [flop | turn ti-major | river outcome-major] ──
+        let mut all_descs: Vec<InfosetDesc> = Vec::new();
+        let flop_desc: Range = (0, plan.flop_infosets.len());
+        all_descs.extend_from_slice(&plan.flop_infosets);
+        let turn_start = all_descs.len();
+        let mut turn_desc: Vec<Range> = Vec::with_capacity(n_turn);
+        for ti in 0..n_turn {
+            turn_desc.push((all_descs.len(), plan.turn_infosets[ti].len()));
+            all_descs.extend_from_slice(&plan.turn_infosets[ti]);
+        }
+        let turn_desc_all: Range = (turn_start, all_descs.len() - turn_start);
+        let river_start = all_descs.len();
+        let mut river_desc: Vec<Range> = Vec::with_capacity(n_turn * max_river);
+        for o in 0..n_turn * max_river {
+            river_desc.push((all_descs.len(), plan.river_infosets[o].len()));
+            all_descs.extend_from_slice(&plan.river_infosets[o]);
+        }
+        let river_desc_all: Range = (river_start, all_descs.len() - river_start);
+        let descs_buf = buf_from(ctx, &all_descs);
+
+        // ── Reach edges per (zone, level), concatenated ──
+        let mut all_edges: Vec<ReachEdge> = Vec::new();
+        let mut edge_ranges = |levels: &[Vec<ReachEdge>]| -> Vec<Range> {
+            levels
+                .iter()
+                .map(|es| {
+                    let r = (all_edges.len(), es.len());
+                    all_edges.extend_from_slice(es);
+                    r
+                })
+                .collect()
+        };
+        let flop_edge_lv = edge_ranges(&plan.flop_edges);
+        let turn_edge_lv = edge_ranges(&plan.turn_edges);
+        let river_edge_lv = edge_ranges(&plan.river_edges);
+        let edges_buf = buf_from(ctx, &all_edges);
+
+        // ── Bottom-up descriptors per (zone, outcome, level) ──
+        let mut all_bu: Vec<BuDesc> = Vec::new();
+        let mut bu_ranges = |levels: &[Vec<BuDesc>]| -> Vec<Range> {
+            levels
+                .iter()
+                .map(|ds| {
+                    let r = (all_bu.len(), ds.len());
+                    all_bu.extend_from_slice(ds);
+                    r
+                })
+                .collect()
+        };
+        let flop_bu_lv = bu_ranges(&plan.flop_bu);
+        let turn_bu_lv: Vec<Vec<Range>> =
+            plan.turn_bu.iter().map(|lv| bu_ranges(lv)).collect();
+        let river_bu_lv: Vec<Vec<Range>> =
+            plan.river_bu.iter().map(|lv| bu_ranges(lv)).collect();
+        let bu_buf = buf_from(ctx, &all_bu);
+
+        let children_buf = buf_from(ctx, &plan.children_flat);
+        let node_child_off_buf = buf_from(ctx, &plan.node_child_off);
+        let node_local_base_buf = buf_from(ctx, &layout.node_local_base);
+
+        // ── Maps + omegas, runout-indexed (ridx·nh) ──
+        let n_runouts = 1 + n_turn + n_turn * max_river;
+        let mut maps = vec![u16::MAX; n_runouts * nh];
+        let mut omegas = vec![0.0f32; n_runouts * nh];
+        maps[0..nh].copy_from_slice(&bk.flop_map);
+        omegas[0..nh].copy_from_slice(&bk.flop_omega);
+        for ti in 0..n_turn {
+            let r = 1 + ti;
+            maps[r * nh..(r + 1) * nh].copy_from_slice(&bk.turn_map[ti]);
+            omegas[r * nh..(r + 1) * nh].copy_from_slice(&bk.turn_omega[ti]);
+            for ri in 0..n_rivers[ti] {
+                let r = 1 + n_turn + ti * max_river + ri;
+                maps[r * nh..(r + 1) * nh].copy_from_slice(&bk.river_map[ti][ri]);
+                omegas[r * nh..(r + 1) * nh].copy_from_slice(&bk.river_omega[ti][ri]);
+            }
+        }
+        let maps_buf = buf_from(ctx, &maps);
+        let omegas_buf = buf_from(ctx, &omegas);
+
+        let weights_buf = buf_from(ctx, &table.initial_weight_flat());
+
+        // ── Chance probabilities (identical call chain to the CPU run) ──
+        let mut cp_turn = vec![0.0f32; n_turn * nh];
+        for ti in 0..n_turn {
+            for h in 0..nh {
+                cp_turn[ti * nh + h] = table.chance_probability_turn(ti, h);
+            }
+        }
+        let cp_turn_buf = buf_from(ctx, &cp_turn);
+        let mut cp_river: Vec<f32> = Vec::new();
+        let mut cp_river_off = vec![0usize; n_turn];
+        for ti in 0..n_turn {
+            cp_river_off[ti] = cp_river.len();
+            let tc_card = table.remaining_deck[ti];
+            for ri in 0..n_rivers[ti] {
+                for h in 0..nh {
+                    cp_river.push(table.chance_probability_river(tc_card, ri, h));
+                }
+            }
+        }
+        let cp_river_buf = buf_from(ctx, &cp_river);
+
+        let ts_count = plan.turn_seed_nodes.len();
+        let rs_count = plan.river_seed_nodes.len();
+        let turn_seed_buf = buf_from(ctx, &plan.turn_seed_nodes);
+        let river_seed_buf = buf_from(ctx, &plan.river_seed_nodes);
+
+        // ── cfv-offset lists for the chance accumulations ──
+        let mut river_offs: Vec<u32> = Vec::with_capacity(total_rivers);
+        let mut river_offs_off = vec![0usize; n_turn];
+        for ti in 0..n_turn {
+            river_offs_off[ti] = river_offs.len();
+            for ri in 0..n_rivers[ti] {
+                river_offs.push(cfv_offs[river_walk_base[ti] + ri]);
+            }
+        }
+        let river_cfv_offs_buf = buf_from(ctx, &river_offs);
+        let turn_offs: Vec<u32> =
+            (0..n_turn).map(|ti| cfv_offs[total_rivers + ti]).collect();
+        let turn_cfv_offs_buf = buf_from(ctx, &turn_offs);
+
+        Ok(Self {
+            queue: ctx.queue().to_owned(),
+            p_strat: ctx.create_pipeline("bucketed_native_strategies")?,
+            p_zero: ctx.create_pipeline("bucketed_native_zero")?,
+            p_root_init: ctx.create_pipeline("bucketed_native_root_init")?,
+            p_seed: ctx.create_pipeline("bucketed_native_seed")?,
+            p_reach: ctx.create_pipeline("bucketed_native_reach_level")?,
+            p_cfv: ctx.create_pipeline("bucketed_native_cfv_level")?,
+            p_regret: ctx.create_pipeline("bucketed_native_regret_update")?,
+            p_chance: ctx.create_pipeline("bucketed_native_chance_accum")?,
+            p_root_accum: ctx.create_pipeline("bucketed_native_root_accum")?,
+            term,
+            regrets: zeros_buf(ctx, dims.total_floats()),
+            cum: zeros_buf(ctx, dims.total_floats()),
+            strategy: zeros_buf(ctx, dims.total_floats()),
+            flop_stride: dims.flop_stride(),
+            turn_total: dims.turn_total(),
+            river_total: dims.river_total(),
+            turn_offset_f: dims.turn_offset(),
+            river_offset_f: dims.river_offset(),
+            turn_stride: dims.turn_stride(),
+            river_stride: dims.river_stride(),
+            reach_mega: zeros_buf(ctx, n_walks * reach_per_walk),
+            cfv_mega: zeros_buf(ctx, n_walks * cfv_per_walk),
+            root_cfv: zeros_buf(ctx, nh),
+            descs_buf,
+            flop_desc,
+            turn_desc_all,
+            river_desc_all,
+            turn_desc,
+            river_desc,
+            edges_buf,
+            flop_edge_lv,
+            turn_edge_lv,
+            river_edge_lv,
+            bu_buf,
+            flop_bu_lv,
+            turn_bu_lv,
+            river_bu_lv,
+            children_buf,
+            node_child_off_buf,
+            node_local_base_buf,
+            maps_buf,
+            omegas_buf,
+            weights_buf,
+            cp_turn_buf,
+            cp_river_buf,
+            cp_river_off,
+            turn_seed_buf,
+            ts_count,
+            river_seed_buf,
+            rs_count,
+            river_cfv_offs_buf,
+            river_offs_off,
+            turn_cfv_offs_buf,
+            walks: plan.walks,
+            reach_offs,
+            cfv_offs,
+            n_rivers,
+            river_walk_base,
+            total_rivers,
+            np,
+            nh,
+            n_turn,
+            max_river,
+            nb_flop: bk.nb_flop,
+            nb_turn: bk.nb_turn,
+            nb_river: bk.nb_river,
+            reach_per_walk,
+            iteration: 0,
+            // Mirror of BucketedFlopCfr::new's default.
+            regret_floor: -1e30,
+            inflight: Vec::new(),
+            gpu_busy_s: 0.0,
+        })
+    }
+
+    fn wparams(
+        &self,
+        count: usize,
+        nb: usize,
+        map_off: usize,
+        traverser: u8,
+        d: &DcfrParams,
+    ) -> WalkParamsGpu {
+        WalkParamsGpu {
+            count: count as u32,
+            np: self.np as u32,
+            nh: self.nh as u32,
+            nb: nb as u32,
+            map_off: map_off as u32,
+            omega_off: map_off as u32, // same ridx·nh scheme
+            traverser: traverser as u32,
+            alpha_t: d.alpha_t(),
+            beta_t: d.beta_t(),
+            gamma_t: d.gamma_t(),
+            regret_floor: self.regret_floor,
+            _pad: 0,
+        }
+    }
+
+    /// One encoder, one dispatch, ceil(n/256)×256 threads; the kernels
+    /// all guard with `if (idx >= count) return`.
+    fn dispatch(
+        &self,
+        cmd: &metal::CommandBufferRef,
+        pipe: &ComputePipelineState,
+        n: usize,
+        setup: impl FnOnce(&ComputeCommandEncoderRef),
+    ) {
+        if n == 0 {
+            return;
+        }
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipe);
+        setup(enc);
+        let tg = 256u64.min(n as u64).max(1);
+        let groups = (n as u64).div_ceil(tg);
+        enc.dispatch_thread_groups(
+            MTLSize { width: groups, height: 1, depth: 1 },
+            MTLSize { width: tg, height: 1, depth: 1 },
+        );
+        enc.end_encoding();
+    }
+
+    fn set_params(enc: &ComputeCommandEncoderRef, idx: u64, p: &WalkParamsGpu) {
+        enc.set_bytes(
+            idx,
+            std::mem::size_of::<WalkParamsGpu>() as u64,
+            p as *const _ as *const std::ffi::c_void,
+        );
+    }
+
+    fn set_u32(enc: &ComputeCommandEncoderRef, idx: u64, v: u32) {
+        enc.set_bytes(idx, 4, &v as *const _ as *const std::ffi::c_void);
+    }
+
+    /// Strategy bases for the reach kernel (`zone_outcome_base`).
+    fn zone_outcome_base(&self, zone: Zone, ti: Option<usize>, ri: Option<usize>) -> usize {
+        match zone {
+            Zone::Flop => 0,
+            Zone::Turn => self.turn_offset_f + ti.unwrap() * self.turn_stride,
+            Zone::River => {
+                self.river_offset_f
+                    + (ti.unwrap() * self.max_river + ri.unwrap()) * self.river_stride
+            }
+            Zone::Preflop => unreachable!(),
+        }
+    }
+
+    fn walk_index(&self, zone: Zone, ti: Option<usize>, ri: Option<usize>) -> usize {
+        match zone {
+            Zone::River => self.river_walk_base[ti.unwrap()] + ri.unwrap(),
+            Zone::Turn => self.total_rivers + ti.unwrap(),
+            Zone::Flop => self.total_rivers + self.n_turn,
+            Zone::Preflop => unreachable!(),
+        }
+    }
+
+    /// Encode one walk's reach: seed (or root init) + ascending-level
+    /// edge propagation. The region is zeroed by the pass-wide zero.
+    fn encode_reach_walk(
+        &self,
+        cmd: &metal::CommandBufferRef,
+        zone: Zone,
+        ti: Option<usize>,
+        ri: Option<usize>,
+        traverser: u8,
+        d: &DcfrParams,
+    ) {
+        let w = self.walk_index(zone, ti, ri);
+        let reach_byte = (self.reach_offs[w] as u64) * 4;
+        let (nb, edge_lv): (usize, &Vec<Range>) = match zone {
+            Zone::Flop => (self.nb_flop, &self.flop_edge_lv),
+            Zone::Turn => (self.nb_turn, &self.turn_edge_lv),
+            Zone::River => (self.nb_river, &self.river_edge_lv),
+            Zone::Preflop => unreachable!(),
+        };
+        match zone {
+            Zone::Flop => {
+                let p = self.wparams(0, nb, 0, traverser, d);
+                self.dispatch(cmd, &self.p_root_init, self.np * self.nh, |enc| {
+                    enc.set_buffer(0, Some(&self.reach_mega), reach_byte);
+                    enc.set_buffer(1, Some(&self.weights_buf), 0);
+                    Self::set_params(enc, 2, &p);
+                });
+            }
+            Zone::Turn => {
+                // Seed from the flop walk's reach.
+                let src_byte =
+                    (self.reach_offs[self.walk_index(Zone::Flop, None, None)] as u64) * 4;
+                let p = self.wparams(self.ts_count, nb, 0, traverser, d);
+                self.dispatch(
+                    cmd,
+                    &self.p_seed,
+                    self.ts_count * self.np * self.nh,
+                    |enc| {
+                        enc.set_buffer(0, Some(&self.reach_mega), reach_byte);
+                        enc.set_buffer(1, Some(&self.reach_mega), src_byte);
+                        enc.set_buffer(2, Some(&self.turn_seed_buf), 0);
+                        Self::set_params(enc, 3, &p);
+                    },
+                );
+            }
+            Zone::River => {
+                // Seed from this ti's turn walk reach.
+                let src_byte =
+                    (self.reach_offs[self.walk_index(Zone::Turn, ti, None)] as u64) * 4;
+                let p = self.wparams(self.rs_count, nb, 0, traverser, d);
+                self.dispatch(
+                    cmd,
+                    &self.p_seed,
+                    self.rs_count * self.np * self.nh,
+                    |enc| {
+                        enc.set_buffer(0, Some(&self.reach_mega), reach_byte);
+                        enc.set_buffer(1, Some(&self.reach_mega), src_byte);
+                        enc.set_buffer(2, Some(&self.river_seed_buf), 0);
+                        Self::set_params(enc, 3, &p);
+                    },
+                );
+            }
+            Zone::Preflop => unreachable!(),
+        }
+        let map_off = self.runout_index(zone, ti, ri) * self.nh;
+        let zob = self.zone_outcome_base(zone, ti, ri) as u32;
+        for &(e_off, e_len) in edge_lv.iter() {
+            if e_len == 0 {
+                continue;
+            }
+            let p = self.wparams(e_len, nb, map_off, traverser, d);
+            let edge_byte = (e_off * std::mem::size_of::<ReachEdge>()) as u64;
+            self.dispatch(cmd, &self.p_reach, e_len * self.nh, |enc| {
+                enc.set_buffer(0, Some(&self.reach_mega), reach_byte);
+                enc.set_buffer(1, Some(&self.strategy), 0);
+                enc.set_buffer(2, Some(&self.node_local_base_buf), 0);
+                enc.set_buffer(3, Some(&self.maps_buf), 0);
+                enc.set_buffer(4, Some(&self.edges_buf), edge_byte);
+                Self::set_params(enc, 5, &p);
+                Self::set_u32(enc, 6, zob);
+            });
+        }
+    }
+
+    /// Encode one walk's bottom-up: descending-level cfv dispatches,
+    /// then ONE regret/cum update over the walk's infosets (deferred to
+    /// after the levels — value-identical: every cfv row it reads is
+    /// final once its level is done, and nothing in the walk reads
+    /// regrets or cum).
+    fn encode_bu_walk(
+        &self,
+        cmd: &metal::CommandBufferRef,
+        zone: Zone,
+        ti: Option<usize>,
+        ri: Option<usize>,
+        traverser: u8,
+        d: &DcfrParams,
+    ) {
+        let w = self.walk_index(zone, ti, ri);
+        let cfv_byte = (self.cfv_offs[w] as u64) * 4;
+        let (nb, bu_lv, desc): (usize, &Vec<Range>, Range) = match zone {
+            Zone::Flop => (self.nb_flop, &self.flop_bu_lv, self.flop_desc),
+            Zone::Turn => (self.nb_turn, &self.turn_bu_lv[ti.unwrap()], self.turn_desc[ti.unwrap()]),
+            Zone::River => {
+                let o = ti.unwrap() * self.max_river + ri.unwrap();
+                (self.nb_river, &self.river_bu_lv[o], self.river_desc[o])
+            }
+            Zone::Preflop => unreachable!(),
+        };
+        let map_off = self.runout_index(zone, ti, ri) * self.nh;
+        for &(b_off, b_len) in bu_lv.iter().rev() {
+            if b_len == 0 {
+                continue;
+            }
+            let p = self.wparams(b_len, nb, map_off, traverser, d);
+            let bu_byte = (b_off * std::mem::size_of::<BuDesc>()) as u64;
+            self.dispatch(cmd, &self.p_cfv, b_len * self.nh, |enc| {
+                enc.set_buffer(0, Some(&self.cfv_mega), cfv_byte);
+                enc.set_buffer(1, Some(&self.strategy), 0);
+                enc.set_buffer(2, Some(&self.maps_buf), 0);
+                enc.set_buffer(3, Some(&self.bu_buf), bu_byte);
+                enc.set_buffer(4, Some(&self.children_buf), 0);
+                Self::set_params(enc, 5, &p);
+            });
+        }
+        let (d_off, d_len) = desc;
+        if d_len == 0 {
+            return;
+        }
+        let p = self.wparams(d_len, nb, map_off, traverser, d);
+        let desc_byte = (d_off * std::mem::size_of::<InfosetDesc>()) as u64;
+        self.dispatch(cmd, &self.p_regret, d_len * MAX_NA_POSTFLOP * nb, |enc| {
+            enc.set_buffer(0, Some(&self.cfv_mega), cfv_byte);
+            enc.set_buffer(1, Some(&self.regrets), 0);
+            enc.set_buffer(2, Some(&self.cum), 0);
+            enc.set_buffer(3, Some(&self.strategy), 0);
+            enc.set_buffer(4, Some(&self.maps_buf), 0);
+            enc.set_buffer(5, Some(&self.omegas_buf), 0);
+            enc.set_buffer(6, Some(&self.descs_buf), desc_byte);
+            enc.set_buffer(7, Some(&self.children_buf), 0);
+            enc.set_buffer(8, Some(&self.node_child_off_buf), 0);
+            Self::set_params(enc, 9, &p);
+        });
+    }
+
+    /// One traverser pass, one command buffer (Fix-C: encode
+    /// everything, commit, NO wait — hazard tracking orders dependent
+    /// dispatches; cross-command-buffer order is queue submission
+    /// order on tracked resources).
+    fn encode_traverser_pass(&mut self, traverser: u8, d: &DcfrParams) {
+        let cmd = self.queue.new_command_buffer().to_owned();
+
+        // ── 1. Strategies (all zones, all outcomes; regrets fixed) ──
+        for (range, nb) in [
+            (self.flop_desc, self.nb_flop),
+            (self.turn_desc_all, self.nb_turn),
+            (self.river_desc_all, self.nb_river),
+        ] {
+            let (d_off, d_len) = range;
+            if d_len == 0 {
+                continue;
+            }
+            let p = self.wparams(d_len, nb, 0, traverser, d);
+            let desc_byte = (d_off * std::mem::size_of::<InfosetDesc>()) as u64;
+            self.dispatch(&cmd, &self.p_strat, d_len * nb, |enc| {
+                enc.set_buffer(0, Some(&self.regrets), 0);
+                enc.set_buffer(1, Some(&self.strategy), 0);
+                enc.set_buffer(2, Some(&self.descs_buf), desc_byte);
+                Self::set_params(enc, 3, &p);
+            });
+        }
+
+        // ── 2. Zero all reach (CPU allocates fresh-zeroed per walk;
+        //       unwritten rows — e.g. below UNUSED-offset skips — must
+        //       read as zero at terminals exactly like the CPU's) ──
+        let total_reach = self.walks.len() * self.reach_per_walk;
+        self.dispatch(&cmd, &self.p_zero, total_reach, |enc| {
+            enc.set_buffer(0, Some(&self.reach_mega), 0);
+            Self::set_u32(enc, 1, total_reach as u32);
+        });
+
+        // ── 3. Reach in dependency order: flop → turns → rivers ──
+        self.encode_reach_walk(&cmd, Zone::Flop, None, None, traverser, d);
+        for ti in 0..self.n_turn {
+            self.encode_reach_walk(&cmd, Zone::Turn, Some(ti), None, traverser, d);
+        }
+        for ti in 0..self.n_turn {
+            for ri in 0..self.n_rivers[ti] {
+                self.encode_reach_walk(&cmd, Zone::River, Some(ti), Some(ri), traverser, d);
+            }
+        }
+
+        // ── 4. ALL terminals, one batched dispatch (resident mode) ──
+        self.term.encode_walks_resident(
+            &cmd,
+            &self.walks,
+            traverser,
+            &self.reach_mega,
+            &self.cfv_mega,
+            &self.reach_offs,
+            &self.cfv_offs,
+        );
+
+        // ── 5. Bottom-up in run() order: rivers → per-ti chance accum
+        //       → turns → flop chance accum → flop ──
+        for ti in 0..self.n_turn {
+            for ri in 0..self.n_rivers[ti] {
+                self.encode_bu_walk(&cmd, Zone::River, Some(ti), Some(ri), traverser, d);
+            }
+        }
+        for ti in 0..self.n_turn {
+            // turn_cfv[child] = Σ_ri cp_river · river_cfv[child]
+            // (outcome-ascending — the CPU's accumulation order).
+            let dst_byte =
+                (self.cfv_offs[self.walk_index(Zone::Turn, Some(ti), None)] as u64) * 4;
+            let p = self.wparams(self.rs_count, self.nb_turn, 0, traverser, d);
+            let offs_byte = (self.river_offs_off[ti] * 4) as u64;
+            let cp_byte = (self.cp_river_off[ti] * 4) as u64;
+            let n_out = self.n_rivers[ti] as u32;
+            self.dispatch(&cmd, &self.p_chance, self.rs_count * self.nh, |enc| {
+                enc.set_buffer(0, Some(&self.cfv_mega), dst_byte);
+                enc.set_buffer(1, Some(&self.cfv_mega), 0);
+                enc.set_buffer(2, Some(&self.river_cfv_offs_buf), offs_byte);
+                enc.set_buffer(3, Some(&self.cp_river_buf), cp_byte);
+                enc.set_buffer(4, Some(&self.river_seed_buf), 0);
+                Self::set_params(enc, 5, &p);
+                Self::set_u32(enc, 6, n_out);
+            });
+        }
+        for ti in 0..self.n_turn {
+            self.encode_bu_walk(&cmd, Zone::Turn, Some(ti), None, traverser, d);
+        }
+        {
+            // flop_cfv[child] = Σ_ti cp_turn · turn_cfv[child]
+            let dst_byte =
+                (self.cfv_offs[self.walk_index(Zone::Flop, None, None)] as u64) * 4;
+            let p = self.wparams(self.ts_count, self.nb_flop, 0, traverser, d);
+            self.dispatch(&cmd, &self.p_chance, self.ts_count * self.nh, |enc| {
+                enc.set_buffer(0, Some(&self.cfv_mega), dst_byte);
+                enc.set_buffer(1, Some(&self.cfv_mega), 0);
+                enc.set_buffer(2, Some(&self.turn_cfv_offs_buf), 0);
+                enc.set_buffer(3, Some(&self.cp_turn_buf), 0);
+                enc.set_buffer(4, Some(&self.turn_seed_buf), 0);
+                Self::set_params(enc, 5, &p);
+                Self::set_u32(enc, 6, self.n_turn as u32);
+            });
+        }
+        self.encode_bu_walk(&cmd, Zone::Flop, None, None, traverser, d);
+
+        // ── 6. Root accumulation (traverser 0 only, like run()) ──
+        if traverser == 0 {
+            let flop_cfv_byte =
+                (self.cfv_offs[self.walk_index(Zone::Flop, None, None)] as u64) * 4;
+            self.dispatch(&cmd, &self.p_root_accum, self.nh, |enc| {
+                enc.set_buffer(0, Some(&self.root_cfv), 0);
+                enc.set_buffer(1, Some(&self.cfv_mega), flop_cfv_byte);
+                Self::set_u32(enc, 2, self.nh as u32);
+            });
+        }
+
+        cmd.commit();
+        self.inflight.push(cmd);
+    }
+
+    /// Flush: wait for the last committed command buffer (same-queue
+    /// completion is in submission order) and harvest GPU-busy
+    /// attribution from every in-flight buffer.
+    pub fn sync(&mut self) {
+        if let Some(last) = self.inflight.last() {
+            last.wait_until_completed();
+        }
+        for cmd in self.inflight.drain(..) {
+            unsafe {
+                use objc::{msg_send, sel, sel_impl};
+                let start: f64 = msg_send![&*cmd, GPUStartTime];
+                let end: f64 = msg_send![&*cmd, GPUEndTime];
+                if end > start {
+                    self.gpu_busy_s += end - start;
+                }
+            }
+        }
+    }
+
+    /// The fully GPU-native mirror of `BucketedFlopCfr::run`: per
+    /// iteration, per traverser, one async command buffer; single
+    /// flush at the end; returns the averaged root cfv exactly like
+    /// the CPU (sum over traverser-0 passes / iteration count).
+    pub fn run(&mut self, num_iterations: u32) -> Vec<f32> {
+        assert!(self.inflight.is_empty(), "run() while passes in flight");
+        // root_cfv starts at zero each run (fresh CPU-side vec mirror).
+        unsafe {
+            std::ptr::write_bytes(self.root_cfv.contents() as *mut u8, 0, self.nh * 4);
+        }
+        let mut count = 0u32;
+        for _ in 0..num_iterations {
+            let d = DcfrParams::new(self.iteration);
+            self.iteration += 1;
+            for traverser in 0..self.np {
+                self.encode_traverser_pass(traverser as u8, &d);
+                if traverser == 0 {
+                    count += 1;
+                }
+            }
+        }
+        self.sync();
+        let out = unsafe {
+            std::slice::from_raw_parts(self.root_cfv.contents() as *const f32, self.nh)
+        };
+        out.iter().map(|&v| v / count as f32).collect()
+    }
+
+    // ── Gate readback (call after run/sync; slices mirror the CPU
+    //    solver's per-zone buffers exactly — ZoneDims concatenation) ──
+
+    fn state_slice<'a>(&self, buf: &'a Buffer, off: usize, len: usize) -> &'a [f32] {
+        assert!(self.inflight.is_empty(), "readback while passes in flight");
+        unsafe {
+            std::slice::from_raw_parts((buf.contents() as *const f32).add(off), len)
+        }
+    }
+
+    pub fn regrets_flop(&self) -> &[f32] {
+        self.state_slice(&self.regrets, 0, self.flop_stride)
+    }
+    pub fn cum_strategy_flop(&self) -> &[f32] {
+        self.state_slice(&self.cum, 0, self.flop_stride)
+    }
+    pub fn regrets_turn(&self) -> &[f32] {
+        self.state_slice(&self.regrets, self.turn_offset_f, self.turn_total)
+    }
+    pub fn cum_strategy_turn(&self) -> &[f32] {
+        self.state_slice(&self.cum, self.turn_offset_f, self.turn_total)
+    }
+    pub fn regrets_river(&self) -> &[f32] {
+        self.state_slice(&self.regrets, self.river_offset_f, self.river_total)
+    }
+    pub fn cum_strategy_river(&self) -> &[f32] {
+        self.state_slice(&self.cum, self.river_offset_f, self.river_total)
+    }
+
+    /// Cumulative GPU-busy seconds (the G4 attribution channel,
+    /// carried over: pair with wall-clock for occupancy claims).
+    pub fn gpu_busy_seconds(&self) -> f64 {
+        self.gpu_busy_s + self.term.gpu_busy_seconds()
+    }
+}

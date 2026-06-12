@@ -688,6 +688,144 @@ impl BucketedTerminalGpu {
         }
     }
 
+    /// G5: encode the batched terminal in RESIDENT mode (mode = 1) onto
+    /// the caller's command buffer — reach read from each walk's
+    /// resident region BY NODE ID (`node_ids_all[node_off + lt]`), cfv
+    /// written to each walk's resident region at the node row. No
+    /// commit, no wait, no packing: ordering comes from the caller's
+    /// hazard-tracked command stream (the Fix-C pattern), which is the
+    /// entire point of the G5 native path.
+    ///
+    /// `reach_offs[w]` / `cfv_offs[w]` are FLOAT offsets of walk w's
+    /// region in the mega buffers (walk order = `walks`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_walks_resident(
+        &self,
+        cmd: &metal::CommandBufferRef,
+        walks: &[WalkKey],
+        traverser: u8,
+        reach_mega: &Buffer,
+        cfv_mega: &Buffer,
+        reach_offs: &[u32],
+        cfv_offs: &[u32],
+    ) {
+        assert_eq!(walks.len(), reach_offs.len());
+        assert_eq!(walks.len(), cfv_offs.len());
+        let nh = self.nh;
+        let mut jobs: Vec<[u32; 2]> = Vec::new();
+        let mut descs: Vec<WalkDescGpu> = Vec::with_capacity(walks.len());
+        for (w, &(zone, tc, rc)) in walks.iter().enumerate() {
+            let (n_terms, zi): (usize, usize) = match zone {
+                Zone::Flop => (self.flop_term_ids.len(), 0),
+                Zone::Turn => (self.turn_term_ids.len(), 1),
+                Zone::River => (self.river_term_ids.len(), 2),
+                Zone::Preflop => unreachable!(),
+            };
+            let nb_zone = match zone {
+                Zone::Flop => self.nb_flop,
+                Zone::Turn => self.nb_turn,
+                Zone::River => self.nb_river,
+                Zone::Preflop => unreachable!(),
+            };
+            let stripes_zone = self.stripes.min(32 / nb_zone as u32).max(1);
+            let (board0, board1) = match zone {
+                Zone::Flop => (0xFFFFu32, 0xFFFFu32),
+                Zone::Turn => (self.remaining_deck[tc.unwrap()] as u32, 0xFFFF),
+                Zone::River => {
+                    let tcc = self.remaining_deck[tc.unwrap()];
+                    let rcc = self.river_decks[tcc as usize][rc.unwrap()];
+                    (tcc as u32, rcc as u32)
+                }
+                Zone::Preflop => unreachable!(),
+            };
+            let ridx = self.runout_index(zone, tc, rc);
+            descs.push(WalkDescGpu {
+                reach_off: reach_offs[w],
+                cfv_off: cfv_offs[w],
+                contrib_off: self.zone_contrib_off[zi],
+                fold_off: self.zone_fold_off[zi],
+                table_off: self.table_offs[ridx],
+                map_off: (ridx * nh) as u32,
+                board0,
+                board1,
+                nb: nb_zone as u32,
+                stripes: stripes_zone,
+                _pad0: self.zone_nodeid_off[zi], // node_off (resident mode)
+                _pad1: 0,
+            });
+            for lt in 0..n_terms {
+                jobs.push([w as u32, lt as u32]);
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let params = BatchedParamsGpu {
+            num_jobs: jobs.len() as u32,
+            np: self.np as u32,
+            nh: nh as u32,
+            num_opp: (self.np - 1) as u32,
+            traverser: traverser as u32,
+            nc: self.nc,
+            starting_pot: self.starting_pot,
+            rake_rate: self.rake_rate,
+            rake_cap: self.rake_cap,
+            mode: 1,
+        };
+        let jobs_flat: Vec<u32> = jobs.iter().flatten().copied().collect();
+        let jobs_buf = {
+            let b = self.queue.device().new_buffer(
+                (jobs_flat.len() * 4).max(4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    jobs_flat.as_ptr(),
+                    b.contents() as *mut u32,
+                    jobs_flat.len(),
+                );
+            }
+            b
+        };
+        let descs_buf = {
+            let bytes = std::mem::size_of::<WalkDescGpu>() * descs.len();
+            let b = self
+                .queue
+                .device()
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    descs.as_ptr() as *const u8,
+                    b.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            b
+        };
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.batched_pipeline);
+        enc.set_bytes(
+            0,
+            std::mem::size_of::<BatchedParamsGpu>() as u64,
+            &params as *const _ as *const std::ffi::c_void,
+        );
+        enc.set_buffer(1, Some(&jobs_buf), 0);
+        enc.set_buffer(2, Some(&descs_buf), 0);
+        enc.set_buffer(3, Some(&self.contribs_all), 0);
+        enc.set_buffer(4, Some(&self.folds_all), 0);
+        enc.set_buffer(5, Some(reach_mega), 0);
+        enc.set_buffer(6, Some(&self.fractions), 0);
+        enc.set_buffer(7, Some(&self.maps), 0);
+        enc.set_buffer(8, Some(&self.hand_cards), 0);
+        enc.set_buffer(9, Some(cfv_mega), 0);
+        enc.set_buffer(10, Some(&self.node_ids_all), 0);
+        enc.dispatch_thread_groups(
+            MTLSize { width: jobs.len() as u64, height: 1, depth: 1 },
+            MTLSize { width: 32, height: 1, depth: 1 },
+        );
+        enc.end_encoding();
+    }
+
     /// Consume self into a `BucketedFlopCfr` terminal offload hook.
     pub fn into_hook(mut self) -> TerminalOffloadHook {
         Box::new(move |zone, tc, rc, traverser, reach, cfv| {

@@ -380,6 +380,8 @@ impl BucketedGpuLayout {
 
 /// One decision infoset instance at a concrete (zone, outcome):
 /// everything the strategy / regret kernels need, precomputed.
+/// repr(C): uploaded verbatim as the Metal `NativeInfosetDesc`.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InfosetDesc {
     /// Float base into the concatenated bucket-granular buffers
@@ -392,6 +394,8 @@ pub struct InfosetDesc {
 
 /// One reach-propagation edge (parent → child via action a), in the
 /// CPU walk's exact iteration order within its (zone, level).
+/// repr(C): uploaded verbatim as the Metal `NativeReachEdge`.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReachEdge {
     pub parent: u32,
@@ -406,6 +410,8 @@ pub struct ReachEdge {
 /// One bottom-up node instance at a concrete (zone, outcome): player
 /// (kind 0, with absolute strategy base) or chance (kind 1).
 /// Terminals are the terminal kernel's job, not the walk's.
+/// repr(C): uploaded verbatim as the Metal `NativeBuDesc`.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BuDesc {
     pub node: u32,
@@ -443,6 +449,9 @@ pub struct NativePlan {
     pub river_seed_nodes: Vec<u32>,
     /// Flat children array (tree.node_children concatenated, node order).
     pub children_flat: Vec<u32>,
+    /// Per-node offset into `children_flat` (the regret-update kernel's
+    /// buffer 8 — child lookup by node id).
+    pub node_child_off: Vec<u32>,
     /// Per (zone, outcome, level): bottom-up node descriptors in the
     /// CPU walk's order (zone_node_ids levels, node order within level).
     /// Outcome flattening as for *_infosets.
@@ -856,6 +865,7 @@ impl BucketedFlopCfr {
             turn_seed_nodes: self.turn_chance_children.clone(),
             river_seed_nodes: self.river_chance_children.clone(),
             children_flat,
+            node_child_off: child_off,
             flop_bu,
             turn_bu,
             river_bu,

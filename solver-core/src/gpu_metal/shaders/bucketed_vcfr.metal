@@ -831,15 +831,19 @@ kernel void bucketed_native_strategies(
     uint col = gid % p.nb;
     if (di >= p.count) return;
     NativeInfosetDesc d = descs[di];
+    // REGRET_MATCH_EPS mirror — MUST match the CPU's 1e-5
+    // (flop_start_vector_cfr::regret_matching_into) or the first
+    // regret-matched iteration diverges.
+    const float EPS = 1e-5f;
     float pos_sum = 0.0f;
     for (uint a = 0; a < d.na; a++) {
         float r = regrets[d.base + a * p.nb + col];
-        if (r > 1e-9f) pos_sum += r;   // REGRET_MATCH_EPS mirror
+        if (r > EPS) pos_sum += r;
     }
     if (pos_sum > 0.0f) {
         for (uint a = 0; a < d.na; a++) {
             float r = regrets[d.base + a * p.nb + col];
-            strategy[d.base + a * p.nb + col] = (r > 1e-9f) ? r / pos_sum : 0.0f;
+            strategy[d.base + a * p.nb + col] = (r > EPS) ? r / pos_sum : 0.0f;
         }
     } else {
         float uniform = 1.0f / float(d.na);
