@@ -168,6 +168,7 @@ impl GameSpec {
             force_allin_threshold: 1.0,
             merging_threshold: 0.0,
             button_player: Some(self.num_players - 1),
+            max_bets_per_street: None,
         }
     }
 
@@ -202,6 +203,7 @@ impl GameSpec {
             force_allin_threshold: 1.0,
             merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
         }
     }
 }
@@ -265,4 +267,43 @@ pub struct TreeConfig {
     /// it `None` for backward compatibility; new 6-max code paths set
     /// it explicitly.
     pub button_player: Option<u8>,
+    /// RAISE-DEPTH cap (2026-06-12, Pluribus-style): maximum number of
+    /// aggressive actions (bets + raises) per STREET; once reached,
+    /// only fold/call/check remain. `None` = unlimited. This caps the
+    /// raise-WAR depth (how many times betting re-escalates in a
+    /// round), NOT the raise sizes per decision — the size menu stays
+    /// at full width at every decision that is still allowed to raise.
+    /// Blinds are not actions and don't count; an all-in ends the
+    /// aggression chain via allin_flag regardless of this cap.
+    ///
+    /// DISCIPLINE PIN: the production value is MEASURED, not assumed —
+    /// action-abstraction changes get validated (the postflop MAX_NA
+    /// saga: pruning the wrong action creates catastrophic
+    /// exploitability). Depth 3 vs 4 is decided by the exploitability
+    /// A/B; pick the smallest cap that is defense-complete.
+    pub max_bets_per_street: Option<BetCap>,
+}
+
+/// See `TreeConfig::max_bets_per_street`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BetCap {
+    /// Maximum bets + raises per street.
+    pub cap: u8,
+    /// Apply the cap to ONE seat only (`None` = all seats — the
+    /// production shape). The single-seat form builds the A/B's
+    /// asymmetric measurement game: the capped seat cannot escalate
+    /// past `cap` while the exploiter seat keeps full depth, so every
+    /// defensive infoset the capped seat needs (facing deep raises)
+    /// stays IN the tree and the equilibrium is well-defined — no
+    /// action-translation lift required to measure the cap's cost.
+    pub seat: Option<u8>,
+}
+
+impl BetCap {
+    pub fn all(cap: u8) -> Option<BetCap> {
+        Some(BetCap { cap, seat: None })
+    }
+    pub fn seat_only(cap: u8, seat: u8) -> Option<BetCap> {
+        Some(BetCap { cap, seat: Some(seat) })
+    }
 }

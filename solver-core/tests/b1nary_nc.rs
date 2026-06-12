@@ -17,7 +17,7 @@ fn main() {
         turn_bet_sizes: [one_pot.clone(), one_pot.clone()],
         river_bet_sizes: [one_pot.clone(), one_pot.clone()],
         ..Default::default()
-    };
+};
     let action_tree = ActionTree::new(tree_config).unwrap();
     let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
     game.allocate_memory(false);

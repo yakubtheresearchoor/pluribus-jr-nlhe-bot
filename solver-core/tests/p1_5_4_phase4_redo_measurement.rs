@@ -184,6 +184,7 @@ fn build_tree_with_stacks(stacks: i32, bets: Vec<BetSize>, raises: Vec<BetSize>)
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: None,
+            max_bets_per_street: None,
     };
     build_tree(&config).unwrap()
 }

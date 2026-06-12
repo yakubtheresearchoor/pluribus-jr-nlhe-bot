@@ -794,6 +794,17 @@ impl<'a> TreeBuilder<'a> {
         // Note: the all-in-forced-check case is handled by the early return
         // above at `player_remaining <= 0`. So here we only need to handle
         // FacingBet and NotFacingBet.
+        // RAISE-DEPTH cap (2026-06-12, Pluribus-style — see the
+        // TreeConfig field doc): once num_bets reaches the per-street
+        // cap, aggression is pruned; defensive actions (fold / call /
+        // check) are NEVER pruned — defense-completeness holds by
+        // construction, only the cap VALUE needs the exploitability
+        // measurement.
+        let may_aggress = self.config.max_bets_per_street.map_or(true, |bc| {
+            let applies = bc.seat.map_or(true, |s| s as usize == player);
+            !applies || info.num_bets < bc.cap as i32
+        });
+
         let action_class = self.compute_legal_action_class(info, player);
         match action_class {
             ActionClass::AllInForcedCheck => {
@@ -806,24 +817,28 @@ impl<'a> TreeBuilder<'a> {
                 // FOLD is NOT legal (nothing to call).
                 actions.push(Action::Check);
 
-                for &bet_size in &bet_options.bet {
-                    // Pass prev_amount (max other committed) so bet sizes produce
-                    // TOTAL post-action commitment (C1), not raw delta.
-                    self.add_bet_size_action(
-                        &bet_size,
-                        pot,
-                        prev_amount,
-                        max_amount,
-                        min_amount,
-                        num_remaining_streets,
-                        0,
-                        spr_after_call,
-                        &mut actions,
-                    );
-                }
+                if may_aggress {
+                    for &bet_size in &bet_options.bet {
+                        // Pass prev_amount (max other committed) so bet sizes produce
+                        // TOTAL post-action commitment (C1), not raw delta.
+                        self.add_bet_size_action(
+                            &bet_size,
+                            pot,
+                            prev_amount,
+                            max_amount,
+                            min_amount,
+                            num_remaining_streets,
+                            0,
+                            spr_after_call,
+                            &mut actions,
+                        );
+                    }
 
-                if max_amount <= (pot as f64 * self.config.add_allin_threshold).round() as i32 {
-                    actions.push(Action::AllIn(max_amount));
+                    if max_amount
+                        <= (pot as f64 * self.config.add_allin_threshold).round() as i32
+                    {
+                        actions.push(Action::AllIn(max_amount));
+                    }
                 }
             }
             ActionClass::FacingBet => {
@@ -832,7 +847,7 @@ impl<'a> TreeBuilder<'a> {
                 actions.push(Action::Fold);
                 actions.push(Action::Call);
 
-                if !info.allin_flag {
+                if !info.allin_flag && may_aggress {
                     for &bet_size in &bet_options.raise {
                         self.add_raise_size_action(
                             &bet_size,

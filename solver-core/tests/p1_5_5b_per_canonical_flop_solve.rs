@@ -40,6 +40,9 @@ fn build_simple_flop_tree() -> solver_core::tree::flat::FlatTree {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     build_tree(&cfg).expect("flop tree builds")
 }

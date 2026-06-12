@@ -162,6 +162,7 @@ fn build_lean_tree(stacks: i32) -> FlatTree {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: None,
+            max_bets_per_street: None,
     };
     build_tree(&config).unwrap()
 }

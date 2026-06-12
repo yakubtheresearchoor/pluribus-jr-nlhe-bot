@@ -290,6 +290,7 @@ fn tree_correctness_gate_multi_config() {
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
 
             }
         );
@@ -305,6 +306,7 @@ fn tree_correctness_gate_multi_config() {
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
 
             }
         );
@@ -320,6 +322,7 @@ fn tree_correctness_gate_multi_config() {
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
 
             }
         );
@@ -337,6 +340,7 @@ fn tree_correctness_gate_multi_config() {
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
 
             }
         );
@@ -355,6 +359,7 @@ fn tree_correctness_gate_multi_config() {
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
 
             }
         );
@@ -375,6 +380,7 @@ fn tree_correctness_gate_multi_config() {
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 0.5, force_allin_threshold: 1.0, merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
 
             }
         );
@@ -393,6 +399,7 @@ fn tree_correctness_gate_multi_config() {
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
 
             }
         );
@@ -409,6 +416,7 @@ fn tree_correctness_gate_multi_config() {
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
 
             }
         );
@@ -435,6 +443,7 @@ fn tree_correctness_gate_multi_config() {
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
             button_player: None,
+            max_bets_per_street: None,
 
             }
         );

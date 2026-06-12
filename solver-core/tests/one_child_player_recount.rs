@@ -57,6 +57,9 @@ fn one_child_player_fraction_across_corrected_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("6p symmetric [5;6]", TreeConfig {
             num_players: 6, initial_state: BoardState::Flop, starting_pot: 30,
@@ -65,6 +68,9 @@ fn one_child_player_fraction_across_corrected_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("3p asymmetric [10,5,5]", TreeConfig {
             num_players: 3, initial_state: BoardState::Flop, starting_pot: 15,
@@ -73,6 +79,9 @@ fn one_child_player_fraction_across_corrected_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("2p HU symmetric [5,5]", TreeConfig {
             num_players: 2, initial_state: BoardState::Flop, starting_pot: 10,
@@ -81,6 +90,9 @@ fn one_child_player_fraction_across_corrected_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
     ];
 

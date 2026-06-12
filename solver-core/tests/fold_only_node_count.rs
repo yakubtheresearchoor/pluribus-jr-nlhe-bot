@@ -42,6 +42,9 @@ fn fold_only_nodes_zero_across_all_gate_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("6p symmetric [5;6]", TreeConfig {
             num_players: 6, initial_state: BoardState::Flop, starting_pot: 30,
@@ -50,6 +53,9 @@ fn fold_only_nodes_zero_across_all_gate_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("3p asymmetric [10,5,5]", TreeConfig {
             num_players: 3, initial_state: BoardState::Flop, starting_pot: 15,
@@ -58,6 +64,9 @@ fn fold_only_nodes_zero_across_all_gate_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("2p HU symmetric [5,5]", TreeConfig {
             num_players: 2, initial_state: BoardState::Flop, starting_pot: 10,
@@ -66,6 +75,9 @@ fn fold_only_nodes_zero_across_all_gate_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("2p HU asymmetric [2,1]", TreeConfig {
             num_players: 2, initial_state: BoardState::Flop, starting_pot: 3,
@@ -74,6 +86,9 @@ fn fold_only_nodes_zero_across_all_gate_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("6p asym allin_thr=0.5", TreeConfig {
             num_players: 6, initial_state: BoardState::Flop, starting_pot: 35,
@@ -82,6 +97,9 @@ fn fold_only_nodes_zero_across_all_gate_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 0.5, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("6p asym starting at TURN", TreeConfig {
             num_players: 6, initial_state: BoardState::Turn, starting_pot: 35,
@@ -90,6 +108,9 @@ fn fold_only_nodes_zero_across_all_gate_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
         ("6p asym starting at RIVER", TreeConfig {
             num_players: 6, initial_state: BoardState::River, starting_pot: 35,
@@ -98,6 +119,9 @@ fn fold_only_nodes_zero_across_all_gate_configs() {
             rake_rate: 0.0, rake_cap: 0.0,
             bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
             add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         }),
     ];
 

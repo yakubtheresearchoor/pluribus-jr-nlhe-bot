@@ -21,6 +21,28 @@ fn env_or_skip() -> Option<(Blueprint, solver_core::tree::flat::FlatTree)> {
     Some((Blueprint::load(path).unwrap(), build_oracle_tree()))
 }
 
+/// Artifact freshness guard for tests that INDEX the blueprint (the
+/// anchor doesn't — its policies never call strategy()). A stale
+/// artifact (banked on an older tree shape) has cum sections sized for
+/// the old layout; indexing it from the current tree panics deep in
+/// the walk. The loader round-trip gate is the LOUD alarm for that;
+/// here we skip cleanly so the suite distinguishes "stale artifact"
+/// (re-bank needed) from "machinery broken".
+fn fresh_or_skip(bp: &Blueprint, tree: &solver_core::tree::flat::FlatTree) -> bool {
+    let idx = bp.indexer(tree);
+    let want = idx.flop_stride();
+    if bp.cum_flop.len() != want {
+        eprintln!(
+            "SKIP: banked artifact is STALE (cum_flop {} vs current tree layout {}) — \
+             re-bank on the current tree (loader gate is the loud alarm for this)",
+            bp.cum_flop.len(),
+            want
+        );
+        return false;
+    }
+    true
+}
+
 #[test]
 // UN-IGNORED 2026-06-12: the two tree surfaces this anchor exposed are
 // fixed at the root — (1) folds no longer collapse the hand (fold masks
@@ -47,6 +69,9 @@ fn anchor_aggressor_vs_checkfolders_exact() {
 #[test]
 fn blueprint_selfplay_audit_mode() {
     let Some((bp, tree)) = env_or_skip() else { return };
+    if !fresh_or_skip(&bp, &tree) {
+        return;
+    }
     let env = MatchEnv::new(&bp, &tree);
     let mut rng = 1234u64;
     const N: usize = 20_000;

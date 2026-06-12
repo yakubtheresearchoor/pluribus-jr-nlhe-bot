@@ -83,6 +83,7 @@ fn build_m2_tree() -> FlatTree {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: None,
+            max_bets_per_street: None,
     };
     build_tree(&config).unwrap()
 }
@@ -273,5 +274,98 @@ fn g4_batched_iteration_probe() {
              (per-walk path was: B=8 0.68s, B=10 2.48s)",
             100.0 * busy / iter_s
         );
+    }
+}
+
+/// G4 ladder: batched hybrid iteration cost at B ∈ {8,10} × runouts
+/// {1×1, 2×2, 4×4}, plus clean CPU rows (quiet box — baseline done).
+/// CPU rows measure iter-1 (dense) and iter-5 (post-sparsification) so
+/// the converged-average comparison is honest on both sides; the
+/// hybrid's cost is flat (full B^K regardless of sparsity).
+#[test]
+#[ignore = "G4 ladder (~20-40 min); run with --ignored --nocapture"]
+fn g4_ladder() {
+    use std::sync::{Arc, Mutex};
+    eprintln!("\n════ G4 ladder: batched hybrid × (B, runouts), quiet box ════");
+    let ctx = MetalContext::new().expect("Metal");
+    let tree = build_m2_tree();
+
+    let build_table_runout = |n_turn: usize, n_river: usize| -> FlopChanceTable {
+        let flop: [Card; 3] = [
+            card_from_str("2h").unwrap(),
+            card_from_str("7d").unwrap(),
+            card_from_str("Ks").unwrap(),
+        ];
+        let board_mask: u64 = flop.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
+        let deck: Vec<u8> = (0..52u8).filter(|c| board_mask & (1u64 << c) == 0).collect();
+        let turn_positions = [12usize, 36, 6, 24];
+        let river_positions = [10usize, 30, 16, 40];
+        let turn_cards: Vec<u8> = turn_positions[..n_turn].iter().map(|&p| deck[p]).collect();
+        let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+        for &tc in &turn_cards {
+            let rdeck: Vec<u8> = deck.iter().copied().filter(|&c| c != tc).collect();
+            river_decks[tc as usize] =
+                river_positions[..n_river].iter().map(|&p| rdeck[p]).collect();
+        }
+        FlopChanceTable::build_full_nh_sampled(flop, NP, &turn_cards, &river_decks)
+    };
+
+    for nb in [8usize, 10] {
+        for (rn, rt, rr) in [("1x1", 1usize, 1usize), ("2x2", 2, 2), ("4x4", 4, 4)] {
+            let table = build_table_runout(rt, rr);
+            let (fm, tm, rm) = quantile_maps(&table, nb);
+            let game = FlopStartGame::new(table);
+            let bk = FlopBucketing::from_maps(game.table(), nb, nb, nb, fm, tm, rm);
+
+            // Hybrid batched.
+            let mut hyb = BucketedFlopCfr::new(&tree, game.table(), &bk);
+            hyb.set_terminal_design(TerminalDesign::Design1Collapsed);
+            let gpu = Arc::new(Mutex::new(
+                BucketedTerminalGpu::new(&ctx, &tree, game.table(), &bk, &hyb, (32 / nb) as u32)
+                    .expect("gpu"),
+            ));
+            let gh = gpu.clone();
+            hyb.set_terminal_offload_hook(Some(Box::new(
+                move |zone, tc, rc, trav, reach: &[f32], cfv: &mut [f32]| {
+                    gh.lock().unwrap().fill_terminals(zone, tc, rc, trav, reach, cfv)
+                },
+            )));
+            let gf = gpu.clone();
+            let mut bf = move |walks: &[(Zone, Option<usize>, Option<usize>)],
+                               trav: u8,
+                               reaches: &[&[f32]]| {
+                gf.lock().unwrap().fill_walks(walks, trav, reaches);
+            };
+            hyb.run_batched(&tree, &game, &bk, 1, &mut bf); // warm
+            let t0 = Instant::now();
+            hyb.run_batched(&tree, &game, &bk, 1, &mut bf);
+            let hyb_s = t0.elapsed().as_secs_f64();
+            let busy0 = gpu.lock().unwrap().gpu_busy_seconds();
+            let t0 = Instant::now();
+            hyb.run_batched(&tree, &game, &bk, 1, &mut bf);
+            let hyb_s2 = t0.elapsed().as_secs_f64();
+            let busy = gpu.lock().unwrap().gpu_busy_seconds() - busy0;
+
+            // CPU rows: iter-1 dense + iter-5 sparse.
+            let table2 = build_table_runout(rt, rr);
+            let (fm2, tm2, rm2) = quantile_maps(&table2, nb);
+            let game2 = FlopStartGame::new(table2);
+            let bk2 = FlopBucketing::from_maps(game2.table(), nb, nb, nb, fm2, tm2, rm2);
+            let mut cpu = BucketedFlopCfr::new(&tree, game2.table(), &bk2);
+            cpu.set_terminal_design(TerminalDesign::Design1Collapsed);
+            let t0 = Instant::now();
+            cpu.run(&tree, &game2, &bk2, 1);
+            let cpu1 = t0.elapsed().as_secs_f64();
+            cpu.run(&tree, &game2, &bk2, 3);
+            let t0 = Instant::now();
+            cpu.run(&tree, &game2, &bk2, 1);
+            let cpu5 = t0.elapsed().as_secs_f64();
+
+            eprintln!(
+                "B={nb} {rn}: hybrid {hyb_s:.2}/{hyb_s2:.2}s/iter (busy {:.0}%) | \
+                 CPU iter1 {cpu1:.1}s iter5 {cpu5:.2}s",
+                100.0 * busy / hyb_s2
+            );
+        }
     }
 }

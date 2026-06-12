@@ -51,7 +51,8 @@ fn build_game() -> (solver_core::tree::flat::FlatTree, FlopStartGame) {
     let initial_weights: Vec<Vec<f32>> = (0..num_players).map(|_| { let mut w = vec![0.0f32; nh]; for h in 0..nh { let (c1,c2) = index_to_card_pair(valid_hand_indices[h] as usize); let mut blocked = 0; for h2 in 0..nh { if h2 == h { continue; } let (c3,c4) = index_to_card_pair(valid_hand_indices[h2] as usize); if c1==c3||c1==c4||c2==c3||c2==c4 { blocked += 1; } } w[h] = if blocked < (nh-1) as i32 { 1.0 } else { 0.0 }; } w }).collect();
     let num_combinations = initial_weights[0].iter().sum::<f32>() * initial_weights[1].iter().sum::<f32>();
     let table = FlopChanceTable { hand_ranks_base, valid_hand_indices, num_valid, conflict, hand_cards, remaining_deck: turn_cards, turn_ranks, turn_sorted_str, turn_sorted_idx, river_ranks, river_sorted_str, river_sorted_idx, initial_weights, num_players, num_combinations: num_combinations as f64, river_decks };
-    let config = TreeConfig { num_players: 2, initial_state: BoardState::Flop, starting_pot: 10, starting_stacks: vec![100, 100], initial_contributions: vec![5, 5], rake_rate: 0.0, rake_cap: 0.0, bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] }, add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0 };
+    let config = TreeConfig { num_players: 2, initial_state: BoardState::Flop, starting_pot: 10, starting_stacks: vec![100, 100], initial_contributions: vec![5, 5], rake_rate: 0.0, rake_cap: 0.0, bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] }, add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0, button_player: None,
+            max_bets_per_street: None,};
     let tree = build_tree(&config).expect("tree build");
     let game = FlopStartGame::new(table);
     (tree, game)

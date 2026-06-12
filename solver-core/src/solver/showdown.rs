@@ -1024,10 +1024,13 @@ pub fn side_pot_showdown_cfv_with_rake(
                     let mut prev_l = 0i32;
                     for (li, &lev) in levels.iter().enumerate() {
                         let pc = lev - prev_l;
-                        if pc == 0 { prev_l = lev; continue; }
+                        // 2.A.2 FIX: pc==0 only skips if pot_l after
+                        // starting_pot addition is also 0. See line 1116
+                        // for the HU equivalent.
                         let num_contrib = (0..np).filter(|&p| contributions[p] >= lev).count();
                         let mut pot_l = (pc * num_contrib as i32) as f32;
                         if li == 0 { pot_l += starting_pot as f32; }
+                        if pot_l == 0.0 { prev_l = lev; continue; }
 
                         let trav_elig = !traverser_folded && c_t >= lev;
                         let a_elig = !a_folded && c_opp_a >= lev;
@@ -1113,10 +1116,18 @@ pub fn side_pot_showdown_cfv_with_rake(
                 let mut prev_l = 0i32;
                 for (li, &lev) in levels.iter().enumerate() {
                     let pc = lev - prev_l;
-                    if pc == 0 { prev_l = lev; continue; }
+                    // STEP 2.A.2 BUG FIX 2026-06: previously was
+                    //   `if pc == 0 { prev_l = lev; continue; }`
+                    // which skipped level 0 entirely when all contributions
+                    // were zero — losing the starting_pot. Now check pot_l
+                    // AFTER starting_pot is added. See vcfr.metal lines
+                    // 520-537 for the parallel GPU fix. The bug surfaced
+                    // when terminal-CFV at all-zero-contributions check-down
+                    // terminals was hand-derived against CFR formula.
                     let num_contrib = (0..np).filter(|&p| contributions[p] >= lev).count();
                     let mut pot_l = (pc * num_contrib as i32) as f32;
                     if li == 0 { pot_l += starting_pot as f32; }
+                    if pot_l == 0.0 { prev_l = lev; continue; }  // No pot at this level → skip
                     let trav_elig = !traverser_folded && c_t >= lev;
                     let a_elig = !a_folded && c_opp_a >= lev;
                     let n_elig = trav_elig as i32 + a_elig as i32;
@@ -1246,10 +1257,11 @@ pub fn side_pot_showdown_cfv_with_rake(
                 let mut prev_l = 0i32;
                 for (li, &lev) in levels.iter().enumerate() {
                     let pc = lev - prev_l;
-                    if pc == 0 { prev_l = lev; continue; }
+                    // 2.A.2 FIX: see line 1116 / 1027 for rationale.
                     let num_contrib = (0..np).filter(|&p| contributions[p] >= lev).count();
                     let mut pot_l = (pc * num_contrib as i32) as f32;
                     if li == 0 { pot_l += starting_pot as f32; }
+                    if pot_l == 0.0 { prev_l = lev; continue; }
 
                     let trav_elig = !traverser_folded && c_t >= lev;
 

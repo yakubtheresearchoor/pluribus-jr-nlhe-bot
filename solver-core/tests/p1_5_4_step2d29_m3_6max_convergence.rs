@@ -65,6 +65,7 @@ fn build_6p_table(nh: usize) -> (FlatTree, FlopChanceTable) {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: None,
+            max_bets_per_street: None,
     };
     let tree = build_tree(&config).unwrap();
     (tree, table)

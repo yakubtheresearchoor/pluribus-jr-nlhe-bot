@@ -70,6 +70,7 @@ fn build_np_table(np: u8, nh: usize) -> (FlatTree, FlopChanceTable) {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: None,
+            max_bets_per_street: None,
     };
     let tree = build_tree(&config).unwrap();
     (tree, table)
@@ -112,6 +113,123 @@ fn step2d28_tg_parallel_6p_speedup() {
         let ms = measure_gpu_iters(np, nh, n_iters);
         eprintln!("{:>4}  {:>5}  {:>14.3}", np, nh, ms);
     }
+}
+
+/// Exp C: per-card accumulators in TG memory. Measures tg-parallel vs tgmem.
+/// tgmem caps nh at 256 due to 32 KB TG budget.
+#[test]
+#[ignore = "Exp C: tg vs tgmem dispatch"]
+fn exp_c_tgmem_compare() {
+    use std::env;
+    eprintln!("\n=== Exp C: tg vs tgmem ===");
+    eprintln!("{:>4}  {:>4}  {:>12}  {:>12}  {:>10}", "np", "nh", "TG ms", "TGMEM ms", "ratio");
+    for &(np, nh, iters) in &[
+        (3u8, 30usize, 10u32),
+        (3, 50, 5),
+        (4, 20, 5),
+        (4, 30, 3),
+        (4, 50, 3),
+        (5, 16, 5),
+        (5, 20, 3),
+        (6, 12, 5),
+        (6, 16, 3),
+        (6, 20, 2),
+    ] {
+        env::remove_var("SOLVER_DISABLE_TG_PARALLEL");
+        env::remove_var("SOLVER_DISPATCH");
+        let tg = measure_gpu_iters(np, nh, iters);
+        env::set_var("SOLVER_DISPATCH", "tgmem");
+        let tgm = measure_gpu_iters(np, nh, iters);
+        env::remove_var("SOLVER_DISPATCH");
+        let ratio = tg / tgm.max(1e-9);
+        eprintln!("{:>4}  {:>4}  {:>12.3}  {:>12.3}  {:>9.2}x", np, nh, tg, tgm, ratio);
+    }
+}
+
+/// Exp A: TG_SIZE sweep at meaningful nh. Tests philipturner's hypothesis
+/// that smaller TG_SIZE (closer to 1 simdgroup = 32 threads) gives better
+/// occupancy on Apple GPUs (24 simds/core max ALU utilization).
+#[test]
+#[ignore = "Exp A: TG_SIZE sweep across np/nh"]
+fn exp_a_tg_size_sweep() {
+    use std::env;
+    eprintln!("\n=== Exp A: TG_SIZE sweep ===");
+    eprintln!("Apple SIMD=32; max ALU at ~24 simds/core. Smaller TG_SIZE → more TGs/SM in flight.\n");
+
+    let configs: &[(u8, usize, u32)] = &[
+        (3, 30, 10),
+        (3, 50, 5),
+        (4, 30, 5),
+        (4, 50, 3),
+        (5, 16, 5),
+        (5, 20, 3),
+        (6, 12, 5),
+        (6, 16, 3),
+        (6, 20, 2),
+    ];
+    let tg_sizes: &[u64] = &[32, 64, 128, 256, 512];
+
+    env::remove_var("SOLVER_DISABLE_TG_PARALLEL");
+    env::remove_var("SOLVER_DISPATCH");
+
+    eprint!("{:>4}  {:>4}", "np", "nh");
+    for &tg in tg_sizes { eprint!("  {:>10}", format!("tg={}", tg)); }
+    eprintln!();
+    for &(np, nh, iters) in configs {
+        eprint!("{:>4}  {:>4}", np, nh);
+        for &tg in tg_sizes {
+            env::set_var("SOLVER_TG_SIZE", tg.to_string());
+            let ms = measure_gpu_iters(np, nh, iters);
+            eprint!("  {:>10.2}", ms);
+        }
+        eprintln!();
+    }
+    env::remove_var("SOLVER_TG_SIZE");
+}
+
+/// 3-way A/B/C measurement: SERIAL vs TG-parallel vs G0-parallel.
+/// Sweeps np and nh; for K=2 (3p) G0 falls back to tg-parallel so we only
+/// report SERIAL vs TG. For K>=3 (4p+) the g0 mode is meaningful.
+#[test]
+#[ignore = "Lever 1 sweep: SERIAL vs TG vs G0 across nh"]
+fn step2d28_lever1_3way_sweep() {
+    use std::env;
+    eprintln!("\n=== Step 2.D.28 + Lever 1: 3-way kernel sweep ===");
+    eprintln!("{:>4}  {:>4}  {:>12}  {:>12}  {:>12}  {:>10}  {:>10}",
+        "np", "nh", "SERIAL ms", "TG ms", "G0 ms", "tg/ser", "g0/tg");
+
+    for &(np, nh, n_iters) in &[
+        (4u8, 30usize, 5u32),
+        (4, 50, 3),
+        (4, 80, 3),
+        (4, 100, 2),
+        (5, 20, 3),
+        (5, 30, 2),
+        (5, 50, 2),
+        (6, 16, 3),
+        (6, 20, 2),
+        (6, 24, 2),
+        (6, 30, 1),
+    ] {
+        env::set_var("SOLVER_DISABLE_TG_PARALLEL", "1");
+        env::remove_var("SOLVER_DISPATCH");
+        let serial_ms = measure_gpu_iters(np, nh, n_iters);
+
+        env::remove_var("SOLVER_DISABLE_TG_PARALLEL");
+        env::remove_var("SOLVER_DISPATCH");
+        let tg_ms = measure_gpu_iters(np, nh, n_iters);
+
+        env::remove_var("SOLVER_DISABLE_TG_PARALLEL");
+        env::set_var("SOLVER_DISPATCH", "g0");
+        let g0_ms = measure_gpu_iters(np, nh, n_iters);
+
+        let tg_speedup = serial_ms / tg_ms.max(1e-9);
+        let g0_vs_tg = tg_ms / g0_ms.max(1e-9);
+        eprintln!("{:>4}  {:>4}  {:>12.3}  {:>12.3}  {:>12.3}  {:>9.2}x  {:>9.2}x",
+            np, nh, serial_ms, tg_ms, g0_ms, tg_speedup, g0_vs_tg);
+    }
+    env::remove_var("SOLVER_DISPATCH");
+    env::remove_var("SOLVER_DISABLE_TG_PARALLEL");
 }
 
 #[test]

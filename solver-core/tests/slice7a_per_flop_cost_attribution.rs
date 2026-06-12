@@ -77,6 +77,9 @@ fn slice7a_table_vs_solve_cost_split() {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     let flop_tree = build_tree(&flop_cfg).expect("flop tree builds");
 

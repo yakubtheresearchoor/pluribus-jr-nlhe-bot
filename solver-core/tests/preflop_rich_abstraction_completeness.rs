@@ -491,6 +491,7 @@ fn config_hu_preflop_with_one_raise() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
     }
 
 }
@@ -516,6 +517,7 @@ fn config_hu_preflop_option_b_style() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
     }
 
 }
@@ -594,7 +596,8 @@ fn config_6max_preflop_simplest() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
-        button_player: Some(5),  // Player 5 is on the button → UTG = (5+3)%6 = 2
+        button_player: Some(5),
+            max_bets_per_street: None,  // Player 5 is on the button → UTG = (5+3)%6 = 2
     }
 }
 
@@ -618,6 +621,7 @@ fn config_6max_preflop_with_one_raise() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: Some(5),
+            max_bets_per_street: None,
     }
 }
 
@@ -693,6 +697,7 @@ fn config_6max_preflop_option_b_style() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: Some(5),
+            max_bets_per_street: None,
     }
 }
 

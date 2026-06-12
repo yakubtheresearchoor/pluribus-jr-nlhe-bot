@@ -48,6 +48,9 @@ fn betsizes_produce_different_terminal_distributions() {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet, raise },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     eprintln!("\n=== Does bet_sizes produce DIFFERENT terminal contribution distributions? ===");

@@ -40,6 +40,9 @@ fn cpu_turn_start_runs() {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).expect("tree build failed");
@@ -111,6 +114,9 @@ fn cpu_turn_start_exploitability_convergence() {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).expect("tree build failed");

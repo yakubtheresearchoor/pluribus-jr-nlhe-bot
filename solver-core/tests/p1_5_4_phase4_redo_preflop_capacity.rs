@@ -109,6 +109,7 @@ fn phase4_redo_preflop_structural_capacity_smoke() {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: Some(5),
+            max_bets_per_street: None,
     };
 
     let preflop_tree = build_tree(&pre_cfg);

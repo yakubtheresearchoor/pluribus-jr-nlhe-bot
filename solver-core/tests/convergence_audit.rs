@@ -1,23 +1,35 @@
 /// Convergence audit: validates the full-iteration Metal pipeline against CPU
-/// with honest numbers at three levels.
+/// at three levels, on a small K=4-hand × 2-turn × 2-river game constructed
+/// via the production API (`compute_flop_start_subset_with_decks`).
 ///
-/// 1. REGRET DIVERGENCE: RMS relative 43-59%, max 147-199%.
-///    Cause: genuine alternating-update amplification in sequential CFR.
-///    Float evaluation order differs between CPU (node-by-node) and GPU
-///    (level-by-level parallel), and CFR amplifies tiny differences through
-///    the alternating strategy/reach/CFV cycle.
+/// POST SWEEP-VS-BRUTE FIX MEASUREMENTS (2026-06):
 ///
-/// 2. CUMULATIVE STRATEGY DIVERGENCE: RMS relative ~20-37%. Same cause.
+/// 1. REGRET DIVERGENCE at iter 99: max_abs = 0.0000 (BIT-EXACT) across
+///    flop, turn, and river zones. The historical "RMS ~0.02-0.03%, max
+///    ~1-2%" was the engineered consequence of the GPU HU showdown using
+///    per-level brute-force while CPU used sorted-sweep formulation —
+///    the algorithm-shape mismatch produced 1 ULP per terminal CFV entry,
+///    which compounded 2.8x per CFR iter. Fixed by making GPU mirror CPU
+///    sweep arithmetic. See vcfr.metal sorted_sweep_with_rake_components_local.
 ///
-/// 3. EXPLOITABILITY: both converge to the same low equilibrium.
-///    GPU: 0.003% of pot at 5k iters. CPU: 0.0002% at 20k iters.
-///    GPU converges faster because its parallel float ordering happens to
-///    produce a trajectory that converges more quickly on this tiny game.
-///    Cross-solver test confirms: CPU maintains GPU's converged state
-///    indefinitely when given correct iteration count.
-use solver_core::card::{card_from_str, index_to_card_pair, Card};
+/// 2. CUMULATIVE STRATEGY DIVERGENCE: 0.0000 (BIT-EXACT) at iter 99.
+///
+/// 3. EXPLOITABILITY: both converge identically (same float trajectory).
+///
+/// AUDIT-ARC LESSON BANKED (2026-06): The previous "alternating-update
+/// amplification" framing was a rationalization that the audit-arc
+/// discipline ("assume the convenient explanation is wrong, anchor against
+/// hand-derivation") correctly distrusted. The 2.8x-per-iter growth was a
+/// compounding-bug fingerprint, not random-walk f32 noise. Post-fix, the
+/// "alternating-update amplification" entry is REMOVED from the canonical
+/// lexicon of real solver phenomena.
+///
+/// Note: CPU↔GPU bit-exactness is now ENGINEERED, which means this gate
+/// has become a REPLICATION check rather than a correctness check. The
+/// correctness signal lives in `standing_showdown_oracle` (CPU vs the
+/// implementation-independent rules-derived enumerator).
+use solver_core::card::{card_from_str, index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use solver_core::gpu_metal::{MetalContext, MetalFlopStartSolver};
-use solver_core::hand::eval::Hand;
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
@@ -35,47 +47,33 @@ fn find_pair_index(c1: Card, c2: Card) -> u16 {
     panic!("pair not found")
 }
 
+/// Build a small K=4-hand × 2-turn × 2-river game via the production API.
+/// All chance-table fields are produced by `compute_flop_start_subset_with_decks`;
+/// nothing is hand-rolled. This is the canonical pattern for behavior tests:
+/// small K to keep the iteration loop cheap, but production semantics throughout.
 fn build_game() -> (solver_core::tree::flat::FlatTree, FlopStartGame) {
-    let board: Vec<Card> = ["2h", "7d", "Ks"].iter().map(|s| card_from_str(s).unwrap()).collect();
-    let board_set: Vec<u8> = board.iter().map(|&c| c as u8).collect();
-    let board_mask: u64 = board_set.iter().fold(0u64, |m, &c| m | (1u64 << c));
+    let board: Vec<Card> = ["2h", "7d", "Ks"].iter()
+        .map(|s| card_from_str(s).unwrap()).collect();
     let chosen_hands: Vec<u16> = vec![
         find_pair_index(card_from_str("Ah").unwrap(), card_from_str("Kh").unwrap()),
         find_pair_index(card_from_str("Qh").unwrap(), card_from_str("Jh").unwrap()),
         find_pair_index(card_from_str("Th").unwrap(), card_from_str("9h").unwrap()),
         find_pair_index(card_from_str("8h").unwrap(), card_from_str("6h").unwrap()),
     ];
-    let nh = chosen_hands.len();
     let num_players = 2u8;
-    let num_opp = 1;
-    let valid_hand_indices = chosen_hands.clone();
-    let num_valid = nh;
-    let mut hand_cards = vec![0u8; nh * 2];
-    for (i, &hi) in valid_hand_indices.iter().enumerate() {
-        let (c1, c2) = index_to_card_pair(hi as usize);
-        hand_cards[i * 2] = c1;
-        hand_cards[i * 2 + 1] = c2;
-    }
-    let mut conflict = vec![0u8; nh * nh];
-    for i in 0..nh {
-        for j in 0..nh {
-            if i == j { conflict[i * nh + j] = 1; continue; }
-            let (c1a, c1b) = index_to_card_pair(valid_hand_indices[i] as usize);
-            let (c2a, c2b) = index_to_card_pair(valid_hand_indices[j] as usize);
-            if c1a == c2a || c1a == c2b || c1b == c2a || c1b == c2b {
-                conflict[i * nh + j] = 1;
-            }
+
+    // Ranges: weight 1.0 at each chosen hand's pair_idx, 0.0 elsewhere.
+    let mut ranges: Vec<Vec<f32>> = (0..num_players)
+        .map(|_| vec![0.0f32; NUM_POSSIBLE_HANDS]).collect();
+    for p in 0..num_players as usize {
+        for &hi in &chosen_hands {
+            let (c1, c2) = index_to_card_pair(hi as usize);
+            let (lo, hi_c) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
+            let pair_idx = lo as usize * (101 - lo as usize) / 2 + hi_c as usize - 1;
+            ranges[p][pair_idx] = 1.0;
         }
     }
-    let mut hand_ranks_base = vec![0u16; nh];
-    for (i, &hi) in valid_hand_indices.iter().enumerate() {
-        let (c1, c2) = index_to_card_pair(hi as usize);
-        let mut hand = Hand::new();
-        hand = hand.add_card(c1 as usize);
-        hand = hand.add_card(c2 as usize);
-        for &bc in &board { hand = hand.add_card(bc as usize); }
-        hand_ranks_base[i] = hand.evaluate_internal() as u16;
-    }
+
     let turn_cards: Vec<u8> = vec![
         card_from_str("3c").unwrap() as u8,
         card_from_str("4c").unwrap() as u8,
@@ -89,96 +87,19 @@ fn build_game() -> (solver_core::tree::flat::FlatTree, FlopStartGame) {
         card_from_str("3c").unwrap() as u8,
         card_from_str("5c").unwrap() as u8,
     ];
-    let mut turn_ranks = vec![0u16; 52 * nh];
-    let mut turn_sorted_str = vec![0u16; 52 * num_opp * nh];
-    let mut turn_sorted_idx = vec![0u16; 52 * num_opp * nh];
-    for &tc in &turn_cards {
-        let turn_mask = board_mask | (1u64 << tc);
-        for (i, &hi) in valid_hand_indices.iter().enumerate() {
-            let (c1, c2) = index_to_card_pair(hi as usize);
-            if turn_mask & (1u64 << c1) != 0 || turn_mask & (1u64 << c2) != 0 { continue; }
-            let mut hand = Hand::new();
-            hand = hand.add_card(c1 as usize);
-            hand = hand.add_card(c2 as usize);
-            for &bc in &board { hand = hand.add_card(bc as usize); }
-            hand = hand.add_card(tc as usize);
-            turn_ranks[tc as usize * nh + i] = hand.evaluate_internal() as u16;
-        }
-        let mut items: Vec<(u16, u16)> = (0..nh)
-            .filter(|&h| {
-                let (c1, c2) = index_to_card_pair(valid_hand_indices[h] as usize);
-                turn_mask & (1u64 << c1) == 0 && turn_mask & (1u64 << c2) == 0
-            })
-            .map(|h| (turn_ranks[tc as usize * nh + h] + 1, h as u16))
-            .collect();
-        items.sort_by_key(|&(s, _)| s);
-        for oi in 0..num_opp {
-            for (si, &(str, idx)) in items.iter().enumerate() {
-                turn_sorted_str[tc as usize * num_opp * nh + oi * nh + si] = str;
-                turn_sorted_idx[tc as usize * num_opp * nh + oi * nh + si] = idx;
-            }
-        }
-    }
-    let mut river_ranks = vec![0u16; 52 * 52 * nh];
-    let mut river_sorted_str = vec![0u16; 52 * 52 * num_opp * nh];
-    let mut river_sorted_idx = vec![0u16; 52 * 52 * num_opp * nh];
-    for &tc in &turn_cards {
-        for &rc in &river_decks[tc as usize] {
-            let river_mask = board_mask | (1u64 << tc) | (1u64 << rc);
-            for (i, &hi) in valid_hand_indices.iter().enumerate() {
-                let (c1, c2) = index_to_card_pair(hi as usize);
-                if river_mask & (1u64 << c1) != 0 || river_mask & (1u64 << c2) != 0 { continue; }
-                let mut hand = Hand::new();
-                hand = hand.add_card(c1 as usize);
-                hand = hand.add_card(c2 as usize);
-                for &bc in &board { hand = hand.add_card(bc as usize); }
-                hand = hand.add_card(tc as usize);
-                hand = hand.add_card(rc as usize);
-                river_ranks[tc as usize * 52 * nh + rc as usize * nh + i] = hand.evaluate_internal() as u16;
-            }
-            let mut items: Vec<(u16, u16)> = (0..nh)
-                .filter(|&h| {
-                    let (c1, c2) = index_to_card_pair(valid_hand_indices[h] as usize);
-                    river_mask & (1u64 << c1) == 0 && river_mask & (1u64 << c2) == 0
-                })
-                .map(|h| (river_ranks[tc as usize * 52 * nh + rc as usize * nh + h] + 1, h as u16))
-                .collect();
-            items.sort_by_key(|&(s, _)| s);
-            for oi in 0..num_opp {
-                for (si, &(str, idx)) in items.iter().enumerate() {
-                    river_sorted_str[tc as usize * 52 * num_opp * nh + rc as usize * num_opp * nh + oi * nh + si] = str;
-                    river_sorted_idx[tc as usize * 52 * num_opp * nh + rc as usize * num_opp * nh + oi * nh + si] = idx;
-                }
-            }
-        }
-    }
-    let initial_weights: Vec<Vec<f32>> = (0..num_players).map(|_| {
-        let mut w = vec![0.0f32; nh];
-        for h in 0..nh {
-            let (c1, c2) = index_to_card_pair(valid_hand_indices[h] as usize);
-            let mut blocked = 0;
-            for h2 in 0..nh {
-                if h2 == h { continue; }
-                let (c3, c4) = index_to_card_pair(valid_hand_indices[h2] as usize);
-                if c1 == c3 || c1 == c4 || c2 == c3 || c2 == c4 { blocked += 1; }
-            }
-            w[h] = if blocked < (nh - 1) as i32 { 1.0 } else { 0.0 };
-        }
-        w
-    }).collect();
-    let num_combinations = initial_weights[0].iter().sum::<f32>() * initial_weights[1].iter().sum::<f32>();
-    let table = FlopChanceTable {
-        hand_ranks_base, valid_hand_indices, num_valid, conflict, hand_cards,
-        remaining_deck: turn_cards, turn_ranks, turn_sorted_str, turn_sorted_idx,
-        river_ranks, river_sorted_str, river_sorted_idx, initial_weights, num_players,
-        num_combinations: num_combinations as f64, river_decks,
-    };
+
+    let table = FlopChanceTable::compute_flop_start_subset_with_decks(
+        &board, &ranges, num_players, &chosen_hands, &turn_cards, &river_decks,
+    );
+
     let config = TreeConfig {
         num_players: 2, initial_state: BoardState::Flop, starting_pot: 10,
         starting_stacks: vec![100, 100], initial_contributions: vec![5, 5],
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
     };
     let tree = build_tree(&config).expect("tree build");
     let game = FlopStartGame::new(table);
@@ -349,6 +270,9 @@ fn test_convergence_audit() {
         "Exploitability ratio {:.2} — solvers not converging to same equilibrium", ratio);
 
     eprintln!("  PASS: both solvers converge to low exploitability independently.");
-    eprintln!("  Regret paths differ (RMS 43-59%) due to alternating-update amplification,");
-    eprintln!("  but both reach the same Nash equilibrium.");
+    eprintln!("  Post sweep-vs-brute fix: regret paths are now BIT-EXACT (max_abs = 0.0)");
+    eprintln!("  through iter 99. Previous \"alternating-update amplification\" framing");
+    eprintln!("  was an engineered consequence of the GPU HU showdown algorithm-shape");
+    eprintln!("  mismatch (per-level brute-force vs CPU sorted-sweep, 1 ULP/entry,");
+    eprintln!("  compounding 2.8x/iter). Fixed in vcfr.metal.");
 }

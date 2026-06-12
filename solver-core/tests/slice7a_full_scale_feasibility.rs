@@ -109,6 +109,9 @@ fn slice7a_per_flop_solve_wallclock_and_full_pass_projection() {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     let t_tree_start = std::time::Instant::now();
     let flop_tree = build_tree(&flop_cfg).expect("flop tree builds");

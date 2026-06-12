@@ -174,6 +174,9 @@ fn build_minimal_table() -> (FlatTree, FlopChanceTable) {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     let tree = build_tree(&config).expect("tree build");
     (tree, table)

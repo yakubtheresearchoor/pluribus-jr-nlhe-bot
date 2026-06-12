@@ -26,7 +26,10 @@ fn make_config(
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
     }
+
 }
 
 fn build_hu_turn(bet: &[f64], raise: &[f64]) -> FlatTree {
@@ -379,6 +382,9 @@ fn v0_6max_two_active_players() {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).unwrap();

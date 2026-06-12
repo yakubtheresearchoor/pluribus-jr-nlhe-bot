@@ -114,7 +114,7 @@ fn validate_architecture() {
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
         ..Default::default()
-    };
+};
     let action_tree = ActionTree::new(tree_config).unwrap();
 
     println!("\n╔══════════════════════════════════════════════════════════════╗");

@@ -177,6 +177,9 @@ fn build_6max_table(nh: usize) -> Option<(solver_core::tree::flat::FlatTree, Flo
             raise: vec![],
         },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     eprintln!("Building 6-player tree...");
     let tb_t0 = Instant::now();

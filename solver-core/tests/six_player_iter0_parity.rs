@@ -40,13 +40,26 @@ use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig}
 use solver_core::tree::builder::build_tree;
 use solver_core::tree::flat::FlatTree;
 
+/// AUDIT MIGRATION 2026-06: build_6p_table now uses the production API
+/// `compute_flop_start_subset_with_decks`. This test anchors the
+/// "6-player GPU correctness" claim that's load-bearing for eventual
+/// 6-max production. It was tightened from 1e-3 to 1e-5 in commit
+/// adb0d6c (#38) on a hand-rolled table; the audit confirms whether
+/// that tightening was on solid ground.
+///
+/// FINDING (2026-06): This test's hand-rolled pattern was structurally
+/// "done correctly" — it used the +1 anti-zero-padding rule, exact
+/// recursive num_combinations enumeration, and uniform initial_weights
+/// (matches what production gives for ranges=1.0 at chosen hands).
+/// Substantively equivalent to production. Migration expected to
+/// reproduce same max_diff.
 fn build_6p_table(nh: usize) -> (FlatTree, FlopChanceTable) {
     let board: Vec<Card> = ["2h", "7d", "Ks"]
         .iter().map(|s| card_from_str(s).unwrap()).collect();
     let board_mask: u64 = board.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
     let num_players = 6u8;
-    let num_opp = 5usize;
 
+    // Same hand selection as pre-migration: even step across non-board-blocking hands.
     let mut all_valid: Vec<u16> = Vec::new();
     for idx in 0..NUM_POSSIBLE_HANDS {
         let (c1, c2) = index_to_card_pair(idx);
@@ -55,97 +68,26 @@ fn build_6p_table(nh: usize) -> (FlatTree, FlopChanceTable) {
     }
     let step = all_valid.len() / nh;
     let chosen: Vec<u16> = (0..nh).map(|i| all_valid[i * step]).collect();
-    let mut hand_cards = vec![0u8; nh * 2];
-    for (i, &hi) in chosen.iter().enumerate() {
-        let (c1, c2) = index_to_card_pair(hi as usize);
-        hand_cards[i*2] = c1; hand_cards[i*2+1] = c2;
-    }
-    let mut conflict = vec![0u8; nh*nh];
-    for i in 0..nh { for j in 0..nh {
-        if i == j { conflict[i*nh+j] = 1; continue; }
-        let (a1,a2) = index_to_card_pair(chosen[i] as usize);
-        let (b1,b2) = index_to_card_pair(chosen[j] as usize);
-        if a1==b1||a1==b2||a2==b1||a2==b2 { conflict[i*nh+j] = 1; }
-    }}
-    let mut hr = vec![0u16; nh];
-    for (i, &hi) in chosen.iter().enumerate() {
-        let (c1, c2) = index_to_card_pair(hi as usize);
-        let mut h = Hand::new().add_card(c1 as usize).add_card(c2 as usize);
-        for &bc in &board { h = h.add_card(bc as usize); }
-        hr[i] = h.evaluate_internal() as u16;
-    }
-    let tc = vec![card_from_str("3c").unwrap() as u8];
-    let mut rd: Vec<Vec<u8>> = vec![vec![]; 52];
-    rd[tc[0] as usize] = vec![card_from_str("5s").unwrap() as u8];
 
-    let mut turn_ranks = vec![0u16; 52 * nh];
-    let mut turn_sorted_str = vec![0u16; 52 * num_opp * nh];
-    let mut turn_sorted_idx = vec![0u16; 52 * num_opp * nh];
-    for &t in &tc {
-        for (i, &hi) in chosen.iter().enumerate() {
+    // Ranges: weight 1.0 at each chosen hand, 0.0 elsewhere.
+    let mut ranges: Vec<Vec<f32>> = (0..num_players)
+        .map(|_| vec![0.0f32; NUM_POSSIBLE_HANDS]).collect();
+    for p in 0..num_players as usize {
+        for &hi in &chosen {
             let (c1, c2) = index_to_card_pair(hi as usize);
-            let tm = board_mask | (1u64 << t);
-            if tm & (1u64 << c1) != 0 || tm & (1u64 << c2) != 0 { continue; }
-            let mut h = Hand::new().add_card(c1 as usize).add_card(c2 as usize);
-            for &bc in &board { h = h.add_card(bc as usize); }
-            h = h.add_card(t as usize);
-            turn_ranks[t as usize * nh + i] = h.evaluate_internal() as u16;
-        }
-        let mut items: Vec<(u16, u16)> = (0..nh)
-            .map(|h| (turn_ranks[t as usize * nh + h] + 1, h as u16)).collect();
-        items.sort_by_key(|&(s, _)| s);
-        for oi in 0..num_opp {
-            let off = t as usize * num_opp * nh + oi * nh;
-            for h in 0..nh { turn_sorted_str[off + h] = items[h].0; turn_sorted_idx[off + h] = items[h].1; }
+            let (lo, hi_c) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
+            let pair_idx = lo as usize * (101 - lo as usize) / 2 + hi_c as usize - 1;
+            ranges[p][pair_idx] = 1.0;
         }
     }
-    let mut river_ranks = vec![0u16; 52 * 52 * nh];
-    let mut river_sorted_str = vec![0u16; 52 * 52 * num_opp * nh];
-    let mut river_sorted_idx = vec![0u16; 52 * 52 * num_opp * nh];
-    for &t in &tc {
-        let tm = board_mask | (1u64 << t);
-        for &r in &rd[t as usize] {
-            let fm = tm | (1u64 << r);
-            for (i, &hi) in chosen.iter().enumerate() {
-                let (c1, c2) = index_to_card_pair(hi as usize);
-                if fm & (1u64 << c1) != 0 || fm & (1u64 << c2) != 0 { continue; }
-                let mut h = Hand::new().add_card(c1 as usize).add_card(c2 as usize);
-                for &bc in &board { h = h.add_card(bc as usize); }
-                h = h.add_card(t as usize).add_card(r as usize);
-                river_ranks[t as usize * 52 * nh + r as usize * nh + i] = h.evaluate_internal() as u16;
-            }
-            let mut items: Vec<(u16, u16)> = (0..nh)
-                .map(|h| (river_ranks[t as usize * 52 * nh + r as usize * nh + h] + 1, h as u16))
-                .collect();
-            items.sort_by_key(|&(s, _)| s);
-            for oi in 0..num_opp {
-                let off = t as usize * 52 * num_opp * nh + r as usize * num_opp * nh + oi * nh;
-                for h in 0..nh { river_sorted_str[off + h] = items[h].0; river_sorted_idx[off + h] = items[h].1; }
-            }
-        }
-    }
-    let iw = vec![vec![1.0f32; nh]; num_players as usize];
 
-    // Compute num_combinations exactly (no fallback).
-    fn enum_nc(player: usize, np: usize, nh: usize, combined: u64,
-               hand_cards: &[u8], weight: f64) -> f64 {
-        if player == np { return weight; }
-        let mut total = 0.0;
-        for h in 0..nh {
-            let m = (1u64 << hand_cards[h * 2]) | (1u64 << hand_cards[h * 2 + 1]);
-            if combined & m != 0 { continue; }
-            total += enum_nc(player + 1, np, nh, combined | m, hand_cards, weight);
-        }
-        total
-    }
-    let nc = enum_nc(0, num_players as usize, nh, 0, &hand_cards[..], 1.0);
+    let turn_cards = vec![card_from_str("3c").unwrap() as u8];
+    let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+    river_decks[turn_cards[0] as usize] = vec![card_from_str("5s").unwrap() as u8];
 
-    let table = FlopChanceTable {
-        hand_ranks_base: hr, valid_hand_indices: chosen, num_valid: nh, conflict, hand_cards,
-        remaining_deck: tc, turn_ranks, turn_sorted_str, turn_sorted_idx,
-        river_ranks, river_sorted_str, river_sorted_idx,
-        initial_weights: iw, num_players, num_combinations: nc, river_decks: rd,
-    };
+    let table = FlopChanceTable::compute_flop_start_subset_with_decks(
+        &board, &ranges, num_players, &chosen, &turn_cards, &river_decks,
+    );
 
     let config = TreeConfig {
         num_players, initial_state: BoardState::Flop, starting_pot: 30,
@@ -153,6 +95,9 @@ fn build_6p_table(nh: usize) -> (FlatTree, FlopChanceTable) {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     let tree = build_tree(&config).unwrap();
     (tree, table)

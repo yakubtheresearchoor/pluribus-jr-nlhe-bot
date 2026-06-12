@@ -56,6 +56,7 @@ fn max_na_tree_sizing_hu_symmetric_options() {
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
 
     };
     let _ = tree_stats("Current: 1 bet PotRel(1.0), 0 raise", &cur).unwrap();
@@ -75,6 +76,7 @@ fn max_na_tree_sizing_hu_symmetric_options() {
         },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
 
     };
     let _ = tree_stats("Option A: 1 bet + 1 raise PotRel(1.0)", &opt_a).unwrap();
@@ -95,6 +97,7 @@ fn max_na_tree_sizing_hu_symmetric_options() {
         },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
 
     };
     let opt_b_result = std::panic::catch_unwind(|| {
@@ -133,6 +136,7 @@ fn max_na_tree_sizing_hu_symmetric_options() {
         },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
 
     };
     let opt_c_result = std::panic::catch_unwind(|| { build_tree(&opt_c) });

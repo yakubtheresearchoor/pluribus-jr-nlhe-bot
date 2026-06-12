@@ -53,6 +53,9 @@ fn config_with(bet: Vec<BetSize>, raise: Vec<BetSize>, label: &str) -> (String, 
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet, raise },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     (label.to_string(), cfg)
 }

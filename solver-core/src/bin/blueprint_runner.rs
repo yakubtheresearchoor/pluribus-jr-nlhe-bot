@@ -76,6 +76,7 @@ fn build_oracle_tree() -> FlatTree {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: None,
+            max_bets_per_street: None,
     };
     build_tree(&cfg).expect("oracle tree builds")
 }

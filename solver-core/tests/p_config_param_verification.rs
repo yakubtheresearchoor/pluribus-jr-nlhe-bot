@@ -57,6 +57,9 @@ fn verify_ante_flows_to_root_contributions() {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     let tree = build_tree(&cfg).expect("tree builds");
 
@@ -102,7 +105,10 @@ fn verify_stack_depth_bounds_max_betting() {
             add_allin_threshold: 1.0,
             force_allin_threshold: 1.0,
             merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
         }
+
     }
 
     let short = build_tree(&make_cfg(20)).expect("short-stack tree builds");
@@ -966,6 +972,9 @@ fn build_flop_start_game_with_rake(rake_rate: f64, rake_cap: f64)
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     let tree = build_tree(&cfg).expect("tree builds");
     let board = vec![
@@ -1089,6 +1098,9 @@ fn verify_stack_depth_reaches_solver_root_cfv_end_to_end() {
             add_allin_threshold: 0.0,
             force_allin_threshold: 0.5,
             merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         };
         let tree = build_tree(&cfg).expect("tree builds");
         let board = vec![
@@ -1160,6 +1172,9 @@ fn verify_ante_reaches_solver_root_cfv_end_to_end() {
             add_allin_threshold: 1.0,
             force_allin_threshold: 1.0,
             merging_threshold: 0.0,
+        button_player: None,
+            max_bets_per_street: None,
+
         };
         let tree = build_tree(&cfg).expect("tree builds");
         let board = vec![
@@ -1255,6 +1270,9 @@ fn verify_storage_round_trip_for_all_four_parameters() {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     let tree = build_tree(&cfg).expect("tree builds");
 

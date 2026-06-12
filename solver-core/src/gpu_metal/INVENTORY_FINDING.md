@@ -788,3 +788,320 @@ BUT — apply the standing detection method anyway when closing (e):
 
 Apply same to any future post-Phase-B site that might come from
 preflop integration.
+
+## Phase 1 preflop scope items not to lose behind sizing questions (2026-06-04)
+
+Slice 7a and its follow-up convergence study surfaced two findings
+worth keeping above the noise of the slice 7c sizing question:
+
+### Scope: P1.5.4 / task #44 — preflop CFR loop is unbuilt
+
+`FlopStartVectorCfr` has the four-zone classification done (P1.5.2)
+with `Zone::Preflop`, `preflop_local_offset`, `preflop_infoset_count`
+populated for preflop-rooted trees. BUT the actual preflop processing
+in `bottom_up_zone` is explicitly `unreachable!("preflop processing
+lives in P1.5.4 (#44)")`. The pieces for the value pass
+(`compute_preflop_cfv_per_canonical_pass`) exist, but the CFR update
+loop around it (preflop strategy + preflop reach + preflop regret
+update around the per-canonical solve) is missing.
+
+The convergence study currently uses `FlopStartVectorCfr::run` at
+flop-start as a POSTFLOP-CFR-rate proxy because the real preflop CFR
+loop doesn't exist yet. Pinning N to size a slice 7c run is moot
+without the loop being built first. P1.5.4 is a prerequisite for both
+the actual preflop solve AND the gate — it is not a downstream item
+of the sizing question.
+
+### Standing: convergence-trajectory anomaly check before sizing
+
+Slice 7a's first single-flop trajectory at production nh=1176 on
+canonical[0] showed the time-averaged strategy flipping its preferred
+action between iter 10 and iter 30 with iter-delta still drifting at
+0.024 — anomalous-looking for a 2-action single-flop case if it
+indicated CFR instability. Per the lead: "An anomalously-converging CPU
+isn't the hyper-confident reference the gate requires." The
+`slice7a_multi_flop_convergence_check.rs` test ran the corrected
+cum_strategy metric on 6 canonical flops; 6 of 6 showed the same flip
+pattern. That LOOKED like bucket (2) (CFR convergence problem) but
+the actual discriminator turned out to be a direct correctness check
+of the solver against its own documented audit, not interpretation of
+the early-iter trajectory.
+
+The discriminator: `tests/convergence_audit.rs` documents specific
+exploitability numbers after 100 iters on nh=4 (CPU ~8.8% pot, GPU
+~6.0% pot, gates assert both < 20% pot and ratio within [0.25, 4.0]).
+Running it (2026-06-04): test passes, and currently measures **CPU
+0.37% / GPU 0.37%** of pot — about 24x tighter than the docstring's
+recorded baseline at the same iter count, with CPU/GPU agreeing to 5
+decimal places. The solver has improved since the docstring was
+written (the docstring is now stale and should be updated separately).
+Solver is converging correctly to a low-exploitability equilibrium on
+its documented baseline.
+
+Therefore the 30-iter drift on nh=1176 single canonicals is NOT a
+structural CFR problem; it is the expected early-iter regime of a
+larger problem (whatever the specific mechanism — gamma-reset,
+cum_strategy averaging timescale, generic). Solver correctness is
+established by the audit; the proxy's exact convergence timescale on
+the bigger problem doesn't need to be diagnosed further to know the
+solver is sound.
+
+The methodology lesson is the carry: when an interpretive read of an
+early-iter trajectory looks anomalous, the discriminator is an
+execution-grounded correctness check (does the solver reproduce a
+known result), not a longer or wider interpretive run. The 6/6
+multi-flop pattern was consistent with bucket (2) but ALSO consistent
+with bucket (1) under a different cum_strategy timescale; only the
+correctness check distinguishes them. "Reasoning to a conclusion"
+from consistency alone (CFR bug → benign gamma-reset → CFR bug) is
+the signal to switch to a falsifiable test.
+
+Standing rule going forward: any convergence-rate measurement that
+will size a long bounded run must FIRST pass a solver-correctness
+gate against a documented baseline (i.e., the solver does the right
+thing when given iters), and SECOND pass an anomaly check across
+multiple instances of the held-fixed random dimension. Correctness
+before rate. Without the correctness gate, the rate measurement is
+interpreting an unanchored signal.
+
+### The convergence-sizing question is blocked on P1.5.4, not on rate
+
+The proxy convergence study uses `FlopStartVectorCfr::run` at
+flop-start because the actual preflop CFR loop doesn't exist. Even
+with a clean rate estimate from the proxy, the N would be an estimate
+for a loop that isn't built. Once P1.5.4 lands, the convergence study
+can run on the real preflop solve (which has its own convergence
+behavior — preflop signal averaged over 1755 canonicals may converge
+differently). The proxy convergence rate is not the bottleneck;
+P1.5.4 is.
+
+## P1.5.4 status: Slice A complete + Slice B built (2026-06-04)
+
+### Slice A complete
+
+Six sub-slices, 19 tests passing at f32 floor or exact 0 diff:
+
+  - A.1 PreflopVectorCfr struct + compute_preflop_strategy
+  - A.2 compute_preflop_reach
+  - A.3a compute_chance_node_cfv_with_expansion
+  - A.3b bottom_up_preflop_for_traverser + run_one_iteration
+  - A.3c class×class blocking matrix + per-class fold-terminal CFV
+  - A.3d chip_delta from tree.contributions (anchored hand-computed
+    asymmetric HU SB=1/BB=2 cases + cross-check vs actual
+    showdown_oracle on symmetric overlap)
+
+Files: solver-core/src/solver/preflop_cfr.rs (~700 lines),
+solver-core/src/solver/preflop_terminal.rs (~180 lines), 6 test files.
+
+Discoveries (carries):
+  1. Preflop→flop chance nodes carry `board_state == Flop`
+     (destination convention per flop_start_vector_cfr.rs:174-175);
+     discriminator is "parent in preflop zone" not own state.
+  2. Oracle's `hand_cards` is a SHARED layout for both players' combos,
+     so nh=1 cross-check setups have full self-blocking (cfv=0). Use
+     nh=2 with opp_reach favoring non-conflicting combo.
+  3. Chip-delta convention: tree.contributions is ground truth; oracle's
+     `starting_pot/np + c_t` formula is reused in a NEW preflop-specific
+     function (validated oracle NOT extended). Symmetric overlap +
+     extended asymmetric cross-checks both pass at sub-ULP.
+
+### Slice B built (engine wiring + multi-iter at reduced flop count)
+
+Added to preflop_cfr.rs:
+  - make_per_flop_solver_iter0(flop_tree): production per_flop_solver
+    closure wrapping compute_v_flop_at_root_iter0 per canonical,
+    ephemeral tables (per slice 7a cost attribution: table = 2% of
+    per-flop cost, no caching), layout reconciliation between engine's
+    flop_combo_layout and FlopChanceTable's hand_cards order.
+  - make_production_terminal_value_fn_hu(tree, blocking_matrix):
+    composes A.3c + A.3d into the production terminal_value_fn.
+  - compute_chance_node_cfv_with_expansion_subset: subset-of-canonicals
+    variant aggregating via P5a-anchored aggregate_preflop_chance_subset.
+  - run_one_iteration_subset: subset-aware iteration driver.
+  - compute_traverser_br_value + br_recursive: best-response value at
+    root for one traverser (argmax-per-class at traverser nodes, plain
+    sum at opp nodes per factored CFR convention).
+
+Test:
+  - p1_5_4_slice_b_multi_iter_correctness_baseline.rs (#[ignore]):
+    runs 50 iters on a subset of 10 canonicals (subset = cheap dimension
+    preserving convergence dynamics per the lead's directive), with
+    periodic BR exploitability proxy checks. Correctness-baseline-first:
+    if exploitability proxy decreases over checkpoints, the loop is
+    converging correctly toward the subset's equilibrium and N can be
+    read from when cum_strategy iter-delta stabilizes over a window.
+    If exploitability INCREASES or stays high → bug to investigate
+    BEFORE trusting any N readout.
+
+### Carries to Slice C (full-scale gate)
+
+Once Slice B confirms correctness baseline + measures N on the real
+engine:
+  - Full 1755 canonicals (no subset)
+  - Asymmetric-input action-order seam check (button-first preflop to
+    postflop-flop mapping must be detectable, not hidden by symmetric
+    inputs)
+  - Scale measurements at the real 11.5s/iter steady-state
+  - F32 drift at the linear-not-sqrt regime (carried from P5a anchor)
+  - Bounded run sized from Slice B's N, long enough that developed
+    dynamics are present, confirmed converging correctly
+
+Phase 1 completion gate before GPU port (Phase 2).
+
+## Multiway terminal CFV cost is real, not synthetic (2026-06-04, Slice B.3b)
+
+After B.3's dense-reach smoke test measured 94s/traverser at 6-max,
+the lead's "measure the real cost before treating synthetic worst-case as
+constraint" discipline pushed B.3b: vary opp reach sparsity, measure
+the cost curve.
+
+Data (5 opps, 6-max fold terminal, varying n_nonzero classes per opp):
+
+  n=1 : 0.000s (degenerate — 5×AA needs 10 aces, joint = 0)
+  n=2 : 0.029s
+  n=5 : 29.7s
+  n=10: ~16 min (extrapolated; matches B.3's 94s × 169 traverser classes)
+  n=20+: hours, combinatorial blowup
+
+Growth: 2→5 was 1024× for (5/2)^5 = 97× expected by tuple count alone.
+Per-tuple joint enumeration also grows with class diversity. Net is
+roughly O(n_nonzero^5) at 6-max.
+
+The sparsity exploit IS in the code (`preflop_terminal.rs:243,251`:
+cumulative-product zero prune + per-class continue). The enumeration
+already only visits non-zero-reach opp tuples. The combinatorial
+blowup is OVER the non-zero count, not naively over all 169.
+
+At realistic 6-max preflop fold-terminal opp reach density (~30-100
+classes per opp depending on position + prior action), 5 opps × 30-50
+classes each = 25M-300M tuples per call. Cost is real, not synthetic.
+
+What this implies (carried into the sequencing):
+
+  1. **Postflop abstraction (#42) matters for terminal CFV too**, not
+     just per-flop solves. At the terminal computation layer,
+     bucketing opp classes into a smaller equivalence set cuts the
+     n^5 multiplier directly.
+  2. **Memoization** on sorted class-tuple keys (joint blocking is
+     symmetric in classes) is a small drop-in that helps independently
+     of bucketing.
+  3. **The seam already supports optimization**: terminal_value_fn is
+     a closure; optimized implementations slot in without composition
+     rework, same way PostflopValueOracle accommodates Fix B and #42.
+
+The cost itself is acceptable for small-scale CPU validation (sparse
+synthetic reaches give sub-second per call); production-scale runs
+need memoization + likely terminal-layer bucketing in addition to
+postflop bucketing.
+
+## CRITICAL: per_flop_solver must use CONVERGED postflop, not iter-0 (2026-06-04)
+
+Architectural finding surfaced when Slice B's BR exploitability proxy
+asymmetry was investigated: the engine as initially wired used
+`compute_v_flop_at_root_iter0` as the per_flop_solver. That function
+runs ONE pass of postflop CFR with UNIFORM postflop strategies for
+both players, returning the per-combo CFV under that uniform-postflop
+assumption.
+
+This means the engine was solving "preflop CFR with fixed iter-0
+postflop", NOT NLHE. The preflop equilibrium under iter-0 postflop is
+DIFFERENT from the NLHE preflop equilibrium because traverser's best
+preflop action depends on what happens postflop, and the optimal
+postflop strategy is not uniform.
+
+Per the lead's directive (2026-06-04): the reference MUST solve the real
+game, because:
+  - (A) "consistent reproduction" is the trap — a perfectly faithful
+    GPU reproduction of an iter-0-postflop engine is a faithful
+    reproduction of a strategy you can't play.
+  - (B) "converged postflop" is the answer because the expensive thing
+    is exactly what the GPU exists to make feasible.
+  - The fix is localized to the per_flop_solver boundary. The
+    P5a/P5b/P5c composition anchoring is unchanged — it validated the
+    composition, not the postflop source.
+
+### What landed
+
+`solver-core/src/solver/flop_start_vector_cfr.rs`:
+  - `strategy_{flop,turn,river}_mut()` accessors added
+  - `freeze_average_strategy(&mut self, &FlatTree)` method added —
+    normalizes cum_strategy into the strategy buffer across all 3
+    zones, so a subsequent CFV pass uses the time-averaged Nash-
+    converging strategy rather than the oscillating current-iter one
+  - `normalize_cum_into_strategy` helper added
+
+`solver-core/src/solver/preflop_start_game.rs`:
+  - `compute_v_flop_at_root_converged(canonical, flop_tree, ranges,
+    traverser, num_postflop_iters)` added — drop-in replacement for
+    `compute_v_flop_at_root_iter0` with correct-game semantics: runs
+    num_postflop_iters of DCFR, freezes the averaged strategy, then
+    does the CFV pass
+
+`solver-core/src/solver/preflop_cfr.rs`:
+  - `make_per_flop_solver_converged(flop_tree, num_postflop_iters)`
+    builder added — the production per_flop_solver
+  - `make_per_flop_solver_iter0` marked DEPRECATED in docstring (kept
+    for Slice A unit-test scenarios where the per-flop CFV semantics
+    don't matter — synthetic v_flop_fn validations of the
+    composition wiring)
+
+### Cost implications
+
+Each per-flop solve becomes ~num_postflop_iters× the iter-0 cost
+(measured in slice 7a as ~7.2s/per-flop-iter at production nh with
+slice-7a's bet structure). At num_postflop_iters=100, each per-flop
+solve is ~720s = 12 min. A single preflop iteration at full scale
+(1755 canonicals × 2 traversers) is ~700 hours of CPU. This is the
+expensive thing the GPU is for. CPU validates at SMALL SCALE (small
+ranges, restricted nh, few canonicals); the GPU port replicates
+at small scale (parity validation) and then runs production scale.
+
+The Slice B test was updated to use the converged solver. Its iter
+cost is now too expensive even on a 10-canonical subset at production
+nh; Slice B sizing requires further scope reduction (smaller flop
+tree, restricted ranges, fewer postflop iters per per-flop solve
+balanced against postflop convergence). That sizing is its own slice
+question after the wiring is confirmed.
+
+### BR asymmetry deferred
+
+The iter-2 BR asymmetry (40.75 vs 0.0097) observed before the fix may
+be partly iter-0-game degeneracy; A.3d's chip_delta and the factored-
+CFR-convention plain-sum at opp nodes both passed independent
+validations (oracle cross-check + matching the postflop solver's
+pattern). Per the lead: investigate independently if the asymmetry
+persists after the postflop fix, but expect some of it dissolves
+because the engine now solves the real game.
+
+### Why this didn't surface earlier
+
+Slice A's tests used synthetic v_flop_fn closures (constant K or
+reach-aware lookups) that bypass the per-flop solve entirely. The
+P5c-anchored composition tests validated the orchestration, not the
+postflop source. The wrong-game choice was invisible until Slice B
+tried to read a meaningful BR exploitability, at which point the
+"what game is this engine actually solving" question became
+load-bearing for the correctness baseline.
+
+The slice discipline still worked: the bug surfaced at the
+composition boundary where it could be caught, not silently in a
+later phase. The honest framing of "the engine solves preflop-CFR-
+with-iter-0-postflop, is that the intended reference" is what
+exposed it.
+
+### Standing: methodology self-correction is the convergence-signal
+### counterpart to scale discrimination
+
+The slice 7a study's first metric (current-iter `strategy_flop`
+deviation from uniform) triggered trivially at iter 1 because
+regret-matching produces pure best-responses immediately; the metric
+measured the wrong quantity. The corrected metric (iter-over-iter L1
+delta of normalized `cum_strategy_flop`) measures CFR's actual
+convergence signal. The pattern: when a measurement returns
+something inside the trusted range, ask which trusted regime it
+landed in (linear-N×ULP accumulation vs sqrt-statistical for f32
+floor; or trivial-iter-1 vs developed-dynamics for CFR convergence).
+Scale discrimination is the f32-precision instance of this; the
+strategy-vs-cum_strategy correction is the convergence-signal
+instance. Both belong to the standing "agreement between un-anchored
+sides is not correctness" discipline.

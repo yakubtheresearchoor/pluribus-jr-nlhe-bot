@@ -1184,6 +1184,7 @@ mod tests {
             force_allin_threshold: 1.0,
             merging_threshold: 0.0,
         button_player: None,
+            max_bets_per_street: None,
 
         };
         let tree = build_tree(&cfg).expect("preflop tree builds");

@@ -34,6 +34,9 @@ fn setup_our_solver() -> (FlatTree, FlopStartGame) {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).expect("tree build");
@@ -165,7 +168,7 @@ fn t2f_b1nary_50_iters() {
         turn_bet_sizes: [one_pot.clone(), one_pot.clone()],
         river_bet_sizes: [one_pot.clone(), one_pot.clone()],
         ..Default::default()
-    };
+};
 
     let action_tree = ActionTree::new(tree_config).unwrap();
     let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();

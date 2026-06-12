@@ -34,6 +34,9 @@ fn flop_start_tree_builds_with_chance_nodes() {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).expect("tree build should succeed");
@@ -87,6 +90,9 @@ fn flop_start_solver_initializes() {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).expect("tree build should succeed");
@@ -132,6 +138,9 @@ fn flop_start_solver_runs_iterations() {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).expect("tree build should succeed");

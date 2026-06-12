@@ -18,6 +18,9 @@ fn test_2player_tree_builds() {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).unwrap();
@@ -48,6 +51,9 @@ fn test_3player_tree_builds() {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).unwrap();
@@ -88,6 +94,9 @@ fn test_3player_contributions_track_correctly() {
         add_allin_threshold: 0.0,
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).unwrap();
@@ -118,6 +127,9 @@ fn test_single_bet_size_tree() {
         add_allin_threshold: 0.0,
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).unwrap();
@@ -159,6 +171,9 @@ fn test_6player_tree_builds() {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).unwrap();
@@ -212,6 +227,9 @@ fn test_6player_river_tree_reasonable_size() {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
 
     let tree = build_tree(&config).unwrap();

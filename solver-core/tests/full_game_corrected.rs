@@ -23,6 +23,9 @@ fn setup_our() -> (solver_core::tree::flat::FlatTree, FlopStartGame) {
         rake_rate: 0.0, rake_cap: 0.0,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
+
     };
     let tree = build_tree(&config).unwrap();
     let table = solver_core::solver::flop_start_game::FlopChanceTable::compute_flop_start(&board, &ranges, 2);
@@ -43,7 +46,7 @@ fn setup_b1nary() -> postflop_solver::PostFlopGame {
         turn_bet_sizes: [one_pot.clone(), one_pot.clone()],
         river_bet_sizes: [one_pot.clone(), one_pot.clone()],
         ..Default::default()
-    };
+};
     let action_tree = ActionTree::new(tree_config).unwrap();
     let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
     game.allocate_memory(false);

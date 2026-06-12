@@ -97,6 +97,7 @@ fn build_rich_preflop_tree() -> (FlatTree, usize) {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: Some(5),
+            max_bets_per_street: None,
     };
     let tree = build_tree(&pre_cfg).expect("rich preflop tree builds (capacity smoke passed)");
     (tree, max_raise_count)
@@ -119,6 +120,7 @@ fn build_oracle_flop_tree() -> FlatTree {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
         button_player: None,
+            max_bets_per_street: None,
     };
     build_tree(&flop_cfg).expect("oracle flop tree builds")
 }

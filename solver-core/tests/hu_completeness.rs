@@ -58,6 +58,7 @@ fn hu_symmetric_cfg() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
     }
 
 }
@@ -79,6 +80,7 @@ fn hu_asymmetric_cfg() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
     }
 
 }
@@ -1093,6 +1095,7 @@ fn config_6p_asymmetric() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
     }
 
 }
@@ -1114,6 +1117,7 @@ fn config_6p_symmetric() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
     }
 
 }
@@ -1135,6 +1139,7 @@ fn config_3p_asymmetric() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
     }
 
 }
@@ -1227,6 +1232,7 @@ fn config_hu_preflop_asymmetric() -> TreeConfig {
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
     button_player: None,
+            max_bets_per_street: None,
     }
 
 }

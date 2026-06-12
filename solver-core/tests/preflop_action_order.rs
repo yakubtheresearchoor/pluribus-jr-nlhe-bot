@@ -38,7 +38,10 @@ fn hu_preflop_cfg() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
     }
+
 }
 
 fn hu_flop_cfg() -> TreeConfig {
@@ -61,7 +64,10 @@ fn hu_flop_cfg() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
+            max_bets_per_street: None,
     }
+
 }
 
 #[test]
