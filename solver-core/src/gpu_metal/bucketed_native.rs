@@ -103,6 +103,8 @@ pub struct BucketedNativeGpu {
     p_cfv: ComputePipelineState,
     p_regret: ComputePipelineState,
     p_chance: ComputePipelineState,
+    p_accum_step: ComputePipelineState,
+    p_publish: ComputePipelineState,
     p_root_accum: ComputePipelineState,
     /// Terminal resources + the batched collapsed kernel (resident
     /// mode); single-source with the G3-gated hybrid path.
@@ -124,6 +126,20 @@ pub struct BucketedNativeGpu {
     reach_mega: Buffer,
     cfv_mega: Buffer,
     root_cfv: Buffer,
+    /// SHARED-BUFFER SEQUENTIAL MODE (2026-06-12 big-tree unlock): when
+    /// the per-walk mega-buffer layout (n_walks × nn × np × nh) exceeds
+    /// the u32 walk-offset range or the device buffer limit, allocate
+    /// ONE nn-sized reach/cfv buffer (all walk offsets 0, absolute node
+    /// indexing unchanged) and SERIALIZE walks by encode order — Metal
+    /// hazard tracking on the shared buffer enforces it. Chance sums
+    /// accumulate per outcome into `acc_buf` (outcome-ascending — the
+    /// mega kernel's exact f32 order) and publish to the boundary rows.
+    /// Free by the G5 wall=busy finding: one walk at these widths
+    /// already saturates the GPU, so walk concurrency buys nothing.
+    /// Regrets always encode inline per walk here (the walk's cfv rows
+    /// are overwritten by the next outcome).
+    shared_mode: bool,
+    acc_buf: Buffer,
 
     // ── Plan-derived (uploaded once) ──
     descs_buf: Buffer,
@@ -206,6 +222,37 @@ impl BucketedNativeGpu {
         solver: &BucketedFlopCfr,
         stripes: u32,
     ) -> MetalResult<Self> {
+        Self::new_inner(ctx, tree, table, bk, solver, stripes, false)
+    }
+
+    /// Force the SHARED-BUFFER SEQUENTIAL pass regardless of size —
+    /// for the bit-exactness gates (small trees auto-select mega mode,
+    /// so the shared path needs an explicit handle to be gated on the
+    /// same fixtures).
+    pub fn new_forced_shared(
+        ctx: &MetalContext,
+        tree: &FlatTree,
+        table: &FlopChanceTable,
+        bk: &FlopBucketing,
+        solver: &BucketedFlopCfr,
+        stripes: u32,
+    ) -> MetalResult<Self> {
+        Self::new_inner(ctx, tree, table, bk, solver, stripes, true)
+    }
+
+    pub fn is_shared_mode(&self) -> bool {
+        self.shared_mode
+    }
+
+    fn new_inner(
+        ctx: &MetalContext,
+        tree: &FlatTree,
+        table: &FlopChanceTable,
+        bk: &FlopBucketing,
+        solver: &BucketedFlopCfr,
+        stripes: u32,
+        force_shared: bool,
+    ) -> MetalResult<Self> {
         let plan = solver.native_plan(tree, bk);
         let layout = solver.gpu_layout(bk);
         let dims = layout.dims;
@@ -230,35 +277,53 @@ impl BucketedNativeGpu {
         let reach_per_walk = nn * np * nh;
         let cfv_per_walk = nn * nh;
 
-        // ── CAPACITY PRE-FLIGHT (2026-06-12, after the v1 live-6 cell
-        // SIGSEGV: 45,711-node tree → 27 GB reach_mega → nil buffer →
-        // bzero through NULL). Two independent limits, both checked
-        // here with the numbers in the error:
+        // ── CAPACITY PRE-FLIGHT + MODE SELECTION (2026-06-12, after
+        // the v1 live-6 cell SIGSEGV: 45,711-node tree → 27 GB
+        // reach_mega → nil buffer → bzero through NULL). Limits:
         //   1. Walk offsets are u32 FLOAT indices in the GPU
-        //      descriptors (WalkDescGpu.reach_off) — the layout caps at
-        //      4 Gi floats (16 GiB) per mega-buffer REGARDLESS of
-        //      device memory. Overflow would silently corrupt, which is
-        //      worse than the crash.
-        //   2. Per-buffer device limit (max_buffer_length), enforced in
-        //      alloc_buf at every allocation.
-        // The mega-buffer layout allocates nn-sized reach/cfv per walk
-        // (absolute node indexing); the NAMED UNLOCK for big trees is
-        // zone-local indexing (Σ zone sizes ≈ nn instead of n_walks ×
-        // nn). Until then, callers get a clean Err and fall back to the
-        // hybrid path (CPU walk + GPU striped terminals).
-        let reach_floats = n_walks as u64 * reach_per_walk as u64;
-        let cfv_floats = n_walks as u64 * cfv_per_walk as u64;
-        if reach_floats > u32::MAX as u64 || cfv_floats > u32::MAX as u64 {
+        //      descriptors (WalkDescGpu.reach_off) — the mega layout
+        //      caps at 4 Gi floats per buffer REGARDLESS of device
+        //      memory. Overflow would silently corrupt — worse than
+        //      the crash.
+        //   2. Per-buffer device limit (max_buffer_length), enforced
+        //      in alloc_buf at every allocation.
+        // When the mega layout (n_walks × nn × np × nh) exceeds either
+        // limit, fall back to SHARED-BUFFER SEQUENTIAL MODE: one
+        // nn-sized reach/cfv buffer, all walk offsets 0, walks
+        // serialized by encode order (see the `shared_mode` field doc).
+        // Zone-size probe verdict (zone_size_probe.rs): per-zone
+        // buffers do NOT unlock big trees — the river zone is ~70% of
+        // nn and 16 concurrent river walks would still need 16 GB+;
+        // the shared buffer is the layout that actually fits (live-6
+        // limp: 27 GB → 1.29 GB).
+        let max_buf = ctx.device().max_buffer_length() as u64;
+        let mega_reach_floats = n_walks as u64 * reach_per_walk as u64;
+        let mega_cfv_floats = n_walks as u64 * cfv_per_walk as u64;
+        let shared_mode = force_shared
+            || mega_reach_floats > u32::MAX as u64
+            || mega_cfv_floats > u32::MAX as u64
+            || mega_reach_floats * 4 > max_buf
+            || mega_cfv_floats * 4 > max_buf;
+        if shared_mode
+            && ((reach_per_walk as u64) > u32::MAX as u64
+                || (reach_per_walk as u64) * 4 > max_buf)
+        {
             return Err(MetalError::CapacityExceeded(format!(
-                "walk-offset u32 overflow: reach_mega {reach_floats} floats / cfv_mega \
-                 {cfv_floats} floats exceed 4 Gi (nn {nn} × np {np} × nh {nh} × walks \
-                 {n_walks}); tree too large for the absolute-node-indexed mega-buffer \
-                 layout — use the hybrid path (zone-local indexing is the named unlock)"
+                "even the shared-buffer layout does not fit: nn {nn} × np {np} × nh {nh} \
+                 = {reach_per_walk} floats per reach buffer (u32 cap {}, device cap {} \
+                 bytes)",
+                u32::MAX,
+                max_buf
             )));
         }
-        let reach_offs: Vec<u32> =
-            (0..n_walks).map(|w| (w * reach_per_walk) as u32).collect();
-        let cfv_offs: Vec<u32> = (0..n_walks).map(|w| (w * cfv_per_walk) as u32).collect();
+        let (reach_offs, cfv_offs): (Vec<u32>, Vec<u32>) = if shared_mode {
+            (vec![0; n_walks], vec![0; n_walks])
+        } else {
+            (
+                (0..n_walks).map(|w| (w * reach_per_walk) as u32).collect(),
+                (0..n_walks).map(|w| (w * cfv_per_walk) as u32).collect(),
+            )
+        };
 
         // ── Infoset descriptors: [flop | turn ti-major | river outcome-major] ──
         let mut all_descs: Vec<InfosetDesc> = Vec::new();
@@ -391,6 +456,8 @@ impl BucketedNativeGpu {
             p_cfv: ctx.create_pipeline("bucketed_native_cfv_level")?,
             p_regret: ctx.create_pipeline("bucketed_native_regret_update")?,
             p_chance: ctx.create_pipeline("bucketed_native_chance_accum")?,
+            p_accum_step: ctx.create_pipeline("bucketed_native_chance_accum_step")?,
+            p_publish: ctx.create_pipeline("bucketed_native_rows_publish")?,
             p_root_accum: ctx.create_pipeline("bucketed_native_root_accum")?,
             term,
             regrets: zeros_buf(ctx, dims.total_floats(), "regrets")?,
@@ -403,9 +470,19 @@ impl BucketedNativeGpu {
             river_offset_f: dims.river_offset(),
             turn_stride: dims.turn_stride(),
             river_stride: dims.river_stride(),
-            reach_mega: zeros_buf(ctx, n_walks * reach_per_walk, "reach_mega")?,
-            cfv_mega: zeros_buf(ctx, n_walks * cfv_per_walk, "cfv_mega")?,
+            reach_mega: if shared_mode {
+                zeros_buf(ctx, reach_per_walk, "reach_shared")?
+            } else {
+                zeros_buf(ctx, n_walks * reach_per_walk, "reach_mega")?
+            },
+            cfv_mega: if shared_mode {
+                zeros_buf(ctx, cfv_per_walk, "cfv_shared")?
+            } else {
+                zeros_buf(ctx, n_walks * cfv_per_walk, "cfv_mega")?
+            },
             root_cfv: zeros_buf(ctx, nh, "root_cfv")?,
+            shared_mode,
+            acc_buf: zeros_buf(ctx, ts_count.max(rs_count) * nh, "acc")?,
             descs_buf,
             flop_desc,
             turn_desc_all,
@@ -571,7 +648,10 @@ impl BucketedNativeGpu {
                     Self::set_params(enc, 2, &p);
                 });
             }
-            Zone::Turn => {
+            // In SHARED mode the parent walk already wrote the seed
+            // rows in place (same buffer, offset 0) — the copy would
+            // be a bit-identical self-copy; skip the dispatch.
+            Zone::Turn if !self.shared_mode => {
                 // Seed from the flop walk's reach.
                 let src_byte =
                     (self.reach_offs[self.walk_index(Zone::Flop, None, None)] as u64) * 4;
@@ -588,7 +668,7 @@ impl BucketedNativeGpu {
                     },
                 );
             }
-            Zone::River => {
+            Zone::River if !self.shared_mode => {
                 // Seed from this ti's turn walk reach.
                 let src_byte =
                     (self.reach_offs[self.walk_index(Zone::Turn, ti, None)] as u64) * 4;
@@ -605,6 +685,7 @@ impl BucketedNativeGpu {
                     },
                 );
             }
+            Zone::Turn | Zone::River => {}
             Zone::Preflop => unreachable!(),
         }
         let map_off = self.runout_index(zone, ti, ri) * self.nh;
@@ -733,14 +814,127 @@ impl BucketedNativeGpu {
         self.queue.new_command_buffer().to_owned()
     }
 
-    /// One traverser pass, one command buffer (Fix-C: encode
-    /// everything, commit, NO wait — hazard tracking orders dependent
-    /// dispatches; cross-command-buffer order is queue submission
-    /// order on tracked resources).
-    fn encode_traverser_pass(&mut self, traverser: u8, d: &DcfrParams) {
-        let mut cmd = self.queue.new_command_buffer().to_owned();
+    /// SHARED-BUFFER SEQUENTIAL pass: one nn-sized reach/cfv buffer,
+    /// walks serialized by encode order (hazard tracking on the shared
+    /// buffers enforces it — every dispatch references them). Identical
+    /// arithmetic to the mega pass:
+    ///   - seeds are in place (parent walks write boundary rows
+    ///     directly; the mega mode's seed copy is a self-copy here);
+    ///   - chance sums accumulate per outcome in ascending order into
+    ///     acc_buf (the mega kernel's exact f32 op sequence), then
+    ///     publish to the boundary rows;
+    ///   - regrets encode inline per walk (its cfv rows are overwritten
+    ///     by the next outcome), which is the mega mode's default too.
+    /// Write-sets per zone are outcome-invariant (edges/BU descs are
+    /// per-zone), so the single pass-wide zero gives the same
+    /// unwritten-rows-read-zero semantics as the CPU's fresh per-walk
+    /// arrays.
+    fn encode_traverser_pass_shared(&mut self, traverser: u8, d: &DcfrParams) {
+        let cmd = self.queue.new_command_buffer().to_owned();
 
-        // ── 1. Strategies (all zones, all outcomes; regrets fixed) ──
+        // 1. Strategies (all zones/outcomes — regret-only input).
+        self.encode_strategies(&cmd, traverser, d);
+
+        // 2. Zero shared reach (one walk's worth IS the buffer).
+        self.dispatch(&cmd, &self.p_zero, self.reach_per_walk, |enc| {
+            enc.set_buffer(0, Some(&self.reach_mega), 0);
+            Self::set_u32(enc, 1, self.reach_per_walk as u32);
+        });
+
+        // 3. Flop subtree: reach → terminals (flop rows stay intact
+        //    below — turn/river walks write disjoint rows).
+        self.encode_reach_walk(&cmd, Zone::Flop, None, None, traverser, d);
+        self.term.encode_walks_resident(
+            &cmd,
+            &self.walks[self.walk_index(Zone::Flop, None, None)..][..1],
+            traverser,
+            &self.reach_mega,
+            &self.cfv_mega,
+            &[0],
+            &[0],
+        );
+
+        // 4. Per-turn subtrees, sequentially.
+        for ti in 0..self.n_turn {
+            self.encode_reach_walk(&cmd, Zone::Turn, Some(ti), None, traverser, d);
+            self.term.encode_walks_resident(
+                &cmd,
+                &self.walks[self.walk_index(Zone::Turn, Some(ti), None)..][..1],
+                traverser,
+                &self.reach_mega,
+                &self.cfv_mega,
+                &[0],
+                &[0],
+            );
+            for ri in 0..self.n_rivers[ti] {
+                self.encode_reach_walk(&cmd, Zone::River, Some(ti), Some(ri), traverser, d);
+                self.term.encode_walks_resident(
+                    &cmd,
+                    &self.walks[self.walk_index(Zone::River, Some(ti), Some(ri))..][..1],
+                    traverser,
+                    &self.reach_mega,
+                    &self.cfv_mega,
+                    &[0],
+                    &[0],
+                );
+                self.encode_bu_walk(
+                    &cmd, Zone::River, Some(ti), Some(ri), traverser, d, true,
+                );
+                // acc[r,h] += cp_river[ti][ri][h] · cfv[river_root_r, h]
+                let p = self.wparams(self.rs_count, self.nb_turn, 0, traverser, d);
+                let cp_byte = ((self.cp_river_off[ti] + ri * self.nh) * 4) as u64;
+                self.dispatch(&cmd, &self.p_accum_step, self.rs_count * self.nh, |enc| {
+                    enc.set_buffer(0, Some(&self.acc_buf), 0);
+                    enc.set_buffer(1, Some(&self.cfv_mega), 0);
+                    enc.set_buffer(2, Some(&self.cp_river_buf), cp_byte);
+                    enc.set_buffer(3, Some(&self.river_seed_buf), 0);
+                    Self::set_params(enc, 4, &p);
+                });
+            }
+            // Publish Σ_ri into the river-root rows; re-zero acc.
+            let p = self.wparams(self.rs_count, self.nb_turn, 0, traverser, d);
+            self.dispatch(&cmd, &self.p_publish, self.rs_count * self.nh, |enc| {
+                enc.set_buffer(0, Some(&self.cfv_mega), 0);
+                enc.set_buffer(1, Some(&self.acc_buf), 0);
+                enc.set_buffer(2, Some(&self.river_seed_buf), 0);
+                Self::set_params(enc, 3, &p);
+            });
+            self.encode_bu_walk(&cmd, Zone::Turn, Some(ti), None, traverser, d, true);
+            // acc[r,h] += cp_turn[ti][h] · cfv[turn_root_r, h]
+            let p = self.wparams(self.ts_count, self.nb_flop, 0, traverser, d);
+            let cp_byte = ((ti * self.nh) * 4) as u64;
+            self.dispatch(&cmd, &self.p_accum_step, self.ts_count * self.nh, |enc| {
+                enc.set_buffer(0, Some(&self.acc_buf), 0);
+                enc.set_buffer(1, Some(&self.cfv_mega), 0);
+                enc.set_buffer(2, Some(&self.cp_turn_buf), cp_byte);
+                enc.set_buffer(3, Some(&self.turn_seed_buf), 0);
+                Self::set_params(enc, 4, &p);
+            });
+        }
+        // Publish Σ_ti into the turn-root rows; flop bottom-up; root.
+        let p = self.wparams(self.ts_count, self.nb_flop, 0, traverser, d);
+        self.dispatch(&cmd, &self.p_publish, self.ts_count * self.nh, |enc| {
+            enc.set_buffer(0, Some(&self.cfv_mega), 0);
+            enc.set_buffer(1, Some(&self.acc_buf), 0);
+            enc.set_buffer(2, Some(&self.turn_seed_buf), 0);
+            Self::set_params(enc, 3, &p);
+        });
+        self.encode_bu_walk(&cmd, Zone::Flop, None, None, traverser, d, true);
+        if traverser == 0 {
+            self.dispatch(&cmd, &self.p_root_accum, self.nh, |enc| {
+                enc.set_buffer(0, Some(&self.root_cfv), 0);
+                enc.set_buffer(1, Some(&self.cfv_mega), 0);
+                Self::set_u32(enc, 2, self.nh as u32);
+            });
+        }
+        cmd.commit();
+        self.inflight.push(cmd);
+        self.inflight_stages.push(usize::MAX);
+    }
+
+    /// Strategy dispatches for all zones/outcomes (shared by both pass
+    /// modes — strategies read only regrets, fixed within a pass).
+    fn encode_strategies(&self, cmd: &metal::CommandBufferRef, traverser: u8, d: &DcfrParams) {
         for (range, nb) in [
             (self.flop_desc, self.nb_flop),
             (self.turn_desc_all, self.nb_turn),
@@ -752,13 +946,27 @@ impl BucketedNativeGpu {
             }
             let p = self.wparams(d_len, nb, 0, traverser, d);
             let desc_byte = (d_off * std::mem::size_of::<InfosetDesc>()) as u64;
-            self.dispatch(&cmd, &self.p_strat, d_len * nb, |enc| {
+            self.dispatch(cmd, &self.p_strat, d_len * nb, |enc| {
                 enc.set_buffer(0, Some(&self.regrets), 0);
                 enc.set_buffer(1, Some(&self.strategy), 0);
                 enc.set_buffer(2, Some(&self.descs_buf), desc_byte);
                 Self::set_params(enc, 3, &p);
             });
         }
+    }
+
+    /// One traverser pass, one command buffer (Fix-C: encode
+    /// everything, commit, NO wait — hazard tracking orders dependent
+    /// dispatches; cross-command-buffer order is queue submission
+    /// order on tracked resources).
+    fn encode_traverser_pass(&mut self, traverser: u8, d: &DcfrParams) {
+        if self.shared_mode {
+            return self.encode_traverser_pass_shared(traverser, d);
+        }
+        let mut cmd = self.queue.new_command_buffer().to_owned();
+
+        // ── 1. Strategies (all zones, all outcomes; regrets fixed) ──
+        self.encode_strategies(&cmd, traverser, d);
 
         cmd = self.stage_cut(cmd, 0); // strategies
 

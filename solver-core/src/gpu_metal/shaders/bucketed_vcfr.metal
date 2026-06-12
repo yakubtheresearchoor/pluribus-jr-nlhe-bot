@@ -1047,6 +1047,43 @@ kernel void bucketed_native_chance_accum(
     dst_cfv[row] = acc;
 }
 
+// SHARED-BUFFER SEQUENTIAL MODE (2026-06-12, big-tree unlock): one
+// outcome's contribution to the chance sum, accumulated into a small
+// per-boundary-row buffer while the shared cfv buffer still holds that
+// outcome's values. acc starts zeroed; outcome-ascending dispatch order
+// reproduces the mega-mode kernel's in-register loop bit-exactly
+// (acc = ((cp0·v0) + cp1·v1) + ... — same f32 op sequence).
+kernel void bucketed_native_chance_accum_step(
+    device float* acc                        [[buffer(0)]],  // [r*nh + h]
+    const device float* cfv                  [[buffer(1)]],  // shared, offset 0
+    const device float* cp                   [[buffer(2)]],  // pre-offset: [h]
+    const device uint* rows                  [[buffer(3)]],  // child node ids
+    constant NativeWalkParams& p             [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint r = gid / p.nh;
+    uint h = gid % p.nh;
+    if (r >= p.count) return;
+    acc[gid] += cp[h] * cfv[ulong(rows[r]) * p.nh + h];
+}
+
+// Companion: publish the accumulated sums into the shared cfv buffer
+// at the boundary rows (so the parent zone's bottom-up reads them as
+// child values), and re-zero acc for the next outcome group.
+kernel void bucketed_native_rows_publish(
+    device float* cfv                        [[buffer(0)]],
+    device float* acc                        [[buffer(1)]],
+    const device uint* rows                  [[buffer(2)]],
+    constant NativeWalkParams& p             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint r = gid / p.nh;
+    uint h = gid % p.nh;
+    if (r >= p.count) return;
+    cfv[ulong(rows[r]) * p.nh + h] = acc[gid];
+    acc[gid] = 0.0f;
+}
+
 // Root cfv accumulation across iterations (traverser 0): one thread
 // per h, dst += flop_cfv[root, h].
 kernel void bucketed_native_root_accum(

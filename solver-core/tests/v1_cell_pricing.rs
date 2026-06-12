@@ -182,11 +182,14 @@ fn v1_cell_pricing_gpu() {
     }
 }
 
-/// STANDING GATE (2026-06-12, regression for the live-6 SIGSEGV):
-/// constructing the native orchestrator on a tree whose mega-buffers
-/// overflow the u32 walk-offset layout must return a clean
-/// CapacityExceeded error — never a nil-buffer write (the original
-/// failure: 27 GB reach_mega → nil → bzero through NULL).
+/// STANDING GATE (2026-06-12, regression for the live-6 SIGSEGV; the
+/// original failure: 27 GB reach_mega → nil buffer → bzero through
+/// NULL). Updated same day for the SHARED-BUFFER SEQUENTIAL mode: a
+/// tree whose MEGA layout overflows the u32 walk-offset range must now
+/// construct successfully IN SHARED MODE (auto-selected) — and the
+/// shared buffers themselves are nil-checked (alloc_buf), so a tree
+/// too big even for shared mode gets a clean CapacityExceeded, never a
+/// crash.
 #[cfg(feature = "metal")]
 #[test]
 fn native_gpu_capacity_pre_flight_gate() {
@@ -197,33 +200,25 @@ fn native_gpu_capacity_pre_flight_gate() {
     let flop_bets =
         BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
     const NB: usize = 8;
-    // The live-6 limp cell: 45,711 nodes → reach_mega 6.77e9 floats,
-    // beyond both the u32 float-offset cap (4 Gi) and the device
-    // buffer limit.
+    // The live-6 limp cell: 45,711 nodes → mega layout 6.77e9 floats
+    // (> u32) → shared mode must engage (1.29 GB single buffer).
     let cfg = spec.flop_seam_config(6, 2, 12, flop_bets);
     let tree = build_tree(&cfg).expect("seam tree");
-    assert!(tree.nodes.len() > 40_000, "repro tree must stay oversized");
+    assert!(tree.nodes.len() > 40_000, "repro tree must stay oversized for the mega layout");
     let table = build_table(6);
     let (fm, tm, rm) = quantile_maps(&table, NB);
     let game = FlopStartGame::new(table);
     let bk = FlopBucketing::from_maps(game.table(), NB, NB, NB, fm, tm, rm);
     let mut solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
     solver.set_terminal_design(TerminalDesign::Design1Collapsed);
-    let r = BucketedNativeGpu::new(&ctx, &tree, game.table(), &bk, &solver, (32 / NB) as u32);
-    match r {
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("capacity") || msg.contains("Capacity") || msg.contains("overflow"),
-                "expected a capacity error, got: {msg}"
-            );
-            eprintln!("pre-flight gate: clean rejection — {msg}");
-        }
-        Ok(_) => panic!(
-            "native construction unexpectedly succeeded on the oversized tree — \
-             if zone-local indexing landed, update this gate to a larger repro"
-        ),
-    }
+    let native =
+        BucketedNativeGpu::new(&ctx, &tree, game.table(), &bk, &solver, (32 / NB) as u32)
+            .expect("oversized-for-mega tree must construct in shared mode");
+    assert!(
+        native.is_shared_mode(),
+        "mega layout overflows u32 here — shared mode must auto-select"
+    );
+    eprintln!("pre-flight gate: shared mode auto-selected on the 45k-node tree");
 }
 
 #[test]

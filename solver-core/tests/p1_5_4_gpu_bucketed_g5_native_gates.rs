@@ -293,3 +293,49 @@ fn gate_n2_native_divergent_dims_trajectory() {
          accumulated-rounding scale — breakage"
     );
 }
+
+/// Gate N1-SHARED (2026-06-12, big-tree unlock): the SHARED-BUFFER
+/// SEQUENTIAL pass (one nn-sized reach/cfv buffer, walks serialized by
+/// encode order, per-outcome incremental chance accumulation) must be
+/// bit-exact vs the pure CPU at identity — same standard as N1. Small
+/// trees auto-select mega mode, so this forces shared on the same
+/// fixture; if it matches CPU bit-for-bit, it also matches mega mode.
+#[test]
+fn gate_n1_shared_sequential_identity_bit_exact() {
+    const NH: usize = 6;
+    const ITERS: u32 = 3;
+    let ctx = MetalContext::new().expect("Metal");
+    let tree = build_identity_tree();
+
+    let game_a = FlopStartGame::new(build_table(NH));
+    let bk_a = FlopBucketing::identity(game_a.table());
+    let solver_a = BucketedFlopCfr::new(&tree, game_a.table(), &bk_a);
+    let mut native =
+        BucketedNativeGpu::new_forced_shared(&ctx, &tree, game_a.table(), &bk_a, &solver_a, 1)
+            .expect("native gpu (shared)");
+    assert!(native.is_shared_mode());
+    let root_gpu = native.run(ITERS);
+
+    let game_b = FlopStartGame::new(build_table(NH));
+    let bk_b = FlopBucketing::identity(game_b.table());
+    let mut cpu = BucketedFlopCfr::new(&tree, game_b.table(), &bk_b);
+    cpu.set_terminal_design(TerminalDesign::Design1Collapsed);
+    let root_cpu = cpu.run(&tree, &game_b, &bk_b, ITERS);
+
+    for (i, (a, b)) in root_gpu.iter().zip(&root_cpu).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "root cfv[{i}]: shared {a} vs cpu {b}");
+    }
+    for ((label, ga), (_, ca)) in gpu_buffers(&native).iter().zip(cpu_buffers(&cpu).iter()) {
+        assert_eq!(ga.len(), ca.len(), "{label} length");
+        for i in 0..ga.len() {
+            assert_eq!(
+                ga[i].to_bits(),
+                ca[i].to_bits(),
+                "{label}[{i}]: shared {} vs cpu {}",
+                ga[i],
+                ca[i]
+            );
+        }
+    }
+    eprintln!("gate N1-SHARED PASSED: sequential shared-buffer pass bit-exact at identity");
+}
