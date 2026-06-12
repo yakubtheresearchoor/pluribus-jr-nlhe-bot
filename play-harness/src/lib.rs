@@ -8,3 +8,4 @@
 //! both crates' string formats; nothing else may convert ad hoc.
 
 pub mod convert;
+pub mod blueprint;
