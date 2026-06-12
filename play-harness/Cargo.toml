@@ -1,0 +1,12 @@
+[package]
+name = "play-harness"
+version = "0.1.0"
+edition = "2021"
+
+# The harness scores hands through clean-rules (the independent rules
+# oracle) and loads blueprints/agents through solver-core. The RULES
+# side must stay in clean-rules — never re-implement or import solver
+# terminal machinery here for scoring.
+[dependencies]
+clean-rules = { path = "../clean-rules" }
+solver-core = { path = "../solver-core" }

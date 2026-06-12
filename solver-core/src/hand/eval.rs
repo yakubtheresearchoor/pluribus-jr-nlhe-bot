@@ -54,6 +54,54 @@ impl Hand {
         HAND_TABLE.binary_search(&self.evaluate_internal()).unwrap() as u16
     }
 
+    /// Order-preserving u16 index valid for 5-, 6-, AND 7-card hands.
+    ///
+    /// `evaluate_internal` already collapses any hand to its best-5
+    /// value, so the full 5-card value space (7462 classes, built once
+    /// at first use by enumerating all C(52,5) hands) indexes every
+    /// case; `HAND_TABLE` is the 7-card-REACHABLE subset only and has
+    /// gaps for 5/6-card hands (e.g. low high-card hands that cannot
+    /// survive best-5-of-7).
+    ///
+    /// HISTORY (2026-06-11, found by the play-harness fire alarm on
+    /// its first run): every FlopChanceTable rank table was built with
+    /// `evaluate_internal() as u16`, truncating the category bits
+    /// (<<26) and pair/trip sets (<<13) — hands were ordered
+    /// essentially by kicker bit-set. Invisible to every solver-vs-
+    /// solver gate because all arms consumed the same wrong tables;
+    /// caught by the independent clean-room evaluator on the first
+    /// cross-check.
+    pub fn evaluate_full(&self) -> u16 {
+        use std::sync::OnceLock;
+        static FULL_TABLE: OnceLock<Vec<i32>> = OnceLock::new();
+        let table = FULL_TABLE.get_or_init(|| {
+            let mut vals = Vec::with_capacity(2_598_960);
+            for a in 0..52usize {
+                for b in (a + 1)..52 {
+                    for c in (b + 1)..52 {
+                        for d in (c + 1)..52 {
+                            for e in (d + 1)..52 {
+                                let h = Hand::new()
+                                    .add_card(a)
+                                    .add_card(b)
+                                    .add_card(c)
+                                    .add_card(d)
+                                    .add_card(e);
+                                vals.push(h.evaluate_internal());
+                            }
+                        }
+                    }
+                }
+            }
+            vals.sort_unstable();
+            vals.dedup();
+            vals
+        });
+        table
+            .binary_search(&self.evaluate_internal())
+            .expect("hand value outside the 5-card space (fewer than 5 cards?)") as u16
+    }
+
     pub fn evaluate_internal(&self) -> i32 {
         let mut rankset = 0i32;
         let mut rankset_suit = [0i32; 4];

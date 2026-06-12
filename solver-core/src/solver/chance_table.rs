@@ -45,7 +45,7 @@ impl ChanceTable {
             for &bc in known_board {
                 hand = hand.add_card(bc as usize);
             }
-            hand_ranks_base[i] = hand.evaluate_internal() as u16;
+            hand_ranks_base[i] = hand.evaluate_full();
         }
 
         let mut conflict = vec![0u8; num_valid * num_valid];
@@ -84,7 +84,7 @@ impl ChanceTable {
                 for &bc in &full_board {
                     hand = hand.add_card(bc as usize);
                 }
-                chance_ranks_table[river_card as usize * num_valid + i] = hand.evaluate();
+                chance_ranks_table[river_card as usize * num_valid + i] = hand.evaluate_full();
             }
         }
 

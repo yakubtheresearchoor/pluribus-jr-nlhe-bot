@@ -1,0 +1,12 @@
+[package]
+name = "clean-rules"
+version = "0.1.0"
+edition = "2021"
+
+# CLEAN-ROOM MANDATE: this crate has ZERO dependencies — in particular
+# it must NEVER depend on solver-core. It is the independent rules
+# oracle the play harness scores every hand through; sharing code with
+# the solver's terminal machinery would blind the cross-check to bugs
+# shared by both implementations (the inter-implementation-agreement
+# trap). Enforced by the crate graph, auditable here.
+[dependencies]

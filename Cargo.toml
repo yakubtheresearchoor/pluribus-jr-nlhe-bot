@@ -1,3 +1,3 @@
 [workspace]
-members = ["solver-core", "solver-cli"]
+members = ["solver-core", "solver-cli", "clean-rules", "play-harness"]
 resolver = "2"

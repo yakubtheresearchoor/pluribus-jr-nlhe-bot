@@ -71,7 +71,7 @@ impl FlopChanceTable {
             hand = hand.add_card(c1 as usize);
             hand = hand.add_card(c2 as usize);
             for &bc in known_board { hand = hand.add_card(bc as usize); }
-            hand_ranks_base[i] = hand.evaluate_internal() as u16;
+            hand_ranks_base[i] = hand.evaluate_full();
         }
 
         // Conflict matrix
@@ -129,7 +129,7 @@ impl FlopChanceTable {
                 hand = hand.add_card(c2 as usize);
                 for &bc in known_board { hand = hand.add_card(bc as usize); }
                 hand = hand.add_card(turn_card as usize);
-                turn_ranks[turn_card as usize * nh + i] = hand.evaluate_internal() as u16;
+                turn_ranks[turn_card as usize * nh + i] = hand.evaluate_full();
             }
 
             // Sort turn ranks
@@ -167,7 +167,7 @@ impl FlopChanceTable {
                     for &bc in known_board { hand = hand.add_card(bc as usize); }
                     hand = hand.add_card(turn_card as usize);
                     hand = hand.add_card(river_card as usize);
-                    river_ranks[turn_card as usize * 52 * nh + river_card as usize * nh + i] = hand.evaluate_internal() as u16;
+                    river_ranks[turn_card as usize * 52 * nh + river_card as usize * nh + i] = hand.evaluate_full();
                 }
 
                 // Sort river ranks for this (turn, river) pair
@@ -314,7 +314,7 @@ impl FlopChanceTable {
             hand = hand.add_card(c1 as usize);
             hand = hand.add_card(c2 as usize);
             for &bc in known_board { hand = hand.add_card(bc as usize); }
-            hand_ranks_base[i] = hand.evaluate_internal() as u16;
+            hand_ranks_base[i] = hand.evaluate_full();
         }
 
         // Conflict matrix (subset).
@@ -363,7 +363,7 @@ impl FlopChanceTable {
                 hand = hand.add_card(c2 as usize);
                 for &bc in known_board { hand = hand.add_card(bc as usize); }
                 hand = hand.add_card(turn_card as usize);
-                turn_ranks[turn_card as usize * nh + i] = hand.evaluate_internal() as u16;
+                turn_ranks[turn_card as usize * nh + i] = hand.evaluate_full();
             }
             // Sorted turn ranks — INCLUDE ALL nh entries (blocked hands get rank 0 → strength 1).
             // This matches the production rule that prevents the GPU helper's hand_strength[0]
@@ -401,7 +401,7 @@ impl FlopChanceTable {
                     for &bc in known_board { hand = hand.add_card(bc as usize); }
                     hand = hand.add_card(turn_card as usize);
                     hand = hand.add_card(river_card as usize);
-                    river_ranks[turn_card as usize * 52 * nh + river_card as usize * nh + i] = hand.evaluate_internal() as u16;
+                    river_ranks[turn_card as usize * 52 * nh + river_card as usize * nh + i] = hand.evaluate_full();
                 }
                 {
                     let mut items: Vec<(u16, u16)> = (0..nh)
@@ -568,7 +568,7 @@ impl FlopChanceTable {
             for &bc in &flop {
                 h = h.add_card(bc as usize);
             }
-            hr[i] = h.evaluate_internal() as u16;
+            hr[i] = h.evaluate_full();
         }
 
         let mut turn_ranks = vec![0u16; 52 * nh];
@@ -586,7 +586,7 @@ impl FlopChanceTable {
                     h = h.add_card(bc as usize);
                 }
                 h = h.add_card(t as usize);
-                turn_ranks[t as usize * nh + i] = h.evaluate_internal() as u16;
+                turn_ranks[t as usize * nh + i] = h.evaluate_full();
             }
             let mut items: Vec<(u16, u16)> =
                 (0..nh).map(|h| (turn_ranks[t as usize * nh + h] + 1, h as u16)).collect();
@@ -617,7 +617,7 @@ impl FlopChanceTable {
                     }
                     h = h.add_card(t as usize).add_card(r as usize);
                     river_ranks[t as usize * 52 * nh + r as usize * nh + i] =
-                        h.evaluate_internal() as u16;
+                        h.evaluate_full();
                 }
                 let mut items: Vec<(u16, u16)> = (0..nh)
                     .map(|h| {
@@ -711,7 +711,7 @@ impl FlopChanceTable {
             hand = hand.add_card(c1 as usize);
             hand = hand.add_card(c2 as usize);
             for &bc in known_board { hand = hand.add_card(bc as usize); }
-            hand_ranks_base[i] = hand.evaluate_internal() as u16;
+            hand_ranks_base[i] = hand.evaluate_full();
         }
 
         // Conflict matrix.
@@ -764,7 +764,7 @@ impl FlopChanceTable {
                 hand = hand.add_card(c2 as usize);
                 for &bc in known_board { hand = hand.add_card(bc as usize); }
                 hand = hand.add_card(turn_card as usize);
-                turn_ranks[turn_card as usize * nh + i] = hand.evaluate_internal() as u16;
+                turn_ranks[turn_card as usize * nh + i] = hand.evaluate_full();
             }
             {
                 let mut items: Vec<(u16, u16)> = (0..nh)
@@ -798,7 +798,7 @@ impl FlopChanceTable {
                     for &bc in known_board { hand = hand.add_card(bc as usize); }
                     hand = hand.add_card(turn_card as usize);
                     hand = hand.add_card(river_card as usize);
-                    river_ranks[turn_card as usize * 52 * nh + river_card as usize * nh + i] = hand.evaluate_internal() as u16;
+                    river_ranks[turn_card as usize * 52 * nh + river_card as usize * nh + i] = hand.evaluate_full();
                 }
                 {
                     let mut items: Vec<(u16, u16)> = (0..nh)
