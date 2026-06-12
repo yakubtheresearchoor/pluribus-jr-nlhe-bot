@@ -53,6 +53,54 @@
 use crate::card::Card;
 use crate::tree::flat::FlatTree;
 
+/// A preflop→flop SEAM CELL: the flop-entry game context (live player
+/// count, the equal per-live commitment, total pot — dead money
+/// included). Derived from the flop-entry chance node's folded mask +
+/// contributions (the v1_seam_census convention). The strategic
+/// coordinate is (live, SPR = (stack − commit)/pot); the validated
+/// cell-set policy buckets on it at log2 width 0.25.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SeamCell {
+    pub live: u8,
+    pub commit: i32,
+    pub pot: i32,
+}
+
+impl SeamCell {
+    /// The collapse / bucket key under the VALIDATED policy (4f1dabe):
+    /// (live, floor(log2(SPR)/0.25)); all-in cells (behind ≤ 0) get a
+    /// per-live sentinel bin (they need no solve — equity rollouts).
+    /// `stack` = the game class's total per-player stack.
+    pub fn bucket_key(&self, stack: i32) -> (u8, i64) {
+        let behind = stack - self.commit;
+        if behind <= 0 {
+            return (self.live, i64::MIN);
+        }
+        let spr = behind as f64 / self.pot as f64;
+        (self.live, (spr.log2() / 0.25).floor() as i64)
+    }
+
+    /// Derive the cell at a flop-entry chance node (the v1_seam_census
+    /// convention: live set from the folded mask, equal live commits,
+    /// pot = Σ contributions — preflop trees carry no dead
+    /// starting_pot; blinds are live contributions).
+    pub fn at_chance_node(tree: &FlatTree, chance_idx: usize, np: usize) -> SeamCell {
+        let mask = tree.get_folded_mask(chance_idx);
+        let mut live = 0u8;
+        let mut commit = 0i32;
+        let mut pot = 0i32;
+        for p in 0..np {
+            let c = tree.get_contribution(chance_idx, p as u8);
+            pot += c;
+            if mask & (1 << p) == 0 {
+                live += 1;
+                commit = commit.max(c);
+            }
+        }
+        SeamCell { live, commit, pot }
+    }
+}
+
 /// The interface between the preflop engine and the postflop layer.
 ///
 /// The preflop engine asks for per-combo CFV at the flop root for one
@@ -89,6 +137,29 @@ pub trait PostflopValueOracle {
         combo_ranges: &[Vec<f32>],
         traverser: u8,
     ) -> Vec<f32>;
+
+    /// SEAM-CELL-AWARE variant (2026-06-12, v1 pot-bucket-keyed
+    /// oracles): same contract as `flop_root_cfv`, plus the seam cell
+    /// of the flop-entry chance node — (live players, per-live commit,
+    /// pot) — so bucket-keyed oracles can dispatch to the right
+    /// representative blueprint (the validated SPR cell-set policy:
+    /// log2-SPR width 0.25, bin-center reps). Default forwards to the
+    /// cell-blind method so existing oracles are unaffected.
+    ///
+    /// CALLER CONTRACT (mirrors `run_one_iteration_shared_chance`'s):
+    /// under the shared-chance collapse, the answer must depend only
+    /// on (canonical_flop, traverser, the collapse key) — and the
+    /// collapse key must be a function of the cell for cell-keyed
+    /// oracles.
+    fn flop_root_cfv_for_cell(
+        &mut self,
+        canonical_flop: [Card; 3],
+        combo_ranges: &[Vec<f32>],
+        traverser: u8,
+        _cell: SeamCell,
+    ) -> Vec<f32> {
+        self.flop_root_cfv(canonical_flop, combo_ranges, traverser)
+    }
 
     /// Called by the engine BEFORE its per-traverser loop at preflop
     /// iteration `iter`.
