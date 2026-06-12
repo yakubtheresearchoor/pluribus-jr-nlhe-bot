@@ -116,3 +116,47 @@ fn v1_seam_census() {
         eprintln!("  live {live} commit {commit} pot {pot}: {n} nodes");
     }
 }
+
+/// Census at candidate raise-depth caps (the knob's payoff): the
+/// uncapped v1 preflop tree measured 4.33M nodes / 1.99M infosets /
+/// 9,923 seam cells — buffers ~21.5GB each, fold terminals alone
+/// ~132s/iter. The cap prunes the deep raise-war subtrees.
+#[test]
+#[ignore = "census instrument; run with --ignored --nocapture"]
+fn v1_seam_census_depth_capped() {
+    use solver_core::tree::action::BetCap;
+    let spec = production_game_v1();
+    for cap in [3u8, 4] {
+        let mut cfg = spec.preflop_tree_config(preflop_bets());
+        cfg.max_bets_per_street = BetCap::all(cap);
+        let t0 = std::time::Instant::now();
+        let tree = build_tree_preflop_only(&cfg).expect("v1 preflop tree");
+        let nn = tree.nodes.len();
+        let np = spec.num_players as usize;
+        let (mut n_player, mut n_chance, mut n_term) = (0usize, 0usize, 0usize);
+        let mut cells = std::collections::BTreeSet::new();
+        for idx in 0..nn {
+            let n = &tree.nodes[idx];
+            match n.node_type {
+                2 => n_player += 1,
+                0 => n_term += 1,
+                1 => {
+                    n_chance += 1;
+                    let mask = tree.get_folded_mask(idx);
+                    let contribs: Vec<i32> =
+                        (0..np).map(|p| tree.get_contribution(idx, p as u8)).collect();
+                    let live: Vec<usize> =
+                        (0..np).filter(|&p| mask & (1 << p) == 0).collect();
+                    let pot: i32 = contribs.iter().sum();
+                    cells.insert((live.len() as u8, contribs[live[0]], pot));
+                }
+                _ => {}
+            }
+        }
+        eprintln!(
+            "cap {cap}: {} nodes ({} player / {} flop-entry chance / {} fold terminals), \
+             {} seam cells, built in {:.1?}",
+            nn, n_player, n_chance, n_term, cells.len(), t0.elapsed()
+        );
+    }
+}

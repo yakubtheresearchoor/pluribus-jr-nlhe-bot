@@ -276,11 +276,15 @@ pub struct TreeConfig {
     /// Blinds are not actions and don't count; an all-in ends the
     /// aggression chain via allin_flag regardless of this cap.
     ///
-    /// DISCIPLINE PIN: the production value is MEASURED, not assumed —
-    /// action-abstraction changes get validated (the postflop MAX_NA
-    /// saga: pruning the wrong action creates catastrophic
-    /// exploitability). Depth 3 vs 4 is decided by the exploitability
-    /// A/B; pick the smallest cap that is defense-complete.
+    /// MEASURED VERDICT (2026-06-12, v1_depth_cap_ab + k2 refinement;
+    /// HU deep-SPR proxy, natural depth 6, asymmetric games, expl bars
+    /// 5e-7..3e-6): cap 3 is the smallest defense-complete depth —
+    /// k=1 costs 5.5e-4..2.1e-3, k=2 costs a real 3.4e-6..3.4e-5,
+    /// k=3 is zero at solve precision (±2e-9), k=4 adds nothing (its
+    /// tree is 90% of uncapped — depth ≥5 barely exists naturally).
+    /// PRODUCTION PREFLOP CAP = BetCap::all(3). Re-confirm on the
+    /// preflop street via the harness head-to-head once the four-zone
+    /// preflop runtime exists (named proxy caveat).
     pub max_bets_per_street: Option<BetCap>,
 }
 

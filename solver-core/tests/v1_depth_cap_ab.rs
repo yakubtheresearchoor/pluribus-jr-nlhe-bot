@@ -26,6 +26,17 @@
 //! response (both seats) must be small and comparable across arms,
 //! otherwise EV differences are solve noise, not structure. Noise
 //! floor: the uncapped arm re-solved at a different iteration count.
+//!
+//! ═══ MEASURED VERDICT 2026-06-12 (this instrument + refinement) ═══
+//! Deep shape (pot 2, stacks 200, 2-rung ladder, natural depth 6):
+//!   k=1: gap 5.5e-4 / 2.1e-3  — REAL (>> every bar)
+//!   k=2: gap 3.4e-5 / 3.4e-6  — REAL (holds above bars tightened to
+//!        2.7e-6 / 4.0e-7 at 12k iters; resolved by the refinement)
+//!   k=3: gap −1.8e-9 / +2.6e-9 — ZERO at solve precision (bar 5e-7)
+//!   k=4: gap 0 (first shape: k=4 tree bit-identical to uncapped)
+//! ⇒ PRODUCTION CAP = 3 (smallest defense-complete). Census payoff:
+//! v1 preflop tree 4.33M → 1.90M nodes at cap 3 (cap 4: 3.92M — depth
+//! ≥5 barely exists naturally, the cap-4 knob is near-vacuous).
 
 use solver_core::card::{card_from_str, index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
