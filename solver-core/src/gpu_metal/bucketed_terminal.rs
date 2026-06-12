@@ -188,7 +188,10 @@ impl BucketedTerminalGpu {
         solver: &BucketedFlopCfr,
         stripes: u32,
     ) -> MetalResult<Self> {
-        assert!(tree.num_players >= 4, "bucketed terminal: np ≥ 4 only");
+        // np ≥ 3 since 2026-06-12 (scope extension with the CPU
+        // bucketed terminal; gated by np3_bucketed_terminal_gate on
+        // the CPU side + cell_parity_live3 GPU↔CPU at size).
+        assert!(tree.num_players >= 3, "bucketed terminal: np ≥ 3 (HU stays exact)");
         for nb in [bk.nb_flop, bk.nb_turn, bk.nb_river] {
             assert!(nb <= MAX_BUCKETS_GPU, "B > MAX_BUCKETS_GPU stays CPU-only");
         }

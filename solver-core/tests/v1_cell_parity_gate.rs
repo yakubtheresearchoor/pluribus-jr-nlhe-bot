@@ -213,6 +213,13 @@ fn run_cell_parity(ctx: &MetalContext, live: u8, commit: i32, pot: i32, label: &
 }
 
 #[test]
+#[ignore = "at-size parity, live-3 (np=3 scope extension); --ignored --nocapture --release --features metal"]
+fn cell_parity_live3_mega() {
+    let ctx = MetalContext::new().expect("Metal");
+    run_cell_parity(&ctx, 3, 7, 29, "live-3 raised");
+}
+
+#[test]
 #[ignore = "at-size parity, live-4 (~minutes); --ignored --nocapture --release --features metal"]
 fn cell_parity_live4_mega() {
     let ctx = MetalContext::new().expect("Metal");

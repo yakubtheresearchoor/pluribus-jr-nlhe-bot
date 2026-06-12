@@ -232,16 +232,15 @@ fn v1_cell_pricing_cpu() {
 
     // (live, commit, pot, label).
     //
-    // LIVE-3 EXACT IS EXCLUDED — measured finding 2026-06-12: the
-    // first probe run spent 95+ minutes inside ONE live-3 exact cell
-    // (sampled hot stack: 100% side_pot_showdown_cfv_with_rake) at
-    // production nh=1176. Exact multiway terminals are combinatorial
-    // in nh — the very reason bucketing exists. The bucketed terminal
-    // np ≥ 4 scope must be extended to np = 3 before live-3 cells can
-    // be priced (or solved) at production fidelity.
+    // LIVE-3 history: the first probe run spent 95+ minutes inside ONE
+    // live-3 exact cell (hot stack 100% side_pot_showdown_cfv_with_rake
+    // — the exact np=3 arms are O(nh³) per terminal at nh=1176).
+    // RESOLVED 2026-06-12: bucketed terminal scope extended np ≥ 4 →
+    // np ≥ 3 (np3_bucketed_terminal_gate), live-3 now prices bucketed.
     let cells: &[(u8, i32, i32, &str)] = &[
         (2, 7, 15, "HU single-raised (open 3.5bb, sb dead)"),
         (2, 24, 49, "HU 3-bet pot"),
+        (3, 7, 29, "3-way raised (most common multiway family)"),
         (4, 7, 29, "4-way raised"),
         (5, 2, 10, "5-way limp (worst live-5 shape)"),
         (6, 2, 12, "6-way limp (the old oracle's shape)"),
@@ -249,13 +248,12 @@ fn v1_cell_pricing_cpu() {
     ];
 
     eprintln!("\n════ v1 cell pricing: CPU, 4×4 runouts, {ITERS} iters ════");
-    eprintln!("(live ≥ 4: bucketed quantile B={NB} Design1Collapsed; live 2: EXACT vector CFR;");
-    eprintln!(" live 3: EXCLUDED — needs the bucketed-terminal np ≥ 3 extension, see header)");
+    eprintln!("(live ≥ 3: bucketed quantile B={NB} Design1Collapsed; live 2: EXACT vector CFR)");
     for &(live, commit, pot, label) in cells {
         let cfg = spec.flop_seam_config(live, commit, pot, flop_bets.clone());
         let tree = build_tree(&cfg).expect("seam tree");
         let table = build_table(live);
-        let per_iter = if live >= 4 {
+        let per_iter = if live >= 3 {
             let (fm, tm, rm) = quantile_maps(&table, NB);
             let game = FlopStartGame::new(table);
             let bk = FlopBucketing::from_maps(game.table(), NB, NB, NB, fm, tm, rm);
@@ -278,4 +276,48 @@ fn v1_cell_pricing_cpu() {
             per_iter * 34.0 * 1755.0 / 3600.0
         );
     }
+}
+
+/// Focused live-3 pricing (np=3 scope extension, 2026-06-12): the
+/// most common multiway family, previously unpriceable (exact np=3
+/// arms are O(nh³)/terminal). CPU bucketed + GPU native in one run.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "live-3 pricing; --ignored --nocapture --release --features metal"]
+fn v1_cell_pricing_live3() {
+    use solver_core::gpu_metal::bucketed_native::BucketedNativeGpu;
+    use solver_core::gpu_metal::context::MetalContext;
+    let ctx = MetalContext::new().expect("Metal");
+    let spec = production_game_v1();
+    let flop_bets =
+        BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    const NB: usize = 8;
+    let (live, commit, pot) = (3u8, 7i32, 29i32);
+    let cfg = spec.flop_seam_config(live, commit, pot, flop_bets);
+    let tree = build_tree(&cfg).expect("seam tree");
+    let table = build_table(live);
+    let (fm, tm, rm) = quantile_maps(&table, NB);
+    let game = FlopStartGame::new(table);
+    let bk =
+        FlopBucketing::from_maps(game.table(), NB, NB, NB, fm.clone(), tm.clone(), rm.clone());
+    let mut solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
+    solver.set_terminal_design(TerminalDesign::Design1Collapsed);
+    let t0 = Instant::now();
+    let _ = solver.run(&tree, &game, &bk, 3);
+    let cpu = t0.elapsed().as_secs_f64() / 3.0;
+    let mut native =
+        BucketedNativeGpu::new(&ctx, &tree, game.table(), &bk, &solver, (32 / NB) as u32)
+            .expect("native");
+    native.run(1);
+    let t0 = Instant::now();
+    native.run(3);
+    let gpu = t0.elapsed().as_secs_f64() / 3.0;
+    eprintln!(
+        "live-3 raised ({} nodes): CPU bucketed {cpu:.3}s/iter ({:.1}h/cell-row) | \
+         GPU native {gpu:.3}s/iter ({:.2}h/cell-row, {:.0}x)",
+        tree.nodes.len(),
+        cpu * 34.0 * 1755.0 / 3600.0,
+        gpu * 34.0 * 1755.0 / 3600.0,
+        cpu / gpu
+    );
 }

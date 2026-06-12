@@ -164,12 +164,23 @@ pub fn bucketed_showdown_cfv(
     let c_t = contributions[traverser];
     let mut cfv = vec![0.0f32; nb];
 
+    // SCOPE EXTENDED np ≥ 4 → np ≥ 3 (2026-06-12, v1 live-3 seam
+    // cells): the original guard reasoned "no fifth power at np ≤ 3,
+    // exact is cheap there" — disproven at production nh = 1176, where
+    // ONE live-3 cell spent 95+ min inside the exact evaluator. The
+    // Design-1 arms below are num_opp-generic (recurse_eq / per-level
+    // scenario enumeration, MAX_OPP bound); nothing in the math is
+    // np ≥ 4 specific. What CHANGES at np = 3: the EXACT function
+    // dispatches to sweep/fast-path arms with different float-op
+    // order, so the bit-exact "dispatch mirror" claim holds only for
+    // np ≥ 4 — np = 3 correctness is anchored by its own gate
+    // (np3_bucketed_terminal_gate: identity-bucketing vs exact within
+    // f32 tolerance + brute/collapsed bit-agreement + zero-sum).
+    // np = 2 stays out of scope (HU sweep is the production path and
+    // exact HU is genuinely cheap).
     assert!(
-        np >= 4,
-        "bucketed_showdown_cfv: np = {np} < 4. The np ≤ 3 dispatch arms \
-         (HU sweep / 3p fast paths) are out of scope — no fifth power \
-         there, and their sweep/I-E arithmetic is not reproducible from \
-         bucket matrices."
+        np >= 3,
+        "bucketed_showdown_cfv: np = {np} < 3 (HU stays on the exact sweep path)"
     );
     assert!(num_opp == np - 1, "one reach slice per opponent slot");
     assert!(num_opp <= MAX_OPP);
@@ -578,7 +589,9 @@ pub fn bucketed_showdown_cfv_design1_collapsed(
     let c_t = contributions[traverser];
     let mut cfv = vec![0.0f32; nb];
 
-    assert!(np >= 4, "design1_collapsed: np ≥ 4 only (same scope as Design 1)");
+    // np ≥ 3 since 2026-06-12 (same scope extension as Design 1 brute;
+    // see the scope comment there + np3_bucketed_terminal_gate).
+    assert!(np >= 3, "design1_collapsed: np ≥ 3 (HU stays exact)");
     assert!(num_opp == np - 1);
     assert!(num_opp <= MAX_OPP);
 
