@@ -378,8 +378,18 @@ pub fn rake_of(total_commit: &[u32], folded: &[bool], rake_spec: (u32, u32)) -> 
     if commit[idx[0]] > commit[idx[1]] {
         commit[idx[0]] = commit[idx[1]];
     }
-    let _ = folded;
-    let mut levels: Vec<u32> = commit.iter().copied().filter(|&c| c > 0).collect();
+    // BUG FIX 2026-06-12 (caught by production_game_gate on its first
+    // run): levels were built from ALL commits, so a FOLDED player's
+    // partial money (e.g. the folded SB's 1 unit) created a phantom
+    // "main pot level" — main pot computed as 3 units on an 81-unit
+    // pot, flooring the rake to 0. Pot levels are defined by players
+    // WITH A CLAIM (non-folded) only; folded money is dead money that
+    // joins the pots but never defines one.
+    let mut levels: Vec<u32> = (0..np)
+        .filter(|&p| !folded[p])
+        .map(|p| commit[p])
+        .filter(|&c| c > 0)
+        .collect();
     levels.sort_unstable();
     levels.dedup();
     let total_pot: u32 = commit.iter().sum();

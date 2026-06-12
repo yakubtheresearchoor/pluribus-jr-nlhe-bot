@@ -37,6 +37,28 @@ fn oracle_cfg() -> TreeConfig {
     }
 }
 
+/// PRODUCTION GAME CLASS v1 — numeric pins in bb (the behavioral pins
+/// run through clean-rules in the harness `production_game_gate`).
+#[test]
+fn production_game_v1_bb_pins() {
+    use solver_core::tree::action::production_game_v1;
+    let g = production_game_v1();
+    assert_eq!(g.num_players, 6);
+    assert_eq!(g.ante, 0, "v1 is a no-ante game");
+    assert_eq!(g.sb * 2, g.bb, "SB = 0.5 bb");
+    assert_eq!(g.bb, UNITS_PER_BB, "BB = 1 bb by definition");
+    assert_eq!(g.stack / UNITS_PER_BB, 100, "100 bb starting stacks");
+    assert_eq!(g.stack % UNITS_PER_BB, 0);
+    assert!((g.rake_rate - 0.05).abs() < 1e-12, "5% rake");
+    assert_eq!(g.rake_cap / UNITS_PER_BB, 10, "10 bb rake cap");
+    assert_eq!(g.rake_cap % UNITS_PER_BB, 0);
+    assert!(g.no_flop_no_drop, "no flop, no drop");
+    // Rake-rate units sanity: the cap binds at pot = cap/rate = 400
+    // units = 200 bb — exactly the two-stacks-all-in pot. Any pot
+    // below all-in is raked strictly by percentage.
+    assert_eq!((g.rake_cap as f64 / g.rake_rate) as i32, 2 * g.stack);
+}
+
 #[test]
 fn bb_units_gate() {
     assert_eq!(UNITS_PER_BB, 2, "conversion constant is pinned; changing it re-prices every report");

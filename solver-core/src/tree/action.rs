@@ -114,6 +114,48 @@ pub struct DonkSizeOptions {
 /// 12 units = 6 bb.
 pub const UNITS_PER_BB: i32 = 2;
 
+/// A GAME CLASS (table structure + rake), as distinct from a tree
+/// abstraction (bet sizes, runout sampling). Blueprints are solved per
+/// game class; dollar stakes are NOT an axis (poker is scale-invariant
+/// in money — only bb-denominated structure matters).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameSpec {
+    pub num_players: u8,
+    /// All money in chip units (UNITS_PER_BB units = 1 bb).
+    pub sb: i32,
+    pub bb: i32,
+    pub ante: i32,
+    /// Starting TOTAL stack per player (blinds come out of this).
+    pub stack: i32,
+    /// Rake fraction of the pot (e.g. 0.05) and cap in chip units.
+    pub rake_rate: f64,
+    pub rake_cap: i32,
+    /// No flop, no drop: pots that never see a flop are unraked.
+    pub no_flop_no_drop: bool,
+}
+
+/// PRODUCTION GAME CLASS v1 (pinned with user 2026-06-12):
+/// 6-max, no ante, blinds 0.5bb/1bb, 100bb starting stacks,
+/// 5% rake capped at 10bb, no flop no drop.
+///
+/// Single source of truth — runners derive TreeConfigs from this and
+/// the harness derives its clean-rules TableConfig from this; neither
+/// may restate the numbers. Gated by `bb_units_gate` (numeric pins)
+/// and the harness `production_game_gate` (behavioral pins through
+/// the independent rules engine, incl. no-flop-no-drop and the cap).
+pub fn production_game_v1() -> GameSpec {
+    GameSpec {
+        num_players: 6,
+        sb: 1,                       // 0.5 bb
+        bb: UNITS_PER_BB,            // 1 bb
+        ante: 0,
+        stack: 100 * UNITS_PER_BB,   // 100 bb
+        rake_rate: 0.05,
+        rake_cap: 10 * UNITS_PER_BB, // 10 bb
+        no_flop_no_drop: true,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TreeConfig {
     pub num_players: u8,
