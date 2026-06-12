@@ -426,3 +426,75 @@ fn lever7_warm_start_cpu() {
         );
     }
 }
+
+/// ═══ L2-live5: neighbor substitution measured DIRECTLY at live-5
+/// (user hold, 2026-06-12: the 36h→8h saving rested on extrapolation
+/// from live-4/6 — the one unmeasured family, and the number the
+/// "fits in a day" claim silently rests on). Measured AT the accepted
+/// live-5 fidelity (2×2), stratified, two independent near-rank
+/// pairs. Verdict is binary against the 0.0657 floor: under → the 8h
+/// is earned; over → live-5 takes full solves (36h) and the budget
+/// conversation reopens (stop-and-report).
+#[test]
+#[ignore = "L2 live-5 direct; --ignored --nocapture --release --features metal"]
+fn lever2_neighbor_substitution_live5() {
+    let ctx = MetalContext::new().expect("Metal");
+    let tree = seam_tree(5, 2, 10);
+    let pairs: [([&str; 3], [&str; 3]); 2] = [
+        (["2h", "7d", "Ks"], ["2h", "8d", "Ks"]),
+        (["Kc", "8h", "2d"], ["Kc", "9h", "2d"]),
+    ];
+    for (a, b) in pairs {
+        let (_, sa) = solve_sigma(&ctx, &tree, flop(a), 5, 2, 2, 8, 34);
+        let (_, sb) = solve_sigma(&ctx, &tree, flop(b), 5, 2, 2, 8, 34);
+        eprintln!(
+            "L2-live5 @2×2: Δσ(near {a:?}↔{b:?}) {:.4}  [floor 0.0657]",
+            mean_dsigma(&sa, &sb)
+        );
+    }
+}
+
+/// L2-live5 characterization: pair 1 clean (0.0268), pair 2 LOOSE
+/// (0.2251). More pairs to learn the distribution before the
+/// stop-and-report.
+#[test]
+#[ignore = "L2 live-5 characterization; --ignored --nocapture --release --features metal"]
+fn lever2_live5_characterization() {
+    let ctx = MetalContext::new().expect("Metal");
+    let tree = seam_tree(5, 2, 10);
+    let pairs: [([&str; 3], [&str; 3]); 4] = [
+        (["9c", "9d", "2s"], ["9c", "9d", "3s"]),
+        (["6h", "7h", "8s"], ["6h", "7h", "9s"]),
+        (["As", "2d", "7c"], ["As", "2d", "8c"]),
+        (["Td", "Jd", "Qc"], ["Td", "Jd", "Kc"]),
+    ];
+    for (a, b) in pairs {
+        let (_, sa) = solve_sigma(&ctx, &tree, flop(a), 5, 2, 2, 8, 34);
+        let (_, sb) = solve_sigma(&ctx, &tree, flop(b), 5, 2, 2, 8, 34);
+        eprintln!(
+            "L2-live5 char: Δσ({a:?}↔{b:?}) {:.4}  [floor 0.0657]",
+            mean_dsigma(&sa, &sb)
+        );
+    }
+}
+
+/// The live-5 bimodality critique applied back to live-6: the earlier
+/// live-6 ACCEPT rested on the clean-texture pair only. Check a
+/// connectivity-crossing pair at the live-6 stack fidelity (1×1).
+#[test]
+#[ignore = "L2 live-6 loose-texture check; --ignored --nocapture --release --features metal"]
+fn lever2_live6_loose_texture() {
+    let ctx = MetalContext::new().expect("Metal");
+    let tree = seam_tree(6, 2, 12);
+    for (a, b) in [
+        (["6h", "7h", "8s"], ["6h", "7h", "9s"]),
+        (["Kc", "8h", "2d"], ["Kc", "9h", "2d"]),
+    ] {
+        let (_, sa) = solve_sigma(&ctx, &tree, flop(a), 6, 1, 1, 8, 34);
+        let (_, sb) = solve_sigma(&ctx, &tree, flop(b), 6, 1, 1, 8, 34);
+        eprintln!(
+            "L2-live6 @1×1 loose-texture: Δσ({a:?}↔{b:?}) {:.4}  [floor 0.0657]",
+            mean_dsigma(&sa, &sb)
+        );
+    }
+}
