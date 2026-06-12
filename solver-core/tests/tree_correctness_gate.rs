@@ -439,8 +439,50 @@ fn tree_correctness_gate_multi_config() {
             }
         );
 
+        // Config J: PRODUCTION GAME v1 preflop (6-max, blinds 1/2,
+        // equal-total 200 stacks, button 5 → UTG first), derived from
+        // GameSpec — the config the production preflop layer solves.
+        // PREFLOP-ONLY build (flop-entry chance nodes are leaves; the
+        // frozen postflop oracle owns everything past them). Reduced
+        // raise ladder [0.5, 1.0, 2.0] keeps the gate fast (~100k
+        // nodes); the legality classifier under test is identical at
+        // any ladder width, and the full-ladder build is exercised by
+        // the v1_seam_census instrument.
+        let v_j = {
+            use solver_core::tree::action::production_game_v1;
+            use solver_core::tree::builder::build_tree_preflop_only;
+            let spec = production_game_v1();
+            let cfg = spec.preflop_tree_config(BetSizeOptions {
+                bet: vec![BetSize::PotRelative(1.0)],
+                raise: vec![
+                    BetSize::PotRelative(0.5),
+                    BetSize::PotRelative(1.0),
+                    BetSize::PotRelative(2.0),
+                ],
+            });
+            let tree = build_tree_preflop_only(&cfg).unwrap();
+            let np = cfg.num_players as usize;
+            let max_committable: Vec<i32> = cfg
+                .starting_stacks
+                .iter()
+                .zip(&cfg.initial_contributions)
+                .map(|(s, c)| s + c)
+                .collect();
+            // Equal-total invariant from the GameSpec derivation.
+            for (p, &m) in max_committable.iter().enumerate() {
+                assert_eq!(m, spec.stack, "seat {p} max_committable != spec.stack");
+            }
+            eprintln!(
+                "\n>>> Gate run: v1 PRODUCTION PREFLOP (preflop-only, reduced ladder) (tree: {} nodes)",
+                tree.num_nodes()
+            );
+            let vs = validate_tree(&tree, np, &max_committable, true);
+            print_violations("v1 PRODUCTION PREFLOP", &vs, 5);
+            vs
+        };
+
         v_a.total() + v_b.total() + v_c.total() + v_d.total() + v_e.total()
-            + v_f.total() + v_g.total() + v_h.total() + v_i.total()
+            + v_f.total() + v_g.total() + v_h.total() + v_i.total() + v_j.total()
     };
 
     eprintln!("\n=== ROLLUP ===");

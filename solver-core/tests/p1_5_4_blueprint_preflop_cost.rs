@@ -64,28 +64,30 @@ use std::time::Instant;
 
 const PROJECTION_BUDGET_S: f64 = 900.0;
 
-/// Rich 6-max preflop tree — the production MAX_NA_PREFLOP=16 config
-/// (verbatim from the Phase 4 bootstrap).
+/// Rich 6-max preflop tree — RETARGETED 2026-06-12 to PRODUCTION GAME
+/// v1 (GameSpec-derived: no ante, blinds 1/2 units, equal-total 200
+/// stacks, button 5) with the MAX_NA_PREFLOP=16 raise ladder, built
+/// PREFLOP-ONLY (flop-entry chance nodes are oracle leaves — the
+/// production layer never descends past them, and the preflop ladder
+/// is not a legal postflop abstraction).
+///
+/// HISTORY: the bootstrap config (starting_pot 3 + blinds in
+/// contributions, flat [100;6] stacks) double-counted the blinds under
+/// the pinned additive semantics and gave the blinds deeper totals;
+/// its 2026-06-10 numbers (239,467 nodes / 7,466 infosets / 3.4s
+/// shared-chance iter) also predate the fold-continuation tree fix.
 fn build_rich_preflop_tree() -> FlatTree {
+    use solver_core::tree::action::production_game_v1;
+    use solver_core::tree::builder::build_tree_preflop_only;
     let max_raise_count = MAX_NA_PREFLOP.saturating_sub(2);
     let raises: Vec<BetSize> = (0..max_raise_count)
         .map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64))
         .collect();
-    let pre_cfg = TreeConfig {
-        num_players: 6,
-        initial_state: BoardState::Preflop,
-        starting_pot: 3,
-        starting_stacks: vec![100; 6],
-        initial_contributions: vec![1, 2, 0, 0, 0, 0],
-        rake_rate: 0.0,
-        rake_cap: 0.0,
-        bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: raises },
-        add_allin_threshold: 1.0,
-        force_allin_threshold: 1.0,
-        merging_threshold: 0.0,
-        button_player: Some(5),
-    };
-    build_tree(&pre_cfg).expect("rich preflop tree builds")
+    let pre_cfg = production_game_v1().preflop_tree_config(BetSizeOptions {
+        bet: vec![BetSize::PotRelative(1.0)],
+        raise: raises,
+    });
+    build_tree_preflop_only(&pre_cfg).expect("v1 preflop tree builds")
 }
 
 /// Frozen-CFV stub oracle: cache per canonical flop, lookup + clone per

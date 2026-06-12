@@ -134,6 +134,78 @@ pub struct GameSpec {
     pub no_flop_no_drop: bool,
 }
 
+impl GameSpec {
+    /// Derive the PREFLOP-rooted TreeConfig for this game class.
+    /// Conventions (all pinned by the tree-correctness + bb-units
+    /// gates):
+    ///   - button = seat np−1, SB = seat 0, BB = seat 1 (UTG = seat 2
+    ///     acts first preflop via `button_player`).
+    ///   - starting_pot = ante money only (DEAD); the blinds are LIVE
+    ///     first-round commits in `initial_contributions` (2026-06-12
+    ///     semantics — the bootstrap's `starting_pot: 3` double-counted).
+    ///   - EQUAL TOTAL stacks: `starting_stacks[p] = stack − contrib[p]`
+    ///     so max_committable = `stack` for every seat (the bootstrap's
+    ///     flat `[100;6]` gave the blinds deeper totals).
+    ///   - Rake fields threaded from the spec. Under no-flop-no-drop
+    ///     the preflop-zone terminals (folds) are unraked BY
+    ///     CONSTRUCTION in the layered architecture: rake is applied in
+    ///     postflop terminal evaluation only (flop_seen = true there).
+    pub fn preflop_tree_config(&self, bet_sizes: BetSizeOptions) -> TreeConfig {
+        let np = self.num_players as usize;
+        let mut contrib = vec![self.ante; np];
+        contrib[0] += self.sb;
+        contrib[1] += self.bb;
+        TreeConfig {
+            num_players: self.num_players,
+            initial_state: BoardState::Preflop,
+            starting_pot: 0,
+            starting_stacks: contrib.iter().map(|&c| self.stack - c).collect(),
+            initial_contributions: contrib,
+            rake_rate: self.rake_rate,
+            rake_cap: self.rake_cap as f64,
+            bet_sizes,
+            add_allin_threshold: 1.0,
+            force_allin_threshold: 1.0,
+            merging_threshold: 0.0,
+            button_player: Some(self.num_players - 1),
+        }
+    }
+
+    /// Derive a FLOP-START TreeConfig for one preflop→flop SEAM CELL:
+    /// `live` players reach the flop having each committed `commit`
+    /// units, with `pot` total units in the middle (pot ≥ live×commit;
+    /// the excess is dead money from folders/antes). All flop money is
+    /// dead at flop start (contributions 0, pot additive), stacks are
+    /// what remains behind. Rake threaded; flop trees evaluate
+    /// terminals with flop_seen = true (the flop has been dealt by
+    /// definition of the seam).
+    pub fn flop_seam_config(
+        &self,
+        live: u8,
+        commit: i32,
+        pot: i32,
+        bet_sizes: BetSizeOptions,
+    ) -> TreeConfig {
+        assert!(live >= 2 && live <= self.num_players);
+        assert!(pot >= live as i32 * commit, "pot must cover live commits");
+        assert!(commit <= self.stack);
+        TreeConfig {
+            num_players: live,
+            initial_state: BoardState::Flop,
+            starting_pot: pot,
+            starting_stacks: vec![self.stack - commit; live as usize],
+            initial_contributions: vec![0; live as usize],
+            rake_rate: self.rake_rate,
+            rake_cap: self.rake_cap as f64,
+            bet_sizes,
+            add_allin_threshold: 1.0,
+            force_allin_threshold: 1.0,
+            merging_threshold: 0.0,
+            button_player: None,
+        }
+    }
+}
+
 /// PRODUCTION GAME CLASS v1 (pinned with user 2026-06-12):
 /// 6-max, no ante, blinds 0.5bb/1bb, 100bb starting stacks,
 /// 5% rake capped at 10bb, no flop no drop.

@@ -4,6 +4,27 @@ use crate::tree::flat::{FlatNode, FlatTree, NODE_TYPE_PLAYER, NODE_TYPE_TERMINAL
 const MAX_DEPTH: usize = 64;
 
 pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
+    build_tree_inner(config, false)
+}
+
+/// PREFLOP-ONLY build (2026-06-12, v1 game derivation): truncate the
+/// tree at the preflop→flop chance nodes (they become childless CHANCE
+/// leaves). This is the tree the PRODUCTION preflop layer actually
+/// walks — `PreflopVectorCfr` evaluates flop-entry chance nodes via
+/// the frozen postflop ORACLE and never descends past them, and the
+/// preflop raise ladder (MAX_NA_PREFLOP=16) is NOT a legal postflop
+/// abstraction (it overflows MAX_NA_POSTFLOP), so fully expanding the
+/// postflop zones under the preflop config is both wasted memory and a
+/// build-time cap violation at production depth. Postflop zones get
+/// their own seam-derived trees (`GameSpec::flop_seam_config`).
+pub fn build_tree_preflop_only(config: &TreeConfig) -> Result<FlatTree, String> {
+    if config.initial_state != BoardState::Preflop {
+        return Err("preflop-only build requires initial_state = Preflop".into());
+    }
+    build_tree_inner(config, true)
+}
+
+fn build_tree_inner(config: &TreeConfig, truncate_at_flop: bool) -> Result<FlatTree, String> {
     let num_players = config.num_players as usize;
     if num_players < 2 || num_players > 10 {
         return Err(format!("num_players must be 2-10, got {}", num_players));
@@ -42,6 +63,7 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
 
     let mut builder = TreeBuilder {
         config,
+        truncate_at_flop,
         tree: FlatTree::new(
             config.num_players,
             config.starting_pot,
@@ -175,6 +197,10 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
 
 struct TreeBuilder<'a> {
     config: &'a TreeConfig,
+    /// Preflop-only build: flop-entry chance nodes become leaves (the
+    /// production preflop layer replaces their subtrees with the
+    /// frozen postflop oracle). See `build_tree_preflop_only`.
+    truncate_at_flop: bool,
     tree: FlatTree,
 }
 
@@ -656,10 +682,22 @@ impl<'a> TreeBuilder<'a> {
         self.tree.nodes[parent_idx].node_type =
             crate::tree::flat::NODE_TYPE_CHANCE;
         self.tree.nodes[parent_idx].board_state = info.board_state as u8;
+        // Record the fold state at the chance boundary (informational —
+        // terminals remain the authoritative settlement surface; seam
+        // instruments read this to recover the live set at flop entry).
+        self.tree.set_folded_mask(parent_idx, info.folded_mask());
         // Note: the action_label on parent_idx is whatever brought us here
         // (e.g., CALL, CHECK). The gate uses this when propagating folded_mask
         // from the grandparent; CALL/CHECK don't trigger FOLD propagation, so
         // that's correct.
+
+        // PREFLOP-ONLY BUILD: the flop-entry chance node is a leaf of
+        // this tree; the frozen postflop oracle supplies its value.
+        if self.truncate_at_flop
+            && info.board_state == crate::tree::action::BoardState::Flop
+        {
+            return;
+        }
 
         let child_node = {
             let first = self.first_postflop_player_with_button(&info.active);
@@ -719,19 +757,24 @@ impl<'a> TreeBuilder<'a> {
         // max_amount: the most this player can commit in TOTAL — capped at
         // their physical chip total (starting_stack + initial_contribution).
         let max_amount = max_player_total;
-        // min_amount: the minimum legal TOTAL commitment to participate.
-        // Must at least match the largest committer (but no more than this
-        // player can physically pay). A short-stack call is bounded above
-        // by max_player_total, which the clamp routine then forces all-in.
-        let min_amount = (player_committed + to_call.min(player_remaining))
-            .clamp(1, max_amount);
-
+        // All-in (or zero-stack seam cell): forced check. MUST precede
+        // the min_amount computation — with max_committable = 0 (e.g. a
+        // flop-seam tree where everyone is all-in preflop) the
+        // clamp(1, 0) below panics (caught by the v1 seam census
+        // 2026-06-12).
         if player_remaining <= 0 {
             let mut child_info = info.clone_for_child();
             child_info.has_acted_this_round[player] = true;
             out.push((Action::Check, child_info));
             return;
         }
+
+        // min_amount: the minimum legal TOTAL commitment to participate.
+        // Must at least match the largest committer (but no more than this
+        // player can physically pay). A short-stack call is bounded above
+        // by max_player_total, which the clamp routine then forces all-in.
+        let min_amount = (player_committed + to_call.min(player_remaining))
+            .clamp(1, max_amount);
 
         let spr_after_call =
             (player_remaining - to_call.min(player_remaining)) as f64
