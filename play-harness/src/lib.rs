@@ -3,9 +3,40 @@
 //! deferred A/Bs (map family, B count, cell, runout residual, GPU
 //! challenger), the Monte-Carlo value audit, and the analytic anchors.
 //!
-//! Card-encoding boundary: solver cards are `suit * 13 + rank`-style?
-//! NO — conversions live in `convert` and are pinned by a test against
-//! both crates' string formats; nothing else may convert ad hoc.
+//! Status: H1 (clean-rules engine) + H2 (fire alarm) + H3 slice 1
+//! (SSBP1 loader, round-trip gated) DONE. The fire alarm's first run
+//! caught the rank-truncation bug (see 1ee5c98).
+//!
+//! ═══ H3 DESIGN (pinned 2026-06-12, before the agent is built) ═══
+//!
+//! v1 match game: the blueprint's OWN flop-start game (oracle tree:
+//! 6p, pot 12, stacks 94, 1.0×pot bet, no raises), on the blueprint's
+//! flop. The oracle tree IS the state machine the agents traverse;
+//! ALL money math and showdown scoring happen in clean-rules (a
+//! `settle_pots`-style free function refactored out of
+//! HandState::settle — never re-implement pot logic here).
+//!
+//! TWO DEAL MODES, deliberately distinct:
+//!   - AUDIT mode (H4): turn/river dealt only from the blueprint's
+//!     SAMPLED runout set with the solver's chance probabilities —
+//!     this is exactly the game the solver solved, so sampled EVs are
+//!     comparable to solver root CFVs within error bars.
+//!   - PLAY mode (A/Bs): full-deck runouts + RUNOUT PROJECTION v1
+//!     (named approximation): dealt turn maps to the sampled turn
+//!     nearest by rank (ties: matching suit-class relative to board),
+//!     same per-turn for rivers. The audit-vs-play EV gap MEASURES the
+//!     runout residual — one of the five A/Bs, for free.
+//!
+//! Duplicate-play control: same shuffled deck replayed with seat
+//! rotation (each strategy plays every seat on the same cards);
+//! per-deck paired differences give the variance-reduced A/B stat.
+//!
+//! Hand→index: h = position of (c1,c2) among the table's
+//! `hand_cards` (the loader rebuilds the table, so the mapping is the
+//! solver's own). Bucket: banked maps per (street, runout).
+//!
+//! Card-encoding boundary: conversions live in `convert`, pinned by
+//! test; nothing else may convert ad hoc.
 
-pub mod convert;
 pub mod blueprint;
+pub mod convert;
