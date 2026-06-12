@@ -165,7 +165,11 @@ pub struct BucketedNativeGpu {
     iteration: u32,
     regret_floor: f32,
     inflight: Vec<CommandBuffer>,
+    /// Parallel to `inflight`: stage tag (usize::MAX = untagged).
+    inflight_stages: Vec<usize>,
     gpu_busy_s: f64,
+    stage_timing: bool,
+    stage_busy: [f64; 5],
 }
 
 impl BucketedNativeGpu {
@@ -410,7 +414,10 @@ impl BucketedNativeGpu {
             // Mirror of BucketedFlopCfr::new's default.
             regret_floor: -1e30,
             inflight: Vec::new(),
+            inflight_stages: Vec::new(),
             gpu_busy_s: 0.0,
+            stage_timing: false,
+            stage_busy: [0.0; 5],
         })
     }
 
@@ -593,15 +600,16 @@ impl BucketedNativeGpu {
         ri: Option<usize>,
         traverser: u8,
         d: &DcfrParams,
+        with_regrets: bool,
     ) {
         let w = self.walk_index(zone, ti, ri);
         let cfv_byte = (self.cfv_offs[w] as u64) * 4;
-        let (nb, bu_lv, desc): (usize, &Vec<Range>, Range) = match zone {
-            Zone::Flop => (self.nb_flop, &self.flop_bu_lv, self.flop_desc),
-            Zone::Turn => (self.nb_turn, &self.turn_bu_lv[ti.unwrap()], self.turn_desc[ti.unwrap()]),
+        let (nb, bu_lv): (usize, &Vec<Range>) = match zone {
+            Zone::Flop => (self.nb_flop, &self.flop_bu_lv),
+            Zone::Turn => (self.nb_turn, &self.turn_bu_lv[ti.unwrap()]),
             Zone::River => {
                 let o = ti.unwrap() * self.max_river + ri.unwrap();
-                (self.nb_river, &self.river_bu_lv[o], self.river_desc[o])
+                (self.nb_river, &self.river_bu_lv[o])
             }
             Zone::Preflop => unreachable!(),
         };
@@ -621,6 +629,37 @@ impl BucketedNativeGpu {
                 Self::set_params(enc, 5, &p);
             });
         }
+        if with_regrets {
+            self.encode_regret_walk(cmd, zone, ti, ri, traverser, d);
+        }
+    }
+
+    /// The walk's regret/cum update. Reads only the walk's FINAL cfv
+    /// rows; regrets/cum are consumed by nothing until the next pass's
+    /// strategies — so this may encode any time after the walk's cfv
+    /// levels (stage-timing mode defers all of them to a tagged
+    /// buffer; values identical).
+    fn encode_regret_walk(
+        &self,
+        cmd: &metal::CommandBufferRef,
+        zone: Zone,
+        ti: Option<usize>,
+        ri: Option<usize>,
+        traverser: u8,
+        d: &DcfrParams,
+    ) {
+        let w = self.walk_index(zone, ti, ri);
+        let cfv_byte = (self.cfv_offs[w] as u64) * 4;
+        let (nb, desc): (usize, Range) = match zone {
+            Zone::Flop => (self.nb_flop, self.flop_desc),
+            Zone::Turn => (self.nb_turn, self.turn_desc[ti.unwrap()]),
+            Zone::River => {
+                let o = ti.unwrap() * self.max_river + ri.unwrap();
+                (self.nb_river, self.river_desc[o])
+            }
+            Zone::Preflop => unreachable!(),
+        };
+        let map_off = self.runout_index(zone, ti, ri) * self.nh;
         let (d_off, d_len) = desc;
         if d_len == 0 {
             return;
@@ -641,12 +680,25 @@ impl BucketedNativeGpu {
         });
     }
 
+    /// Stage-timing cut: in timing mode, commit the current buffer
+    /// tagged with its stage and start a fresh one (same queue —
+    /// submission order + hazard tracking keep semantics identical).
+    fn stage_cut(&mut self, cmd: CommandBuffer, stage: usize) -> CommandBuffer {
+        if !self.stage_timing {
+            return cmd;
+        }
+        cmd.commit();
+        self.inflight.push(cmd);
+        self.inflight_stages.push(stage);
+        self.queue.new_command_buffer().to_owned()
+    }
+
     /// One traverser pass, one command buffer (Fix-C: encode
     /// everything, commit, NO wait — hazard tracking orders dependent
     /// dispatches; cross-command-buffer order is queue submission
     /// order on tracked resources).
     fn encode_traverser_pass(&mut self, traverser: u8, d: &DcfrParams) {
-        let cmd = self.queue.new_command_buffer().to_owned();
+        let mut cmd = self.queue.new_command_buffer().to_owned();
 
         // ── 1. Strategies (all zones, all outcomes; regrets fixed) ──
         for (range, nb) in [
@@ -668,6 +720,8 @@ impl BucketedNativeGpu {
             });
         }
 
+        cmd = self.stage_cut(cmd, 0); // strategies
+
         // ── 2. Zero all reach (CPU allocates fresh-zeroed per walk;
         //       unwritten rows — e.g. below UNUSED-offset skips — must
         //       read as zero at terminals exactly like the CPU's) ──
@@ -688,6 +742,8 @@ impl BucketedNativeGpu {
             }
         }
 
+        cmd = self.stage_cut(cmd, 1); // reach (zero + seeds + levels)
+
         // ── 4. ALL terminals, one batched dispatch (resident mode) ──
         self.term.encode_walks_resident(
             &cmd,
@@ -699,11 +755,18 @@ impl BucketedNativeGpu {
             &self.cfv_offs,
         );
 
+        cmd = self.stage_cut(cmd, 2); // terminal
+
         // ── 5. Bottom-up in run() order: rivers → per-ti chance accum
-        //       → turns → flop chance accum → flop ──
+        //       → turns → flop chance accum → flop. In stage-timing
+        //       mode regrets defer to a tagged buffer (value-identical
+        //       — see encode_regret_walk).
+        let with_regrets = !self.stage_timing;
         for ti in 0..self.n_turn {
             for ri in 0..self.n_rivers[ti] {
-                self.encode_bu_walk(&cmd, Zone::River, Some(ti), Some(ri), traverser, d);
+                self.encode_bu_walk(
+                    &cmd, Zone::River, Some(ti), Some(ri), traverser, d, with_regrets,
+                );
             }
         }
         for ti in 0..self.n_turn {
@@ -726,7 +789,7 @@ impl BucketedNativeGpu {
             });
         }
         for ti in 0..self.n_turn {
-            self.encode_bu_walk(&cmd, Zone::Turn, Some(ti), None, traverser, d);
+            self.encode_bu_walk(&cmd, Zone::Turn, Some(ti), None, traverser, d, with_regrets);
         }
         {
             // flop_cfv[child] = Σ_ti cp_turn · turn_cfv[child]
@@ -743,7 +806,7 @@ impl BucketedNativeGpu {
                 Self::set_u32(enc, 6, self.n_turn as u32);
             });
         }
-        self.encode_bu_walk(&cmd, Zone::Flop, None, None, traverser, d);
+        self.encode_bu_walk(&cmd, Zone::Flop, None, None, traverser, d, with_regrets);
 
         // ── 6. Root accumulation (traverser 0 only, like run()) ──
         if traverser == 0 {
@@ -756,8 +819,26 @@ impl BucketedNativeGpu {
             });
         }
 
-        cmd.commit();
-        self.inflight.push(cmd);
+        // ── 7. Deferred regret updates (stage-timing mode only) ──
+        if self.stage_timing {
+            cmd = self.stage_cut(cmd, 3); // cfv levels + chance + root
+            for ti in 0..self.n_turn {
+                for ri in 0..self.n_rivers[ti] {
+                    self.encode_regret_walk(&cmd, Zone::River, Some(ti), Some(ri), traverser, d);
+                }
+            }
+            for ti in 0..self.n_turn {
+                self.encode_regret_walk(&cmd, Zone::Turn, Some(ti), None, traverser, d);
+            }
+            self.encode_regret_walk(&cmd, Zone::Flop, None, None, traverser, d);
+            cmd.commit();
+            self.inflight.push(cmd);
+            self.inflight_stages.push(4); // regret updates
+        } else {
+            cmd.commit();
+            self.inflight.push(cmd);
+            self.inflight_stages.push(usize::MAX);
+        }
     }
 
     /// Flush: wait for the last committed command buffer (same-queue
@@ -767,16 +848,39 @@ impl BucketedNativeGpu {
         if let Some(last) = self.inflight.last() {
             last.wait_until_completed();
         }
-        for cmd in self.inflight.drain(..) {
+        for (cmd, stage) in self.inflight.drain(..).zip(self.inflight_stages.drain(..)) {
             unsafe {
                 use objc::{msg_send, sel, sel_impl};
                 let start: f64 = msg_send![&*cmd, GPUStartTime];
                 let end: f64 = msg_send![&*cmd, GPUEndTime];
                 if end > start {
                     self.gpu_busy_s += end - start;
+                    if stage < self.stage_busy.len() {
+                        self.stage_busy[stage] += end - start;
+                    }
                 }
             }
         }
+    }
+
+    /// G6 lever-1 toggle passthrough (specialized terminal pipeline).
+    pub fn set_use_specialized(&mut self, on: bool) {
+        self.term.set_use_specialized(on);
+    }
+
+    /// Stage-timing probe controls (attribution: per-stage command
+    /// buffers on one queue — same hazard semantics, slight wall
+    /// distortion, busy attribution valid).
+    pub fn set_stage_timing(&mut self, on: bool) {
+        self.stage_timing = on;
+    }
+    pub const STAGE_NAMES: [&'static str; 5] =
+        ["strategies", "reach", "terminal", "cfv+chance", "regret"];
+    pub fn stage_busy(&self) -> [f64; 5] {
+        self.stage_busy
+    }
+    pub fn reset_stage_busy(&mut self) {
+        self.stage_busy = [0.0; 5];
     }
 
     /// The fully GPU-native mirror of `BucketedFlopCfr::run`: per

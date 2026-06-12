@@ -125,6 +125,11 @@ pub struct BucketedTerminalGpu {
     gpu_busy_s: f64,
     // ── Batched path (G4 step 3) ──
     batched_pipeline: ComputePipelineState,
+    /// G6 lever 1: function-constant-specialized batched pipeline
+    /// (uniform per-street B only). Bit-exact with the generic one by
+    /// construction; toggle for keep/discard measurement.
+    batched_pipeline_spec: Option<ComputePipelineState>,
+    use_specialized: bool,
     /// Concatenated [flop | turn | river] zone contribs / fold masks
     /// (i32 / u32), with per-zone element offsets.
     contribs_all: Buffer,
@@ -205,7 +210,28 @@ impl BucketedTerminalGpu {
             .unwrap_or(0);
 
         let pipeline = ctx.create_pipeline("bucketed_terminal_collapsed")?;
-        let batched_pipeline = ctx.create_pipeline("bucketed_terminal_collapsed_batched")?;
+        // The batched kernel declares optional function constants, so
+        // even the GENERIC pipeline must be built via the
+        // constantValues path (empty set ⇒ all constants undefined ⇒
+        // runtime params — Metal validation requires this).
+        let batched_pipeline =
+            ctx.create_pipeline_with_constants("bucketed_terminal_collapsed_batched", &[])?;
+        // Specialized variant: only when per-street B is uniform (the
+        // production config) — per-zone stripes are then uniform too.
+        let batched_pipeline_spec = if bk.nb_flop == bk.nb_turn && bk.nb_turn == bk.nb_river {
+            let s_uniform = stripes.min(32 / bk.nb_flop as u32).max(1);
+            Some(ctx.create_pipeline_with_constants(
+                "bucketed_terminal_collapsed_batched",
+                &[
+                    (0, bk.nb_flop as u32),            // FC_NB
+                    (1, tree.num_players as u32),      // FC_NP
+                    (2, (tree.num_players - 1) as u32), // FC_NUM_OPP
+                    (3, s_uniform),                    // FC_STRIPES
+                ],
+            )?)
+        } else {
+            None
+        };
 
         // ── Concatenated fraction tables + maps, runout-indexed.
         //    Per-runout table size is 4·nb_zone² (divergent per-street
@@ -338,6 +364,8 @@ impl BucketedTerminalGpu {
             stripes,
             gpu_busy_s: 0.0,
             batched_pipeline,
+            batched_pipeline_spec,
+            use_specialized: true,
             contribs_all,
             folds_all,
             zone_contrib_off,
@@ -489,6 +517,21 @@ impl BucketedTerminalGpu {
         self.queue = queue;
     }
 
+    /// The batched pipeline in effect: specialized when available and
+    /// enabled, generic otherwise (and always for divergent dims).
+    fn batched_pipe(&self) -> &ComputePipelineState {
+        if self.use_specialized {
+            self.batched_pipeline_spec.as_ref().unwrap_or(&self.batched_pipeline)
+        } else {
+            &self.batched_pipeline
+        }
+    }
+
+    /// G6 lever-1 toggle (keep/discard measurement).
+    pub fn set_use_specialized(&mut self, on: bool) {
+        self.use_specialized = on;
+    }
+
     /// Cumulative GPU-busy seconds across this object's dispatches
     /// (per-command-buffer GPU timestamps). The attribution channel:
     /// wall-clock ratio ≈ 1 with LOW busy-fraction = orchestration
@@ -634,7 +677,7 @@ impl BucketedTerminalGpu {
 
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.batched_pipeline);
+        enc.set_compute_pipeline_state(self.batched_pipe());
         enc.set_bytes(
             0,
             std::mem::size_of::<BatchedParamsGpu>() as u64,
@@ -803,7 +846,7 @@ impl BucketedTerminalGpu {
             b
         };
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.batched_pipeline);
+        enc.set_compute_pipeline_state(self.batched_pipe());
         enc.set_bytes(
             0,
             std::mem::size_of::<BatchedParamsGpu>() as u64,

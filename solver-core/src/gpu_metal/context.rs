@@ -101,6 +101,32 @@ impl MetalContext {
                 format!("{}: {}", function_name, e)
             ))
     }
+
+    /// Create a pipeline SPECIALIZED via function constants (G6 lever
+    /// 1): the compiler constant-folds the values — same ops, same
+    /// order, bit-exact with the generic pipeline by construction.
+    pub fn create_pipeline_with_constants(
+        &self,
+        function_name: &str,
+        constants: &[(u64, u32)], // (function_constant index, value)
+    ) -> MetalResult<ComputePipelineState> {
+        let fcv = metal::FunctionConstantValues::new();
+        for &(idx, v) in constants {
+            fcv.set_constant_value_at_index(
+                &v as *const u32 as *const std::ffi::c_void,
+                metal::MTLDataType::UInt,
+                idx,
+            );
+        }
+        let function = self.library.get_function(function_name, Some(fcv))
+            .map_err(|e| MetalError::FunctionNotFound(
+                format!("{} (specialized): {}", function_name, e)
+            ))?;
+        self.device.new_compute_pipeline_state_with_function(&function)
+            .map_err(|e| MetalError::PipelineCreation(
+                format!("{} (specialized): {}", function_name, e)
+            ))
+    }
     
     /// Create a new command buffer.
     pub fn new_command_buffer(&self) -> &metal::CommandBufferRef {

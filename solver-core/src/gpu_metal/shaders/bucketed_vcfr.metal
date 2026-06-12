@@ -45,6 +45,20 @@ using namespace metal;
 
 constant uint NO_BUCKET_GPU = 0xFFFFu;
 
+// ── G6 lever 1: function-constant specialization (batched kernel).
+// When the host sets these (uniform per-street B — the production
+// case), the compiler constant-folds nb/np/num_opp/S: loop unrolling,
+// stripe-logic elimination, better register allocation. Same
+// operations in the same order — bit-exact with the generic pipeline
+// by construction; the identity gates run THROUGH the specialized
+// pipeline (uniform dims), N2's divergent dims exercise the generic
+// fallback. ──
+constant uint FC_NB        [[function_constant(0)]];
+constant uint FC_NP        [[function_constant(1)]];
+constant uint FC_NUM_OPP   [[function_constant(2)]];
+constant uint FC_STRIPES   [[function_constant(3)]];
+constant bool FC_UNIFORM = is_function_constant_defined(FC_NB);
+
 struct BucketedTermParams {
     uint num_terminals;
     uint np;
@@ -549,11 +563,11 @@ kernel void bucketed_terminal_collapsed_batched(
     const BucketedWalkDesc desc = walks[job.x];
     const uint lt = job.y;
     const uint node = node_ids_all[desc._pad0 + lt];  // _pad0 = zone node_off
-    const uint np = params.np;
+    const uint np = FC_UNIFORM ? FC_NP : params.np;
     const uint nh = params.nh;
-    const uint nb = desc.nb;
-    const uint num_opp = params.num_opp;
-    const uint S = desc.stripes;
+    const uint nb = FC_UNIFORM ? FC_NB : desc.nb;
+    const uint num_opp = FC_UNIFORM ? FC_NUM_OPP : params.num_opp;
+    const uint S = FC_UNIFORM ? FC_STRIPES : desc.stripes;
     const uint trav = params.traverser;
 
     threadgroup float bucket_reach_tg[MAX_OPP_BUCKETED * MAX_BUCKETS_GPU];
