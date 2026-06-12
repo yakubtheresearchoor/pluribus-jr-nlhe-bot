@@ -22,7 +22,11 @@ fn env_or_skip() -> Option<(Blueprint, solver_core::tree::flat::FlatTree)> {
 }
 
 #[test]
-#[ignore = "OPEN (2026-06-12): anchor exposed two solver-tree surfaces the harness must pin first: (1) get_folded_mask under-reports folds at multi-fold terminals (0b000010 at a 5-fold terminal) — money-neutral inside the solver (contribution-0 players are pot-ineligible) but the harness must derive folds from child semantics (contribution deltas), not the mask; (2) get_contribution shows a 1.0x-pot bet as 1 unit vs starting_pot=12 — units must be pinned before harness settlement uses real amounts. Self-play MC gate is mask-independent and passes."]
+// UN-IGNORED 2026-06-12: the two tree surfaces this anchor exposed are
+// fixed at the root — (1) folds no longer collapse the hand (fold masks
+// accumulate per fold; 5-fold terminal reads 0b111110), (2) get_pot
+// includes starting_pot so a 1.0x-pot bet records 12, not 1. Policies
+// now select by action label, not child position.
 fn anchor_aggressor_vs_checkfolders_exact() {
     let Some((bp, tree)) = env_or_skip() else { return };
     let env = MatchEnv::new(&bp, &tree);
@@ -30,7 +34,7 @@ fn anchor_aggressor_vs_checkfolders_exact() {
     for hand in 0..500u32 {
         let holes = env.deal_holes(&mut rng);
         let mut pol: Vec<Policy> = (0..6).map(|_| Policy::CheckFold).collect();
-        pol[0] = Policy::AlwaysFirst;
+        pol[0] = Policy::AlwaysAggressive;
         let Some(net) = env.play_hand(&pol, &holes, &mut rng) else { continue };
         assert_eq!(net[0], 10, "hand {hand}: aggressor must win all five antes exactly");
         for p in 1..6 {

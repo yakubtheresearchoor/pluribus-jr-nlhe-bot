@@ -27,8 +27,8 @@ pub enum Policy<'a> {
     Blueprint(&'a Blueprint),
     /// Check when possible, fold to any bet (the exact-EV anchor).
     CheckFold,
-    /// First action always (bet/leading line where available).
-    AlwaysFirst,
+    /// Most aggressive action available (bet, else call).
+    AlwaysAggressive,
 }
 
 pub struct MatchEnv<'a> {
@@ -151,12 +151,24 @@ impl<'a> MatchEnv<'a> {
             // Player node.
             let p = n.player_id as usize;
             let na = n.num_children as usize;
+            // Select by ACTION LABEL, not child position (2026-06-12):
+            // positional selection silently inverts when the builder's
+            // ordering convention shifts. Labels are pinned tree facts
+            // (FOLD=0 CHECK=1 CALL=2 BET=3 RAISE=4 ALLIN=5).
+            let children = self.tree.node_children(node);
+            let pick = |prefs: &[u8]| -> usize {
+                prefs
+                    .iter()
+                    .find_map(|&want| {
+                        children.iter().position(|&c| {
+                            self.tree.nodes[c as usize].action_label == want
+                        })
+                    })
+                    .expect("policy found no matching action label")
+            };
             let a = match &policies[p] {
-                // Child ordering pinned by tree trace + the exact
-                // anchor test: child 0 = aggressive (bet / call),
-                // LAST child = passive (check / fold).
-                Policy::AlwaysFirst => 0,
-                Policy::CheckFold => na - 1,
+                Policy::AlwaysAggressive => pick(&[3, 4, 5, 2]), // bet/raise/allin, else call
+                Policy::CheckFold => pick(&[1, 0]),              // check, else fold
                 Policy::Blueprint(_) => {
                     let hkey = {
                         let h = holes[p];

@@ -14,6 +14,14 @@ pub fn to_solver(c: u8) -> u8 {
     c
 }
 
+/// Chip units → big blinds, THE reporting boundary (2026-06-12 bb-units
+/// pin). All harness-internal money stays in integer chip units; every
+/// human-facing number goes through here. The conversion constant lives
+/// in solver-core (`UNITS_PER_BB`) — never redefine it locally.
+pub fn units_to_bb(units: i64) -> f64 {
+    units as f64 / solver_core::tree::action::UNITS_PER_BB as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

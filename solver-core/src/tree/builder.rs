@@ -518,8 +518,8 @@ impl<'a> TreeBuilder<'a> {
         );
 
         // EARLY RETURN: if this node was already constructed as TERMINAL or
-        // CHANCE by make_child_node (e.g., the FOLD action correctly sets
-        // child_type = TERMINAL), don't re-process it here. Re-processing
+        // CHANCE by make_child_node (e.g., a FOLD that leaves only one
+        // player active is typed TERMINAL), don't re-process it here. Re-processing
         // adds spurious children and forces the post-build TERMINAL→PLAYER
         // fixup, creating empty PLAYER nodes that the standing gate flags.
         // This is a key Phase 3 structural fix.
@@ -1001,15 +1001,20 @@ impl<'a> TreeBuilder<'a> {
         let parent = &self.tree.nodes[parent_idx];
         let player = parent.player_id;
 
-        let child_type = match action {
-            Action::Fold => NODE_TYPE_TERMINAL,
-            _ => {
-                if self.only_one_active(info) {
-                    NODE_TYPE_TERMINAL
-                } else {
-                    NODE_TYPE_PLAYER
-                }
-            }
+        // BUG FIX 2026-06-12 (harness anchor chain): FOLD was typed
+        // TERMINAL unconditionally — a heads-up assumption. In multiway
+        // trees this ended the entire hand on ANY fold (p0 bets, p1
+        // folds → terminal while p2..p5 never act), which is a wrong
+        // game. It also produced the "fold-mask under-reporting"
+        // symptom the harness caught: single-fold masks at terminals
+        // that should represent longer fold sequences that were never
+        // built. `info` here is the POST-action child info (the fold
+        // already cleared active[player]), so the uniform rule applies:
+        // terminal iff at most one player remains.
+        let child_type = if self.only_one_active(info) {
+            NODE_TYPE_TERMINAL
+        } else {
+            NODE_TYPE_PLAYER
         };
 
         let next_player = if child_type == NODE_TYPE_TERMINAL {

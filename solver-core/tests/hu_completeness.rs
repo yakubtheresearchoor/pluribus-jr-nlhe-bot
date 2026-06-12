@@ -43,7 +43,9 @@ fn hu_symmetric_cfg() -> TreeConfig {
     TreeConfig {
         num_players: 2,
         initial_state: BoardState::Flop,
-        starting_pot: 10,
+        // 2026-06-12 semantics: starting_pot is dead money ADDITIVE with
+        // contributions; this legacy config double-counted (pot 10 = [5,5]).
+        starting_pot: 0,
         starting_stacks: vec![100; 2],
         initial_contributions: vec![5, 5],
         rake_rate: 0.0,
@@ -55,14 +57,16 @@ fn hu_symmetric_cfg() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
     }
+
 }
 
 fn hu_asymmetric_cfg() -> TreeConfig {
     TreeConfig {
         num_players: 2,
         initial_state: BoardState::Flop,
-        starting_pot: 3,
+        starting_pot: 0, // was 3: double-counted [2,1] (2026-06-12 semantics)
         starting_stacks: vec![100; 2],
         initial_contributions: vec![2, 1],
         rake_rate: 0.0,
@@ -74,7 +78,9 @@ fn hu_asymmetric_cfg() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
     }
+
 }
 
 // ============================================================================
@@ -656,8 +662,10 @@ enum RefAct {
     AllIn(i32),
 }
 
-fn ref_pot(s: &RefState) -> i32 {
-    s.commits.iter().sum()
+fn ref_pot(cfg: &TreeConfig, s: &RefState) -> i32 {
+    // Mirrors builder get_pot (2026-06-12 fix): starting_pot is dead
+    // money additive with cumulative commits.
+    cfg.starting_pot + s.commits.iter().sum::<i32>()
 }
 
 fn ref_max_committable(cfg: &TreeConfig, p: usize) -> i32 {
@@ -697,7 +705,7 @@ fn ref_actions(cfg: &TreeConfig, s: &RefState) -> Vec<RefAct> {
     let player_committed = s.commits[p];
     let max_amount = ref_max_committable(cfg, p);
     let player_remaining = (max_amount - player_committed).max(0);
-    let pot = ref_pot(s);
+    let pot = ref_pot(cfg, s);
     // prev_amount for bet/raise/call target = max CUMULATIVE commit among
     // OTHER non-folded players (Model A semantics — Call matches it, Bet
     // adds delta over it). Mirrors builder line 535.
@@ -903,13 +911,16 @@ fn ref_count(cfg: &TreeConfig, s: &RefState) -> (usize, usize, usize) {
     //      (b) all non-folded have per-street commit 0 (no-betting case
     //      for asymmetric blinds).
     let all_acted = unfolded.iter().all(|&p| s.has_acted[p]);
-    let cum_eq = unfolded
-        .iter()
-        .all(|&p| s.commits[p] == s.commits[unfolded[0]]);
+    // Standing-bet rule (parallel fix to builder.rs is_round_complete,
+    // 2026-06-04): matched standing bet OR all-in at max_committable.
+    let standing_bet = unfolded.iter().map(|&p| s.commits[p]).max().unwrap();
+    let matched_or_allin = unfolded.iter().all(|&p| {
+        s.commits[p] == standing_bet || s.commits[p] >= ref_max_committable(cfg, p)
+    });
     let no_betting = unfolded
         .iter()
         .all(|&p| s.commits[p] - s.round_start[p] == 0);
-    let round_complete = all_acted && (cum_eq || no_betting);
+    let round_complete = all_acted && (matched_or_allin || no_betting);
 
     if round_complete {
         // River-end check: use chronological street ordinal (Preflop=0,
@@ -927,25 +938,22 @@ fn ref_count(cfg: &TreeConfig, s: &RefState) -> (usize, usize, usize) {
         return (cp, cc + 1, ct);
     }
 
-    // PLAYER node. Generate actions, recurse on each.
-    // Important multi-player convention (builder make_child_node line 828):
-    // Fold ALWAYS produces a TERMINAL, regardless of remaining-player count.
-    // Standard CFR practice: the folding player's strategy at that decision
-    // is captured, and the non-folders' subsequent infosets are enumerated
-    // via other (non-fold) branches in the tree where they reach equivalent
-    // positions. Without this collapse, multi-player trees blow up
-    // exponentially with per-fold subtree expansion. In HU it's a no-op
-    // because Fold reduces num_unfolded to 1, which already triggers our
-    // terminal check; in 3p+ this is the critical pruning.
+    // PLAYER node. Generate actions, recurse on each — INCLUDING Fold.
+    //
+    // HISTORY (2026-06-12): this enumerator (and the builder) used to
+    // collapse EVERY fold to a terminal, justified as "standard CFR
+    // pruning — other branches enumerate equivalent positions". That
+    // justification was false: after p1 folds to p0's bet, no other
+    // branch puts p2 facing that bet with p1 out. The collapse silently
+    // deleted all multiway fold-continuation subtrees (a wrong GAME,
+    // caught by the play-harness fold-mask audit). Folds now recurse
+    // through ref_apply like any action; the num_unfolded <= 1 check at
+    // the top of ref_count terminates the genuine hand-ending folds.
     let acts = ref_actions(cfg, s);
     let mut tot_p = 1usize; // this PLAYER node
     let mut tot_c = 0usize;
     let mut tot_t = 0usize;
     for a in acts {
-        if matches!(a, RefAct::Fold) {
-            tot_t += 1; // Fold → TERMINAL, no further recursion
-            continue;
-        }
         let child = ref_apply(cfg, s, a);
         let (cp, cc, ct) = ref_count(cfg, &child);
         tot_p += cp;
@@ -973,10 +981,18 @@ fn ref_initial(cfg: &TreeConfig) -> RefState {
         }
         _ => 0,
     };
+    // round_start: parallel fix to builder.rs's committed_at_round_start.
+    // At preflop, no round preceded — blinds are first-round actions,
+    // so round_start = 0 for everyone. At postflop, initial_contributions
+    // represent pre-this-street commits → round_start = initial_contribs.
+    let round_start = match cfg.initial_state {
+        BoardState::Preflop => vec![0_i32; np],
+        _ => cfg.initial_contributions.clone(),
+    };
     RefState {
         street: cfg.initial_state.street(),
         commits: cfg.initial_contributions.clone(),
-        round_start: cfg.initial_contributions.clone(),
+        round_start,
         folded: vec![false; np],
         has_acted: vec![false; np],
         allin_flag: false,
@@ -1064,7 +1080,7 @@ fn config_6p_asymmetric() -> TreeConfig {
     TreeConfig {
         num_players: 6,
         initial_state: BoardState::Flop,
-        starting_pot: 35,
+        starting_pot: 0, // was 35: double-counted contribs (2026-06-12 semantics)
         starting_stacks: vec![200; 6],
         initial_contributions: vec![10, 5, 5, 5, 5, 5],
         rake_rate: 0.0,
@@ -1076,14 +1092,16 @@ fn config_6p_asymmetric() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
     }
+
 }
 
 fn config_6p_symmetric() -> TreeConfig {
     TreeConfig {
         num_players: 6,
         initial_state: BoardState::Flop,
-        starting_pot: 30,
+        starting_pot: 0, // was 30: double-counted contribs (2026-06-12 semantics)
         starting_stacks: vec![200; 6],
         initial_contributions: vec![5; 6],
         rake_rate: 0.0,
@@ -1095,14 +1113,16 @@ fn config_6p_symmetric() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
     }
+
 }
 
 fn config_3p_asymmetric() -> TreeConfig {
     TreeConfig {
         num_players: 3,
         initial_state: BoardState::Flop,
-        starting_pot: 15,
+        starting_pot: 0, // was 15: double-counted contribs (2026-06-12 semantics)
         starting_stacks: vec![200; 3],
         initial_contributions: vec![10, 5, 5],
         rake_rate: 0.0,
@@ -1114,7 +1134,9 @@ fn config_3p_asymmetric() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
     }
+
 }
 
 fn run_count_check(cfg: &TreeConfig, label: &str) {
@@ -1192,7 +1214,7 @@ fn config_hu_preflop_asymmetric() -> TreeConfig {
     TreeConfig {
         num_players: 2,
         initial_state: BoardState::Preflop,
-        starting_pot: 3,
+        starting_pot: 0, // was 3: double-counted the live blinds (2026-06-12 semantics)
         starting_stacks: vec![100, 100],
         initial_contributions: vec![2, 1],
         rake_rate: 0.0,
@@ -1204,7 +1226,9 @@ fn config_hu_preflop_asymmetric() -> TreeConfig {
         add_allin_threshold: 1.0,
         force_allin_threshold: 1.0,
         merging_threshold: 0.0,
+    button_player: None,
     }
+
 }
 
 #[test]

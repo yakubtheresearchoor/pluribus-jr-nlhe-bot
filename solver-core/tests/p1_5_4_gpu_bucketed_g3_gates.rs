@@ -216,9 +216,17 @@ fn gate2_striped_general_b_drift_pinned() {
         (32 / NB) as u32, // S = 8 at B = 4: full 32-lane striping
     );
 
-    let mut max_drift = 0.0f64;
     let scale = |xs: &[f32]| xs.iter().map(|v| v.abs()).fold(0.0f32, f32::max) as f64;
-    for ((label, ga), (_, ca)) in buffers(&gpu_arm).iter().zip(buffers(&cpu_arm).iter()) {
+
+    // REGRET buffers + root cfv: continuous accumulations — reordered
+    // f32 sums must stay at accumulated-rounding scale. Bug line set
+    // from the collapse-gate precedent (per-terminal reorder ≈ 1e-5;
+    // the CFR loop compounds ~2.8×/iter → ≤ ~1e-4 at 3 iters). Beyond
+    // 1e-3 is breakage, not rounding.
+    let mut max_drift = 0.0f64;
+    let bufs_g = buffers(&gpu_arm);
+    let bufs_c = buffers(&cpu_arm);
+    for ((label, ga), (_, ca)) in bufs_g.iter().zip(bufs_c.iter()) {
         let s = scale(ca).max(1e-30);
         let d = ga
             .iter()
@@ -226,7 +234,7 @@ fn gate2_striped_general_b_drift_pinned() {
             .map(|(a, b)| (*a as f64 - *b as f64).abs() / s)
             .fold(0.0, f64::max);
         eprintln!("gate 2 {label}: max rel drift {d:.2e}");
-        if d > max_drift {
+        if label.starts_with("regrets") && d > max_drift {
             max_drift = d;
         }
     }
@@ -237,14 +245,59 @@ fn gate2_striped_general_b_drift_pinned() {
         .fold(0.0, f64::max)
         / scale(&root_cpu).max(1e-30);
     eprintln!("gate 2 root cfv: max rel drift {root_d:.2e}");
-    // Accumulated f32 rounding through 3 DCFR iterations of reordered
-    // terminal sums. Bug line set from the collapse-gate precedent
-    // (per-terminal reorder ≈ 1e-5; the CFR loop compounds ~2.8×/iter
-    // → ≤ ~1e-4 at 3 iters). Beyond 1e-3 is breakage, not rounding.
     assert!(
         max_drift.max(root_d) < 1e-3,
         "striped drift {max_drift:.2e} beyond accumulated-rounding scale — breakage"
     );
+
+    // CUM-STRATEGY buffers: regret matching is DISCONTINUOUS at the
+    // EPS threshold, so a max-norm pin is knife-edge-fragile by
+    // construction. Measured 2026-06-12 (fold-continuation tree, probe
+    // `gate2_drift_probe`): ONE river infoset with regrets ±5e-6 —
+    // CPU 5.000001e-6 vs GPU 4.999999e-6, a ±2e-12 reordering
+    // difference straddling the matching threshold — flipped pure vs
+    // uniform strategy and jumped cum by 0.5 reach (rel drift 4.45e-1)
+    // at 2 of 17.8M entries, while regrets agreed to 1e-5 and root cfv
+    // to 3e-7. At |regret| ≲ EPS the strategy is genuinely
+    // indeterminate at f32 precision; the CPU's pick is not "more
+    // correct". Gate accordingly: every cum outlier beyond 1e-3·scale
+    // must be CERTIFIED as a knife-edge (its infoset's regrets all
+    // within the dead zone |r| ≤ 2×EPS) and outliers must stay rare
+    // (≤ 8 entries — measured 2; growth means a real bug).
+    const EPS: f32 = 1e-5; // the solver's regret-match epsilon
+    use solver_core::tree::flat::MAX_NA_POSTFLOP;
+    let nb = NB;
+    let mut outliers = 0usize;
+    for (((label, ga), (_, ca)), (_, rc)) in bufs_g
+        .iter()
+        .zip(bufs_c.iter())
+        .filter(|((l, _), _)| l.starts_with("cum"))
+        .zip(bufs_c.iter().filter(|(l, _)| l.starts_with("regrets")))
+    {
+        let s = scale(ca).max(1e-30);
+        for i in 0..ga.len() {
+            let d = (ga[i] as f64 - ca[i] as f64).abs() / s;
+            if d <= 1e-3 {
+                continue;
+            }
+            outliers += 1;
+            let block = i - (i % (MAX_NA_POSTFLOP * nb));
+            let b = i % nb;
+            let max_r = (0..MAX_NA_POSTFLOP)
+                .map(|a| rc[block + a * nb + b].abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_r <= 2.0 * EPS,
+                "{label}[{i}] drift {d:.2e} at an infoset with max |regret| \
+                 {max_r:.2e} > 2×EPS — NOT a knife-edge flip: breakage"
+            );
+            eprintln!(
+                "gate 2 {label}[{i}]: certified knife-edge flip \
+                 (drift {d:.2e}, infoset max |regret| {max_r:.2e} ≤ 2×EPS)"
+            );
+        }
+    }
+    assert!(outliers <= 8, "{outliers} cum knife-edge outliers (measured 2; growth = bug)");
 }
 
 /// G4 step 3 gate: the BATCHED path (run_batched + fill_walks, one
@@ -305,4 +358,63 @@ fn gate1b_batched_identity_walk_bit_exact() {
         }
     }
     eprintln!("gate 1b PASSED: batched path bit-exact at identity ({ITERS} iters)");
+}
+
+/// PROBE (2026-06-12, fold-continuation tree): gate2's cum_river drift
+/// jumped to 4.45e-1 while regrets stay at 1e-5 and root cfv at 1e-7.
+/// Hypothesis: regret-matching knife-edge — striped-reduction rounding
+/// flips an infoset between proportional and uniform-fallback strategy,
+/// jumping cum by O(reach) while regrets stay close. This probe locates
+/// the argmax cum_river entry and prints both arms' regrets for the
+/// full action block at that infoset.
+#[test]
+#[ignore = "diagnostic probe, run on demand"]
+fn gate2_drift_probe() {
+    let ctx = MetalContext::new().expect("Metal");
+    let tree = build_gate_tree();
+    const NB: usize = 4;
+    let (gpu_arm, cpu_arm, _rg, _rc) = run_pair(
+        &ctx,
+        &tree,
+        |t| {
+            let (fm, tm, rm) = quantile_maps(t, NB);
+            FlopBucketing::from_maps(t, NB, NB, NB, fm, tm, rm)
+        },
+        (32 / NB) as u32,
+    );
+    let ga = gpu_arm.cum_strategy_river();
+    let ca = cpu_arm.cum_strategy_river();
+    let scale = ca.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let (mut argmax, mut best) = (0usize, 0.0f64);
+    for i in 0..ga.len() {
+        let d = (ga[i] as f64 - ca[i] as f64).abs();
+        if d > best {
+            best = d;
+            argmax = i;
+        }
+    }
+    eprintln!("buffer scale (max |cpu cum_river|): {scale:.6e}");
+    eprintln!("argmax {argmax}: gpu {} cpu {} absdiff {best:.6e} rel {:.3e}",
+        ga[argmax], ca[argmax], best / scale as f64);
+    // Locate the infoset block: index = base + a*nb + b with
+    // a in 0..MAX_NA_POSTFLOP. Print the whole action block (same b).
+    use solver_core::tree::flat::MAX_NA_POSTFLOP;
+    let nb = NB;
+    let b = argmax % nb;
+    let block = argmax - (argmax % (MAX_NA_POSTFLOP * nb));
+    let rg = gpu_arm.regrets_river();
+    let rc = cpu_arm.regrets_river();
+    eprintln!("infoset block at {block}, bucket {b}:");
+    for a in 0..MAX_NA_POSTFLOP {
+        let i = block + a * nb + b;
+        eprintln!(
+            "  a{a}: cum gpu {:+.6e} cpu {:+.6e} | regret gpu {:+.6e} cpu {:+.6e}",
+            ga[i], ca[i], rg[i], rc[i]
+        );
+    }
+    // Count entries with absdiff above 1e-3 of scale to see locality.
+    let n_big = (0..ga.len())
+        .filter(|&i| (ga[i] as f64 - ca[i] as f64).abs() > 1e-3 * scale as f64)
+        .count();
+    eprintln!("entries beyond 1e-3*scale: {n_big} / {}", ga.len());
 }

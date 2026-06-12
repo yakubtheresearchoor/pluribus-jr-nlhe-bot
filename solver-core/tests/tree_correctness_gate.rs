@@ -130,13 +130,28 @@ fn print_violations(label: &str, vs: &Violations, max_samples: usize) {
 
 /// Iterative DFS that threads commit_at_round_start through the walk.
 /// At each chance node, the snapshot for its children = contribs at the chance node.
-/// At root, snapshot = initial contributions.
-fn validate_tree(tree: &FlatTree, np: usize, max_committable: &[i32]) -> Violations {
+///
+/// Root snapshot (FIXED 2026-06-12): for POSTFLOP-start trees the root
+/// contributions are prior-street money, so the snapshot = root contribs
+/// (per-street commits start at 0). For PREFLOP-start trees the blinds
+/// are LIVE first-round commits (no street preceded them) — snapshot
+/// must be ZERO so the SB genuinely faces the BB's blind. The old
+/// unconditional snapshot=root-contribs zeroed the blinds out and
+/// misclassified the HU-preflop root (flagged the builder's correct
+/// {FOLD,CALL,RAISE} as illegal — the 4 phantom violations).
+fn validate_tree(
+    tree: &FlatTree,
+    np: usize,
+    max_committable: &[i32],
+    preflop_root: bool,
+) -> Violations {
     let mut vs = Violations::default();
     // Iterative DFS: stack of (node_idx, commit_at_round_start, folded_mask)
-    let initial_snapshot: Vec<i32> = (0..np)
-        .map(|p| tree.get_contribution(0, p as u8))
-        .collect();
+    let initial_snapshot: Vec<i32> = if preflop_root {
+        vec![0; np]
+    } else {
+        (0..np).map(|p| tree.get_contribution(0, p as u8)).collect()
+    };
     let mut stack: Vec<(usize, Vec<i32>, u16)> = vec![(0, initial_snapshot, 0)];
 
     while let Some((idx, round_start, folded_mask)) = stack.pop() {
@@ -247,7 +262,12 @@ fn run_gate(label: &str, config: TreeConfig) -> Violations {
         .map(|(s, c)| s + c)
         .collect();
     eprintln!("\n>>> Gate run: {} (tree: {} nodes)", label, tree.num_nodes());
-    let vs = validate_tree(&tree, np, &max_committable);
+    let vs = validate_tree(
+        &tree,
+        np,
+        &max_committable,
+        config.initial_state == BoardState::Preflop,
+    );
     print_violations(label, &vs, 5);
     vs
 }
