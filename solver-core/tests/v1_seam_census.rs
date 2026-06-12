@@ -160,3 +160,130 @@ fn v1_seam_census_depth_capped() {
         );
     }
 }
+
+/// CELL-WIDTH ANALYSIS (2026-06-12): the depth cap shrank the preflop
+/// tree 2.3× but the seam-cell count barely moved (9,923 → 9,521) —
+/// production cost is driven by cell WIDTH. This instrument asks what
+/// width actually is. A flop-start cell is the game (live, behind,
+/// pot) with behind = stack − commit; with pot-relative sizing the
+/// tree and (scaled) equilibrium depend on the cell essentially
+/// through (live, SPR = behind/pot) — thousands of distinct integer
+/// (commit, pot) pairs collapse onto a far smaller strategic surface.
+/// Quantified here: log2-SPR binning at several widths, weighted by
+/// flop-entry multiplicity, on the CAP-3 production preflop tree.
+/// (Reach-weighting needs the preflop solve; multiplicity is the
+/// structural proxy. The bucketing residual is a harness A/B.)
+#[test]
+#[ignore = "analysis instrument; run with --ignored --nocapture"]
+fn v1_cell_width_analysis() {
+    use solver_core::tree::action::BetCap;
+    use std::collections::BTreeMap;
+    let spec = production_game_v1();
+    let mut cfg = spec.preflop_tree_config(preflop_bets());
+    cfg.max_bets_per_street = BetCap::all(3);
+    let tree = build_tree_preflop_only(&cfg).expect("v1 preflop tree (cap 3)");
+    let np = spec.num_players as usize;
+
+    // (live, commit, pot) → multiplicity.
+    let mut cells: BTreeMap<(u8, i32, i32), usize> = BTreeMap::new();
+    for idx in 0..tree.nodes.len() {
+        let n = &tree.nodes[idx];
+        if n.node_type != NODE_TYPE_CHANCE || n.board_state != BoardState::Flop as u8 {
+            continue;
+        }
+        let mask = tree.get_folded_mask(idx);
+        let contribs: Vec<i32> =
+            (0..np).map(|p| tree.get_contribution(idx, p as u8)).collect();
+        let live: Vec<usize> = (0..np).filter(|&p| mask & (1 << p) == 0).collect();
+        let pot: i32 = contribs.iter().sum();
+        *cells.entry((live.len() as u8, contribs[live[0]], pot)).or_default() += 1;
+    }
+    let total_entries: usize = cells.values().sum();
+    eprintln!("cap-3 cells: {} distinct, {} flop entries", cells.len(), total_entries);
+
+    // Decompose width: how many distinct commits / pots / SPRs per live.
+    for live in 2..=6u8 {
+        let sub: Vec<(&(u8, i32, i32), &usize)> =
+            cells.iter().filter(|((l, _, _), _)| *l == live).collect();
+        if sub.is_empty() {
+            continue;
+        }
+        let commits: std::collections::BTreeSet<i32> =
+            sub.iter().map(|((_, c, _), _)| *c).collect();
+        let pots: std::collections::BTreeSet<i32> =
+            sub.iter().map(|((_, _, p), _)| *p).collect();
+        let allin = sub
+            .iter()
+            .filter(|((_, c, _), _)| *c >= spec.stack)
+            .map(|(_, &m)| m)
+            .sum::<usize>();
+        eprintln!(
+            "live {live}: {} cells | {} distinct commits, {} distinct pots | \
+             all-in entries {} ({:.1}% of live-{live} entries)",
+            sub.len(),
+            commits.len(),
+            pots.len(),
+            allin,
+            100.0 * allin as f64 / sub.iter().map(|(_, &m)| m).sum::<usize>() as f64
+        );
+    }
+
+    // SPR bucketing: bins of log2(SPR) at width w; all-in cells (SPR 0)
+    // get their own bucket per live (they need no solve at all).
+    for w in [0.5f64, 0.25, 0.1] {
+        let mut buckets: BTreeMap<(u8, i64), usize> = BTreeMap::new();
+        let mut allin_buckets = 0usize;
+        for (&(live, commit, pot), &mult) in &cells {
+            let behind = spec.stack - commit;
+            let key = if behind <= 0 {
+                allin_buckets = 1;
+                (live, i64::MIN)
+            } else {
+                let spr = behind as f64 / pot as f64;
+                (live, (spr.log2() / w).floor() as i64)
+            };
+            *buckets.entry(key).or_default() += mult;
+        }
+        let solvable: Vec<(&(u8, i64), &usize)> =
+            buckets.iter().filter(|((_, b), _)| *b != i64::MIN).collect();
+        let n_solve = solvable.len();
+        // Coverage: entries in the top-k solvable buckets.
+        let mut by_mult: Vec<usize> = solvable.iter().map(|(_, &m)| m).collect();
+        by_mult.sort_unstable_by(|a, b| b.cmp(a));
+        let covered: usize = by_mult.iter().take(50).sum();
+        let solvable_total: usize = by_mult.iter().sum();
+        eprintln!(
+            "log2-SPR width {w}: {} SOLVE buckets (+ all-in free) | top-50 buckets \
+             cover {:.1}% of non-allin entries",
+            n_solve,
+            100.0 * covered as f64 / solvable_total.max(1) as f64
+        );
+        let _ = allin_buckets;
+    }
+
+    // Tree-shape collapse check: within a (live, log2-SPR/0.25) bucket,
+    // how many distinct ORACLE-SHAPE tree node counts appear? If ~1,
+    // the bucket members are structurally the same game (the residual
+    // is payoff scaling + integer rounding — harness-measurable).
+    let flop_bets = BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    let mut shape: BTreeMap<(u8, i64), std::collections::BTreeSet<usize>> = BTreeMap::new();
+    for &(live, commit, pot) in cells.keys() {
+        let behind = spec.stack - commit;
+        if behind <= 0 {
+            continue;
+        }
+        let spr = behind as f64 / pot as f64;
+        let b = (spr.log2() / 0.25).floor() as i64;
+        let fcfg = spec.flop_seam_config(live, commit, pot, flop_bets.clone());
+        let ft = build_tree(&fcfg).expect("flop tree");
+        shape.entry((live, b)).or_default().insert(ft.nodes.len());
+    }
+    let multi = shape.values().filter(|s| s.len() > 1).count();
+    let maxv = shape.values().map(|s| s.len()).max().unwrap_or(0);
+    eprintln!(
+        "tree-shape collapse at width 0.25: {} buckets, {} with >1 distinct node count \
+         (max variants in a bucket: {maxv})",
+        shape.len(),
+        multi
+    );
+}
