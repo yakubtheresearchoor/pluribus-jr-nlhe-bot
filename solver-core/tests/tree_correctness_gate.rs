@@ -269,6 +269,8 @@ fn tree_correctness_gate_multi_config() {
                 rake_rate: 0.0, rake_cap: 0.0,
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            button_player: None,
+
             }
         );
 
@@ -282,6 +284,8 @@ fn tree_correctness_gate_multi_config() {
                 rake_rate: 0.0, rake_cap: 0.0,
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            button_player: None,
+
             }
         );
 
@@ -295,6 +299,8 @@ fn tree_correctness_gate_multi_config() {
                 rake_rate: 0.0, rake_cap: 0.0,
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            button_player: None,
+
             }
         );
 
@@ -310,6 +316,8 @@ fn tree_correctness_gate_multi_config() {
                 rake_rate: 0.0, rake_cap: 0.0,
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            button_player: None,
+
             }
         );
 
@@ -326,6 +334,8 @@ fn tree_correctness_gate_multi_config() {
                 rake_rate: 0.0, rake_cap: 0.0,
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            button_player: None,
+
             }
         );
 
@@ -344,6 +354,8 @@ fn tree_correctness_gate_multi_config() {
                 rake_rate: 0.0, rake_cap: 0.0,
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 0.5, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            button_player: None,
+
             }
         );
 
@@ -360,6 +372,8 @@ fn tree_correctness_gate_multi_config() {
                 rake_rate: 0.0, rake_cap: 0.0,
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            button_player: None,
+
             }
         );
 
@@ -374,6 +388,8 @@ fn tree_correctness_gate_multi_config() {
                 rake_rate: 0.0, rake_cap: 0.0,
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            button_player: None,
+
             }
         );
 
@@ -387,12 +403,19 @@ fn tree_correctness_gate_multi_config() {
         let v_i = run_gate(
             "2p HU PREFLOP [2,1], 1 bet PotRel(1.0)",
             TreeConfig {
-                num_players: 2, initial_state: BoardState::Preflop, starting_pot: 3,
+                // starting_pot is DEAD MONEY from before this tree
+                // (additive with contributions in the terminal math —
+                // the 2026-06-12 get_pot fix). Preflop blinds are LIVE
+                // contributions, so starting_pot must be 0 here; the
+                // old value 3 double-counted the blinds.
+                num_players: 2, initial_state: BoardState::Preflop, starting_pot: 0,
                 starting_stacks: vec![100; 2],
                 initial_contributions: vec![2, 1],
                 rake_rate: 0.0, rake_cap: 0.0,
                 bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
                 add_allin_threshold: 1.0, force_allin_threshold: 1.0, merging_threshold: 0.0,
+            button_player: None,
+
             }
         );
 

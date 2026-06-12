@@ -22,8 +22,17 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
             config.initial_contributions.len()
         ));
     }
-    if config.starting_pot <= 0 {
-        return Err(format!("starting_pot must be > 0, got {}", config.starting_pot));
+    // 2026-06-12: starting_pot is DEAD money from before this tree;
+    // live blinds belong in initial_contributions. A preflop tree has
+    // starting_pot 0 legitimately — the invariant is that SOME money
+    // is in play.
+    if config.starting_pot < 0
+        || config.starting_pot + config.initial_contributions.iter().sum::<i32>() <= 0
+    {
+        return Err(format!(
+            "starting_pot + initial contributions must be > 0 (pot {}, contribs {:?})",
+            config.starting_pot, config.initial_contributions
+        ));
     }
     for (i, &s) in config.starting_stacks.iter().enumerate() {
         if s < 0 {
@@ -474,10 +483,17 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn get_pot(&self, node_idx: usize) -> i32 {
+        // BUG FIX 2026-06-12 (harness anchor chain): the pot MUST
+        // include config.starting_pot — the solver terminal math
+        // treats starting_pot + contributions as additive money, but
+        // pot-relative bet sizing here ignored starting_pot, so e.g.
+        // the oracle tree (pot 12, contribs 0) sized every "pot" bet
+        // from pot 0 and floored it to 1 chip.
         let num_players = self.config.num_players as usize;
-        (0..num_players)
-            .map(|p| self.tree.get_contribution(node_idx, p as u8))
-            .sum()
+        self.config.starting_pot
+            + (0..num_players)
+                .map(|p| self.tree.get_contribution(node_idx, p as u8))
+                .sum::<i32>()
     }
 
     fn build_recursive(&mut self, node_idx: usize, info: BuildInfo) {
