@@ -28,10 +28,18 @@
 //!   - Maps: quantile B=8 (the shipped family; GS14 is the in-tree
 //!     challenger for the head-to-head A/B).
 //!
-//! Env: BP_OUT (default blueprint_out/), BP_THREADS (default 14),
-//! BP_ITERS (34), BP_B (8), BP_START / BP_END (flop index range).
+//! Env: BP_OUT (default blueprint_out/), BP_THREADS (default 14 CPU /
+//! 2 GPU), BP_ITERS (34), BP_B (8), BP_START / BP_END (flop index
+//! range), BP_RUNOUTS ("1x1" default; e.g. "4x4" = 4 seeded turns ×
+//! 4 seeded rivers each), BP_GPU=1 (solve on the G5 native GPU path —
+//! bit-exact-gated kernels, striped production config; the artifact
+//! self-describes gpu:true), BP_ROLE (header role string).
 
 use solver_core::card::Card;
+#[cfg(feature = "metal")]
+use solver_core::gpu_metal::bucketed_native::BucketedNativeGpu;
+#[cfg(feature = "metal")]
+use solver_core::gpu_metal::context::MetalContext;
 use solver_core::solver::bucketed_flop_cfr::{
     BucketedFlopCfr, FlopBucketing, TerminalDesign, NO_BUCKET,
 };
@@ -113,11 +121,17 @@ fn quantile_maps(
     (flop_map, turn_maps, river_maps)
 }
 
-/// Normalized flop-zone sigma_avg rows, flat — the convergence-stat basis.
-fn normalized_flop_sigma(solver: &BucketedFlopCfr, tree: &FlatTree, bk: &FlopBucketing) -> Vec<f32> {
+/// Normalized flop-zone sigma_avg rows, flat — the convergence-stat
+/// basis. `cum` is the flop cum-strategy slice (CPU solver buffer or
+/// the GPU-native readback — identical layout).
+fn normalized_flop_sigma(
+    cum: &[f32],
+    solver: &BucketedFlopCfr,
+    tree: &FlatTree,
+    bk: &FlopBucketing,
+) -> Vec<f32> {
     use solver_core::tree::flat::MAX_NA_POSTFLOP;
     let nb = bk.nb_flop;
-    let cum = solver.cum_strategy_flop();
     let mut out = Vec::new();
     for &nid in &tree.decision_node_ids {
         let idx = nid as usize;
@@ -150,6 +164,27 @@ fn u16s(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// CPU solve arm: iters−1 + 1 with the convergence stat in between.
+fn solve_cpu(
+    solver: &mut BucketedFlopCfr,
+    tree: &FlatTree,
+    game: &FlopStartGame,
+    bk: &FlopBucketing,
+    iters: u32,
+    dsigma: &dyn Fn(&[f32], &[f32]) -> f64,
+) -> (f64, Vec<f32>, Vec<f32>, Vec<f32>) {
+    solver.run(tree, game, bk, iters - 1);
+    let before = normalized_flop_sigma(solver.cum_strategy_flop(), solver, tree, bk);
+    solver.run(tree, game, bk, 1);
+    let after = normalized_flop_sigma(solver.cum_strategy_flop(), solver, tree, bk);
+    (
+        dsigma(&before, &after),
+        solver.cum_strategy_flop().to_vec(),
+        solver.cum_strategy_turn().to_vec(),
+        solver.cum_strategy_river().to_vec(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn solve_and_bank(
     fi: usize,
@@ -157,21 +192,39 @@ fn solve_and_bank(
     tree: &FlatTree,
     nb: usize,
     iters: u32,
+    nt: usize,
+    nr: usize,
     out_dir: &str,
+    role: &str,
+    #[cfg(feature = "metal")] ctx: Option<&MetalContext>,
 ) -> std::io::Result<f64> {
-    // Seeded 1×1 runout draw.
+    // Seeded nt×nr runout draw (chained splitmix without replacement;
+    // nt=1/nr=1 first draws match the banked 1×1 baseline recipe).
     let board_mask: u64 = flop.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
     let deck: Vec<u8> = (0..52u8).filter(|c| board_mask & (1u64 << c) == 0).collect();
-    let tpos = (splitmix64(fi as u64) % deck.len() as u64) as usize;
-    let tc = deck[tpos];
-    let rdeck: Vec<u8> = deck.iter().copied().filter(|&c| c != tc).collect();
-    let rpos = (splitmix64(fi as u64 ^ 0xDEAD_BEEF) % rdeck.len() as u64) as usize;
-    let rc = rdeck[rpos];
+    let mut turn_cards: Vec<u8> = Vec::with_capacity(nt);
+    {
+        let mut pool = deck.clone();
+        let mut x = fi as u64;
+        for _ in 0..nt {
+            x = splitmix64(x);
+            let i = (x % pool.len() as u64) as usize;
+            turn_cards.push(pool.remove(i));
+        }
+    }
     let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
-    river_decks[tc as usize] = vec![rc];
+    for &tc in &turn_cards {
+        let mut pool: Vec<u8> = deck.iter().copied().filter(|&c| c != tc).collect();
+        let mut x = (fi as u64) ^ 0xDEAD_BEEF ^ ((tc as u64) << 40);
+        for _ in 0..nr {
+            x = splitmix64(x);
+            let i = (x % pool.len() as u64) as usize;
+            river_decks[tc as usize].push(pool.remove(i));
+        }
+    }
 
     let t0 = Instant::now();
-    let table = FlopChanceTable::build_full_nh_sampled(flop, 6, &[tc], &river_decks);
+    let table = FlopChanceTable::build_full_nh_sampled(flop, 6, &turn_cards, &river_decks);
     let (fm, tm, rm) = quantile_maps(&table, nb);
     let game = FlopStartGame::new(table);
     let bk = FlopBucketing::from_maps(game.table(), nb, nb, nb, fm, tm, rm);
@@ -181,15 +234,39 @@ fn solve_and_bank(
     // iterations (normalized rows) — the per-flop "convergence reached"
     // number the harness reads without re-solving.
     assert!(iters >= 2);
-    solver.run(tree, &game, &bk, iters - 1);
-    let sigma_before = normalized_flop_sigma(&solver, tree, &bk);
-    solver.run(tree, &game, &bk, 1);
-    let sigma_after = normalized_flop_sigma(&solver, tree, &bk);
-    let conv: f64 = {
-        let n = sigma_before.len().max(1);
-        sigma_before.iter().zip(&sigma_after).map(|(a, b)| (a - b).abs() as f64).sum::<f64>()
+
+    // Solve on CPU or the G5 native GPU path; either way the cum
+    // buffers come back in the SAME ZoneDims-concatenated layout.
+    let dsigma = |before: &[f32], after: &[f32]| -> f64 {
+        let n = before.len().max(1);
+        before.iter().zip(after).map(|(a, b)| (*a as f64 - *b as f64).abs()).sum::<f64>()
             / n as f64
     };
+    #[cfg(feature = "metal")]
+    let gpu_flag = ctx.is_some();
+    #[cfg(not(feature = "metal"))]
+    let gpu_flag = false;
+
+    let (conv, cum_flop, cum_turn, cum_river): (f64, Vec<f32>, Vec<f32>, Vec<f32>);
+    #[cfg(feature = "metal")]
+    if let Some(ctx) = ctx {
+        let mut n = BucketedNativeGpu::new(ctx, tree, game.table(), &bk, &solver, (32 / nb) as u32)
+            .map_err(|e| std::io::Error::other(format!("native gpu: {e}")))?;
+        n.run(iters - 1);
+        let before = normalized_flop_sigma(n.cum_strategy_flop(), &solver, tree, &bk);
+        n.run(1);
+        let after = normalized_flop_sigma(n.cum_strategy_flop(), &solver, tree, &bk);
+        conv = dsigma(&before, &after);
+        cum_flop = n.cum_strategy_flop().to_vec();
+        cum_turn = n.cum_strategy_turn().to_vec();
+        cum_river = n.cum_strategy_river().to_vec();
+    } else {
+        (conv, cum_flop, cum_turn, cum_river) = solve_cpu(&mut solver, tree, &game, &bk, iters, &dsigma);
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        (conv, cum_flop, cum_turn, cum_river) = solve_cpu(&mut solver, tree, &game, &bk, iters, &dsigma);
+    }
     let secs = t0.elapsed().as_secs_f64();
 
     let path = format!("{out_dir}/flop_{fi:04}.bp");
@@ -198,22 +275,38 @@ fn solve_and_bank(
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         f.write_all(b"SSBP1\n")?;
         let code = std::env::var("BP_GIT").unwrap_or_else(|_| "unknown".into());
+        let turns_json =
+            turn_cards.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
+        let rivers_json = turn_cards
+            .iter()
+            .map(|&tc| {
+                format!(
+                    "[{}]",
+                    river_decks[tc as usize]
+                        .iter()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         writeln!(
             f,
-            "{{\"role\":\"bootstrap-config-baseline (oracle-shape tree; NOT the production blueprint)\",\
+            "{{\"role\":\"{role}\",\
              \"format\":1,\"fi\":{fi},\"flop\":[{},{},{}],\"b\":[{nb},{nb},{nb}],\
-             \"turn\":[{tc}],\"rivers\":[[{rc}]],\
-             \"runout_seed\":\"splitmix64(fi); turn=s%deck; river=(s^0xDEADBEEF)%rdeck\",\
+             \"turn\":[{turns_json}],\"rivers\":[{rivers_json}],\
+             \"runout_seed\":\"chained splitmix64 w/o replacement; turn x0=fi; river x0=fi^0xDEADBEEF^(tc<<40)\",\
              \"iters\":{iters},\"conv_mean_dsigma_last_iter\":{conv:.6},\
              \"tree\":{{\"np\":6,\"pot\":12,\"stacks\":94,\"contribs\":0,\"bets\":[1.0],\"raises\":[]}},\
              \"nh\":{},\"terminal\":\"design1_collapsed\",\"maps\":\"quantile-strength\",\
-             \"code\":\"{code}\",\"secs\":{secs:.1}}}",
+             \"gpu\":{gpu_flag},\"code\":\"{code}\",\"secs\":{secs:.1}}}",
             flop[0], flop[1], flop[2],
             game.table().num_valid,
         )?;
-        write_section(&mut f, "cum_flop", &f32s(solver.cum_strategy_flop()))?;
-        write_section(&mut f, "cum_turn", &f32s(solver.cum_strategy_turn()))?;
-        write_section(&mut f, "cum_river", &f32s(solver.cum_strategy_river()))?;
+        write_section(&mut f, "cum_flop", &f32s(&cum_flop))?;
+        write_section(&mut f, "cum_turn", &f32s(&cum_turn))?;
+        write_section(&mut f, "cum_river", &f32s(&cum_river))?;
         write_section(&mut f, "map_flop", &u16s(&bk.flop_map))?;
         let turn_cat: Vec<u16> = bk.turn_map.iter().flatten().copied().collect();
         write_section(&mut f, "map_turn", &u16s(&turn_cat))?;
@@ -228,11 +321,28 @@ fn solve_and_bank(
 
 fn main() {
     let out_dir = std::env::var("BP_OUT").unwrap_or_else(|_| "blueprint_out".into());
-    let threads: usize =
-        std::env::var("BP_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(14);
+    let gpu: bool = std::env::var("BP_GPU").map(|s| s == "1").unwrap_or(false);
+    if gpu && !cfg!(feature = "metal") {
+        panic!("BP_GPU=1 requires building with --features metal");
+    }
+    let threads: usize = std::env::var("BP_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if gpu { 2 } else { 14 });
     let iters: u32 = std::env::var("BP_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(34);
     let nb: usize = std::env::var("BP_B").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
     let start: usize = std::env::var("BP_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let runouts = std::env::var("BP_RUNOUTS").unwrap_or_else(|_| "1x1".into());
+    let (nt, nr): (usize, usize) = {
+        let mut it = runouts.split('x');
+        (
+            it.next().and_then(|s| s.parse().ok()).expect("BP_RUNOUTS NTxNR"),
+            it.next().and_then(|s| s.parse().ok()).expect("BP_RUNOUTS NTxNR"),
+        )
+    };
+    let role = std::env::var("BP_ROLE").unwrap_or_else(|_| {
+        "bootstrap-config-baseline (oracle-shape tree; NOT the production blueprint)".into()
+    });
     std::fs::create_dir_all(&out_dir).expect("create out dir");
     // Run-level manifest: the artifact set is self-describing as a whole.
     {
@@ -240,17 +350,21 @@ fn main() {
         let mut mf = std::fs::File::create(format!("{out_dir}/manifest.json")).expect("manifest");
         writeln!(
             mf,
-            "{{\"role\":\"bootstrap-config-baseline (oracle-shape tree; NOT the production blueprint)\",\
-             \"cell\":\"A: 1755 x seeded 1x1\",\"b\":{nb},\"iters\":{iters},\
+            "{{\"role\":\"{role}\",\
+             \"cell\":\"1755 x seeded {nt}x{nr}\",\"b\":{nb},\"iters\":{iters},\"gpu\":{gpu},\
              \"tree\":{{\"np\":6,\"pot\":12,\"stacks\":94,\"contribs\":0,\"bets\":[1.0],\"raises\":[]}},\
              \"terminal\":\"design1_collapsed\",\"maps\":\"quantile-strength\",\
-             \"runout_seed\":\"splitmix64(fi); turn=s%deck; river=(s^0xDEADBEEF)%rdeck\",\
+             \"runout_seed\":\"chained splitmix64 w/o replacement; turn x0=fi; river x0=fi^0xDEADBEEF^(tc<<40)\",\
              \"code\":\"{code}\",\"format\":1}}"
         )
         .expect("manifest write");
     }
 
-    eprintln!("blueprint_runner: cell A baseline (B={nb}, {iters} iters, 1×1 seeded runouts)");
+    eprintln!(
+        "blueprint_runner: B={nb}, {iters} iters, {nt}×{nr} seeded runouts, \
+         {} arm",
+        if gpu { "GPU-native" } else { "CPU" }
+    );
     let ranges: Vec<Vec<f32>> =
         (0..6).map(|_| vec![1.0 / N_CLASSES as f32; N_CLASSES]).collect();
     let ptable = PreflopChanceTable::new(6, ranges);
@@ -275,13 +389,30 @@ fn main() {
     let t_all = Instant::now();
     std::thread::scope(|s| {
         for _ in 0..threads.min(todo.len()) {
-            s.spawn(|| loop {
+            s.spawn(|| {
+                // One Metal context (own queue) per worker thread.
+                #[cfg(feature = "metal")]
+                let ctx: Option<MetalContext> =
+                    if gpu { Some(MetalContext::new().expect("Metal")) } else { None };
+                loop {
                 let k = next.fetch_add(1, Ordering::Relaxed);
                 if k >= todo.len() {
                     break;
                 }
                 let fi = todo[k];
-                match solve_and_bank(fi, canon[fi], &tree, nb, iters, &out_dir) {
+                match solve_and_bank(
+                    fi,
+                    canon[fi],
+                    &tree,
+                    nb,
+                    iters,
+                    nt,
+                    nr,
+                    &out_dir,
+                    &role,
+                    #[cfg(feature = "metal")]
+                    ctx.as_ref(),
+                ) {
                     Ok(secs) => {
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                         if d % 25 == 0 || d == todo.len() {
@@ -295,6 +426,7 @@ fn main() {
                         }
                     }
                     Err(e) => eprintln!("flop {fi} FAILED: {e}"),
+                }
                 }
             });
         }
