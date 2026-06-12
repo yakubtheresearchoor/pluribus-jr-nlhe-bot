@@ -520,7 +520,12 @@ struct BucketedBatchedParams {
     int starting_pot;
     float rake_rate;
     float rake_cap;
-    uint _pad;
+    // 0 = packed mode (hybrid path: reach rows packed per terminal,
+    // cfv packed per terminal); 1 = resident mode (G5 native: reach
+    // read from the walk's resident buffer by NODE id via
+    // node_ids_all[desc.node_off + lt], cfv written to the walk's
+    // resident buffer at the node row).
+    uint mode;
 };
 
 kernel void bucketed_terminal_collapsed_batched(
@@ -534,6 +539,7 @@ kernel void bucketed_terminal_collapsed_batched(
     const device ushort*   bucket_map        [[buffer(7)]],
     const device uchar*    hand_cards        [[buffer(8)]],
     device float*          cfv_packed        [[buffer(9)]],
+    const device uint*     node_ids_all      [[buffer(10)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]])
@@ -542,6 +548,7 @@ kernel void bucketed_terminal_collapsed_batched(
     const uint2 job = jobs[tgid];
     const BucketedWalkDesc desc = walks[job.x];
     const uint lt = job.y;
+    const uint node = node_ids_all[desc._pad0 + lt];  // _pad0 = zone node_off
     const uint np = params.np;
     const uint nh = params.nh;
     const uint nb = desc.nb;
@@ -565,7 +572,9 @@ kernel void bucketed_terminal_collapsed_batched(
         fn_tg[i] = tab[3 * nb * nb + i];
     }
     const device ushort* map = bucket_map + desc.map_off;
-    const device float* reach_term = reach_packed + desc.reach_off + ulong(lt) * np * nh;
+    const device float* reach_term = (params.mode == 1)
+        ? reach_packed + desc.reach_off + ulong(node) * np * nh
+        : reach_packed + desc.reach_off + ulong(lt) * np * nh;
     if (tid < num_opp) {
         uint oi = tid;
         uint p = (oi < trav) ? oi : oi + 1;
@@ -745,7 +754,9 @@ kernel void bucketed_terminal_collapsed_batched(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device float* out = cfv_packed + desc.cfv_off + ulong(lt) * nh;
+    device float* out = (params.mode == 1)
+        ? cfv_packed + desc.cfv_off + ulong(node) * nh
+        : cfv_packed + desc.cfv_off + ulong(lt) * nh;
     float nc = params.nc;
     for (uint h = tid; h < nh; h += tg_size) {
         ushort b = map[h];
@@ -759,4 +770,273 @@ kernel void bucketed_terminal_collapsed_batched(
         }
         out[h] = v;
     }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// G5: fully GPU-native bucketed iteration — walk kernels.
+// Bit-exactness design (the same argument as every prior port): each
+// output element is computed by exactly one thread, with inner loops
+// in the CPU's iteration order (actions ascending, hands ascending,
+// children ascending, outcomes ascending), so at singleton buckets the
+// computation graphs coincide with the CPU walk element-for-element.
+// ════════════════════════════════════════════════════════════════════
+
+struct NativeInfosetDesc {  // mirrors Rust InfosetDesc
+    uint base;
+    uint na;
+    uint owner;
+    uint node;
+};
+
+struct NativeBuDesc {  // mirrors Rust BuDesc
+    uint node;
+    uint kind;  // 0 player, 1 chance
+    uint na;
+    uint owner;
+    uint base;
+    uint child_off;
+};
+
+struct NativeReachEdge {  // mirrors Rust ReachEdge
+    uint parent;
+    uint child;
+    uint action;  // MAX = chance pass-through
+    uint owner;
+};
+
+struct NativeWalkParams {
+    uint count;      // items in this dispatch (descs / edges / rows)
+    uint np;
+    uint nh;
+    uint nb;         // zone bucket count
+    uint map_off;    // runout map offset for this walk's zone outcome
+    uint omega_off;  // runout omega offset
+    uint traverser;
+    float alpha_t;
+    float beta_t;
+    float gamma_t;
+    float regret_floor;
+    uint _pad;
+};
+
+// regret matching, one thread per (infoset desc, bucket column).
+kernel void bucketed_native_strategies(
+    const device float* regrets              [[buffer(0)]],
+    device float* strategy                   [[buffer(1)]],
+    const device NativeInfosetDesc* descs    [[buffer(2)]],
+    constant NativeWalkParams& p             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint di = gid / p.nb;
+    uint col = gid % p.nb;
+    if (di >= p.count) return;
+    NativeInfosetDesc d = descs[di];
+    float pos_sum = 0.0f;
+    for (uint a = 0; a < d.na; a++) {
+        float r = regrets[d.base + a * p.nb + col];
+        if (r > 1e-9f) pos_sum += r;   // REGRET_MATCH_EPS mirror
+    }
+    if (pos_sum > 0.0f) {
+        for (uint a = 0; a < d.na; a++) {
+            float r = regrets[d.base + a * p.nb + col];
+            strategy[d.base + a * p.nb + col] = (r > 1e-9f) ? r / pos_sum : 0.0f;
+        }
+    } else {
+        float uniform = 1.0f / float(d.na);
+        for (uint a = 0; a < d.na; a++) {
+            strategy[d.base + a * p.nb + col] = uniform;
+        }
+    }
+}
+
+kernel void bucketed_native_zero(
+    device float* buf       [[buffer(0)]],
+    constant uint& n        [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < n) buf[gid] = 0.0f;
+}
+
+// reach[p*nh + h] = initial_weights[p*nh + h] at the root (flop walk).
+kernel void bucketed_native_root_init(
+    device float* reach              [[buffer(0)]],
+    const device float* weights     [[buffer(1)]],
+    constant NativeWalkParams& p     [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.np * p.nh) return;
+    reach[gid] = weights[gid];
+}
+
+// Copy seed rows (all players) from the parent walk's reach buffer.
+kernel void bucketed_native_seed(
+    device float* dst                [[buffer(0)]],
+    const device float* src         [[buffer(1)]],
+    const device uint* rows          [[buffer(2)]],  // node ids
+    constant NativeWalkParams& p     [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint per_row = p.np * p.nh;
+    uint ri = gid / per_row;
+    uint k = gid % per_row;
+    if (ri >= p.count) return;
+    ulong base = ulong(rows[ri]) * per_row;
+    dst[base + k] = src[base + k];
+}
+
+// One reach level: thread per (edge, h); loops players in order.
+// child[p] = parent[p]; child[owner] = parent[owner] * sigma — the
+// CPU's copy-then-multiply collapses to one expression with the same
+// float value (x stored then x*sigma  ≡  x*sigma).
+kernel void bucketed_native_reach_level(
+    device float* reach                      [[buffer(0)]],
+    const device float* strategy             [[buffer(1)]],
+    const device uint* node_local_base       [[buffer(2)]],
+    const device ushort* bucket_map          [[buffer(3)]],
+    const device NativeReachEdge* edges      [[buffer(4)]],
+    constant NativeWalkParams& p             [[buffer(5)]],
+    constant uint& zone_outcome_base         [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint ei = gid / p.nh;
+    uint h = gid % p.nh;
+    if (ei >= p.count) return;
+    NativeReachEdge e = edges[ei];
+    ulong src = ulong(e.parent) * p.np * p.nh;
+    ulong dst = ulong(e.child) * p.np * p.nh;
+    if (e.action == 0xFFFFFFFFu) {
+        for (uint pl = 0; pl < p.np; pl++) {
+            reach[dst + pl * p.nh + h] = reach[src + pl * p.nh + h];
+        }
+        return;
+    }
+    const device ushort* map = bucket_map + p.map_off;
+    for (uint pl = 0; pl < p.np; pl++) {
+        float v = reach[src + pl * p.nh + h];
+        if (pl == e.owner) {
+            ushort b = map[h];
+            if (b == NO_BUCKET_GPU) {
+                v = 0.0f;  // CPU: NO_BUCKET hands zeroed at strategy step
+            } else {
+                v = v * strategy[zone_outcome_base + node_local_base[e.parent]
+                                 + e.action * p.nb + b];
+            }
+        }
+        reach[dst + pl * p.nh + h] = v;
+    }
+}
+
+// One bottom-up cfv level: thread per (bu desc, h). Player traverser:
+// sigma-weighted child sum; player other: plain child sum; chance:
+// child sum. Children ascending — the CPU's order.
+kernel void bucketed_native_cfv_level(
+    device float* cfv                        [[buffer(0)]],
+    const device float* strategy             [[buffer(1)]],
+    const device ushort* bucket_map          [[buffer(2)]],
+    const device NativeBuDesc* descs         [[buffer(3)]],
+    const device uint* children              [[buffer(4)]],
+    constant NativeWalkParams& p             [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint di = gid / p.nh;
+    uint h = gid % p.nh;
+    if (di >= p.count) return;
+    NativeBuDesc d = descs[di];
+    const device ushort* map = bucket_map + p.map_off;
+    float acc = 0.0f;
+    if (d.kind == 0 && d.owner == p.traverser) {
+        ushort b = map[h];
+        if (b != NO_BUCKET_GPU) {
+            for (uint a = 0; a < d.na; a++) {
+                uint child = children[d.child_off + a];
+                acc += strategy[d.base + a * p.nb + b] * cfv[ulong(child) * p.nh + h];
+            }
+        }
+    } else {
+        for (uint a = 0; a < d.na; a++) {
+            uint child = children[d.child_off + a];
+            acc += cfv[ulong(child) * p.nh + h];
+        }
+    }
+    cfv[ulong(d.node) * p.nh + h] = acc;
+}
+
+// Regret + cum update for traverser-owned infosets of one zone walk,
+// after all cfv levels: thread per (desc, action, bucket); member
+// hands summed h-ascending (the CPU's aggregation order).
+kernel void bucketed_native_regret_update(
+    const device float* cfv                  [[buffer(0)]],
+    device float* regrets                    [[buffer(1)]],
+    device float* cum                        [[buffer(2)]],
+    const device float* strategy             [[buffer(3)]],
+    const device ushort* bucket_map          [[buffer(4)]],
+    const device float* omegas               [[buffer(5)]],
+    const device NativeInfosetDesc* descs    [[buffer(6)]],
+    const device uint* children              [[buffer(7)]],
+    const device uint* node_child_off        [[buffer(8)]],
+    constant NativeWalkParams& p             [[buffer(9)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint per_desc = MAX_NA_POSTFLOP * p.nb;   // a-major slot grid
+    uint di = gid / per_desc;
+    uint rem = gid % per_desc;
+    uint a = rem / p.nb;
+    uint b = rem % p.nb;
+    if (di >= p.count) return;
+    NativeInfosetDesc d = descs[di];
+    if (d.owner != p.traverser) return;
+    if (a >= d.na) return;
+    const device ushort* map = bucket_map + p.map_off;
+    const device float* omega = omegas + p.omega_off;
+    uint child = children[node_child_off[d.node] + a];
+    const device float* cfv_child = cfv + ulong(child) * p.nh;
+    const device float* cfv_avg = cfv + ulong(d.node) * p.nh;
+    float inst = 0.0f;
+    for (uint h = 0; h < p.nh; h++) {
+        if (map[h] != b) continue;
+        inst += omega[h] * (cfv_child[h] - cfv_avg[h]);
+    }
+    uint ridx = d.base + a * p.nb + b;
+    float old_r = regrets[ridx];
+    float coef = old_r >= 0.0f ? p.alpha_t : p.beta_t;
+    float nr = coef * old_r + inst;
+    if (nr < p.regret_floor) nr = p.regret_floor;
+    regrets[ridx] = nr;
+    cum[ridx] = p.gamma_t * cum[ridx] + strategy[ridx];
+}
+
+// Cross-walk chance accumulation: dst[row, h] = sum over outcomes
+// (ascending — the CPU's loop order) of cp[o, h] * src_o[row, h].
+// src walk cfv buffers live in one mega buffer at walk_offs[o].
+kernel void bucketed_native_chance_accum(
+    device float* dst_cfv                    [[buffer(0)]],
+    const device float* cfv_mega             [[buffer(1)]],
+    const device uint* walk_offs             [[buffer(2)]],  // float offsets
+    const device float* cp                   [[buffer(3)]],  // [o*nh + h]
+    const device uint* rows                  [[buffer(4)]],  // child node ids
+    constant NativeWalkParams& p             [[buffer(5)]],
+    constant uint& n_outcomes                [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint ri = gid / p.nh;
+    uint h = gid % p.nh;
+    if (ri >= p.count) return;
+    ulong row = ulong(rows[ri]) * p.nh + h;
+    float acc = 0.0f;
+    for (uint o = 0; o < n_outcomes; o++) {
+        acc += cp[o * p.nh + h] * cfv_mega[walk_offs[o] + row];
+    }
+    dst_cfv[row] = acc;
+}
+
+// Root cfv accumulation across iterations (traverser 0): one thread
+// per h, dst += flop_cfv[root, h].
+kernel void bucketed_native_root_accum(
+    device float* dst                        [[buffer(0)]],
+    const device float* flop_cfv             [[buffer(1)]],
+    constant uint& nh                        [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= nh) return;
+    dst[gid] += flop_cfv[gid];
 }

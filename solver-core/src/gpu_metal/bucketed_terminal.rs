@@ -77,7 +77,8 @@ struct BatchedParamsGpu {
     starting_pot: i32,
     rake_rate: f32,
     rake_cap: f32,
-    _pad: u32,
+    /// 0 = packed (hybrid), 1 = resident (G5 native).
+    mode: u32,
 }
 
 /// Walk identity for the batched cache.
@@ -130,6 +131,8 @@ pub struct BucketedTerminalGpu {
     folds_all: Buffer,
     zone_contrib_off: [u32; 3], // int offset per zone (flop, turn, river)
     zone_fold_off: [u32; 3],
+    node_ids_all: Buffer,
+    zone_nodeid_off: [u32; 3],
     /// Per-walk packed terminal cfv, filled by `fill_walks`, drained by
     /// `fill_terminals` (cache-first).
     cache: HashMap<(u8, usize, usize, u8), Vec<f32>>,
@@ -286,6 +289,15 @@ impl BucketedTerminalGpu {
         }
         let contribs_all = buf_from(ctx, &contribs_cat);
         let folds_all = buf_from(ctx, &folds_cat);
+        // Concatenated zone node ids (resident-mode terminal indexing);
+        // zone offsets parallel zone_fold_off (per-terminal grain).
+        let mut node_ids_cat: Vec<u32> = Vec::new();
+        let mut zone_nodeid_off = [0u32; 3];
+        for (zi, ids) in [&f_ids, &t_ids, &r_ids].iter().enumerate() {
+            zone_nodeid_off[zi] = node_ids_cat.len() as u32;
+            node_ids_cat.extend_from_slice(ids);
+        }
+        let node_ids_all = buf_from(ctx, &node_ids_cat);
 
         let reach_buf = ctx.device().new_buffer(
             (nn * np * nh * 4) as u64,
@@ -330,6 +342,8 @@ impl BucketedTerminalGpu {
             folds_all,
             zone_contrib_off,
             zone_fold_off,
+            node_ids_all,
+            zone_nodeid_off,
             cache: HashMap::new(),
         })
     }
@@ -546,7 +560,7 @@ impl BucketedTerminalGpu {
                 board1,
                 nb: nb_zone as u32,
                 stripes: stripes_zone,
-                _pad0: 0,
+                _pad0: self.zone_nodeid_off[zi], // node_off (resident mode)
                 _pad1: 0,
             });
             for lt in 0..ids.len() {
@@ -569,7 +583,7 @@ impl BucketedTerminalGpu {
             starting_pot: self.starting_pot,
             rake_rate: self.rake_rate,
             rake_cap: self.rake_cap,
-            _pad: 0,
+            mode: 0,
         };
 
         // Per-call buffers (job/desc small; reach the big one).
@@ -635,6 +649,7 @@ impl BucketedTerminalGpu {
         enc.set_buffer(7, Some(&self.maps), 0);
         enc.set_buffer(8, Some(&self.hand_cards), 0);
         enc.set_buffer(9, Some(&cfv_pk_buf), 0);
+        enc.set_buffer(10, Some(&self.node_ids_all), 0);
         enc.dispatch_thread_groups(
             MTLSize { width: jobs.len() as u64, height: 1, depth: 1 },
             MTLSize { width: 32, height: 1, depth: 1 },

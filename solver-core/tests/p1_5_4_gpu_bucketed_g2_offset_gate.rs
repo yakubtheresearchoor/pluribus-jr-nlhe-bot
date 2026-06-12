@@ -401,3 +401,59 @@ fn gpu_native_plan_gate_divergent_dims() {
         eprintln!("native plan gate: {zname} {n_edges} edges, single-writer ✓");
     }
 }
+
+/// G5 plan gate part 2: bottom-up descriptors + children flat array.
+#[test]
+fn gpu_native_plan_bu_gate() {
+    let tree = build_gate_tree();
+    let game = FlopStartGame::new(build_table());
+    let (fm, tm, rm) = quantile_maps_divergent(game.table());
+    let bk = FlopBucketing::from_maps(game.table(), NB_F, NB_T, NB_R, fm, tm, rm);
+    let solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
+    let layout = solver.gpu_layout(&bk);
+    let plan = solver.native_plan(&tree, &bk);
+
+    // children_flat round-trip: every BuDesc's (child_off, na) slice
+    // equals tree.node_children(node).
+    let mut n_bu = 0usize;
+    let check = |descs: &Vec<solver_core::solver::bucketed_flop_cfr::BuDesc>,
+                 ti: Option<usize>,
+                 ri: Option<usize>,
+                 n_bu: &mut usize| {
+        for d in descs {
+            let kids = tree.node_children(d.node as usize);
+            assert_eq!(d.na as usize, kids.len());
+            let off = d.child_off as usize;
+            assert_eq!(&plan.children_flat[off..off + kids.len()], kids);
+            let node = &tree.nodes[d.node as usize];
+            assert!(!node.is_terminal());
+            if d.kind == 0 {
+                assert!(node.is_player());
+                assert_eq!(
+                    d.base as usize,
+                    layout.flat_index(d.node as usize, ti, ri, 0, 0)
+                );
+            } else {
+                assert!(node.is_chance());
+                assert_eq!(d.base, u32::MAX);
+            }
+            *n_bu += 1;
+        }
+    };
+    for lv in &plan.flop_bu {
+        check(lv, None, None, &mut n_bu);
+    }
+    let max_river = plan.river_bu.len() / plan.turn_bu.len();
+    for (ti, levels) in plan.turn_bu.iter().enumerate() {
+        for lv in levels {
+            check(lv, Some(ti), None, &mut n_bu);
+        }
+    }
+    for (oi, levels) in plan.river_bu.iter().enumerate() {
+        let (ti, ri) = (oi / max_river, oi % max_river);
+        for lv in levels {
+            check(lv, Some(ti), Some(ri), &mut n_bu);
+        }
+    }
+    eprintln!("native plan BU gate: {n_bu} descriptors verified (children, bases, kinds)");
+}

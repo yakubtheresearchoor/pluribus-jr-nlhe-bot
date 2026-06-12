@@ -403,6 +403,23 @@ pub struct ReachEdge {
     pub owner: u32,
 }
 
+/// One bottom-up node instance at a concrete (zone, outcome): player
+/// (kind 0, with absolute strategy base) or chance (kind 1).
+/// Terminals are the terminal kernel's job, not the walk's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BuDesc {
+    pub node: u32,
+    /// 0 = player, 1 = chance.
+    pub kind: u32,
+    pub na: u32,
+    pub owner: u32,
+    /// Absolute float base into the bucket-granular buffers (player
+    /// nodes; u32::MAX for chance / UNUSED).
+    pub base: u32,
+    /// Offset into the flat children array.
+    pub child_off: u32,
+}
+
 /// The full GPU-native iteration plan.
 pub struct NativePlan {
     /// Walk list in run()'s order: rivers (ti-major, ri-minor), then
@@ -424,6 +441,14 @@ pub struct NativePlan {
     /// the parent walk's buffer).
     pub turn_seed_nodes: Vec<u32>,
     pub river_seed_nodes: Vec<u32>,
+    /// Flat children array (tree.node_children concatenated, node order).
+    pub children_flat: Vec<u32>,
+    /// Per (zone, outcome, level): bottom-up node descriptors in the
+    /// CPU walk's order (zone_node_ids levels, node order within level).
+    /// Outcome flattening as for *_infosets.
+    pub flop_bu: Vec<Vec<BuDesc>>,
+    pub turn_bu: Vec<Vec<Vec<BuDesc>>>,
+    pub river_bu: Vec<Vec<Vec<BuDesc>>>,
 }
 
 /// The bucketed walk. Field-by-field mirror of `FlopStartVectorCfr`
@@ -754,6 +779,71 @@ impl BucketedFlopCfr {
             levels
         };
 
+        // Flat children + per-node offsets.
+        let mut children_flat: Vec<u32> = Vec::new();
+        let mut child_off = vec![u32::MAX; nn];
+        for idx in 0..nn {
+            child_off[idx] = children_flat.len() as u32;
+            children_flat.extend_from_slice(tree.node_children(idx));
+        }
+
+        // Bottom-up descriptors per (zone, outcome, level), in the CPU
+        // walk's iteration order (zone_node_ids per level, terminals
+        // excluded — they're the terminal kernel's job).
+        let bu_for = |zone: Zone, ti: Option<usize>, ri: Option<usize>| -> Vec<Vec<BuDesc>> {
+            let zone_nodes = match zone {
+                Zone::Flop => &self.flop_zone_nodes,
+                Zone::Turn => &self.turn_zone_nodes,
+                Zone::River => &self.river_zone_nodes,
+                Zone::Preflop => unreachable!(),
+            };
+            let mut levels = Vec::with_capacity(max_depth + 1);
+            for lv in zone_nodes.iter() {
+                let mut descs = Vec::new();
+                for &nid in lv {
+                    let idx = nid as usize;
+                    let node = &tree.nodes[idx];
+                    if node.is_terminal() {
+                        continue;
+                    }
+                    if node.is_chance() {
+                        descs.push(BuDesc {
+                            node: nid,
+                            kind: 1,
+                            na: node.num_children as u32,
+                            owner: u32::MAX,
+                            base: u32::MAX,
+                            child_off: child_off[idx],
+                        });
+                    } else {
+                        descs.push(BuDesc {
+                            node: nid,
+                            kind: 0,
+                            na: node.num_children as u32,
+                            owner: node.player_id as u32,
+                            base: layout.flat_index(idx, ti, ri, 0, 0) as u32,
+                            child_off: child_off[idx],
+                        });
+                    }
+                }
+                levels.push(descs);
+            }
+            levels
+        };
+        let flop_bu = bu_for(Zone::Flop, None, None);
+        let turn_bu: Vec<Vec<Vec<BuDesc>>> =
+            (0..n_turn).map(|ti| bu_for(Zone::Turn, Some(ti), None)).collect();
+        let river_bu: Vec<Vec<Vec<BuDesc>>> = (0..n_turn)
+            .flat_map(|ti| (0..self.max_n_river).map(move |ri| (ti, ri)))
+            .map(|(ti, ri)| {
+                if ri < bk.river_map[ti].len() {
+                    bu_for(Zone::River, Some(ti), Some(ri))
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+
         NativePlan {
             walks,
             reach_floats_per_walk: nn * np * nh,
@@ -765,6 +855,10 @@ impl BucketedFlopCfr {
             river_edges: edges_for(Zone::River),
             turn_seed_nodes: self.turn_chance_children.clone(),
             river_seed_nodes: self.river_chance_children.clone(),
+            children_flat,
+            flop_bu,
+            turn_bu,
+            river_bu,
         }
     }
 
