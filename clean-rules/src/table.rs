@@ -336,7 +336,6 @@ impl HandState {
     pub fn settle(&self) -> Settlement {
         assert!(self.is_over(), "settle before hand over");
         let np = self.np();
-        let mut net: Vec<i64> = (0..np).map(|p| -(self.total_commit[p] as i64)).collect();
 
         // Showdown ranks for live players (the cross-check surface).
         let live: Vec<usize> = (0..np).filter(|&p| !self.folded[p]).collect();
@@ -357,12 +356,62 @@ impl HandState {
             })
             .collect();
 
+        let rake_spec = if self.flop_seen {
+            (self.cfg.rake_milli, self.cfg.rake_cap)
+        } else {
+            (0, 0)
+        };
+        let net = settle_pots(&self.total_commit, &self.folded, &ranks, self.button, rake_spec);
+        Settlement { net, rake: rake_of(&self.total_commit, &self.folded, rake_spec), showdown_ranks }
+
+    }
+}
+
+
+/// Rake actually taken under (milli, cap) on the main pot (after the
+/// uncalled refund). Pass (0, 0) when no flop was seen.
+pub fn rake_of(total_commit: &[u32], folded: &[bool], rake_spec: (u32, u32)) -> u32 {
+    let np = total_commit.len();
+    let mut commit: Vec<u32> = total_commit.to_vec();
+    let mut idx: Vec<usize> = (0..np).collect();
+    idx.sort_unstable_by_key(|&p| std::cmp::Reverse(commit[p]));
+    if commit[idx[0]] > commit[idx[1]] {
+        commit[idx[0]] = commit[idx[1]];
+    }
+    let _ = folded;
+    let mut levels: Vec<u32> = commit.iter().copied().filter(|&c| c > 0).collect();
+    levels.sort_unstable();
+    levels.dedup();
+    let total_pot: u32 = commit.iter().sum();
+    let main_level = levels.first().copied().unwrap_or(0);
+    let main_pot: u32 =
+        commit.iter().map(|&c| c.min(main_level)).sum::<u32>().min(total_pot);
+    ((main_pot as u64 * rake_spec.0 as u64 / 1000) as u32).min(rake_spec.1)
+}
+
+/// THE pot-settlement function: clean-room layered side pots with
+/// uncalled refund, rake on the main pot, ties split (odd chips to
+/// the earliest eligible seat left of the button). `ranks[p]` is the
+/// showdown strength of live players (any consistent value when a
+/// player wins uncontested). Returns net chip delta per seat;
+/// CONSERVATION (Σ net = −rake) is asserted — an always-on invariant
+/// the harness inherits for every settled hand.
+pub fn settle_pots(
+    total_commit: &[u32],
+    folded: &[bool],
+    ranks: &[Option<u32>],
+    button: usize,
+    rake_spec: (u32, u32),
+) -> Vec<i64> {
+    let np = total_commit.len();
+    let mut net: Vec<i64> = (0..np).map(|p| -(total_commit[p] as i64)).collect();
+    let rake = rake_of(total_commit, folded, rake_spec);
         // Uncalled-bet refund (live rule): the strict-largest total
         // commitment refunds down to the second-largest before pots
         // form. (A folded player can never hold the strict max: you
         // only fold facing a commitment at least your own.) All other
         // folded money stays in the pot.
-        let mut commit: Vec<u32> = self.total_commit.clone();
+        let mut commit: Vec<u32> = total_commit.to_vec();
         {
             let mut idx: Vec<usize> = (0..np).collect();
             idx.sort_unstable_by_key(|&p| std::cmp::Reverse(commit[p]));
@@ -379,19 +428,7 @@ impl HandState {
         let mut levels: Vec<u32> = commit.iter().copied().filter(|&c| c > 0).collect();
         levels.sort_unstable();
         levels.dedup();
-        let mut rake_left = if self.flop_seen {
-            let total_pot: u32 = commit.iter().sum();
-            let main_level = levels.first().copied().unwrap_or(0);
-            let main_pot: u32 = commit
-                .iter()
-                .map(|&c| c.min(main_level))
-                .sum::<u32>()
-                .min(total_pot);
-            ((main_pot as u64 * self.cfg.rake_milli as u64 / 1000) as u32).min(self.cfg.rake_cap)
-        } else {
-            0
-        };
-        let rake = rake_left;
+        let mut rake_left = rake;
 
         let mut prev = 0u32;
         for &lev in &levels {
@@ -406,7 +443,7 @@ impl HandState {
             // Eligible: not folded and committed to this level. After
             // the refund, every layer has at least one live claimant.
             let elig: Vec<usize> = (0..np)
-                .filter(|&p| !self.folded[p] && commit[p] >= lev)
+                .filter(|&p| !folded[p] && commit[p] >= lev)
                 .collect();
             assert!(!elig.is_empty(), "pot layer with no eligible live player");
             let best = elig.iter().map(|&p| ranks[p].unwrap()).max().unwrap();
@@ -416,7 +453,7 @@ impl HandState {
             let mut odd = pot - share * winners.len() as u64;
             // Odd chips: earliest winner left of the button.
             let mut order: Vec<usize> = winners.clone();
-            order.sort_by_key(|&p| (p + np - (self.button + 1) % np) % np);
+            order.sort_by_key(|&p| (p + np - (button + 1) % np) % np);
             for w in order {
                 let extra = if odd > 0 { 1 } else { 0 };
                 odd -= extra;
@@ -432,8 +469,10 @@ impl HandState {
             -(rake as i64),
             "money conservation violated: Σnet {total} rake {rake}"
         );
-        Settlement { net, rake, showdown_ranks }
-    }
+
+    let total: i64 = net.iter().sum();
+    assert_eq!(total, -(rake as i64), "money conservation violated");
+    net
 }
 
 #[cfg(test)]

@@ -1,0 +1,218 @@
+//! Duplicate-play match core (H3 slice 2): blueprint agents walk the
+//! oracle tree (the tree IS the state machine); chance nodes deal
+//! turn/river in AUDIT mode (from the blueprint's sampled runout set,
+//! excluding cards held by any player — the exact game the solver
+//! solved); terminals settle through clean-rules (`settle_pots` +
+//! `best5` — never solver code). Per-hand conservation is asserted
+//! inside settle_pots.
+
+use crate::blueprint::Blueprint;
+use clean_rules::eval::best5;
+use clean_rules::table::settle_pots;
+use solver_core::solver::bucketed_flop_cfr::BucketedFlopCfr;
+use solver_core::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
+use std::collections::HashMap;
+
+pub fn splitmix64(x: &mut u64) -> u64 {
+    *x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// A seat's policy.
+pub enum Policy<'a> {
+    /// Play the blueprint's normalized average strategy.
+    Blueprint(&'a Blueprint),
+    /// Check when possible, fold to any bet (the exact-EV anchor).
+    CheckFold,
+    /// First action always (bet/leading line where available).
+    AlwaysFirst,
+}
+
+pub struct MatchEnv<'a> {
+    pub bp: &'a Blueprint, // defines the game (flop, runouts, maps)
+    pub tree: &'a FlatTree,
+    pub idx: BucketedFlopCfr,
+    /// (c1, c2) → hand index in the table's universe.
+    pub hand_of: HashMap<(u8, u8), usize>,
+}
+
+impl<'a> MatchEnv<'a> {
+    pub fn new(bp: &'a Blueprint, tree: &'a FlatTree) -> Self {
+        let idx = bp.indexer(tree);
+        let hc = &bp.game.table().hand_cards;
+        let mut hand_of = HashMap::new();
+        for h in 0..bp.nh {
+            let (a, b) = (hc[h * 2], hc[h * 2 + 1]);
+            hand_of.insert((a.min(b), a.max(b)), h);
+        }
+        MatchEnv { bp, tree, idx, hand_of }
+    }
+
+    /// Normalized average-strategy distribution at (node, street ctx,
+    /// hand) — uniform where no cum mass (the solver's own fallback).
+    fn strategy(
+        &self,
+        node: usize,
+        ti: Option<usize>,
+        ri: Option<usize>,
+        h: usize,
+        out: &mut [f32],
+    ) {
+        let na = self.tree.nodes[node].num_children as usize;
+        let nb = self.bp.nb;
+        let bp = self.bp;
+        let (cum, base, b): (&[f32], usize, u16) = if let Some(ri) = ri {
+            let ti = ti.unwrap();
+            let local = self.idx.river_local_offset_at(node).expect("river infoset");
+            (
+                &bp.cum_river,
+                (ti * self.idx.max_river_outcomes() + ri) * self.idx.river_stride()
+                    + local * MAX_NA_POSTFLOP * nb,
+                bp.bk.river_map[ti][ri][h],
+            )
+        } else if let Some(ti) = ti {
+            let local = self.idx.turn_local_offset_at(node).expect("turn infoset");
+            (
+                &bp.cum_turn,
+                ti * self.idx.turn_stride() + local * MAX_NA_POSTFLOP * nb,
+                bp.bk.turn_map[ti][h],
+            )
+        } else {
+            let local = self.idx.flop_local_offset_at(node).expect("flop infoset");
+            (&bp.cum_flop, local * MAX_NA_POSTFLOP * nb, bp.bk.flop_map[h])
+        };
+        let uniform = 1.0 / na as f32;
+        if b == u16::MAX {
+            out[..na].fill(uniform);
+            return;
+        }
+        let mut sum = 0.0f32;
+        for a in 0..na {
+            let v = cum[base + a * nb + b as usize].max(0.0);
+            out[a] = v;
+            sum += v;
+        }
+        if sum > 0.0 {
+            for v in out[..na].iter_mut() {
+                *v /= sum;
+            }
+        } else {
+            out[..na].fill(uniform);
+        }
+    }
+
+    /// Play ONE hand in AUDIT mode with the given per-seat policies
+    /// and dealt hole cards; returns net chips per seat (ante 2 each
+    /// included). `rng` drives action sampling and runout draws.
+    /// Returns None when the dealt hands block every sampled runout
+    /// (audit mode rejection-samples such deals).
+    pub fn play_hand(&self, policies: &[Policy], holes: &[[u8; 2]; 6], rng: &mut u64) -> Option<Vec<i64>> {
+        let blocked = |c: u8| holes.iter().any(|h| h[0] == c || h[1] == c);
+        let mut node = 0usize;
+        let (mut ti, mut ri): (Option<usize>, Option<usize>) = (None, None);
+        let mut board: Vec<u8> = self.bp.flop.to_vec();
+        let mut buf = [0f32; MAX_NA_POSTFLOP];
+        loop {
+            let n = &self.tree.nodes[node];
+            if n.is_terminal() {
+                break;
+            }
+            if n.is_chance() {
+                // AUDIT mode: draw uniformly from the sampled runouts
+                // that don't collide with any dealt hand.
+                if ti.is_none() {
+                    let opts: Vec<usize> = (0..self.bp.turns.len())
+                        .filter(|&t| !blocked(self.bp.turns[t]))
+                        .collect();
+                    if opts.is_empty() {
+                        return None;
+                    }
+                    let t = opts[(splitmix64(rng) % opts.len() as u64) as usize];
+                    ti = Some(t);
+                    board.push(self.bp.turns[t]);
+                } else {
+                    let t = ti.unwrap();
+                    let opts: Vec<usize> = (0..self.bp.rivers[t].len())
+                        .filter(|&r| !blocked(self.bp.rivers[t][r]))
+                        .collect();
+                    if opts.is_empty() {
+                        return None;
+                    }
+                    let r = opts[(splitmix64(rng) % opts.len() as u64) as usize];
+                    ri = Some(r);
+                    board.push(self.bp.rivers[t][r]);
+                }
+                node = self.tree.node_children(node)[0] as usize;
+                continue;
+            }
+            // Player node.
+            let p = n.player_id as usize;
+            let na = n.num_children as usize;
+            let a = match &policies[p] {
+                // Child ordering pinned by tree trace + the exact
+                // anchor test: child 0 = aggressive (bet / call),
+                // LAST child = passive (check / fold).
+                Policy::AlwaysFirst => 0,
+                Policy::CheckFold => na - 1,
+                Policy::Blueprint(_) => {
+                    let hkey = {
+                        let h = holes[p];
+                        (h[0].min(h[1]), h[0].max(h[1]))
+                    };
+                    let h = *self.hand_of.get(&hkey).expect("hand in universe");
+                    self.strategy(node, ti, ri, h, &mut buf);
+                    let mut x = (splitmix64(rng) % 1_000_000) as f32 / 1_000_000.0;
+                    let mut pick = na - 1;
+                    for (i, &v) in buf[..na].iter().enumerate() {
+                        if x < v {
+                            pick = i;
+                            break;
+                        }
+                        x -= v;
+                    }
+                    pick
+                }
+            };
+            node = self.tree.node_children(node)[a] as usize;
+        }
+        // Terminal: settle through clean-rules.
+        let fold_mask = self.tree.get_folded_mask(node);
+        let folded: Vec<bool> = (0..6).map(|p| fold_mask & (1 << p) != 0).collect();
+        let commits: Vec<u32> =
+            (0..6).map(|p| 2 + self.tree.get_contribution(node, p as u8) as u32).collect();
+        let live = folded.iter().filter(|&&f| !f).count();
+        let ranks: Vec<Option<u32>> = (0..6)
+            .map(|p| {
+                if folded[p] {
+                    None
+                } else if live == 1 {
+                    Some(0)
+                } else {
+                    let mut cards = holes[p].to_vec();
+                    cards.extend_from_slice(&board);
+                    Some(best5(&cards).0)
+                }
+            })
+            .collect();
+        Some(settle_pots(&commits, &folded, &ranks, 0, (0, 0)))
+    }
+
+    /// Deal hole cards from the deck minus the flop (seeded).
+    pub fn deal_holes(&self, rng: &mut u64) -> [[u8; 2]; 6] {
+        let fm: u64 =
+            self.bp.flop.iter().fold(0u64, |m, &c| m | (1u64 << c));
+        let mut pool: Vec<u8> = (0..52u8).filter(|&c| fm & (1u64 << c) == 0).collect();
+        for i in (1..pool.len()).rev() {
+            let j = (splitmix64(rng) % (i as u64 + 1)) as usize;
+            pool.swap(i, j);
+        }
+        let mut holes = [[0u8; 2]; 6];
+        for p in 0..6 {
+            holes[p] = [pool[2 * p], pool[2 * p + 1]];
+        }
+        holes
+    }
+}

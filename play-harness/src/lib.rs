@@ -39,4 +39,5 @@
 //! test; nothing else may convert ad hoc.
 
 pub mod blueprint;
+pub mod match_play;
 pub mod convert;
