@@ -139,7 +139,14 @@ pub struct BucketedNativeGpu {
     /// Regrets always encode inline per walk here (the walk's cfv rows
     /// are overwritten by the next outcome).
     shared_mode: bool,
-    acc_buf: Buffer,
+    /// Per-ti river chance accumulator (Σ_ri cp·river_cfv at the river
+    /// chance-children rows). MUST be separate from `acc_turn`: the
+    /// turn accumulation spans the whole ti loop while river
+    /// accumulation runs inside each ti — one shared buffer overlapped
+    /// them (the at-size live-6 parity failure, drift ~1.0).
+    acc_river: Buffer,
+    /// Cross-ti turn chance accumulator (Σ_ti cp·turn_cfv).
+    acc_turn: Buffer,
 
     // ── Plan-derived (uploaded once) ──
     descs_buf: Buffer,
@@ -482,7 +489,8 @@ impl BucketedNativeGpu {
             },
             root_cfv: zeros_buf(ctx, nh, "root_cfv")?,
             shared_mode,
-            acc_buf: zeros_buf(ctx, ts_count.max(rs_count) * nh, "acc")?,
+            acc_river: zeros_buf(ctx, rs_count.max(1) * nh, "acc_river")?,
+            acc_turn: zeros_buf(ctx, ts_count.max(1) * nh, "acc_turn")?,
             descs_buf,
             flop_desc,
             turn_desc_all,
@@ -884,7 +892,7 @@ impl BucketedNativeGpu {
                 let p = self.wparams(self.rs_count, self.nb_turn, 0, traverser, d);
                 let cp_byte = ((self.cp_river_off[ti] + ri * self.nh) * 4) as u64;
                 self.dispatch(&cmd, &self.p_accum_step, self.rs_count * self.nh, |enc| {
-                    enc.set_buffer(0, Some(&self.acc_buf), 0);
+                    enc.set_buffer(0, Some(&self.acc_river), 0);
                     enc.set_buffer(1, Some(&self.cfv_mega), 0);
                     enc.set_buffer(2, Some(&self.cp_river_buf), cp_byte);
                     enc.set_buffer(3, Some(&self.river_seed_buf), 0);
@@ -895,7 +903,7 @@ impl BucketedNativeGpu {
             let p = self.wparams(self.rs_count, self.nb_turn, 0, traverser, d);
             self.dispatch(&cmd, &self.p_publish, self.rs_count * self.nh, |enc| {
                 enc.set_buffer(0, Some(&self.cfv_mega), 0);
-                enc.set_buffer(1, Some(&self.acc_buf), 0);
+                enc.set_buffer(1, Some(&self.acc_river), 0);
                 enc.set_buffer(2, Some(&self.river_seed_buf), 0);
                 Self::set_params(enc, 3, &p);
             });
@@ -904,7 +912,7 @@ impl BucketedNativeGpu {
             let p = self.wparams(self.ts_count, self.nb_flop, 0, traverser, d);
             let cp_byte = ((ti * self.nh) * 4) as u64;
             self.dispatch(&cmd, &self.p_accum_step, self.ts_count * self.nh, |enc| {
-                enc.set_buffer(0, Some(&self.acc_buf), 0);
+                enc.set_buffer(0, Some(&self.acc_turn), 0);
                 enc.set_buffer(1, Some(&self.cfv_mega), 0);
                 enc.set_buffer(2, Some(&self.cp_turn_buf), cp_byte);
                 enc.set_buffer(3, Some(&self.turn_seed_buf), 0);
@@ -915,7 +923,7 @@ impl BucketedNativeGpu {
         let p = self.wparams(self.ts_count, self.nb_flop, 0, traverser, d);
         self.dispatch(&cmd, &self.p_publish, self.ts_count * self.nh, |enc| {
             enc.set_buffer(0, Some(&self.cfv_mega), 0);
-            enc.set_buffer(1, Some(&self.acc_buf), 0);
+            enc.set_buffer(1, Some(&self.acc_turn), 0);
             enc.set_buffer(2, Some(&self.turn_seed_buf), 0);
             Self::set_params(enc, 3, &p);
         });
