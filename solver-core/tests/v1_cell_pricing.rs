@@ -78,6 +78,97 @@ fn build_table(np: u8) -> FlopChanceTable {
     FlopChanceTable::build_full_nh_sampled(flop, np, &turn_cards, &river_decks)
 }
 
+/// HYBRID pricing (CPU walk + GPU striped terminals) for the live-6
+/// monster cells — the fallback price while the NATIVE path's SIGSEGV
+/// on ≥45k-node trees is open (see v1_cell_pricing_gpu header).
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "v1 hybrid pricing for live-6; run with --ignored --nocapture --release --features metal"]
+fn v1_cell_pricing_hybrid_live6() {
+    use solver_core::gpu_metal::bucketed_terminal::BucketedTerminalGpu;
+    use solver_core::gpu_metal::context::MetalContext;
+    let ctx = MetalContext::new().expect("Metal");
+    let spec = production_game_v1();
+    let flop_bets =
+        BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    const NB: usize = 8;
+    for &(live, commit, pot, label) in
+        &[(6u8, 2i32, 12i32, "6-way limp"), (6, 7, 42, "6-way raised (largest)")]
+    {
+        let cfg = spec.flop_seam_config(live, commit, pot, flop_bets.clone());
+        let tree = build_tree(&cfg).expect("seam tree");
+        let table = build_table(live);
+        let (fm, tm, rm) = quantile_maps(&table, NB);
+        let game = FlopStartGame::new(table);
+        let bk = FlopBucketing::from_maps(game.table(), NB, NB, NB, fm, tm, rm);
+        let mut solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
+        solver.set_terminal_design(TerminalDesign::Design1Collapsed);
+        let term =
+            BucketedTerminalGpu::new(&ctx, &tree, game.table(), &bk, &solver, (32 / NB) as u32)
+                .expect("gpu terminal");
+        solver.set_terminal_offload_hook(Some(term.into_hook()));
+        let t0 = Instant::now();
+        let _root = solver.run(&tree, &game, &bk, 2);
+        let per_iter = t0.elapsed().as_secs_f64() / 2.0;
+        eprintln!(
+            "HYBRID live {live} commit {commit:>3} pot {pot:>4} ({label}): {} nodes, \
+             {per_iter:.3}s/iter | 34 × 1755 ≈ {:.1}h/cell-row",
+            tree.nodes.len(),
+            per_iter * 34.0 * 1755.0 / 3600.0
+        );
+    }
+}
+
+/// GPU-native pricing for the monster cells (live ≥ 4 limp/raised
+/// families — the only families where CPU s/iter is prohibitive).
+/// KNOWN-OPEN (2026-06-12): SIGSEGV on the live-6 cells (45k+ node
+/// trees) — the native orchestrator was built and gated on the 1.4k-
+/// node oracle shape; some capacity assumption breaks at this scale.
+/// live-4/5 prices measured fine (0.100 / 1.006 s/iter).
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "v1 GPU cell pricing; run with --ignored --nocapture --release --features metal"]
+fn v1_cell_pricing_gpu() {
+    use solver_core::gpu_metal::bucketed_native::BucketedNativeGpu;
+    use solver_core::gpu_metal::context::MetalContext;
+    let ctx = MetalContext::new().expect("Metal");
+    let spec = production_game_v1();
+    let flop_bets =
+        BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    const NB: usize = 8;
+    let cells: &[(u8, i32, i32, &str)] = &[
+        (4, 7, 29, "4-way raised"),
+        (5, 2, 10, "5-way limp"),
+        (6, 2, 12, "6-way limp"),
+        (6, 7, 42, "6-way raised (largest)"),
+    ];
+    eprintln!("\n════ v1 GPU cell pricing: native, quantile B={NB}, 4×4 runouts ════");
+    for &(live, commit, pot, label) in cells {
+        let cfg = spec.flop_seam_config(live, commit, pot, flop_bets.clone());
+        let tree = build_tree(&cfg).expect("seam tree");
+        let table = build_table(live);
+        let (fm, tm, rm) = quantile_maps(&table, NB);
+        let game = FlopStartGame::new(table);
+        let bk = FlopBucketing::from_maps(game.table(), NB, NB, NB, fm, tm, rm);
+        let mut solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
+        solver.set_terminal_design(TerminalDesign::Design1Collapsed);
+        let mut native =
+            BucketedNativeGpu::new(&ctx, &tree, game.table(), &bk, &solver, (32 / NB) as u32)
+                .expect("native gpu");
+        native.run(1); // warm
+        let t0 = Instant::now();
+        native.run(3);
+        let per_iter = t0.elapsed().as_secs_f64() / 3.0;
+        eprintln!(
+            "GPU live {live} commit {commit:>3} pot {pot:>4} ({label}): {} nodes, \
+             {per_iter:.3}s/iter | 34 × 1755 ≈ {:.1}h/cell-row",
+            tree.nodes.len(),
+            per_iter * 34.0 * 1755.0 / 3600.0
+        );
+        let _ = game;
+    }
+}
+
 #[test]
 #[ignore = "v1 cell pricing (CPU, minutes); run with --ignored --nocapture --release"]
 fn v1_cell_pricing_cpu() {
@@ -85,12 +176,19 @@ fn v1_cell_pricing_cpu() {
     let flop_bets =
         BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
     const NB: usize = 8;
-    const ITERS: u32 = 5;
+    const ITERS: u32 = 2;
 
-    // (live, commit, pot, label)
+    // (live, commit, pot, label).
+    //
+    // LIVE-3 EXACT IS EXCLUDED — measured finding 2026-06-12: the
+    // first probe run spent 95+ minutes inside ONE live-3 exact cell
+    // (sampled hot stack: 100% side_pot_showdown_cfv_with_rake) at
+    // production nh=1176. Exact multiway terminals are combinatorial
+    // in nh — the very reason bucketing exists. The bucketed terminal
+    // np ≥ 4 scope must be extended to np = 3 before live-3 cells can
+    // be priced (or solved) at production fidelity.
     let cells: &[(u8, i32, i32, &str)] = &[
         (2, 7, 15, "HU single-raised (open 3.5bb, sb dead)"),
-        (3, 7, 29, "3-way single-raised + dead"),
         (2, 24, 49, "HU 3-bet pot"),
         (4, 7, 29, "4-way raised"),
         (5, 2, 10, "5-way limp (worst live-5 shape)"),
@@ -99,8 +197,8 @@ fn v1_cell_pricing_cpu() {
     ];
 
     eprintln!("\n════ v1 cell pricing: CPU, 4×4 runouts, {ITERS} iters ════");
-    eprintln!("(live ≥ 4: bucketed quantile B={NB} Design1Collapsed — bucketing's np ≥ 4 scope;");
-    eprintln!(" live 2-3: EXACT vector CFR — small-np terminals don't need the abstraction)");
+    eprintln!("(live ≥ 4: bucketed quantile B={NB} Design1Collapsed; live 2: EXACT vector CFR;");
+    eprintln!(" live 3: EXCLUDED — needs the bucketed-terminal np ≥ 3 extension, see header)");
     for &(live, commit, pot, label) in cells {
         let cfg = spec.flop_seam_config(live, commit, pot, flop_bets.clone());
         let tree = build_tree(&cfg).expect("seam tree");
