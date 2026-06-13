@@ -592,3 +592,85 @@ fn keystone_gs14_vs_quantile_clean() {
     }
     eprintln!("→ GS14 min << quantile ⇒ coordinate fix exists; GS14 ≈ quantile ⇒ deeper (budget/more buckets).");
 }
+
+/// GS14 lifted exploitability on the clean board at (nh, nb, seed).
+fn gs14_lifted_clean(tree: &FlatTree, np: u8, nh: usize, nb: usize, seed: u64, iters: u32, pot: i32) -> f32 {
+    use solver_core::abstraction::postflop_buckets::build_postflop_bucketing_for_hands;
+    let board: [Card; 3] = ["Ks", "7d", "2c"].map(|s| card_from_str(s).unwrap());
+    let turn_cards: Vec<Card> = ["9h", "4s"].iter().map(|s| card_from_str(s).unwrap()).collect();
+    let rivers: Vec<Vec<Card>> = [["Qd", "3c"], ["Td", "Js"]].iter()
+        .map(|rs| rs.iter().map(|s| card_from_str(s).unwrap()).collect()).collect();
+    let table = clean_table(np, nh);
+    let hands: Vec<(Card, Card)> = (0..table.num_valid)
+        .map(|h| (table.hand_cards[h*2], table.hand_cards[h*2+1])).collect();
+    let pb = build_postflop_bucketing_for_hands(
+        hands.clone(), &board, &turn_cards, &rivers, nb, nb, nb, 10, seed);
+    assert_eq!(pb.hands, hands);
+    let bk = FlopBucketing::from_maps(&table, nb, nb, nb,
+        pb.flop_map.clone(), pb.turn_map.clone(), pb.river_map.clone());
+    let game = FlopStartGame::new(table);
+    let mut b = BucketedFlopCfr::new(tree, game.table(), &bk);
+    b.set_terminal_design(TerminalDesign::Design1Collapsed);
+    b.run(tree, &game, &bk, iters);
+    let gs = FlopStartGame::new(clean_table(np, nh));
+    let mut sc = FlopStartVectorCfr::new(tree, gs.table());
+    lift_cum_to_exact(tree, &b, &bk, &mut sc);
+    expl_pct(&sc, tree, &gs, pot)
+}
+
+/// COMPRESSION-SCALING: fix nb=8, increase nh → increase compression
+/// ratio (nh/8) toward production-like. If GS14's EDGE over quantile
+/// GROWS with compression, it's a production answer (potential-aware
+/// preserves info whose loss matters more under heavier compression);
+/// if the edge is flat, it's a research-scale artifact. The available
+/// proxy for the unmeasurable production (nh=1176, 147:1) question.
+#[test]
+#[ignore = "compression-scaling GS14 vs quantile; --ignored --nocapture --release"]
+fn keystone_compression_scaling() {
+    const NB: usize = 8;
+    const IT: u32 = 100;
+    let tree = seam_tree(3, 7, 25);
+    let pot = 25;
+    eprintln!("\n═══ COMPRESSION SCALING (clean board, np=3, nb={NB}) ═══");
+    eprintln!("ratio | baseline | quantile | GS14(min over seeds) | gap(q−g) | ratio(q/g)");
+    for &nh in &[16usize, 24, 32, 48] {
+        let mk = move || clean_table(3, nh);
+        let base = exact_expl_tbl(&tree, &mk, IT, pot);
+        let q = lifted_expl_tbl(&tree, &mk, Some(NB), IT, pot);
+        let g = [7u64, 42].iter().map(|&s| gs14_lifted_clean(&tree, 3, nh, NB, s, IT, pot))
+            .fold(f32::INFINITY, f32::min);
+        eprintln!(
+            "{:>4}:1 | {base:7.2}% | {q:7.2}% | {g:7.2}% | {:+6.2} | {:.2}×",
+            nh / NB, q - g, q / g.max(1e-3)
+        );
+    }
+    eprintln!("→ gap/ratio GROWS with compression ⇒ GS14 is the production answer; FLAT ⇒ research artifact.");
+}
+
+/// COMPRESSION-SCALING v2 (2026-06-13): the v1 confounded compression
+/// with subset-resampling (each nh = a different hand set; the
+/// non-monotonic baseline 0.97→0.58 was the tell). FIX: hold the game
+/// FIXED (one nh), increase compression by LOWERING nb. Same game,
+/// constant baseline, only the ratio varies — toward production-like.
+#[test]
+#[ignore = "compression-scaling v2 (fixed game); --ignored --nocapture --release"]
+fn keystone_compression_scaling_v2() {
+    const NH: usize = 48;
+    const IT: u32 = 120;
+    let tree = seam_tree(3, 7, 25);
+    let pot = 25;
+    let mk = || clean_table(3, NH);
+    let base = exact_expl_tbl(&tree, &mk, IT, pot);
+    eprintln!("\n═══ COMPRESSION SCALING v2 (clean board, np=3, FIXED nh={NH}) ═══");
+    eprintln!("baseline (constant, same game): {base:.2}%");
+    eprintln!("ratio | nb | quantile | GS14(min/mean over 3 seeds) | gap(q−g)");
+    for &nb in &[24usize, 16, 8, 4, 2] {
+        let q = lifted_expl_tbl(&tree, &mk, Some(nb), IT, pot);
+        let gv: Vec<f32> = [7u64, 42, 123].iter()
+            .map(|&s| gs14_lifted_clean(&tree, 3, NH, nb, s, IT, pot)).collect();
+        let gmin = gv.iter().cloned().fold(f32::INFINITY, f32::min);
+        let gmean = gv.iter().sum::<f32>() / gv.len() as f32;
+        eprintln!("{:>3}:1 | {nb:2} | {q:7.2}% | {gmin:6.2}/{gmean:6.2}% | {:+6.2}", NH / nb, q - gmin);
+    }
+    eprintln!("→ gap GROWS as ratio rises (nb falls) ⇒ GS14 edge is real at scale; FLAT/noisy ⇒ artifact.");
+}
