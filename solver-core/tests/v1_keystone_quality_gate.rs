@@ -674,3 +674,52 @@ fn keystone_compression_scaling_v2() {
     }
     eprintln!("→ gap GROWS as ratio rises (nb falls) ⇒ GS14 edge is real at scale; FLAT/noisy ⇒ artifact.");
 }
+
+// ════════════════════════════════════════════════════════════════════
+// CONVERGENCE MAP (2026-06-13): the S1-multiway toy revealed np=3 CFR
+// convergence is GAME-DEPENDENT — blueprint-quality and search-tolerance
+// are only well-defined where the reference CONVERGES. So MAP it across
+// the real multiway seam families × textures on the converging machinery
+// (FlopStartVectorCfr, exact). This gates S2 (tolerance is only askable
+// where exploitability converges), informs S3 (non-converging spots =
+// least-predictable live search), and is a direct blueprint-decision
+// input (non-converging spots are a SEPARATE bucket — maybe "play rough,
+// nothing converges there anyway"). The toy thrashed (0.17→0.27→0.24);
+// do the real games converge?
+#[test]
+#[ignore = "convergence map (real machinery, minutes); --ignored --nocapture --release"]
+fn convergence_map_multiway() {
+    // (live, commit, pot, nh) — nh kept so exact exploitability (O(nh^np))
+    // stays feasible (np=4 at nh=16 = 65k; np=3 at nh=24 = 14k).
+    let fams: &[(u8, i32, i32, usize)] = &[(3, 7, 25, 18), (4, 7, 29, 12)];
+    let textures: &[(&str, fn(u8, usize) -> FlopChanceTable)] =
+        &[("dry ", clean_table), ("wet ", research_table_tbl)];
+    let pts = [34u32, 120, 400];
+    eprintln!("\n═══ CONVERGENCE MAP — exact exploitability vs iters (real seam games) ═══");
+    for &(live, commit, pot, nh) in fams {
+        let tree = seam_tree(live, commit, pot);
+        for &(tex, mk) in textures {
+            let mk_box = move || mk(live, nh);
+            let mut series = Vec::new();
+            for it in pts {
+                let e = exact_expl_tbl(&tree, &mk_box, it, pot);
+                eprintln!("  ROW live {live} {tex} @ {it:>3} iters: expl {e:.4}");
+                series.push(e);
+            }
+            // CONVERGES = monotone DECREASING (the real distinction from
+            // the toy, which bounced UP 0.17→0.27→0.24). Threshold-on-tail
+            // alone mislabels a still-falling series; trend is the signal.
+            let monotone = series.windows(2).all(|w| w[1] <= w[0] + 1e-4);
+            let tail = series[series.len() - 1];
+            let verdict = if monotone && tail < 0.15 { "CONVERGES (monotone↓)" }
+                else if monotone { "converging (slow)" } else { "THRASHES (non-monotone)" };
+            eprintln!("  >> live {live} {tex}: {:.3}→{:.3}→{:.3} → {verdict}",
+                series[0], series[1], series[2]);
+        }
+    }
+    eprintln!("MAP: CONVERGES ⇒ S2 tolerance askable there; THRASHES ⇒ separate bucket \
+        (no clean reference — 'play rough, nothing converges there anyway').");
+}
+
+// research_table returns (table, board); adapt to the (np,nh)->table shape.
+fn research_table_tbl(np: u8, nh: usize) -> FlopChanceTable { research_table(np, nh).0 }
