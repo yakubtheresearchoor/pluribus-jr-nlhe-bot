@@ -453,3 +453,142 @@ fn keystone_b_curve_live3() {
         eprintln!("  B={nb}: lifted {e:.2}% pot ({:.1} hands/bucket)", NH as f32 / nb as f32);
     }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// CONFOUND CONTROL (2026-06-13): the fixed board Th9d8c + Jd + Qc is a
+// T-9-8-J-Q BOARD STRAIGHT runout (~903/1081 hands chop), where
+// strength-ordering is degenerate and quantile bucketing is meaningless
+// ON THAT RUNOUT. Could inflate the cliff. Re-run the B-curve on a CLEAN
+// board (no straight/flush on any runout) before trusting the cliff or
+// running GS14 (which would inherit the same poisoned board).
+
+fn clean_table(np: u8, nh: usize) -> FlopChanceTable {
+    // Ks 7d 2c dry rainbow; turns 9h/4s; rivers chosen so no runout makes
+    // a straight or 3-flush.
+    let board: [Card; 3] = ["Ks", "7d", "2c"].map(|s| card_from_str(s).unwrap());
+    let bmask: u64 = board.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
+    let mut all_valid: Vec<u16> = Vec::new();
+    for idx in 0..NUM_POSSIBLE_HANDS {
+        let (c1, c2) = index_to_card_pair(idx);
+        if bmask & ((1u64 << c1) | (1u64 << c2)) == 0 { all_valid.push(idx as u16); }
+    }
+    let step = all_valid.len() / nh;
+    let chosen: Vec<u16> = (0..nh).map(|i| all_valid[i * step]).collect();
+    let mut ranges: Vec<Vec<f32>> = (0..np).map(|_| vec![0.0f32; NUM_POSSIBLE_HANDS]).collect();
+    for p in 0..np as usize { for &hi in &chosen { ranges[p][hi as usize] = 1.0; } }
+    let turn_cards: Vec<u8> = ["9h", "4s"].iter().map(|s| card_from_str(s).unwrap() as u8).collect();
+    let river_strs: [&[&str]; 2] = [&["Qd", "3c"], &["Td", "Js"]];
+    let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+    for (ti, &tc) in turn_cards.iter().enumerate() {
+        river_decks[tc as usize] = river_strs[ti].iter().map(|s| card_from_str(s).unwrap() as u8).collect();
+    }
+    FlopChanceTable::compute_flop_start_subset_with_decks(&board, &ranges, np, &chosen, &turn_cards, &river_decks)
+}
+
+/// Solve+lift+score with a caller-supplied table builder + bucketing.
+fn lifted_expl_tbl(
+    tree: &FlatTree, mk: &dyn Fn() -> FlopChanceTable, nb: Option<usize>, iters: u32, pot: i32,
+) -> f32 {
+    let table = mk();
+    let bk = match nb {
+        Some(b) => { let (fm, tm, rm) = quantile_maps(&table, b); FlopBucketing::from_maps(&table, b, b, b, fm, tm, rm) }
+        None => FlopBucketing::identity(&table),
+    };
+    let game = FlopStartGame::new(table);
+    let mut bucketed = BucketedFlopCfr::new(tree, game.table(), &bk);
+    bucketed.set_terminal_design(TerminalDesign::Design1Collapsed);
+    bucketed.run(tree, &game, &bk, iters);
+    let gs = FlopStartGame::new(mk());
+    let mut scorer = FlopStartVectorCfr::new(tree, gs.table());
+    lift_cum_to_exact(tree, &bucketed, &bk, &mut scorer);
+    expl_pct(&scorer, tree, &gs, pot)
+}
+fn exact_expl_tbl(tree: &FlatTree, mk: &dyn Fn() -> FlopChanceTable, iters: u32, pot: i32) -> f32 {
+    let game = FlopStartGame::new(mk());
+    let mut exact = FlopStartVectorCfr::new(tree, game.table());
+    exact.run(tree, &game, iters);
+    expl_pct(&exact, tree, &game, pot)
+}
+
+#[test]
+#[ignore = "clean-board B-curve control; --ignored --nocapture --release"]
+fn keystone_b_curve_clean_board() {
+    const NH: usize = 32;
+    const IT: u32 = 100;
+    let tree = seam_tree(3, 7, 25);
+    let pot = 25;
+    let mk = |np: u8, nh: usize| move || clean_table(np, nh);
+    let mk3 = mk(3, NH);
+    let base = exact_expl_tbl(&tree, &mk3, IT, pot);
+    let ident = lifted_expl_tbl(&tree, &mk3, None, IT, pot);
+    eprintln!("CLEAN BOARD Ks7d2c live-3 nh={NH}: baseline {base:.2}% | identity-lift {ident:.2}%");
+    for &nb in &[8usize, 12, 16, 24] {
+        let e = lifted_expl_tbl(&tree, &mk3, Some(nb), IT, pot);
+        eprintln!("  B={nb}: lifted {e:.2}% ({:.1} h/bucket)", NH as f32 / nb as f32);
+    }
+}
+
+/// GS14 (potential-aware EMD-kmeans) vs quantile on the CLEAN board,
+/// live-3, across seeds (GS14 fit-at-research-scale is seed noise per
+/// the banked b4_sweep finding, so report the distribution). The
+/// discriminator: does the potential-aware COORDINATE beat strength-rank
+/// quantile where quantile is poor?
+#[test]
+#[ignore = "GS14 vs quantile clean-board; --ignored --nocapture --release"]
+fn keystone_gs14_vs_quantile_clean() {
+    use solver_core::abstraction::postflop_buckets::build_postflop_bucketing_for_hands;
+    use solver_core::solver::bucketed_flop_cfr::NO_BUCKET as NOB;
+    const NH: usize = 32;
+    const IT: u32 = 100;
+    let tree = seam_tree(3, 7, 25);
+    let pot = 25;
+    let mk = || clean_table(3, NH);
+
+    let base = exact_expl_tbl(&tree, &mk, IT, pot);
+    eprintln!("CLEAN live-3 nh={NH}: baseline {base:.2}%");
+
+    let board: [Card; 3] = ["Ks", "7d", "2c"].map(|s| card_from_str(s).unwrap());
+    let turn_cards: Vec<Card> = ["9h", "4s"].iter().map(|s| card_from_str(s).unwrap()).collect();
+    let rivers: Vec<Vec<Card>> = [["Qd", "3c"], ["Td", "Js"]].iter()
+        .map(|rs| rs.iter().map(|s| card_from_str(s).unwrap()).collect()).collect();
+
+    for &nb in &[8usize, 16] {
+        let q = lifted_expl_tbl(&tree, &mk, Some(nb), IT, pot);
+        let mut gs_vals = Vec::new();
+        for seed in [1u64, 7, 42, 99] {
+            let mk_bk = {
+                let board = board; let turn_cards = turn_cards.clone(); let rivers = rivers.clone();
+                move |table: &FlopChanceTable| {
+                    let nh = table.num_valid;
+                    let hands: Vec<(Card, Card)> = (0..nh)
+                        .map(|h| (table.hand_cards[h*2], table.hand_cards[h*2+1])).collect();
+                    let pb = build_postflop_bucketing_for_hands(
+                        hands.clone(), &board, &turn_cards, &rivers, nb, nb, nb, 10, seed);
+                    assert_eq!(pb.hands, hands);
+                    FlopBucketing::from_maps(table, nb, nb, nb,
+                        pb.flop_map.clone(), pb.turn_map.clone(), pb.river_map.clone())
+                }
+            };
+            // solve+lift+score with GS14 bk
+            let table = mk();
+            let bk = mk_bk(&table);
+            let game = FlopStartGame::new(table);
+            let mut b = BucketedFlopCfr::new(&tree, game.table(), &bk);
+            b.set_terminal_design(TerminalDesign::Design1Collapsed);
+            b.run(&tree, &game, &bk, IT);
+            let gs = FlopStartGame::new(mk());
+            let mut sc = FlopStartVectorCfr::new(&tree, gs.table());
+            lift_cum_to_exact(&tree, &b, &bk, &mut sc);
+            gs_vals.push(expl_pct(&sc, &tree, &gs, pot));
+            let _ = NOB;
+        }
+        let gmin = gs_vals.iter().cloned().fold(f32::INFINITY, f32::min);
+        let gmax = gs_vals.iter().cloned().fold(0.0f32, f32::max);
+        let gmean = gs_vals.iter().sum::<f32>() / gs_vals.len() as f32;
+        eprintln!(
+            "B={nb}: QUANTILE {q:.2}% | GS14 seeds {:?} → min {gmin:.2}% mean {gmean:.2}% max {gmax:.2}%",
+            gs_vals.iter().map(|v| format!("{v:.1}")).collect::<Vec<_>>()
+        );
+    }
+    eprintln!("→ GS14 min << quantile ⇒ coordinate fix exists; GS14 ≈ quantile ⇒ deeper (budget/more buckets).");
+}
