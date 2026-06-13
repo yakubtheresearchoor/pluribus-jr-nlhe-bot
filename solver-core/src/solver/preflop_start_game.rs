@@ -229,6 +229,47 @@ pub fn flop_combo_layout(canonical_flop: [Card; 3]) -> Vec<(Card, Card)> {
     out
 }
 
+/// Reconcile a `FlopChanceTable`'s per-hand vector (in the table's
+/// `hand_cards` order, length `num_valid`) into `flop_combo_layout`
+/// order (2026-06-13, the bucketed-oracle keystone). Returns
+/// `perm[layout_idx] = table_hand_idx`. Both index the SAME set of
+/// board-compatible combos, so this is a bijection — gated as such by
+/// `bucketed_oracle_reconciliation_gate`. The bucketed solver
+/// (`run_all_root_cfv`) returns per-hand in table order; the oracle
+/// must hand back per-combo in layout order, and this is the one
+/// silent-bug-prone seam between them.
+pub fn table_hand_to_layout_perm(
+    hand_cards: &[u8],
+    num_valid: usize,
+    canonical_flop: [Card; 3],
+) -> Vec<usize> {
+    use std::collections::HashMap;
+    // table hand h → its (min,max) card pair → table index.
+    let mut by_pair: HashMap<(u8, u8), usize> = HashMap::with_capacity(num_valid);
+    for h in 0..num_valid {
+        let a = hand_cards[h * 2];
+        let b = hand_cards[h * 2 + 1];
+        by_pair.insert((a.min(b), a.max(b)), h);
+    }
+    let layout = flop_combo_layout(canonical_flop);
+    assert_eq!(
+        layout.len(),
+        num_valid,
+        "layout/table combo-count mismatch ({} vs {}) — different board-compatible \
+         sets, reconciliation undefined",
+        layout.len(),
+        num_valid
+    );
+    layout
+        .iter()
+        .map(|&(c1, c2)| {
+            *by_pair.get(&(c1.min(c2), c1.max(c2))).unwrap_or_else(|| {
+                panic!("layout combo ({c1},{c2}) absent from the table — not the same combo set")
+            })
+        })
+        .collect()
+}
+
 /// Per-class expansion sizes at a given canonical flop. Precomputed
 /// once to avoid repeated expansion() calls. Index 0..169.
 fn expansion_sizes_for_flop(canonical_flop: [Card; 3]) -> Vec<u32> {

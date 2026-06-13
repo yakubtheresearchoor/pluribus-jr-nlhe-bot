@@ -97,3 +97,44 @@ fn run_all_root_cfv_traverser0_bit_exact_vs_run() {
     let _ = NB;
     eprintln!("run_all_root_cfv: traverser-0 slice bit-exact vs run ({ITERS} iters, {NP} players)");
 }
+
+// ── Reconciliation gate (the keystone seam): table-hand-order →
+// flop_combo_layout-order must be a BIJECTION over the same combo set. ──
+#[test]
+fn bucketed_oracle_reconciliation_gate() {
+    use solver_core::solver::preflop_start_game::{flop_combo_layout, table_hand_to_layout_perm};
+    let table = build_table(); // NH=6 chosen hands, board Th9d8c
+    // NOTE: build_table uses a SUBSET (NH=6) so layout(full) != num_valid;
+    // the perm gate needs the FULL board-compatible table. Use a full-nh
+    // table on the same board for the bijection check.
+    let board = ["Th", "9d", "8c"].map(|s| card_from_str(s).unwrap());
+    let turn_cards: Vec<u8> =
+        ["2c", "Jd"].iter().map(|s| card_from_str(s).unwrap() as u8).collect();
+    let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+    river_decks[turn_cards[0] as usize] =
+        ["4s", "7h"].iter().map(|s| card_from_str(s).unwrap() as u8).collect();
+    river_decks[turn_cards[1] as usize] =
+        ["3s", "Qc"].iter().map(|s| card_from_str(s).unwrap() as u8).collect();
+    let full = FlopChanceTable::build_full_nh_sampled(board, NP, &turn_cards, &river_decks);
+
+    let perm = table_hand_to_layout_perm(&full.hand_cards, full.num_valid, board);
+    let layout = flop_combo_layout(board);
+    assert_eq!(perm.len(), layout.len());
+    // Bijection: every table index hit exactly once.
+    let mut seen = vec![false; full.num_valid];
+    for &t in &perm {
+        assert!(!seen[t], "table index {t} hit twice — not injective");
+        seen[t] = true;
+    }
+    assert!(seen.iter().all(|&s| s), "not surjective — some table hand unmapped");
+    // Correctness: perm maps layout combo to the table hand with the
+    // SAME cards.
+    for (li, &(c1, c2)) in layout.iter().enumerate() {
+        let h = perm[li];
+        let (a, b) = (full.hand_cards[h * 2], full.hand_cards[h * 2 + 1]);
+        assert_eq!((c1.min(c2), c1.max(c2)), (a.min(b), a.max(b)),
+            "layout {li} ({c1},{c2}) mapped to table hand {h} ({a},{b}) — wrong combo");
+    }
+    let _ = table;
+    eprintln!("reconciliation: table↔layout bijection over {} combos, cards match", perm.len());
+}
