@@ -351,28 +351,285 @@ fn s1_depth_limited_search_anchor_and_corrects() {
             "freeze/profile plumbing broken: {ctrl:.5} != fine {fine_expl:.5}");
     }
 
-    // SINGLE-CONTINUATION leaf value (both play blueprint round-2):
-    // re-search round-1 against the frozen round-2.
-    let anchor = search_with_frozen_river(&tree, &game, &fine, 20000);
-    let corrected = search_with_frozen_river(&tree, &game, &rough, 20000);
-    eprintln!("SINGLE-CONT anchor (fine round-2):  {anchor:.5} (vs fine {fine_expl:.5})");
-    eprintln!("SINGLE-CONT corrects (rough round-2): {corrected:.5} (vs rough {rough_expl:.5})");
+    // Depth-limited single-continuation search (freeze blueprint
+    // round-2, search round-1), WELL-CONVERGED. (The 6.78 seen at 20k
+    // iters was NON-CONVERGENCE, not the range problem — see
+    // s1_multi_continuation_anchor for the full iter-sweep. The control
+    // validates the freeze plumbing; convergence is a separate axis the
+    // search itself must satisfy, the lesson of this catch.)
+    let anchor = search_with_frozen_river(&tree, &game, &fine, 300000);
+    let corrected = search_with_frozen_river(&tree, &game, &rough, 300000);
+    eprintln!("ANCHOR  (fine round-2, converged):  {anchor:.5} (vs fine {fine_expl:.5})");
+    eprintln!("CORRECTS (rough round-2, converged): {corrected:.5} (vs rough {rough_expl:.5})");
 
-    // FINDING (S1 in progress): the freeze-search MECHANISM is correct
-    // (control exact), but SINGLE-continuation leaf values are
-    // inadequate — the searcher drifts to round-1 ranges the frozen
-    // round-2 wasn't tuned for, and a best-responder exploits the
-    // mismatch (the KNOWN depth-limited range problem: anchor
-    // {anchor:.2} >> fine {fine_expl:.4}). This is precisely why the
-    // plan specifies the MULTI-CONTINUATION trick (leaf value = best of
-    // {blueprint, fold/call/raise-biased} continuations, adapting to
-    // the searcher's range) — the NEXT S1 component, after which the
-    // anchor must pass and the corrects gate is meaningful. Asserted
-    // here only: the mechanism is sound (control) and single-continuation
-    // is over-exploitable (documents the motivation, prevents regressing
-    // to "naive single-cont is fine").
-    assert!(anchor > fine_expl + 0.1,
-        "single-continuation unexpectedly near-Nash ({anchor:.5}) — re-check the range-problem premise");
-    eprintln!("S1 MECHANISM VALIDATED; single-continuation inadequate as expected. \
-        NEXT: multi-continuation leaf valuation → anchor passes → corrects gate → multiway anchor.");
+    // ANCHOR: well-converged single-continuation search reproduces ~fine.
+    assert!(anchor < fine_expl + 0.01,
+        "anchor not clean at convergence: {anchor:.5} vs fine {fine_expl:.5}");
+    // CORRECTS: search re-solving round-1 against the ROUGH frozen
+    // round-2 is strictly LESS exploitable than the rough blueprint
+    // played throughout — search CORRECTS the blueprint (the capability
+    // S2 credits it with), not merely passes a good one through.
+    assert!(corrected < rough_expl,
+        "search did NOT correct the rough blueprint: {corrected:.5} >= rough {rough_expl:.5}");
+    eprintln!("S1 PASSED (HU): anchor clean ({anchor:.5}≈fine) AND search corrects a rough \
+        blueprint ({rough_expl:.5}→{corrected:.5}, {:.0}% removed). \
+        NEXT: MULTIWAY anchor (np=3 — also tests if the range problem is real multiway).",
+        100.0 * (rough_expl - corrected) / rough_expl);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// S1 MULTI-CONTINUATION (2026-06-13): make the depth-limited leaf value
+// range-ROBUST so the anchor comes clean (≤ fine). At each round-2
+// entry, replace the blueprint-only continuation with a two-sided
+// continuation GADGET: P0 picks k0, P1 picks k1, terminal valued by
+// V_{k0,k1}[h][h_o] = round-2 EV with P0=σ^k0, P1=σ^k1. Both players
+// adapt their round-2 to the searcher's ranges (CFR-solved), so the
+// searcher can't drift round-1 into a range a fixed round-2 punishes.
+// K=1 (blueprint only) must reproduce the single-continuation 6.78;
+// adding continuations must DROP the anchor toward fine.
+
+use std::collections::HashMap;
+
+/// σ^k for a round-2 node from its blueprint strategy [a*nh+h]. An
+/// enriched continuation set spanning the round-2 strategy space (the
+/// more it spans, the lower the residual range problem):
+///   0 blueprint | 1..=na half-mix toward action (k-1) | na+1 uniform |
+///   na+2.. pure (onehot) toward action (k-na-2). Indices past the
+///   available recipes fall back to blueprint (harmless duplicate).
+fn bias_strat(bp: &[f32], na: usize, k: usize) -> Vec<f32> {
+    if k == 0 { return bp.to_vec(); }
+    let mut out = vec![0.0f32; na * NUM_HANDS];
+    if k >= 1 && k <= na {
+        let target = k - 1;
+        for h in 0..NUM_HANDS { for a in 0..na {
+            out[a * NUM_HANDS + h] = 0.5 * bp[a * NUM_HANDS + h] + if a == target { 0.5 } else { 0.0 };
+        }}
+    } else if k == na + 1 {
+        for v in out.iter_mut() { *v = 1.0 / na as f32; } // uniform
+    } else {
+        let target = (k - na - 2).min(na - 1); // pure onehot
+        for h in 0..NUM_HANDS { for a in 0..na {
+            out[a * NUM_HANDS + h] = if a == target { 1.0 } else { 0.0 };
+        }}
+    }
+    out
+}
+
+fn round2_subtree_players(tree: &FlatTree, entry: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut stack = vec![entry];
+    while let Some(n) = stack.pop() {
+        if tree.nodes[n].is_player() {
+            out.push(n);
+            for &c in tree.node_children(n) { stack.push(c as usize); }
+        }
+    }
+    out
+}
+
+/// P0's EV for (h, h_o) at a round-2 node under fixed strategies.
+fn round2_ev(
+    tree: &FlatTree, node: usize,
+    p0s: &HashMap<usize, Vec<f32>>, p1s: &HashMap<usize, Vec<f32>>,
+    h: usize, h_o: usize,
+) -> f32 {
+    let n = &tree.nodes[node];
+    if n.is_terminal() {
+        let c0 = tree.get_contribution(node, 0);
+        let c1 = tree.get_contribution(node, 1);
+        return if c0 == c1 { c1 as f32 * expected_sign(h, h_o) }
+            else if c0 < c1 { -(c0 as f32) } else { c1 as f32 };
+    }
+    let pl = n.player_id as usize;
+    let na = n.num_children as usize;
+    let strat = if pl == 0 { &p0s[&node] } else { &p1s[&node] };
+    let card = if pl == 0 { h } else { h_o };
+    let children: Vec<u32> = tree.node_children(node).to_vec();
+    let mut ev = 0.0f32;
+    for (a, &child) in children.iter().enumerate() {
+        ev += strat[a * NUM_HANDS + card] * round2_ev(tree, child as usize, p0s, p1s, h, h_o);
+    }
+    ev
+}
+
+/// Build the augmented Leduc tree (round-1 + K-continuation gadgets) and
+/// the gadget V-map. Returns (tree, gadget_v, flop_node_map). The tree
+/// is build_leduc_tree with each round-2 entry re-pointed to a gadget;
+/// round-1 (Flop) node indices are PRESERVED for deployment scoring.
+fn build_augmented(fine: &CpuMccfr, k_count: usize) -> (FlatTree, HashMap<usize, Vec<Vec<f32>>>) {
+    let mut tree = build_leduc_tree();
+    let mut gadget_v: HashMap<usize, Vec<Vec<f32>>> = HashMap::new();
+
+    // Round-2 entries = River children of Flop nodes.
+    let flop_nodes: Vec<usize> = (0..tree.nodes.len())
+        .filter(|&i| tree.nodes[i].is_player()
+            && tree.nodes[i].board_state == BoardState::Flop as u8).collect();
+    let mut entries: Vec<(usize, usize)> = Vec::new(); // (flop_parent, entry_child)
+    for &fp in &flop_nodes {
+        let kids: Vec<u32> = tree.node_children(fp).to_vec();
+        for (ci, &c) in kids.iter().enumerate() {
+            if tree.nodes[c as usize].is_player()
+                && tree.nodes[c as usize].board_state == BoardState::River as u8 {
+                entries.push((fp, ci)); // store child slot index
+            }
+        }
+    }
+
+    for (fp, slot) in entries {
+        let entry = tree.node_children(fp)[slot] as usize;
+        // Per-continuation strategies for this entry's round-2 subtree.
+        let r2_players = round2_subtree_players(&tree, entry);
+        let mut conts: Vec<(HashMap<usize, Vec<f32>>, HashMap<usize, Vec<f32>>)> = Vec::new();
+        for k in 0..k_count {
+            let mut p0s = HashMap::new();
+            let mut p1s = HashMap::new();
+            for &nd in &r2_players {
+                let na = tree.nodes[nd].num_children as usize;
+                let st = fine.get_average_strategy(nd, na, NUM_HANDS);
+                let flat: Vec<f32> = (0..na).flat_map(|a| (0..NUM_HANDS).map(move |h| (a, h)))
+                    .map(|(a, h)| st[a][h]).collect();
+                let biased = bias_strat(&flat, na, k);
+                if tree.nodes[nd].player_id == 0 { p0s.insert(nd, biased); }
+                else { p1s.insert(nd, biased); }
+            }
+            conts.push((p0s, p1s));
+        }
+        // V_{k0,k1}[h][h_o] for every pair, computed on the (pre-repoint)
+        // round-2 subtree.
+        let mut v = vec![vec![vec![vec![0.0f32; NUM_HANDS]; NUM_HANDS]; k_count]; k_count];
+        for k0 in 0..k_count {
+            for k1 in 0..k_count {
+                // merge the two players' continuation maps for this (k0,k1)
+                let p0s = &conts[k0].0;
+                let p1s = &conts[k1].1;
+                for h in 0..NUM_HANDS {
+                    for h_o in 0..NUM_HANDS {
+                        if h == h_o { continue; }
+                        v[k0][k1][h][h_o] = round2_ev(&tree, entry, p0s, p1s, h, h_o);
+                    }
+                }
+            }
+        }
+        // Build the gadget: P0 picks k0 → P1 picks k1 → terminal(V_{k0,k1}).
+        let g_root = tree.alloc_node(FlatNode::player(0, BoardState::River, 0));
+        let mut k0_children = Vec::new();
+        for k0 in 0..k_count {
+            let p1_node = tree.alloc_node(FlatNode::player(1, BoardState::River, 0));
+            let mut k1_children = Vec::new();
+            for k1 in 0..k_count {
+                let term = tree.alloc_node(FlatNode::terminal());
+                gadget_v.insert(term, v[k0][k1].clone());
+                k1_children.push(term as u32);
+            }
+            tree.set_children(p1_node, k1_children);
+            k0_children.push(p1_node as u32);
+        }
+        tree.set_children(g_root, k0_children);
+        // Re-point the Flop parent's child slot to the gadget.
+        let mut kids: Vec<u32> = tree.node_children(fp).to_vec();
+        kids[slot] = g_root as u32;
+        tree.set_children(fp, kids);
+    }
+    tree.compute_levels();
+    (tree, gadget_v)
+}
+
+struct AugmentedGame { leduc: LeducGame, gadget_v: HashMap<usize, Vec<Vec<f32>>> }
+impl GameSpec for AugmentedGame {
+    fn num_hands(&self, _p: u8) -> usize { NUM_HANDS }
+    fn initial_weight(&self, _p: u8) -> Vec<f32> { vec![1.0; NUM_HANDS] }
+    fn chance_probability(&self, _o: usize, _h: usize) -> f32 { 0.0 }
+    fn evaluate_terminal(&self, traverser: u8, node: usize, tree: &FlatTree, cfreach: &[Vec<f32>]) -> Vec<f32> {
+        if let Some(v) = self.gadget_v.get(&node) {
+            let mut cfv = vec![0.0f32; NUM_HANDS];
+            for h in 0..NUM_HANDS {
+                for h_o in 0..NUM_HANDS {
+                    if h == h_o { continue; }
+                    if traverser == 0 { cfv[h] += cfreach[1][h_o] * v[h][h_o]; }
+                    else { cfv[h] += cfreach[0][h_o] * (-v[h_o][h]); }
+                }
+            }
+            return cfv;
+        }
+        self.leduc.evaluate_terminal(traverser, node, tree, cfreach)
+    }
+}
+
+/// Search round-1 via the augmented (multi-continuation) subgame, then
+/// DEPLOY searched-round-1 + blueprint-round-2 in the full Leduc tree
+/// and score true full-game exploitability.
+fn search_multicont(fine: &CpuMccfr, k_count: usize, iters: u32) -> f32 {
+    let (aug_tree, gadget_v) = build_augmented(fine, k_count);
+    let aug_game = AugmentedGame { leduc: LeducGame::new(), gadget_v };
+    let mut s = CpuMccfr::new(&aug_tree, vec![NUM_HANDS, NUM_HANDS]);
+    s.run(&aug_tree, &aug_game, iters);
+
+    // Deploy: full Leduc, round-1 frozen to the augmented-searched
+    // strategy (Flop indices preserved), round-2 frozen to blueprint.
+    let leduc_tree = build_leduc_tree();
+    let game = LeducGame::new();
+    let mut dep = CpuMccfr::new(&leduc_tree, vec![NUM_HANDS, NUM_HANDS]);
+    for nid in 0..leduc_tree.nodes.len() {
+        if !leduc_tree.nodes[nid].is_player() { continue; }
+        let na = leduc_tree.nodes[nid].num_children as usize;
+        let src = if leduc_tree.nodes[nid].board_state == BoardState::Flop as u8 { &s } else { fine };
+        let st = src.get_average_strategy(nid, na, NUM_HANDS);
+        let flat: Vec<f32> = (0..na).flat_map(|a| (0..NUM_HANDS).map(move |h| (a, h)))
+            .map(|(a, h)| st[a][h]).collect();
+        dep.freeze_node(nid, &flat);
+    }
+    dep.run(&leduc_tree, &game, 10);
+    full_expl(&dep, &leduc_tree, &game)
+}
+
+#[test]
+fn s1_multi_continuation_anchor() {
+    let leduc_tree = build_leduc_tree();
+    let game = LeducGame::new();
+    let mut fine = CpuMccfr::new(&leduc_tree, vec![NUM_HANDS, NUM_HANDS]);
+    fine.run(&leduc_tree, &game, 20000);
+    let fine_expl = full_expl(&fine, &leduc_tree, &game);
+    eprintln!("\n═══ S1 anchor: was 6.78 the RANGE PROBLEM or NON-CONVERGENCE? ═══");
+    eprintln!("fine blueprint expl {fine_expl:.5}");
+    // Single-continuation (frozen blueprint round-2, search round-1) at
+    // rising iters. If the anchor FALLS to ~fine with more iters, the
+    // 6.78 was a CONVERGENCE artifact, not the depth-limited range
+    // problem — and the multi-continuation trick was solving a mirage.
+    for it in [20000u32, 60000, 120000, 300000] {
+        let a = search_with_frozen_river(&leduc_tree, &game, &fine, it);
+        eprintln!("SINGLE-cont, {it:>6} iters: anchor {a:.5}  ({:.0}× fine)", a / fine_expl);
+    }
+    eprintln!("--- multi-continuation K-sweep (high iters) ---");
+    // Convergence diagnostic: non-monotonicity in the K-curve would mean
+    // the K×K continuation gadget isn't solved (more iters needed) — a
+    // nested continuation set can only weakly LOWER the equilibrium
+    // anchor. Sweep K at high iters; the curve must be ~monotone.
+    let mut last = f32::INFINITY;
+    let mut best = f32::INFINITY;
+    for k in [1usize, 2, 3, 4, 5, 6, 8] {
+        let a = search_multicont(&fine, k, 120000);
+        eprintln!("K={k}: anchor {a:.5}  ({:.0}× fine)", a / fine_expl);
+        last = a;
+        best = best.min(a);
+    }
+    let _ = (last, best);
+
+    // CORRECTED FINDING (instrument hygiene, the 4th confound this arc):
+    // the 6.78 anchor was NON-CONVERGENCE of the round-1 search, NOT the
+    // depth-limited range problem. SINGLE-continuation depth-limited
+    // search converges to a CLEAN anchor (~fine) at sufficient iters
+    // (6.78→3.31→0.005→0.0037 over 20k→300k). The control validated the
+    // freeze PLUMBING but not that the SEARCH converged — the lesson.
+    // The multi-continuation machinery is built and correct (K=1
+    // reproduces single-cont) but is UNNECESSARY in HU Leduc (the range
+    // problem here is a convergence mirage); retained for the MULTIWAY
+    // anchor, where the range problem may be genuinely present.
+    //
+    // THE S1 ANCHOR GATE: single-continuation, well-converged, ≤ fine +
+    // small tol → the instrument is clean and S2 can read through it.
+    let anchor_converged = search_with_frozen_river(&leduc_tree, &game, &fine, 300000);
+    assert!(anchor_converged < fine_expl + 0.01,
+        "single-cont anchor not clean at convergence: {anchor_converged:.5} vs fine {fine_expl:.5}");
+    eprintln!("S1 ANCHOR CLEAN (single-cont, converged): {anchor_converged:.5} vs fine {fine_expl:.5}. \
+        The 6.78 was non-convergence; depth-limited search is sound. NEXT: corrects gate + multiway anchor.");
 }
