@@ -1,0 +1,15 @@
+blueprint_runner: B=10, 34 iters, 4×4 seeded runouts, GPU-native arm
+1755 canonical flops [0..1755), tree 4161 nodes, 2 threads, out=blueprint_out_b10_4x4
+1755 flops to solve (0 already banked)
+[Metal] Device: "Apple M4 Max"
+[Metal] Recommended max working set: 30150672384 bytes (30.2 GB)
+[Metal] Device: "Apple M4 Max"
+[Metal] Recommended max working set: 30150672384 bytes (30.2 GB)
+[Metal] Loaded shader library from target/release/build/solver-core-e5db1e86af357cb8/out/solver.metallib
+[Metal] Loaded shader library from target/release/build/solver-core-e5db1e86af357cb8/out/solver.metallib
+[25/1755] flop 24 done in 81s | elapsed 0.3h | ETA 17.7h
+[50/1755] flop 49 done in 59s | elapsed 0.5h | ETA 17.2h
+[75/1755] flop 74 done in 80s | elapsed 0.8h | ETA 17.4h
+[100/1755] flop 99 done in 57s | elapsed 1.0h | ETA 16.4h
+[125/1755] flop 124 done in 77s | elapsed 1.3h | ETA 16.4h
+[150/1755] flop 149 done in 88s | elapsed 1.6h | ETA 16.7h

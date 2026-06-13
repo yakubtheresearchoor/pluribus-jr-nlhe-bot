@@ -1,0 +1,1 @@
+{"role":"challenger-B10-4x4 (oracle-shape tree)","cell":"1755 x seeded 4x4","b":10,"iters":34,"gpu":true,"tree":{"np":6,"pot":12,"stacks":94,"contribs":0,"bets":[1.0],"raises":[]},"terminal":"design1_collapsed","maps":"quantile-strength","runout_seed":"chained splitmix64 w/o replacement; turn x0=fi; river x0=fi^0xDEADBEEF^(tc<<40)","code":"1ee5c98","format":1}

@@ -416,6 +416,39 @@ impl PreflopVectorCfr {
     /// engine converges to the SUBSET's equilibrium — a well-defined
     /// reduced-scale problem that preserves the preflop CFR convergence
     /// dynamics per the lead's "cheap dimension" directive.
+    /// Cell-aware subset variant (2026-06-12): subset of canonicals,
+    /// oracle called via `flop_root_cfv_for_cell`. Used by the seam
+    /// gates (cheap canonical subsets) and the bootstrap reach run.
+    pub fn compute_chance_node_cfv_with_expansion_subset_for_cell(
+        &self,
+        chance_node_idx: usize,
+        traverser: u8,
+        reach: &[Vec<f32>],
+        table: &PreflopChanceTable,
+        subset_indices: &[usize],
+        oracle: &mut impl PostflopValueOracle,
+        cell: crate::solver::postflop_oracle::SeamCell,
+    ) -> Vec<f32> {
+        let np = self.num_players as usize;
+        let n_classes = NUM_PREFLOP_CLASSES;
+        let chance_base = chance_node_idx * n_classes;
+        let mut per_canonical_v_class: Vec<Vec<f32>> = Vec::with_capacity(subset_indices.len());
+        for &canonical_idx in subset_indices {
+            let f_canon = table.canonical_flops[canonical_idx];
+            let layout = flop_combo_layout(f_canon);
+            let mut combo_reaches: Vec<Vec<f32>> = Vec::with_capacity(np);
+            for p in 0..np {
+                let class_reach = &reach[p][chance_base..chance_base + n_classes];
+                combo_reaches.push(expand_reach_class_to_combo(f_canon, class_reach, &layout));
+            }
+            let v_combo =
+                oracle.flop_root_cfv_for_cell(f_canon, &combo_reaches, traverser, cell);
+            assert_eq!(v_combo.len(), layout.len());
+            per_canonical_v_class.push(reduce_cfv_combo_to_class(f_canon, &v_combo, &layout));
+        }
+        aggregate_preflop_chance_subset(table, subset_indices, &per_canonical_v_class)
+    }
+
     pub fn compute_chance_node_cfv_with_expansion_subset(
         &self,
         chance_node_idx: usize,

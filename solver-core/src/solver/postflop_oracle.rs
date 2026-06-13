@@ -199,6 +199,95 @@ pub trait PostflopValueOracle {
 /// CFV's semantics (iter-0 vs converged vs synthetic constant) don't
 /// matter and the test wants to drive the composition with a
 /// hand-written closure. The engine API stays as the trait; this
+/// V1 BUCKET-KEYED ORACLE (2026-06-12, slice 1 of the four-zone
+/// runtime): answers per (bucket key, canonical flop, traverser) from
+/// the bucket's OWN seam-cell game — the v1 fix over the bootstrap's
+/// single-game seam (limp pots and raised pots get DIFFERENT postflop
+/// games). The value source is pluggable (`src`): the bootstrap reach
+/// run plugs a cheap iter0/equity source; the production fill plugs
+/// banked representative lookups. Frozen per epoch: answers cached by
+/// (key, flop, traverser) and reused until `begin_preflop_iter`
+/// invalidates per the refresh cadence — satisfying the shared-chance
+/// collapse contract (answer depends only on (flop, traverser, key)).
+///
+/// SCOPE (slice 1): traverser must be LIVE at the cell, and all
+/// players live (HU-complete: any HU fold ends the hand, so HU
+/// flop-entry cells are always all-live). SLICE 2 (named, 6-max):
+/// folded-OPPONENT reach factors (pairwise-blocking convention,
+/// mirroring preflop_terminal) and folded-TRAVERSER constant values —
+/// asserted-against until built so they cannot silently mis-answer.
+pub struct BucketKeyedOracle<S>
+where
+    S: FnMut(SeamCell, [Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
+{
+    pub stack: i32,
+    pub num_players: u8,
+    src: S,
+    cache: std::collections::HashMap<((u8, i64), [Card; 3], u8), Vec<f32>>,
+    /// Refresh cadence: cache cleared when iter % refresh_every == 0
+    /// at begin_preflop_iter (0 = never refresh: fully frozen).
+    pub refresh_every: u32,
+}
+
+impl<S> BucketKeyedOracle<S>
+where
+    S: FnMut(SeamCell, [Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
+{
+    pub fn new(stack: i32, num_players: u8, refresh_every: u32, src: S) -> Self {
+        Self { stack, num_players, src, cache: std::collections::HashMap::new(), refresh_every }
+    }
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+impl<S> PostflopValueOracle for BucketKeyedOracle<S>
+where
+    S: FnMut(SeamCell, [Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
+{
+    fn flop_root_cfv(
+        &mut self,
+        _canonical_flop: [Card; 3],
+        _combo_ranges: &[Vec<f32>],
+        _traverser: u8,
+    ) -> Vec<f32> {
+        panic!(
+            "BucketKeyedOracle requires the cell-aware path (flop_root_cfv_for_cell); \
+             a cell-blind call indicates an engine wiring regression"
+        );
+    }
+
+    fn flop_root_cfv_for_cell(
+        &mut self,
+        canonical_flop: [Card; 3],
+        combo_ranges: &[Vec<f32>],
+        traverser: u8,
+        cell: SeamCell,
+    ) -> Vec<f32> {
+        // Slice-1 scope guard (see struct doc): all players live.
+        assert_eq!(
+            cell.live, self.num_players,
+            "BucketKeyedOracle slice 1: folded players at the seam (live {} of {}) — \
+             the folded-reach/folded-traverser conventions are slice 2; this assert \
+             prevents a silently-wrong answer",
+            cell.live, self.num_players
+        );
+        let key = (cell.bucket_key(self.stack), canonical_flop, traverser);
+        if let Some(v) = self.cache.get(&key) {
+            return v.clone();
+        }
+        let v = (self.src)(cell, canonical_flop, combo_ranges, traverser);
+        self.cache.insert(key, v.clone());
+        v
+    }
+
+    fn begin_preflop_iter(&mut self, iter: u32) {
+        if self.refresh_every > 0 && iter > 0 && iter % self.refresh_every == 0 {
+            self.cache.clear();
+        }
+    }
+}
+
 /// adapter keeps tests on the same code path without forcing them to
 /// declare a full oracle type.
 ///

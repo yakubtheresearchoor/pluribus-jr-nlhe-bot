@@ -1,0 +1,1 @@
+{"role":"bootstrap-config-baseline (oracle-shape tree; NOT the production blueprint)","cell":"A: 1755 x seeded 1x1","b":8,"iters":34,"tree":{"np":6,"pot":12,"stacks":94,"contribs":0,"bets":[1.0],"raises":[]},"terminal":"design1_collapsed","maps":"quantile-strength","runout_seed":"splitmix64(fi); turn=s%deck; river=(s^0xDEADBEEF)%rdeck","code":"96f1772","format":1}
