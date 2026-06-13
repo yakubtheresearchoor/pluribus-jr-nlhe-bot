@@ -24,6 +24,15 @@ pub struct CpuMccfr {
     // counterfactual value the logit responds to.
     lambda: Option<Vec<f32>>,
     last_cfv: Vec<f32>,
+    // DEPTH-LIMITED SEARCH (S1, 2026-06-13): nodes flagged `frozen` play
+    // a FIXED strategy (the blueprint's) and are NOT updated — the
+    // searcher optimizes only the un-frozen (subgame) nodes against the
+    // frozen continuation. Freezing the post-boundary street = the
+    // depth-limited leaf-continuation valuation (leaf value = continue
+    // with the blueprint). The frozen strategy is SWAPPABLE (fine or
+    // rough blueprint) — that swappability IS the S2 measurement.
+    frozen: Vec<bool>,
+    frozen_strategy: Vec<f32>,
 }
 
 impl CpuMccfr {
@@ -52,7 +61,24 @@ impl CpuMccfr {
             regret_floor: -1e30,
             lambda: None,
             last_cfv: vec![0.0; total],
+            frozen: vec![false; tree.num_nodes()],
+            frozen_strategy: vec![0.0; total],
         }
+    }
+
+    /// DEPTH-LIMITED SEARCH: freeze a node to a fixed (blueprint)
+    /// strategy. `strat` is `num_actions × nh` in [a*nh + h] order. The
+    /// node plays this strategy, is never regret/cum-updated, and its
+    /// cum_strategy is set to it so the scored profile reads the
+    /// blueprint there. The un-frozen nodes are searched against it.
+    pub fn freeze_node(&mut self, node_idx: usize, strat: &[f32]) {
+        let off = self.node_data_offset[node_idx];
+        assert_ne!(off, UNUSED, "freeze_node on a non-player node {node_idx}");
+        assert!(off + strat.len() <= self.frozen_strategy.len(), "frozen strat overruns node block");
+        self.frozen[node_idx] = true;
+        self.frozen_strategy[off..off + strat.len()].copy_from_slice(strat);
+        // Seed cum_strategy so StrategyProfile reads the blueprint here.
+        self.cum_strategy[off..off + strat.len()].copy_from_slice(strat);
     }
 
     /// Enable QUANTAL-response (QRE) mode with per-seat inverse-
@@ -204,7 +230,7 @@ impl CpuMccfr {
             }
         }
 
-        if player == traverser {
+        if player == traverser && !self.frozen[node_idx] {
             let offset = self.node_data_offset[node_idx];
             for h in 0..nh {
                 for a in 0..num_actions {
@@ -245,6 +271,13 @@ impl CpuMccfr {
 
     fn compute_strategy(&self, node_idx: usize, num_actions: usize, nh: usize, player: u8) -> Vec<f32> {
         let offset = self.node_data_offset[node_idx];
+
+        // Depth-limited search: a frozen node plays its fixed blueprint
+        // strategy (never regret-matched, never updated).
+        if self.frozen[node_idx] {
+            return self.frozen_strategy[offset..offset + num_actions * nh].to_vec();
+        }
+
         let mut strategy = vec![0.0f32; num_actions * nh];
 
         // QRE (quantal) mode: logit over action counterfactual values at
