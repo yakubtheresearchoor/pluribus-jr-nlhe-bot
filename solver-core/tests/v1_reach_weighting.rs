@@ -57,6 +57,8 @@ fn v1_reach_weighting_uniform_bound() {
     // Also accumulate per (live, SPR-bin) so we can see WHICH live-5/6
     // buckets carry the mass.
     let mut by_bucket: BTreeMap<(u8, i64), f64> = BTreeMap::new();
+    let mut rp_by_bucket: BTreeMap<(u8, i64), f64> = BTreeMap::new();
+    let mut rp_by_live: BTreeMap<u8, f64> = BTreeMap::new();
     for idx in 0..tree.nodes.len() {
         let n = &tree.nodes[idx];
         if n.node_type != NODE_TYPE_CHANCE || n.num_children != 0 {
@@ -77,6 +79,11 @@ fn v1_reach_weighting_uniform_bound() {
         e.1.insert(bin);
         e.2 += 1;
         *by_bucket.entry((live, bin)).or_default() += joint;
+        // reach × pot (in bb) — the EV-error weight: a strategy mistake
+        // in a big pot costs more chips, so degrade-tolerance ∝ stakes.
+        let pot_bb = cell.pot as f64 / 2.0;
+        *rp_by_bucket.entry((live, bin)).or_default() += joint * pot_bb;
+        *rp_by_live.entry(live).or_default() += joint * pot_bb;
     }
 
     eprintln!("\n═══ UNIFORM-STRATEGY REACH (upper bound on equilibrium mass) ═══");
@@ -93,6 +100,31 @@ fn v1_reach_weighting_uniform_bound() {
     let row_h: BTreeMap<u8, f64> =
         [(2u8, 0.5f64), (3, 3.0), (4, 13.0), (5, 36.0), (6, 58.0)].into_iter().collect();
     let bill: f64 = row_h.values().sum();
+
+    // ── REACH × POT (the EV-error / allocation weight) ──
+    // Degrading a bucket injects a strategy error; its EV cost ∝ how
+    // OFTEN the bucket occurs (reach) × how much MONEY is at stake
+    // (pot). This is the weight that decides fidelity, not reach alone.
+    // Cross it with the per-family GPU cost: is the expensive tail also
+    // the high-stakes tail (must-keep), or low-stakes (safe to degrade)?
+    let total_rp: f64 = rp_by_live.values().sum();
+    eprintln!("\n═══ REACH×POT IMPORTANCE vs COST (the allocation lens) ═══");
+    eprintln!("live | reach%% | reach×pot%% | bill h | cost-per-importance");
+    for (&live, &rp) in &rp_by_live {
+        let reach_pct = 100.0 * by_live[&live].0 / total_mass;
+        let rp_pct = 100.0 * rp / total_rp;
+        let h = row_h[&live];
+        eprintln!(
+            "  {live}  | {reach_pct:5.2}% | {rp_pct:9.2}% | {h:5.0} | {:.2} h/%imp",
+            h / rp_pct.max(1e-9)
+        );
+    }
+    eprintln!(
+        "\nREADING: the family whose reach×pot share is FAR below its bill-hour\n\
+         share is the safe-to-degrade tail; a family whose reach×pot is\n\
+         comparable to its cost must keep fidelity. (Low-reach ≠ safe if the\n\
+         pot is big — the user's flag: the tail can be high-stakes.)"
+    );
     // ILLUSTRATIVE ONLY (see caveat below): a delete-below-threshold
     // model. The REAL policy degrades low-reach buckets (min runouts/
     // iters or an equity-rollout fallback), it does NOT omit them —
