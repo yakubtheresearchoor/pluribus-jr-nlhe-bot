@@ -498,3 +498,45 @@ fn lever2_live6_loose_texture() {
         );
     }
 }
+
+/// STRATEGY-DELTA CONVERGENCE MAP for live-5/6 (2026-06-13): exact
+/// exploitability is the O(nh^np) wall at np=5/6, so map convergence by
+/// the AVAILABLE metric — how much the average flop strategy MOVES
+/// between iteration milestones (σ-delta). A converging solve's σ
+/// stabilizes: Δσ(N→2N) SHRINKS with N. Calibrated on live-3/4 (the
+/// exploitability map proved they converge → their σ-delta must shrink),
+/// then applied to live-5/6 (the unmeasured player-count jump where the
+/// crisis is hottest — player-count transfer is the assumption this arc
+/// keeps breaking, so MEASURE it, don't assume live-5/6 ≈ live-3/4).
+/// Production nh=1176, B=8, 1×1 runouts (the rare-family fidelity).
+#[test]
+#[ignore = "live-5/6 σ-delta convergence map (GPU, ~10min); --ignored --nocapture --release --features metal"]
+fn convergence_map_live56_sigma_delta() {
+    let ctx = MetalContext::new().expect("Metal");
+    let f0 = flop(["2h", "7d", "Ks"]);
+    let nb = 8usize;
+    let milestones = [50u32, 150, 450];
+    // (live, commit, pot, label)
+    let cells: &[(u8, i32, i32, &str)] = &[
+        (3, 7, 25, "live-3 (calib: converges)"),
+        (4, 7, 29, "live-4 (calib: converges)"),
+        (5, 2, 10, "live-5 (UNMAPPED)"),
+        (6, 2, 12, "live-6 (UNMAPPED, hottest)"),
+    ];
+    eprintln!("\n═══ STRATEGY-DELTA CONVERGENCE MAP (live-5/6, prod nh, B={nb}, 1×1) ═══");
+    eprintln!("Δσ between σ(50→150) and σ(150→450); SHRINKING ⇒ converges");
+    for &(live, commit, pot, label) in cells {
+        let tree = seam_tree(live, commit, pot);
+        let sigmas: Vec<Vec<Vec<f32>>> = milestones.iter()
+            .map(|&it| solve_sigma(&ctx, &tree, f0, live, 1, 1, nb, it).1)
+            .collect();
+        let d1 = mean_dsigma(&sigmas[0], &sigmas[1]); // 50→150
+        let d2 = mean_dsigma(&sigmas[1], &sigmas[2]); // 150→450
+        let verdict = if d2 < d1 * 0.8 { "CONVERGES (Δσ shrinking)" }
+            else if d2 < d1 + 0.005 { "converging (flat-ish)" } else { "THRASHES (Δσ growing)" };
+        eprintln!("  live {live} {label}: Δσ(50→150) {d1:.4} → Δσ(150→450) {d2:.4}  → {verdict}");
+    }
+    eprintln!("READING: live-5/6 Δσ shrinking like live-3/4 ⇒ they converge, S2 tolerance \
+        transfers; live-5/6 NOT shrinking ⇒ separate non-converging bucket (the player-count \
+        jump breaks, as this arc's transfers keep doing).");
+}
