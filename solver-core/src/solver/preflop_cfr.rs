@@ -328,12 +328,52 @@ impl PreflopVectorCfr {
         self.chance_cfv_expansion_inner(chance_node_idx, traverser, reach, table, oracle, None)
     }
 
+    /// SLICE-2 ROUTER (2026-06-12): the per-chance-node CFV for one
+    /// traverser at the preflop→flop seam, handling folded players.
+    ///   - FOLDED TRAVERSER: value is postflop-independent — exactly the
+    ///     fold chip-delta × pairwise blocking that `terminal_value_fn`
+    ///     computes at any node (it reads contributions + fold mask).
+    ///     Routed there, reusing validated machinery with zero new value
+    ///     logic. (The bottom-up walk treats this chance node like any
+    ///     fold leaf below the traverser's own fold.)
+    ///   - LIVE TRAVERSER: the cell-aware oracle, given the folded_mask
+    ///     so a live-subset value source can pick the live ranges.
+    pub fn chance_cfv_for_traverser(
+        &self,
+        tree: &FlatTree,
+        chance_idx: usize,
+        traverser: u8,
+        reach: &[Vec<f32>],
+        table: &PreflopChanceTable,
+        oracle: &mut impl PostflopValueOracle,
+        terminal_value_fn: &impl Fn(usize, u8, &[Vec<f32>]) -> Vec<f32>,
+    ) -> Vec<f32> {
+        let np = self.num_players as usize;
+        let n_classes = NUM_PREFLOP_CLASSES;
+        let mask = tree.get_folded_mask(chance_idx);
+        if (mask >> traverser) & 1 == 1 {
+            // Folded traverser: same value a fold leaf at this node gives.
+            let base = chance_idx * n_classes;
+            let reach_at: Vec<Vec<f32>> =
+                (0..np).map(|p| reach[p][base..base + n_classes].to_vec()).collect();
+            return terminal_value_fn(chance_idx, traverser, &reach_at);
+        }
+        let cell =
+            crate::solver::postflop_oracle::SeamCell::at_chance_node(tree, chance_idx, np);
+        self.compute_chance_node_cfv_with_expansion_for_cell(
+            chance_idx, traverser, reach, table, oracle, cell, mask,
+        )
+    }
+
     /// SEAM-CELL-AWARE variant (2026-06-12, v1 pot-bucket-keyed
     /// oracles): identical composition, but the oracle is called via
     /// `flop_root_cfv_for_cell` with the flop-entry chance node's seam
-    /// cell — bucket-keyed oracles dispatch to the right representative
-    /// blueprint. Cell-blind oracles behave identically (the trait
-    /// default forwards), so this is a strict generalization.
+    /// cell + `folded_mask` (slice 2: which seats folded preflop, so a
+    /// live-subset oracle can select the live ranges). Cell-blind
+    /// oracles behave identically (the trait default forwards), so this
+    /// is a strict generalization. CONTRACT: the traverser must be LIVE
+    /// (the caller routes folded-traverser chance nodes through the
+    /// fold machinery).
     pub fn compute_chance_node_cfv_with_expansion_for_cell(
         &self,
         chance_node_idx: usize,
@@ -342,6 +382,7 @@ impl PreflopVectorCfr {
         table: &PreflopChanceTable,
         oracle: &mut impl PostflopValueOracle,
         cell: crate::solver::postflop_oracle::SeamCell,
+        folded_mask: u16,
     ) -> Vec<f32> {
         self.chance_cfv_expansion_inner(
             chance_node_idx,
@@ -349,7 +390,7 @@ impl PreflopVectorCfr {
             reach,
             table,
             oracle,
-            Some(cell),
+            Some((cell, folded_mask)),
         )
     }
 
@@ -360,7 +401,7 @@ impl PreflopVectorCfr {
         reach: &[Vec<f32>],
         table: &PreflopChanceTable,
         oracle: &mut impl PostflopValueOracle,
-        cell: Option<crate::solver::postflop_oracle::SeamCell>,
+        cell: Option<(crate::solver::postflop_oracle::SeamCell, u16)>,
     ) -> Vec<f32> {
         let np = self.num_players as usize;
         assert_eq!(reach.len(), np,
@@ -387,7 +428,9 @@ impl PreflopVectorCfr {
             // bucketed lookup); the engine just consumes the per-combo
             // CFV in flop_combo_layout order.
             let v_combo = match cell {
-                Some(c) => oracle.flop_root_cfv_for_cell(f_canon, &combo_reaches, traverser, c),
+                Some((c, mask)) => {
+                    oracle.flop_root_cfv_for_cell(f_canon, &combo_reaches, traverser, c, mask)
+                }
                 None => oracle.flop_root_cfv(f_canon, &combo_reaches, traverser),
             };
             assert_eq!(v_combo.len(), layout.len(),
@@ -428,6 +471,7 @@ impl PreflopVectorCfr {
         subset_indices: &[usize],
         oracle: &mut impl PostflopValueOracle,
         cell: crate::solver::postflop_oracle::SeamCell,
+        folded_mask: u16,
     ) -> Vec<f32> {
         let np = self.num_players as usize;
         let n_classes = NUM_PREFLOP_CLASSES;
@@ -441,8 +485,8 @@ impl PreflopVectorCfr {
                 let class_reach = &reach[p][chance_base..chance_base + n_classes];
                 combo_reaches.push(expand_reach_class_to_combo(f_canon, class_reach, &layout));
             }
-            let v_combo =
-                oracle.flop_root_cfv_for_cell(f_canon, &combo_reaches, traverser, cell);
+            let v_combo = oracle
+                .flop_root_cfv_for_cell(f_canon, &combo_reaches, traverser, cell, folded_mask);
             assert_eq!(v_combo.len(), layout.len());
             per_canonical_v_class.push(reduce_cfv_combo_to_class(f_canon, &v_combo, &layout));
         }
@@ -801,13 +845,9 @@ impl PreflopVectorCfr {
             // the same oracle calls).
             let mut cfv: Vec<Vec<f32>> = vec![vec![0.0_f32; n_classes]; nn];
             for &chance_idx in &chance_nodes {
-                let cell = crate::solver::postflop_oracle::SeamCell::at_chance_node(
-                    tree, chance_idx, np as usize,
+                cfv[chance_idx] = self.chance_cfv_for_traverser(
+                    tree, chance_idx, t, &reach, table, oracle, &terminal_value_fn,
                 );
-                let v = self.compute_chance_node_cfv_with_expansion_for_cell(
-                    chance_idx, t, &reach, table, oracle, cell,
-                );
-                cfv[chance_idx] = v;
             }
 
             // 3b. Bottom-up walk + regret update.
@@ -895,21 +935,35 @@ impl PreflopVectorCfr {
             let mut by_key: std::collections::HashMap<u64, Vec<f32>> =
                 std::collections::HashMap::new();
             for &chance_idx in &chance_nodes {
+                // SLICE-2 (2026-06-12): a FOLDED traverser's value is
+                // postflop-independent and NODE-SPECIFIC (its own
+                // contributions + reaches), so it is NOT collapsed by
+                // key — computed per node via the fold machinery. Only
+                // LIVE-traverser oracle calls are collapsed.
+                let mask = tree.get_folded_mask(chance_idx);
+                if (mask >> t) & 1 == 1 {
+                    let base = chance_idx * n_classes;
+                    let reach_at: Vec<Vec<f32>> = (0..np as usize)
+                        .map(|p| reach[p][base..base + n_classes].to_vec())
+                        .collect();
+                    cfv[chance_idx] = terminal_value_fn(chance_idx, t, &reach_at);
+                    continue;
+                }
                 let key = chance_key(chance_idx);
                 let v = match by_key.get(&key) {
                     Some(v) => v.clone(),
                     None => {
                         // Cell-aware call (2026-06-12): the oracle sees
-                        // the seam cell of the FIRST chance node bearing
-                        // this key — consistent with the caller contract
-                        // (the answer must depend only on (flop, t, key),
-                        // so any key-mate's cell selects the same
+                        // the seam cell + folded_mask of the FIRST chance
+                        // node bearing this key — consistent with the
+                        // caller contract (answer depends only on
+                        // (flop, t, key); any key-mate selects the same
                         // representative blueprint).
                         let cell = crate::solver::postflop_oracle::SeamCell::at_chance_node(
                             tree, chance_idx, np as usize,
                         );
                         let v = self.compute_chance_node_cfv_with_expansion_for_cell(
-                            chance_idx, t, &reach, table, oracle, cell,
+                            chance_idx, t, &reach, table, oracle, cell, mask,
                         );
                         by_key.insert(key, v.clone());
                         v

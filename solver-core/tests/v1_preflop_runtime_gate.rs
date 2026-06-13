@@ -50,6 +50,7 @@ impl PostflopValueOracle for BucketStubOracle {
         _combo_ranges: &[Vec<f32>],
         traverser: u8,
         cell: SeamCell,
+        _folded_mask: u16,
     ) -> Vec<f32> {
         let (live, bin) = cell.bucket_key(STACK);
         self.keys_seen.insert((live, bin));
@@ -244,9 +245,10 @@ fn v1_preflop_runtime_production_measure() {
         s2.compute_preflop_strategy(&tree);
         let reach = s2.compute_preflop_reach(&tree, None);
         let cell = SeamCell::at_chance_node(&tree, idx, 6);
+        let fmask = tree.get_folded_mask(idx);
         let t0 = Instant::now();
         let _ = s2.compute_chance_node_cfv_with_expansion_for_cell(
-            idx, 0, &reach, &table, &mut oracle, cell,
+            idx, 0, &reach, &table, &mut oracle, cell, fmask,
         );
         t0.elapsed().as_secs_f64()
     };

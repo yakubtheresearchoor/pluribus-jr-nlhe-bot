@@ -151,12 +151,20 @@ pub trait PostflopValueOracle {
     /// on (canonical_flop, traverser, the collapse key) — and the
     /// collapse key must be a function of the cell for cell-keyed
     /// oracles.
+    /// `folded_mask`: which of the `combo_ranges.len()` seats folded
+    /// PREFLOP (slice 2, 2026-06-12). The traverser is guaranteed LIVE
+    /// here — the engine routes folded-traverser chance nodes through
+    /// the validated fold machinery (chip-delta × pairwise blocking),
+    /// never the oracle. Folded OPPONENTS enter the postflop game only
+    /// as dead money (already in `cell.pot`) and card-removal; a
+    /// live-subset oracle selects the live seats' ranges via this mask.
     fn flop_root_cfv_for_cell(
         &mut self,
         canonical_flop: [Card; 3],
         combo_ranges: &[Vec<f32>],
         traverser: u8,
         _cell: SeamCell,
+        _folded_mask: u16,
     ) -> Vec<f32> {
         self.flop_root_cfv(canonical_flop, combo_ranges, traverser)
     }
@@ -210,15 +218,22 @@ pub trait PostflopValueOracle {
 /// invalidates per the refresh cadence — satisfying the shared-chance
 /// collapse contract (answer depends only on (flop, traverser, key)).
 ///
-/// SCOPE (slice 1): traverser must be LIVE at the cell, and all
-/// players live (HU-complete: any HU fold ends the hand, so HU
-/// flop-entry cells are always all-live). SLICE 2 (named, 6-max):
-/// folded-OPPONENT reach factors (pairwise-blocking convention,
-/// mirroring preflop_terminal) and folded-TRAVERSER constant values —
-/// asserted-against until built so they cannot silently mis-answer.
+/// SCOPE (slice 2, 2026-06-12): the traverser is always LIVE here — the
+/// engine routes folded-TRAVERSER chance nodes through the validated
+/// fold machinery (chip-delta × pairwise blocking), never the oracle,
+/// so a folded-traverser call is a wiring bug and the guard fires.
+/// Folded OPPONENTS are handled by the value `src`, which receives the
+/// `folded_mask` to select the live seats' ranges and build the
+/// live-subset postflop game; folded opponents enter only as dead money
+/// (already in `cell.pot`) and card-removal (named pairwise-blocking
+/// residual, the same approximation the bucketed terminal already
+/// makes). The collapse key keys ONLY on (bucket, flop, traverser) —
+/// NOT on which seats folded — because the cell-set policy buckets on
+/// (live, SPR) and members with the same (live, commit, pot) are the
+/// same game regardless of seat identity.
 pub struct BucketKeyedOracle<S>
 where
-    S: FnMut(SeamCell, [Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
+    S: FnMut(SeamCell, u16, [Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
 {
     pub stack: i32,
     pub num_players: u8,
@@ -231,7 +246,7 @@ where
 
 impl<S> BucketKeyedOracle<S>
 where
-    S: FnMut(SeamCell, [Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
+    S: FnMut(SeamCell, u16, [Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
 {
     pub fn new(stack: i32, num_players: u8, refresh_every: u32, src: S) -> Self {
         Self { stack, num_players, src, cache: std::collections::HashMap::new(), refresh_every }
@@ -243,7 +258,7 @@ where
 
 impl<S> PostflopValueOracle for BucketKeyedOracle<S>
 where
-    S: FnMut(SeamCell, [Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
+    S: FnMut(SeamCell, u16, [Card; 3], &[Vec<f32>], u8) -> Vec<f32>,
 {
     fn flop_root_cfv(
         &mut self,
@@ -263,20 +278,22 @@ where
         combo_ranges: &[Vec<f32>],
         traverser: u8,
         cell: SeamCell,
+        folded_mask: u16,
     ) -> Vec<f32> {
-        // Slice-1 scope guard (see struct doc): all players live.
+        // The traverser must be LIVE — folded traversers are handled by
+        // the engine, never reach the oracle.
         assert_eq!(
-            cell.live, self.num_players,
-            "BucketKeyedOracle slice 1: folded players at the seam (live {} of {}) — \
-             the folded-reach/folded-traverser conventions are slice 2; this assert \
-             prevents a silently-wrong answer",
-            cell.live, self.num_players
+            (folded_mask >> traverser) & 1,
+            0,
+            "BucketKeyedOracle: folded traverser {traverser} reached the oracle — \
+             the engine must route folded-traverser chance nodes through the fold \
+             machinery, not the postflop value source"
         );
         let key = (cell.bucket_key(self.stack), canonical_flop, traverser);
         if let Some(v) = self.cache.get(&key) {
             return v.clone();
         }
-        let v = (self.src)(cell, canonical_flop, combo_ranges, traverser);
+        let v = (self.src)(cell, folded_mask, canonical_flop, combo_ranges, traverser);
         self.cache.insert(key, v.clone());
         v
     }
