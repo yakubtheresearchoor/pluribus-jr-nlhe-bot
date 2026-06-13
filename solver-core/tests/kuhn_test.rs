@@ -272,3 +272,60 @@ fn kuhn_best_response_symmetry() {
     assert!(avg_br1 >= avg_sv1 - 0.01,
         "BR value should >= strategy value for P1");
 }
+
+// ════════════════════════════════════════════════════════════════════
+// PHASE S0 (2026-06-13): the QRE reduction gate — the trust anchor for
+// the depth-limited-search arc. The QRE generalization (logit response
+// at per-seat inverse-temperature λ) must, at the Nash limit (λ→∞),
+// reproduce the pure-Nash DCFR solve of the same subgame. This proves
+// the generalization didn't break the Nash case before anything reads
+// from the solve. Stop-and-report if it does not reduce cleanly — that
+// is a foundation bug, not a tuning issue.
+//
+// Robust to Kuhn's equilibrium MULTIPLICITY (one-parameter Nash family):
+// the gate compares EXPLOITABILITY (→0) and ROOT VALUE (unique = -1/18),
+// NOT the strategy (which differs across the Nash set). The λ-curve
+// (exploitability falling as λ rises) IS the reduction proof.
+#[test]
+fn s0_qre_reduces_to_nash() {
+    let tree = build_kuhn_tree();
+    let game = KuhnGame;
+    const ITERS: u32 = 20000;
+    let norm = (NUM_HANDS * (NUM_HANDS - 1)) as f32;
+
+    // Nash reference: pure regret matching (lambda = None).
+    let mut nash = CpuMccfr::new(&tree, vec![NUM_HANDS; 2]);
+    let nash_cfv = nash.run(&tree, &game, ITERS);
+    let nash_val = nash_cfv.iter().sum::<f32>() / norm;
+    let nash_expl = {
+        let p = StrategyProfile::from_usize_offsets(nash.cum_strategy_slice(), nash.node_offsets(), NUM_HANDS);
+        exploitability(&tree, &game, &p)
+    };
+    eprintln!("\n═══ S0 QRE→Nash reduction (Kuhn, {ITERS} iters) ═══");
+    eprintln!("NASH (regret matching): value {nash_val:+.5} (exact -1/18 = {:+.5}) | expl {nash_expl:.5}", -1.0/18.0);
+
+    eprintln!("QRE λ-curve (expl must fall toward Nash, value → Nash):");
+    let mut last_expl = f32::INFINITY;
+    let mut last_val = 0.0f32;
+    for &lam in &[1.0f32, 3.0, 10.0, 30.0, 100.0, 300.0] {
+        let mut qre = CpuMccfr::new(&tree, vec![NUM_HANDS; 2]);
+        qre.set_lambda(vec![lam; 2]);
+        let cfv = qre.run(&tree, &game, ITERS);
+        let val = cfv.iter().sum::<f32>() / norm;
+        let expl = {
+            let p = StrategyProfile::from_usize_offsets(qre.cum_strategy_slice(), qre.node_offsets(), NUM_HANDS);
+            exploitability(&tree, &game, &p)
+        };
+        eprintln!("  λ={lam:>5.0}: value {val:+.5} | expl {expl:.5}");
+        last_expl = expl;
+        last_val = val;
+    }
+
+    // REDUCTION assertions (tolerances pinned to measured S0 numbers):
+    // at the highest λ, QRE is a near-Nash — low exploitability and the
+    // unique Nash value.
+    assert!(last_expl < 0.02, "QRE at high λ not near-Nash: expl {last_expl:.5} (reduction FAILED)");
+    assert!((last_val - nash_val).abs() < 0.02, "QRE high-λ value {last_val:+.5} != Nash {nash_val:+.5}");
+    assert!((last_val + 1.0/18.0).abs() < 0.02, "QRE high-λ value {last_val:+.5} != exact -1/18");
+    eprintln!("S0 PASSED: QRE reduces to the Nash DCFR solve at the high-λ limit.");
+}

@@ -11,6 +11,19 @@ pub struct CpuMccfr {
     node_data_offset: Vec<usize>,
     iteration: u32,
     regret_floor: f32,
+    // QRE generalization (S0, 2026-06-13): per-seat inverse-temperature
+    // λ. `None` = pure Nash (regret matching) — bit-identical to the
+    // pre-QRE solver, so existing gates are untouched. `Some(λ)` =
+    // QUANTAL response: the acting player's strategy is a LOGIT over the
+    // action counterfactual values, σ_a ∝ exp(λ_seat · cfv_a) (per hand).
+    // As λ→∞ the logit → argmax(cfv) = best-response-to-last-iterate, so
+    // the averaged play is fictitious play → Nash (the reduction the S0
+    // gate proves). At finite λ it is a genuine quantal response (λ
+    // controls rationality), which S2 uses to model rough opponents.
+    // `last_cfv` holds the previous iteration's per-(node,action,hand)
+    // counterfactual value the logit responds to.
+    lambda: Option<Vec<f32>>,
+    last_cfv: Vec<f32>,
 }
 
 impl CpuMccfr {
@@ -37,7 +50,17 @@ impl CpuMccfr {
             node_data_offset: offsets,
             iteration: 0,
             regret_floor: -1e30,
+            lambda: None,
+            last_cfv: vec![0.0; total],
         }
+    }
+
+    /// Enable QUANTAL-response (QRE) mode with per-seat inverse-
+    /// temperature λ (length = num_players). High λ → Nash limit; the
+    /// S0 reduction gate proves QRE-at-high-λ reproduces the Nash solve.
+    pub fn set_lambda(&mut self, lambda: Vec<f32>) {
+        assert_eq!(lambda.len(), self.num_players as usize, "lambda per seat");
+        self.lambda = Some(lambda);
     }
 
     pub fn run(
@@ -137,7 +160,7 @@ impl CpuMccfr {
         let nh = self.num_hands[player as usize];
         let children = tree.node_children(node_idx);
 
-        let strategy = self.compute_strategy(node_idx, num_actions, nh);
+        let strategy = self.compute_strategy(node_idx, num_actions, nh, player);
 
         let mut cfv_all: Vec<Vec<f32>> = Vec::with_capacity(num_actions);
 
@@ -200,14 +223,61 @@ impl CpuMccfr {
                     self.cum_strategy[idx] += weight * traverser_reach[h] * strategy[a * nh + h];
                 }
             }
+
+            // QRE: ACCUMULATE action values so the logit responds to the
+            // value against the TIME-AVERAGE opponent (smooth fictitious
+            // play — convergent in zero-sum), NOT the last iterate
+            // (Cournot best-response dynamics — oscillates, does not
+            // converge; the S0 v1 bug). cfv is linear in opponent reach,
+            // so the average cfv IS the cfv against the average opponent.
+            // No-op for `lambda == None` (Nash path ignores last_cfv).
+            if self.lambda.is_some() {
+                for h in 0..nh {
+                    for a in 0..num_actions {
+                        self.last_cfv[offset + a * nh + h] += cfv_all[a][h];
+                    }
+                }
+            }
         }
 
         cfv_avg
     }
 
-    fn compute_strategy(&self, node_idx: usize, num_actions: usize, nh: usize) -> Vec<f32> {
+    fn compute_strategy(&self, node_idx: usize, num_actions: usize, nh: usize, player: u8) -> Vec<f32> {
         let offset = self.node_data_offset[node_idx];
         let mut strategy = vec![0.0f32; num_actions * nh];
+
+        // QRE (quantal) mode: logit over action counterfactual values at
+        // the acting seat's inverse-temperature λ. σ_a ∝ exp(λ·cfv_a),
+        // numerically stabilized by subtracting the per-hand max. First
+        // iterate (last_cfv all zero) → uniform, the natural QRE start.
+        if let Some(lam) = &self.lambda {
+            let l = lam[player as usize];
+            // Respond to the AVERAGE action value (accumulated cfv ÷ count
+            // of accumulation iterations = value vs the time-average
+            // opponent). Iteration was incremented at run-start, and
+            // last_cfv accumulates from prior iterations, so the average
+            // denominator is (iteration − 1). First iterate: 0 → uniform.
+            let denom = (self.iteration as f32 - 1.0).max(1.0);
+            for h in 0..nh {
+                let mut mx = f32::NEG_INFINITY;
+                for a in 0..num_actions {
+                    mx = mx.max(self.last_cfv[offset + a * nh + h] / denom);
+                }
+                let mut z = 0.0f32;
+                for a in 0..num_actions {
+                    let avg = self.last_cfv[offset + a * nh + h] / denom;
+                    let w = (l * (avg - mx)).exp();
+                    strategy[a * nh + h] = w;
+                    z += w;
+                }
+                let z = if z > 0.0 { z } else { 1.0 };
+                for a in 0..num_actions {
+                    strategy[a * nh + h] /= z;
+                }
+            }
+            return strategy;
+        }
 
         for h in 0..nh {
             let mut pos_sum = 0.0f32;
@@ -263,7 +333,8 @@ impl CpuMccfr {
     }
 
     pub fn get_current_strategy(&self, node_idx: usize, num_actions: usize, nh: usize) -> Vec<Vec<f32>> {
-        let raw = self.compute_strategy(node_idx, num_actions, nh);
+        let player = 0u8; // informational accessor; player unknown here, Nash-mode uses regrets only
+        let raw = self.compute_strategy(node_idx, num_actions, nh, player);
         let mut result = vec![vec![0.0f32; nh]; num_actions];
         for a in 0..num_actions {
             for h in 0..nh {
