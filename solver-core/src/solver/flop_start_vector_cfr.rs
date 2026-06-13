@@ -1079,6 +1079,105 @@ impl FlopStartVectorCfr {
         root_cfv_sum
     }
 
+    /// ALL-TRAVERSER root CFV (2026-06-13): the EXACT-vector mirror of
+    /// `BucketedFlopCfr::run_all_root_cfv`, returning `[np][nh]`. Serves
+    /// as the cheap (small-nh) independent reference for the bucketed
+    /// keystone's multi-traverser values — the exact CONVERGED source is
+    /// the np≥3 combinatorial wall, but the exact VECTOR solver on an
+    /// NH=6 subset is fast. Gated bit-exact: `run_all_root_cfv(..)[0]` ≡
+    /// `run(..)` (per-traverser-0 arithmetic unchanged; also captures the
+    /// others). DiskBacked load/save preserved for faithfulness.
+    pub fn run_all_root_cfv(
+        &mut self,
+        tree: &FlatTree,
+        game: &FlopStartGame,
+        num_iterations: u32,
+    ) -> Vec<Vec<f32>> {
+        let np = self.num_players as usize;
+        let nh = self.nh;
+        let nn = tree.num_nodes();
+        let table = game.table();
+        let turn_deck = &table.remaining_deck;
+
+        let mut root_all = vec![vec![0.0f32; nh]; np];
+        let mut count = 0u32;
+        let mut flop_cfv = vec![0.0f32; nn * nh];
+        let mut river_cfv_accum = vec![0.0f32; nn * nh];
+        let mut cfv = vec![0.0f32; nn * nh];
+        let mut turn_cfv = vec![0.0f32; nn * nh];
+
+        for _ in 0..num_iterations {
+            let params = if self.vanilla_mode {
+                DcfrParams { alpha_t: 1.0, beta_t: 1.0, gamma_t: 1.0 }
+            } else {
+                DcfrParams::new(self.iteration)
+            };
+            self.iteration += 1;
+
+            for traverser in 0..np {
+                self.compute_flop_strategy(tree);
+                let flop_reach = self.compute_reach_flop(tree, game);
+                for &child_id in &self.turn_chance_children {
+                    let off = child_id as usize * nh;
+                    for h in 0..nh { flop_cfv[off + h] = 0.0; }
+                }
+                for (ti, &tc) in turn_deck.iter().enumerate() {
+                    self.compute_turn_strategy_for_tc(tree, ti);
+                    let turn_reach = self.compute_reach_turn(tree, ti, &flop_reach);
+                    let n_river = self.river_deck_sizes[tc as usize];
+                    for &child_id in &self.river_chance_children {
+                        let off = child_id as usize * nh;
+                        for h in 0..nh { river_cfv_accum[off + h] = 0.0; }
+                    }
+                    for ri in 0..n_river {
+                        self.load_river_pair(ti, ri).expect("load_river_pair");
+                        self.compute_river_strategy_for_pair(tree, ti, ri);
+                        let river_reach = self.compute_reach_river(tree, ti, ri, &turn_reach);
+                        self.bottom_up_zone(
+                            tree, table, traverser as u8, &river_reach, &mut cfv,
+                            Zone::River, Some(ti), Some(ri), &params,
+                        );
+                        self.save_river_pair(ti, ri).expect("save_river_pair");
+                        for &child_id in &self.river_chance_children {
+                            for h in 0..nh {
+                                let cp = table.chance_probability_river(tc, ri, h);
+                                river_cfv_accum[child_id as usize * nh + h] +=
+                                    cp * cfv[child_id as usize * nh + h];
+                            }
+                        }
+                    }
+                    for &child_id in &self.river_chance_children {
+                        for h in 0..nh {
+                            turn_cfv[child_id as usize * nh + h] =
+                                river_cfv_accum[child_id as usize * nh + h];
+                        }
+                    }
+                    self.bottom_up_zone(
+                        tree, table, traverser as u8, &turn_reach, &mut turn_cfv,
+                        Zone::Turn, Some(ti), None, &params,
+                    );
+                    for &child_id in &self.turn_chance_children {
+                        for h in 0..nh {
+                            let cp = table.chance_probability_turn(ti, h);
+                            flop_cfv[child_id as usize * nh + h] +=
+                                cp * turn_cfv[child_id as usize * nh + h];
+                        }
+                    }
+                }
+                self.bottom_up_zone(
+                    tree, table, traverser as u8, &flop_reach, &mut flop_cfv,
+                    Zone::Flop, None, None, &params,
+                );
+                for h in 0..nh { root_all[traverser][h] += flop_cfv[h]; }
+                if traverser == 0 { count += 1; }
+            }
+        }
+        for t in 0..np {
+            for h in 0..nh { root_all[t][h] /= count as f32; }
+        }
+        root_all
+    }
+
     // ══════════════════════════════════════════════
     // Bottom-up zone processing
     // ══════════════════════════════════════════════

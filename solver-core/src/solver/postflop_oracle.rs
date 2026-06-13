@@ -305,6 +305,135 @@ where
     }
 }
 
+/// THE BUCKETED LIVE-SUBSET VALUE SOURCE (2026-06-13, the keystone): a
+/// reach-independent frozen postflop oracle source, shared by all three
+/// consumers (equilibrium-reach verification, production fill, preflop
+/// runtime). Plug into `BucketKeyedOracle::new(.., src)`.
+///
+/// For a flop-entry cell it solves the LIVE-SUBSET game ONCE (all live
+/// traversers) and caches the per-traverser per-combo (flop_combo_layout
+/// order) root CFV. live≥3 uses the bucketed solver
+/// (`run_all_root_cfv` + `table_hand_to_layout_perm`); live==2 uses the
+/// exact converged solver (the bucketed terminal is np≥3 scope). Both
+/// solve against the table's structural UNIFORM range, so the answer is
+/// REACH-INDEPENDENT — it ignores the passed `combo_reaches` (gated:
+/// `bucketed_oracle_range_convention_gate`). That reach-independence is
+/// the assumption the whole three-consumer economy rests on: one solved
+/// cell answers every chance node routing to it (the shared-chance
+/// collapse contract).
+///
+/// `nt`/`nr` = runout fidelity (turn/river samples). NAMED residual:
+/// folded-opponent card-removal is NOT modeled by the live-subset game
+/// (slice-2 residual, rides to the harness).
+pub fn bucketed_live_subset_source(
+    spec: crate::tree::action::GameSpec,
+    nb: usize,
+    nt: usize,
+    nr: usize,
+    iters: u32,
+) -> impl FnMut(SeamCell, u16, [Card; 3], &[Vec<f32>], u8) -> Vec<f32> {
+    use crate::solver::bucketed_flop_cfr::{BucketedFlopCfr, FlopBucketing, TerminalDesign};
+    use crate::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
+    use crate::solver::preflop_start_game::{
+        compute_v_flop_at_root_converged, flop_combo_layout, table_hand_to_layout_perm,
+    };
+    use crate::tree::action::{BetSize, BetSizeOptions};
+    use crate::tree::builder::build_tree;
+    use std::collections::HashMap;
+
+    let bets = BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    // Deterministic nt×nr runout deck positions (the pricing convention).
+    let runout = move |flop: [Card; 3]| -> (Vec<u8>, Vec<Vec<u8>>) {
+        let bm: u64 = flop.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
+        let deck: Vec<u8> = (0..52u8).filter(|c| bm & (1u64 << c) == 0).collect();
+        let tp: &[usize] = match nt { 1 => &[12], 2 => &[12, 36], 4 => &[6, 18, 30, 42], _ => &[12] };
+        let rp: &[usize] = match nr { 1 => &[10], 2 => &[10, 30], 4 => &[8, 20, 32, 44], _ => &[10] };
+        let turn_cards: Vec<u8> = tp.iter().map(|&p| deck[p]).collect();
+        let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+        for &tc in &turn_cards {
+            let rd: Vec<u8> = deck.iter().copied().filter(|&c| c != tc).collect();
+            river_decks[tc as usize] = rp.iter().map(|&p| rd[p]).collect();
+        }
+        (turn_cards, river_decks)
+    };
+
+    let mut trees: HashMap<(u8, i32, i32), std::sync::Arc<FlatTree>> = HashMap::new();
+    // (cell-id, flop) -> [live_index][layout-ordered combo CFV].
+    let mut cache: HashMap<((u8, i32, i32), [Card; 3]), Vec<Vec<f32>>> = HashMap::new();
+
+    move |cell, folded_mask, canonical, combo_reaches, traverser| {
+        let np = combo_reaches.len();
+        let live_seats: Vec<usize> =
+            (0..np).filter(|&p| (folded_mask >> p) & 1 == 0).collect();
+        debug_assert_eq!(live_seats.len(), cell.live as usize);
+        let trav_live = live_seats
+            .iter()
+            .position(|&p| p == traverser as usize)
+            .expect("traverser must be live");
+
+        let cell_id = (cell.live, cell.commit, cell.pot);
+        if !cache.contains_key(&(cell_id, canonical)) {
+            let tree = trees
+                .entry(cell_id)
+                .or_insert_with(|| {
+                    std::sync::Arc::new(
+                        build_tree(&spec.flop_seam_config(
+                            cell.live,
+                            cell.commit.min(spec.stack),
+                            cell.pot,
+                            bets.clone(),
+                        ))
+                        .expect("seam tree"),
+                    )
+                })
+                .clone();
+            let (turn_cards, river_decks) = runout(canonical);
+            let layout = flop_combo_layout(canonical);
+            let nlay = layout.len();
+
+            let per_live: Vec<Vec<f32>> = if cell.live >= 3 {
+                // Bucketed path: one self-play solve, all live traversers.
+                let table =
+                    FlopChanceTable::build_full_nh_sampled(canonical, cell.live, &turn_cards, &river_decks);
+                let bk = FlopBucketing::quantile(&table, nb);
+                let perm = table_hand_to_layout_perm(&table.hand_cards, table.num_valid, canonical);
+                let game = FlopStartGame::new(table);
+                let mut solver = BucketedFlopCfr::new(&tree, game.table(), &bk);
+                solver.set_terminal_design(TerminalDesign::Design1Collapsed);
+                let root_all = solver.run_all_root_cfv(&tree, &game, &bk, iters);
+                root_all
+                    .iter()
+                    .map(|per_hand| perm.iter().map(|&h| per_hand[h]).collect())
+                    .collect()
+            } else {
+                // live == 2: exact converged, per traverser, reach-
+                // independent (uniform full ranges). Returns table order
+                // + its layout; reorder to flop_combo_layout.
+                let uni: Vec<Vec<f32>> =
+                    vec![vec![1.0f32; crate::card::NUM_POSSIBLE_HANDS]; cell.live as usize];
+                (0..cell.live as usize)
+                    .map(|t| {
+                        let (v_tbl, lay_tbl) = compute_v_flop_at_root_converged(
+                            canonical, &tree, &uni, t as u8, iters,
+                        );
+                        let mut pos: HashMap<(Card, Card), usize> = HashMap::new();
+                        for (i, &(a, b)) in lay_tbl.iter().enumerate() {
+                            pos.insert((a.min(b), a.max(b)), i);
+                        }
+                        layout
+                            .iter()
+                            .map(|&(a, b)| v_tbl[pos[&(a.min(b), a.max(b))]])
+                            .collect::<Vec<f32>>()
+                    })
+                    .collect()
+            };
+            debug_assert!(per_live.iter().all(|v| v.len() == nlay));
+            cache.insert((cell_id, canonical), per_live);
+        }
+        cache[&(cell_id, canonical)][trav_live].clone()
+    }
+}
+
 /// adapter keeps tests on the same code path without forcing them to
 /// declare a full oracle type.
 ///

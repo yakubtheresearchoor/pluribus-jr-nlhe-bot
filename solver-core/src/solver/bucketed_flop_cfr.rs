@@ -126,6 +126,51 @@ impl FlopBucketing {
         Self::from_maps(table, nh, nh, nh, id_map, turn_maps, river_maps)
     }
 
+    /// QUANTILE bucketing at B per street/outcome (2026-06-13,
+    /// consolidated from the test-duplicated helper into the library so
+    /// the bucketed oracle and every consumer share ONE definition):
+    /// each player-perspective opponent-strength ordering is split into
+    /// B equal-count quantile buckets over the runout-alive hands
+    /// (NO_BUCKET for hands conflicting with the dealt turn/river). This
+    /// is the production map family.
+    pub fn quantile(table: &FlopChanceTable, nb: usize) -> Self {
+        let nh = table.num_valid;
+        let conflicts = |h: usize, cards: &[u8]| -> bool {
+            let c1 = table.hand_cards[h * 2];
+            let c2 = table.hand_cards[h * 2 + 1];
+            cards.iter().any(|&bc| bc == c1 || bc == c2)
+        };
+        let map_for = |pl_idx: &[u16], dead: &[u8]| -> Vec<u16> {
+            let alive: Vec<usize> = pl_idx[..nh]
+                .iter()
+                .map(|&i| i as usize)
+                .filter(|&h| !conflicts(h, dead))
+                .collect();
+            let n = alive.len();
+            assert!(n >= nb, "quantile: {n} alive hands < B={nb}");
+            let mut map = vec![NO_BUCKET; nh];
+            for (pos, &h) in alive.iter().enumerate() {
+                map[h] = ((pos * nb) / n) as u16;
+            }
+            map
+        };
+        let (_, _, _, base_pi, _) = table.sorted_opp_arrays_base();
+        let flop_map = map_for(&base_pi, &[]);
+        let mut turn_maps = Vec::new();
+        let mut river_maps = Vec::new();
+        for &tc in &table.remaining_deck {
+            let (_, _, _, pi) = table.turn_sorted_arrays(tc);
+            turn_maps.push(map_for(pi, &[tc]));
+            let mut rms = Vec::new();
+            for &rc in &table.river_decks[tc as usize] {
+                let (_, _, _, pi) = table.river_sorted_arrays(tc, rc);
+                rms.push(map_for(pi, &[tc, rc]));
+            }
+            river_maps.push(rms);
+        }
+        Self::from_maps(table, nb, nb, nb, flop_map, turn_maps, river_maps)
+    }
+
     /// General constructor: caller supplies the per-street, per-outcome
     /// hand→bucket maps (NO_BUCKET for runout-conflicting hands at
     /// B < nh); unit initial weights. Builds the per-runout Design-1
