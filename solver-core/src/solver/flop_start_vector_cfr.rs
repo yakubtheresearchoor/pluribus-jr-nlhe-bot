@@ -1524,6 +1524,7 @@ impl FlopStartVectorCfr {
     pub fn cum_strategy_river(&self) -> &[f32] { &self.cum_strategy_river }
     pub fn cum_strategy_river_mut(&mut self) -> &mut [f32] { &mut self.cum_strategy_river }
     pub fn river_stride(&self) -> usize { self.river_stride }
+    pub fn max_n_river(&self) -> usize { self.max_n_river }
 
     /// Mutable accessors for strategy buffers. Needed by callers (e.g.,
     /// `compute_v_flop_at_root_converged`) that want to freeze the
