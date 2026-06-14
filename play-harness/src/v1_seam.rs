@@ -374,8 +374,8 @@ pub struct SeamBlueprint {
 }
 
 impl SeamBlueprint {
-    /// Solve `game`'s seam tree exactly at research `nh` for `iters`.
-    pub fn solve_research(game: &SeamGame, nh: usize, iters: u32) -> Self {
+    /// Research-scale chance table for `game`'s flop at `nh` hands (2×2 runouts).
+    fn research_table(game: &SeamGame, nh: usize) -> FlopChanceTable {
         let board = game.flop;
         let bmask = board.iter().fold(0u64, |m, &c| m | (1u64 << c));
         let valid: Vec<u16> = (0..NUM_POSSIBLE_HANDS)
@@ -396,8 +396,15 @@ impl SeamBlueprint {
         let turn_cards = vec![avail[0], avail[1]];
         let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
         for &tc in &turn_cards { river_decks[tc as usize] = vec![avail[2], avail[3]]; }
-        let table = FlopChanceTable::compute_flop_start_subset_with_decks(
-            &board, &ranges, np, &chosen, &turn_cards, &river_decks);
+        FlopChanceTable::compute_flop_start_subset_with_decks(
+            &board, &ranges, np, &chosen, &turn_cards, &river_decks)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn maps_from(table: &FlopChanceTable) -> (
+        HashMap<(u8, u8), usize>, HashMap<u8, usize>, HashMap<(u8, u8), usize>,
+        Vec<(u8, u8)>, Vec<(u8, u8)>, usize,
+    ) {
         let mut hand_of = HashMap::new();
         let mut hands = Vec::new();
         for h in 0..table.num_valid {
@@ -406,9 +413,7 @@ impl SeamBlueprint {
             hand_of.insert(key, h);
             hands.push(key);
         }
-        let mut turn_of = HashMap::new();
-        let mut river_of = HashMap::new();
-        let mut runouts = Vec::new();
+        let (mut turn_of, mut river_of, mut runouts) = (HashMap::new(), HashMap::new(), Vec::new());
         for (ti, &tc) in table.remaining_deck.iter().enumerate() {
             turn_of.insert(tc, ti);
             for (ri, &rc) in table.river_decks[tc as usize].iter().enumerate() {
@@ -416,11 +421,68 @@ impl SeamBlueprint {
                 runouts.push((tc, rc));
             }
         }
-        let nhv = table.num_valid;
+        let nh = table.num_valid;
+        (hand_of, turn_of, river_of, hands, runouts, nh)
+    }
+
+    /// Solve `game`'s seam tree EXACTLY (per-hand) at research `nh` — the
+    /// ground-truth anchor and the harness fixture.
+    pub fn solve_research(game: &SeamGame, nh: usize, iters: u32) -> Self {
+        let table = Self::research_table(game, nh);
+        let (hand_of, turn_of, river_of, hands, runouts, nhv) = Self::maps_from(&table);
         let game_fsg = FlopStartGame::new(table);
         let mut solver = FlopStartVectorCfr::new(&game.tree, game_fsg.table());
         solver.run(&game.tree, &game_fsg, iters);
         SeamBlueprint { solver, hand_of, turn_of, river_of, hands, runouts, nh: nhv }
+    }
+
+    /// Solve BUCKETED at `nb` quantile buckets, then LIFT back to per-hand so
+    /// the harness can deal specific cards. The lift is the one new error
+    /// surface (many hands → one bucket → one strategy → lifted back), so it
+    /// reuses the gated exact wiring (the lifted strategy lives in a
+    /// FlopStartVectorCfr, read identically) — only the SOURCE changes. The
+    /// bucketed candidate of the fidelity tournament.
+    pub fn solve_research_bucketed(game: &SeamGame, nh: usize, nb: usize, iters: u32) -> Self {
+        use solver_core::solver::bucketed_flop_cfr::{
+            lift_cum_to_exact, BucketedFlopCfr, FlopBucketing, TerminalDesign,
+        };
+        let table = Self::research_table(game, nh);
+        let (hand_of, turn_of, river_of, hands, runouts, nhv) = Self::maps_from(&table);
+        let bk = FlopBucketing::quantile(&table, nb);
+        let game1 = FlopStartGame::new(table);
+        let mut bucketed = BucketedFlopCfr::new(&game.tree, game1.table(), &bk);
+        bucketed.set_terminal_design(TerminalDesign::Design1Collapsed);
+        bucketed.run(&game.tree, &game1, &bk, iters);
+        // Lift into a per-hand scorer = the SeamBlueprint's strategy source.
+        let table2 = Self::research_table(game, nh);
+        let game2 = FlopStartGame::new(table2);
+        let mut solver = FlopStartVectorCfr::new(&game.tree, game2.table());
+        lift_cum_to_exact(&game.tree, &bucketed, &bk, &mut solver);
+        SeamBlueprint { solver, hand_of, turn_of, river_of, hands, runouts, nh: nhv }
+    }
+
+    /// Per-hand flop-bucket assignment (validates lift uniformity: hands in the
+    /// same bucket must play one strategy). Exposed for the bucketed gate.
+    pub fn flop_buckets(game: &SeamGame, nh: usize, nb: usize) -> Vec<u16> {
+        use solver_core::solver::bucketed_flop_cfr::FlopBucketing;
+        let table = Self::research_table(game, nh);
+        FlopBucketing::quantile(&table, nb).flop_map.clone()
+    }
+
+    /// Exploitability (% of `pot`) of this blueprint's lifted strategy on the
+    /// exact research game — the DISTANCE-FROM-EXACT anchor for the tournament.
+    /// The exact blueprint scores ~0 (equilibrium); a bucketed candidate's
+    /// value is the abstraction gap, the ceiling-referenced fidelity number.
+    pub fn exploitability(&self, game: &SeamGame, nh: usize, pot: u32) -> f32 {
+        let fsg = FlopStartGame::new(Self::research_table(game, nh));
+        let np = game.live as usize;
+        let mut total = 0.0f32;
+        for p in 0..np {
+            let br = self.solver.best_response_value_debug(&game.tree, &fsg, p as u8);
+            let sv = self.solver.strategy_value_debug(&game.tree, &fsg, p as u8);
+            for h in 0..br.len().min(sv.len()) { total += (br[h] - sv[h]).max(0.0); }
+        }
+        total / pot as f32 * 100.0
     }
 
     /// Solver hand index for a card pair (validates the card→hand map).
