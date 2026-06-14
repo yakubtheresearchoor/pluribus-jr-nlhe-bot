@@ -106,8 +106,11 @@ impl SeamGame {
 
     /// Monte-Carlo equity of `my` vs `n_opp` random opponents on the
     /// `revealed` board, over remaining runouts. Strategy-independent — the
-    /// equity-rollout's "computed not solved" value estimate.
-    fn equity(&self, my: [u8; 2], revealed: &[u8], n_opp: usize, rng: &mut u64, samples: usize) -> f64 {
+    /// equity-rollout's "computed not solved" value estimate. `n_opp` is the
+    /// ACTUAL live-opponent count (live − 1), so the rollout tightens
+    /// correctly multiway (a hand that is strong heads-up can be trash 6-way).
+    /// Public so the six-way gate can prove the opponent-count-awareness.
+    pub fn equity(&self, my: [u8; 2], revealed: &[u8], n_opp: usize, rng: &mut u64, samples: usize) -> f64 {
         let mut blocked = (1u64 << my[0]) | (1u64 << my[1]);
         for &c in revealed { blocked |= 1u64 << c; }
         let deck: Vec<u8> = (0..52u8).filter(|&c| blocked & (1u64 << c) == 0).collect();
