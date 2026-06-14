@@ -76,3 +76,36 @@ fn multiway_fidelity_sweep() {
     eprintln!("  from exact ⇒ abstraction inadequate (better-than-quantile coordinate). PLUS−rw gap");
     eprintln!("  = whether finer-on-common is worth its cost. (Research ratios; transfer caveat.)");
 }
+
+/// DE-CONFOUND (player count vs nh/bucket-starvation): the ratio sweep used
+/// DIFFERENT nh per family (live-3=21, 4=15, 5=10), so "gap grows with player
+/// count" conflates np with "fewer hands/buckets at a given ratio". Here hold
+/// nh AND absolute bucket count nb EQUAL across families and vary ONLY np. If
+/// live-5 is still worse at equal (nh,nb) ⇒ a REAL multiway effect (fork leans
+/// inadequate). If the families converge ⇒ the ratio sweep's player-count
+/// scaling was the nh artifact (research-scale starvation), and production
+/// (huge nh, hundreds of buckets) looks far better ⇒ fork leans sufficient.
+#[test]
+#[ignore = "fidelity de-confound (research-scale, minutes); --ignored --nocapture --release"]
+fn multiway_fidelity_deconfounded() {
+    const NH: usize = 10; // EQUAL across families (only np varies)
+    let nbs = [3usize, 5, 7];
+    const ITERS: u32 = 500;
+    eprintln!("\n═══ DE-CONFOUND: distance-from-exact at EQUAL nh={NH} + EQUAL bucket count ═══");
+    eprintln!("(only player count varies — isolates the multiway effect from nh-starvation)");
+    eprintln!("family | exact | nb=3 | nb=5 | nb=7   (% pot from exact)");
+    for live in 3u8..=5 {
+        let g = SeamGame::new(live, 2, 12, flop());
+        let exact = SeamBlueprint::solve_research(&g, NH, ITERS + 200);
+        let e0 = exact.exploitability(&g, NH, 12);
+        let mut row = String::new();
+        for &nb in &nbs {
+            let bp = SeamBlueprint::solve_research_bucketed(&g, NH, nb, ITERS);
+            row.push_str(&format!(" {:7.2} |", bp.exploitability(&g, NH, 12)));
+        }
+        eprintln!("  live-{live} | {e0:5.2} |{row}");
+    }
+    eprintln!("\n→ live-5 ≫ live-4 ≫ live-3 at EQUAL nb ⇒ REAL multiway effect (fork leans inadequate).");
+    eprintln!("  Families CONVERGE at equal nb ⇒ ratio-sweep scaling was the nh artifact ⇒ production");
+    eprintln!("  (huge nh) far more favorable ⇒ fork leans bucket-count-sufficient. THE de-confounder.");
+}
