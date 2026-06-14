@@ -92,7 +92,12 @@ impl SeamGame {
     /// Play one seam hand to a terminal; returns (net per live seat, live
     /// count at showdown). Σ(net) = dead − rake.
     pub fn play(&self, policies: &[SeamPolicy], holes: &[[u8; 2]], board: &[u8; 5], rng: &mut u64) -> (Vec<i64>, u8) {
-        let np = self.live as usize;
+        let node = self.walk_to_terminal(policies, rng);
+        self.settle_at(node, holes, board)
+    }
+
+    /// Walk the betting (synthetic policies ignore the board) to a terminal.
+    fn walk_to_terminal(&self, policies: &[SeamPolicy], rng: &mut u64) -> usize {
         let mut node = 0usize;
         loop {
             let n = &self.tree.nodes[node];
@@ -135,6 +140,12 @@ impl SeamGame {
             };
             node = self.tree.node_children(node)[a] as usize;
         }
+        node
+    }
+
+    /// Settle a terminal node given holes + a full board. Σ(net) = dead − rake.
+    fn settle_at(&self, node: usize, holes: &[[u8; 2]], board: &[u8]) -> (Vec<i64>, u8) {
+        let np = self.live as usize;
         // Settle through clean-rules on the live commits (preflop commit +
         // flop contribution); dead money + v1 rake layered on top.
         let fold_mask = self.tree.get_folded_mask(node);
@@ -172,5 +183,49 @@ impl SeamGame {
             net[w] += share + extra;
         }
         (net, n_live as u8)
+    }
+
+    /// AIVAT runout control variate (exact Rao-Blackwellization over the
+    /// turn+river). Plays the actions, then returns BOTH the raw net under
+    /// one drawn runout AND the EXACT expectation of the net over ALL
+    /// enumerable runouts. The expectation is unbiased by construction (it
+    /// IS E[net | actions, holes]) and carries ZERO runout variance, so it
+    /// removes the dominant showdown swing without changing the mean. Needs
+    /// no value function — buildable + gateable now; the blueprint's
+    /// action-node corrections compose on top at option 3.
+    pub fn play_aivat(
+        &self, policies: &[SeamPolicy], holes: &[[u8; 2]], action_rng: &mut u64, runout_rng: &mut u64,
+    ) -> (Vec<i64>, Vec<f64>, u8) {
+        let np = self.live as usize;
+        let node = self.walk_to_terminal(policies, action_rng);
+        let fold_mask = self.tree.get_folded_mask(node);
+        let n_live = (0..np).filter(|&p| fold_mask & (1 << p) == 0).count();
+        let mut blocked = self.flop.iter().fold(0u64, |m, &c| m | (1u64 << c));
+        for h in holes { blocked |= (1u64 << h[0]) | (1u64 << h[1]); }
+        let deck: Vec<u8> = (0..52u8).filter(|&c| blocked & (1u64 << c) == 0).collect();
+        let mk = |a: u8, b: u8| [self.flop[0], self.flop[1], self.flop[2], a, b];
+        // No showdown ⇒ board irrelevant ⇒ raw == aivat (no runout variance).
+        if n_live <= 1 {
+            let (net, live) = self.settle_at(node, holes, &mk(deck[0], deck[1]));
+            let aivat = net.iter().map(|&x| x as f64).collect();
+            return (net, aivat, live);
+        }
+        // RAW: one drawn runout.
+        let i = (splitmix64(runout_rng) % deck.len() as u64) as usize;
+        let mut j = (splitmix64(runout_rng) % (deck.len() - 1) as u64) as usize;
+        if j >= i { j += 1; }
+        let (raw, live) = self.settle_at(node, holes, &mk(deck[i], deck[j]));
+        // AIVAT: exact mean over ALL unordered {turn, river}.
+        let mut acc = vec![0f64; np];
+        let mut cnt = 0u64;
+        for a in 0..deck.len() {
+            for b in (a + 1)..deck.len() {
+                let (net, _) = self.settle_at(node, holes, &mk(deck[a], deck[b]));
+                for p in 0..np { acc[p] += net[p] as f64; }
+                cnt += 1;
+            }
+        }
+        let aivat: Vec<f64> = acc.iter().map(|&s| s / cnt as f64).collect();
+        (raw, aivat, live)
     }
 }
