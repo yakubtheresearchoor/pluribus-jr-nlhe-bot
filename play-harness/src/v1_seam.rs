@@ -13,9 +13,13 @@
 
 use clean_rules::eval::best5;
 use clean_rules::table::settle_pots;
+use solver_core::card::{index_to_card_pair, NUM_POSSIBLE_HANDS};
+use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
+use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions};
 use solver_core::tree::builder::build_tree;
-use solver_core::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
+use solver_core::tree::flat::FlatTree;
+use std::collections::HashMap;
 
 #[inline]
 pub fn splitmix64(x: &mut u64) -> u64 {
@@ -294,5 +298,147 @@ impl SeamGame {
         }
         let aivat: Vec<f64> = acc.iter().map(|&s| s / cnt as f64).collect();
         (raw, aivat, live)
+    }
+
+    /// Audit-mode deal for blueprint play: `live` distinct hands from the
+    /// blueprint's hand universe + a runout from its sampled set, all
+    /// card-disjoint (so the tc/rc audit indices exist). None if rejection
+    /// fails (small universe).
+    pub fn deal_audit(&self, bp: &SeamBlueprint, rng: &mut u64) -> Option<(Vec<[u8; 2]>, [u8; 5])> {
+        for _ in 0..400 {
+            let mut used = self.flop.iter().fold(0u64, |m, &c| m | (1u64 << c));
+            let mut holes = Vec::new();
+            let mut ok = true;
+            for _ in 0..self.live {
+                let h = bp.hands[(splitmix64(rng) % bp.hands.len() as u64) as usize];
+                if used & ((1u64 << h.0) | (1u64 << h.1)) != 0 { ok = false; break; }
+                used |= (1u64 << h.0) | (1u64 << h.1);
+                holes.push([h.0, h.1]);
+            }
+            if !ok { continue; }
+            let (tc, rc) = bp.runouts[(splitmix64(rng) % bp.runouts.len() as u64) as usize];
+            if used & ((1u64 << tc) | (1u64 << rc)) != 0 { continue; }
+            return Some((holes, [self.flop[0], self.flop[1], self.flop[2], tc, rc]));
+        }
+        None
+    }
+
+    /// Play one hand with a blueprint per seat (the tournament path): at each
+    /// decision, sample the seat's blueprint average strategy. Settlement +
+    /// rake identical to `play`.
+    pub fn play_blueprints(&self, bps: &[&SeamBlueprint], holes: &[[u8; 2]], board: &[u8; 5], rng: &mut u64) -> (Vec<i64>, u8) {
+        let mut node = 0usize;
+        loop {
+            let n = &self.tree.nodes[node];
+            if n.is_terminal() { break; }
+            if n.is_chance() { node = self.tree.node_children(node)[0] as usize; continue; }
+            let p = n.player_id as usize;
+            let a = self.sample_blueprint_action(bps[p], node, holes[p], board, rng);
+            node = self.tree.node_children(node)[a] as usize;
+        }
+        self.settle_at(node, holes, board)
+    }
+
+    /// Sample one action index at `node` from a blueprint's average strategy
+    /// for `cards` (the exact step play_blueprints takes — exposed so the
+    /// wiring gate can verify the play path's lookup+sampling directly).
+    pub fn sample_blueprint_action(
+        &self, bp: &SeamBlueprint, node: usize, cards: [u8; 2], board: &[u8; 5], rng: &mut u64,
+    ) -> usize {
+        let na = self.tree.nodes[node].num_children as usize;
+        let dist = bp.action_dist(&self.tree, node, cards, board);
+        let mut x = (splitmix64(rng) % 1_000_000) as f32 / 1_000_000.0;
+        for i in 0..na {
+            if x < dist[i] { return i; }
+            x -= dist[i];
+        }
+        na - 1
+    }
+
+    /// Borrow the seam tree (for gates that call into the blueprint directly).
+    pub fn tree_ref(&self) -> &FlatTree { &self.tree }
+}
+
+/// A research-scale seam blueprint (step-2b fixture): an in-memory EXACT
+/// (FlopStartVectorCfr) solve of a seam family, plus the card→hand and
+/// runout→index maps the harness needs to read its average strategy per
+/// decision. Cheap, no production artifact — the bridge to the tournament.
+pub struct SeamBlueprint {
+    solver: FlopStartVectorCfr,
+    hand_of: HashMap<(u8, u8), usize>,
+    turn_of: HashMap<u8, usize>,
+    river_of: HashMap<(u8, u8), usize>,
+    pub hands: Vec<(u8, u8)>,
+    pub runouts: Vec<(u8, u8)>,
+    pub nh: usize,
+}
+
+impl SeamBlueprint {
+    /// Solve `game`'s seam tree exactly at research `nh` for `iters`.
+    pub fn solve_research(game: &SeamGame, nh: usize, iters: u32) -> Self {
+        let board = game.flop;
+        let bmask = board.iter().fold(0u64, |m, &c| m | (1u64 << c));
+        let valid: Vec<u16> = (0..NUM_POSSIBLE_HANDS)
+            .filter(|&i| { let (a, b) = index_to_card_pair(i); bmask & ((1u64 << a) | (1u64 << b)) == 0 })
+            .map(|i| i as u16)
+            .collect();
+        let step = (valid.len() / nh).max(1);
+        let chosen: Vec<u16> = (0..nh).map(|i| valid[i * step]).collect();
+        let np = game.live;
+        let ranges: Vec<Vec<f32>> = (0..np)
+            .map(|_| {
+                let mut r = vec![0.0f32; NUM_POSSIBLE_HANDS];
+                for &h in &chosen { r[h as usize] = 1.0; }
+                r
+            })
+            .collect();
+        let avail: Vec<u8> = (0..52u8).filter(|&c| bmask & (1u64 << c) == 0).collect();
+        let turn_cards = vec![avail[0], avail[1]];
+        let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+        for &tc in &turn_cards { river_decks[tc as usize] = vec![avail[2], avail[3]]; }
+        let table = FlopChanceTable::compute_flop_start_subset_with_decks(
+            &board, &ranges, np, &chosen, &turn_cards, &river_decks);
+        let mut hand_of = HashMap::new();
+        let mut hands = Vec::new();
+        for h in 0..table.num_valid {
+            let (c1, c2) = (table.hand_cards[2 * h], table.hand_cards[2 * h + 1]);
+            let key = (c1.min(c2), c1.max(c2));
+            hand_of.insert(key, h);
+            hands.push(key);
+        }
+        let mut turn_of = HashMap::new();
+        let mut river_of = HashMap::new();
+        let mut runouts = Vec::new();
+        for (ti, &tc) in table.remaining_deck.iter().enumerate() {
+            turn_of.insert(tc, ti);
+            for (ri, &rc) in table.river_decks[tc as usize].iter().enumerate() {
+                river_of.insert((tc, rc), ri);
+                runouts.push((tc, rc));
+            }
+        }
+        let nhv = table.num_valid;
+        let game_fsg = FlopStartGame::new(table);
+        let mut solver = FlopStartVectorCfr::new(&game.tree, game_fsg.table());
+        solver.run(&game.tree, &game_fsg, iters);
+        SeamBlueprint { solver, hand_of, turn_of, river_of, hands, runouts, nh: nhv }
+    }
+
+    /// Solver hand index for a card pair (validates the card→hand map).
+    pub fn hand_index(&self, cards: (u8, u8)) -> usize {
+        self.hand_of[&(cards.0.min(cards.1), cards.0.max(cards.1))]
+    }
+
+    /// Average action distribution at `node` for `cards` on `board` (per-child
+    /// probabilities). The (tc,rc) outcome indices come from the audit-mode
+    /// runout maps; the hand index from the card map.
+    pub fn action_dist(&self, tree: &FlatTree, node: usize, cards: [u8; 2], board: &[u8; 5]) -> Vec<f32> {
+        let na = tree.nodes[node].num_children as usize;
+        let hand = self.hand_of[&(cards[0].min(cards[1]), cards[0].max(cards[1]))];
+        let (tc, rc) = match tree.nodes[node].board_state as usize {
+            0 => (None, None),
+            1 => (Some(self.turn_of[&board[3]]), None),
+            _ => (Some(self.turn_of[&board[3]]), Some(self.river_of[&(board[3], board[4])])),
+        };
+        self.solver.avg_action_dist(node, na, tc, rc, hand)
     }
 }

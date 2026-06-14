@@ -2555,6 +2555,16 @@ impl FlopStartVectorCfr {
 
 
     /// Get strategy for a specific outcome context.
+    /// Average action distribution at `node_idx` for one `hand` (the
+    /// blueprint's normalized average strategy, length `na`). For harness
+    /// blueprint policies — the swappable value source SeamGame reads.
+    pub fn avg_action_dist(
+        &self, node_idx: usize, na: usize, tc: Option<usize>, rc: Option<usize>, hand: usize,
+    ) -> Vec<f32> {
+        let s = self.get_strategy_for_outcome(node_idx, na, tc, rc);
+        (0..na).map(|a| s[a * self.nh + hand]).collect()
+    }
+
     fn get_strategy_for_outcome(
         &self, node_idx: usize, na: usize,
         tc_idx: Option<usize>, rc_idx: Option<usize>,
