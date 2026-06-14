@@ -374,8 +374,16 @@ pub struct SeamBlueprint {
 }
 
 impl SeamBlueprint {
-    /// Research-scale chance table for `game`'s flop at `nh` hands (2×2 runouts).
+    /// Research-scale chance table for `game`'s flop at `nh` hands, default 2×2.
     fn research_table(game: &SeamGame, nh: usize) -> FlopChanceTable {
+        Self::research_table_grid(game, nh, 2, 2)
+    }
+
+    /// Research table with an explicit SPR/runout grid: `nt` turns × `nr`
+    /// rivers (the cell-grid axis — 1×1 vs 2×2 vs 4×4). Bucket count is a
+    /// separate dial, so holding nh+nb fixed and varying (nt,nr) isolates the
+    /// runout-grid effect.
+    fn research_table_grid(game: &SeamGame, nh: usize, nt: usize, nr: usize) -> FlopChanceTable {
         let board = game.flop;
         let bmask = board.iter().fold(0u64, |m, &c| m | (1u64 << c));
         let valid: Vec<u16> = (0..NUM_POSSIBLE_HANDS)
@@ -393,9 +401,10 @@ impl SeamBlueprint {
             })
             .collect();
         let avail: Vec<u8> = (0..52u8).filter(|&c| bmask & (1u64 << c) == 0).collect();
-        let turn_cards = vec![avail[0], avail[1]];
+        let turn_cards: Vec<u8> = avail[0..nt].to_vec();
+        let rivers: Vec<u8> = avail[nt..nt + nr].to_vec(); // distinct from turns
         let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
-        for &tc in &turn_cards { river_decks[tc as usize] = vec![avail[2], avail[3]]; }
+        for &tc in &turn_cards { river_decks[tc as usize] = rivers.clone(); }
         FlopChanceTable::compute_flop_start_subset_with_decks(
             &board, &ranges, np, &chosen, &turn_cards, &river_decks)
     }
@@ -434,6 +443,38 @@ impl SeamBlueprint {
         let mut solver = FlopStartVectorCfr::new(&game.tree, game_fsg.table());
         solver.run(&game.tree, &game_fsg, iters);
         SeamBlueprint { solver, hand_of, turn_of, river_of, hands, runouts, nh: nhv }
+    }
+
+    /// Solve EXACTLY at an explicit runout grid (nt×nr) — the SPR-grid axis.
+    /// Bucket count is held at exact (per-hand), so comparing two grids
+    /// isolates the runout-resolution effect from bucketing.
+    pub fn solve_research_grid(game: &SeamGame, nh: usize, nt: usize, nr: usize, iters: u32) -> Self {
+        let table = Self::research_table_grid(game, nh, nt, nr);
+        let (hand_of, turn_of, river_of, hands, runouts, nhv) = Self::maps_from(&table);
+        let game_fsg = FlopStartGame::new(table);
+        let mut solver = FlopStartVectorCfr::new(&game.tree, game_fsg.table());
+        solver.run(&game.tree, &game_fsg, iters);
+        SeamBlueprint { solver, hand_of, turn_of, river_of, hands, runouts, nh: nhv }
+    }
+
+    /// Mean |Δσ| of the FLOP strategy vs `other` (same tree+nh), averaged over
+    /// flop decision nodes × hands × actions. The runout-grid sensitivity
+    /// metric: how much the flop strategy moves between two SPR grids.
+    pub fn flop_sigma_delta(&self, other: &SeamBlueprint, tree: &FlatTree) -> f64 {
+        let dummy = [0u8, 1, 2, 3, 4];
+        let (mut acc, mut n) = (0.0f64, 0u64);
+        for nid in 0..tree.nodes.len() {
+            let node = &tree.nodes[nid];
+            if !node.is_player() || node.board_state != 0 { continue; } // flop decisions only
+            for &(c1, c2) in &self.hands {
+                let a = self.action_dist(tree, nid, [c1, c2], &dummy);
+                let b = other.action_dist(tree, nid, [c1, c2], &dummy);
+                let d: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum();
+                acc += d as f64;
+                n += 1;
+            }
+        }
+        if n == 0 { 0.0 } else { acc / n as f64 }
     }
 
     /// Solve BUCKETED at `nb` quantile buckets, then LIFT back to per-hand so
