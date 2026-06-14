@@ -451,7 +451,12 @@ impl SeamBlueprint {
         let bk = FlopBucketing::quantile(&table, nb);
         let game1 = FlopStartGame::new(table);
         let mut bucketed = BucketedFlopCfr::new(&game.tree, game1.table(), &bk);
-        bucketed.set_terminal_design(TerminalDesign::Design1Collapsed);
+        // Design1Collapsed asserts np≥3; HU uses the exact (brute) terminal.
+        bucketed.set_terminal_design(if game.live >= 3 {
+            TerminalDesign::Design1Collapsed
+        } else {
+            TerminalDesign::Design1Brute
+        });
         bucketed.run(&game.tree, &game1, &bk, iters);
         // Lift into a per-hand scorer = the SeamBlueprint's strategy source.
         let table2 = Self::research_table(game, nh);
