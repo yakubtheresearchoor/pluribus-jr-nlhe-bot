@@ -240,6 +240,28 @@ fn s3_cost_arithmetic() {
     eprintln!("  ONCE-PER-BOUNDARY (+): n_bound×turn_it + flop_it, added — the deployable form.");
     eprintln!("→ if full-nh flop-search per-iter alone blows 13s, search un-abstraction is wall-limited");
     eprintln!("  REGARDLESS of nesting; routes to option A or a resolution-bounded search.");
+
+    // AFFORDABLE-RESOLUTION CROSSOVER (the interior the endpoint skipped):
+    // invert the scaling — what search resolution nh_s fits 13s, including
+    // iters-to-converge? CPU and GPU (GPU = measured-bucketed ~100× factor,
+    // STATED ASSUMPTION for the exact-terminal path). B8 = 8 buckets is the
+    // blueprint baseline search must beat to be useful.
+    eprintln!("\n  AFFORDABLE search resolution nh_s (fits 13s budget):");
+    eprintln!("  iters | CPU nh_s | GPU(×100) nh_s | vs B8=8");
+    let budget_ms = 13000.0;
+    for &iters in &[200u32, 500, 1000, 1500] {
+        let solve = |speedup: f64| -> f64 {
+            // a·nh^p · iters / speedup ≤ budget  →  nh ≤ (budget·speedup/(a·iters))^(1/p)
+            (budget_ms * speedup / (a * iters as f64)).powf(1.0 / p)
+        };
+        let cpu = solve(1.0);
+        let gpu = solve(100.0);
+        eprintln!("  {iters:>5} | {cpu:7.1} | {gpu:11.1} | CPU {:.1}× / GPU {:.1}× B8",
+            cpu / 8.0, gpu / 8.0);
+    }
+    eprintln!("→ CPU nh_s ≈ B8 (search useless multiway); GPU nh_s ≈ 8-14× B8 (the useful lever).");
+    eprintln!("  QUALITY at nh_s (search-output vs B8 scored on full) = gadget-on-bucketed build OR harness");
+    eprintln!("  (scorer wall O(nh^np)); cost side already shows the knob's range is NOT zero on GPU.");
 }
 
 // ─── diagnostic ──────────────────────────────────────────────────────────
