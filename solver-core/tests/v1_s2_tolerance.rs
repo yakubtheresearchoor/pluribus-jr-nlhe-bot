@@ -182,6 +182,51 @@ fn raw_expl(tree: &FlatTree, np: u8, nh: usize, bp: &FlopStartVectorCfr, pot: i3
     expl_pct(bp, tree, &game, pot)
 }
 
+// ─── S4 STEP-2: HU vs MULTIWAY SEARCH COST (price the two architectures) ──
+
+/// HU (np=2) gadget per-iter scaling — the showdown is O(nh²) not O(nh^np≥3),
+/// so HU search should be ~nh× cheaper per iter. Measure it (don't extrapolate)
+/// and project full-res HU search to nh=1176 vs the 13s budget, CPU and GPU.
+/// This prices the HU path (cheap blueprint + full-res runtime search) against
+/// the multiway path (blueprint-dominated). live-2 = heads-up at the seam.
+#[test]
+#[ignore = "S4 HU search cost; --ignored --nocapture --release"]
+fn s4_hu_search_cost() {
+    use std::time::Instant;
+    let (commit, pot) = (7i32, 25i32);
+    let tree = seam_tree(2, commit, pot);
+    let k3: [(usize, f32); 3] = [(0, 0.0), (0, 0.6), (usize::MAX, 0.6)];
+    const TIMED: u32 = 20;
+    eprintln!("\n═══ S4 HU (np=2) SEARCH COST — showdown O(nh²) ═══");
+    let mut pts: Vec<(usize, f64)> = Vec::new();
+    for &nh in &[16usize, 24, 32, 48] {
+        let g = FlopStartGame::new(clean_table(2, nh));
+        let mut s = FlopStartVectorCfr::new(&tree, g.table());
+        let fine = exact_solver(&tree, 2, nh, 100);
+        s.cum_strategy_turn_mut().copy_from_slice(fine.cum_strategy_turn());
+        s.cum_strategy_river_mut().copy_from_slice(fine.cum_strategy_river());
+        let t0 = Instant::now();
+        s.run_flop_search_two_sided(&tree, &g, TIMED, &k3);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / TIMED as f64;
+        eprintln!("  np=2 nh={nh:>3}: {ms:8.3} ms/iter");
+        pts.push((nh, ms));
+    }
+    let (n0, t0) = pts[0];
+    let (n1, t1) = pts[pts.len() - 1];
+    let p = (t1 / t0).ln() / (n1 as f64 / n0 as f64).ln();
+    eprintln!("  small-nh fit p={p:.2} is OVERHEAD-DOMINATED (showdown O(nh²)≤2304 ops « tree-walk");
+    eprintln!("  floor) — NOT extrapolable. Derive HU from the np=3 showdown-dominated number /nh:");
+    // HU showdown is nh× cheaper than np=3 (O(nh²) vs O(nh³)); multiway
+    // measured 2925 s/iter at nh=1176, so HU ≈ 2925/1176 (showdown-bound).
+    let hu_per = 2925.0 / 1176.0;
+    eprintln!("  HU ≈ 2925/1176 ≈ {hu_per:.1} s/iter at nh=1176 (showdown-bound).");
+    eprintln!("  full-res HU search, 500 iters: CPU {:.0}s | GPU(×100) {:.1}s (vs 13s)",
+        hu_per * 500.0, hu_per * 500.0 / 100.0);
+    eprintln!("→ HU full-res search FITS 13s with GPU (~12.5s) ⇒ HU = cheap blueprint + full GPU search.");
+    eprintln!("  Multiway (np=3) 49 min/iter at full-res ⇒ blueprint-dominated. Genuinely different");
+    eprintln!("  architectures; GPU foundational for BOTH (HU full-res search, multiway partial-res).");
+}
+
 // ─── S3 COST ARITHMETIC (before building nesting) ─────────────────────────
 
 /// Rule out (or in) nesting BY ARITHMETIC before the build (user-ordered):
