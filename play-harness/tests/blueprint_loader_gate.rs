@@ -9,7 +9,9 @@ use play_harness::blueprint::{build_oracle_tree, Blueprint};
 
 #[test]
 fn loader_roundtrip_against_banked_artifact() {
-    let path = "../blueprint_out_b10_4x4/flop_0000.bp";
+    let path = std::env::var("BP_ARTIFACT")
+        .unwrap_or_else(|_| "../blueprint_out_b10_4x4/flop_0000.bp".into());
+    let path = path.as_str();
     if !std::path::Path::new(path).exists() {
         eprintln!("SKIP: no banked artifact yet at {path}");
         return;

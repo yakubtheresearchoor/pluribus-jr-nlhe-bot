@@ -13,12 +13,13 @@ use play_harness::blueprint::{build_oracle_tree, Blueprint};
 use play_harness::match_play::{MatchEnv, Policy};
 
 fn env_or_skip() -> Option<(Blueprint, solver_core::tree::flat::FlatTree)> {
-    let path = "../blueprint_out_b10_4x4/flop_0000.bp";
-    if !std::path::Path::new(path).exists() {
+    let path = std::env::var("BP_ARTIFACT")
+        .unwrap_or_else(|_| "../blueprint_out_b10_4x4/flop_0000.bp".into());
+    if !std::path::Path::new(&path).exists() {
         eprintln!("SKIP: no banked artifact");
         return None;
     }
-    Some((Blueprint::load(path).unwrap(), build_oracle_tree()))
+    Some((Blueprint::load(&path).unwrap(), build_oracle_tree()))
 }
 
 /// Artifact freshness guard for tests that INDEX the blueprint (the
