@@ -38,6 +38,14 @@ pub enum SeamPolicy {
     /// far below the all-in upper bound). Open node: check 60% / bet 40%.
     /// Facing a bet: fold 35% / call 50% / raise 15%.
     Mixed,
+    /// EQUITY ROLLOUT — honest hand-strength, COMPUTED not solved (the live-6
+    /// "blueprint": no buckets, no balance, no bluffing). Estimates equity vs
+    /// the field by Monte-Carlo over opponent hands + remaining runout on the
+    /// revealed board, then value-bets / calls good equity, checks / folds bad.
+    /// Board-DEPENDENT (actions use the revealed turn/river), so it is played
+    /// through `play`/`play_board` (which know the board), NOT `play_aivat`
+    /// (which fixes actions and varies the runout — invalid for this policy).
+    EquityRollout,
 }
 
 /// One v1 seam family as a seeded game.
@@ -92,12 +100,49 @@ impl SeamGame {
     /// Play one seam hand to a terminal; returns (net per live seat, live
     /// count at showdown). Σ(net) = dead − rake.
     pub fn play(&self, policies: &[SeamPolicy], holes: &[[u8; 2]], board: &[u8; 5], rng: &mut u64) -> (Vec<i64>, u8) {
-        let node = self.walk_to_terminal(policies, rng);
+        let node = self.walk_to_terminal(policies, holes, board, rng);
         self.settle_at(node, holes, board)
     }
 
-    /// Walk the betting (synthetic policies ignore the board) to a terminal.
-    fn walk_to_terminal(&self, policies: &[SeamPolicy], rng: &mut u64) -> usize {
+    /// Monte-Carlo equity of `my` vs `n_opp` random opponents on the
+    /// `revealed` board, over remaining runouts. Strategy-independent — the
+    /// equity-rollout's "computed not solved" value estimate.
+    fn equity(&self, my: [u8; 2], revealed: &[u8], n_opp: usize, rng: &mut u64, samples: usize) -> f64 {
+        let mut blocked = (1u64 << my[0]) | (1u64 << my[1]);
+        for &c in revealed { blocked |= 1u64 << c; }
+        let deck: Vec<u8> = (0..52u8).filter(|&c| blocked & (1u64 << c) == 0).collect();
+        let need = 5 - revealed.len();
+        let draw = n_opp * 2 + need;
+        let mut win = 0.0f64;
+        let mut d = deck.clone();
+        for _ in 0..samples {
+            for i in 0..draw {
+                let j = i + (splitmix64(rng) % (d.len() - i) as u64) as usize;
+                d.swap(i, j);
+            }
+            let mut board: Vec<u8> = revealed.to_vec();
+            for k in 0..need { board.push(d[n_opp * 2 + k]); }
+            let mut mine = my.to_vec();
+            mine.extend_from_slice(&board);
+            let myr = best5(&mine).0;
+            let mut tie = false;
+            let mut lose = false;
+            for o in 0..n_opp {
+                let mut oc = vec![d[2 * o], d[2 * o + 1]];
+                oc.extend_from_slice(&board);
+                let or = best5(&oc).0;
+                if or > myr { lose = true; break; }
+                if or == myr { tie = true; }
+            }
+            if lose { continue; }
+            win += if tie { 0.5 } else { 1.0 };
+        }
+        win / samples as f64
+    }
+
+    /// Walk the betting to a terminal. `board` + `holes` are used only by the
+    /// board-dependent EquityRollout policy; synthetic policies ignore them.
+    fn walk_to_terminal(&self, policies: &[SeamPolicy], holes: &[[u8; 2]], board: &[u8; 5], rng: &mut u64) -> usize {
         let mut node = 0usize;
         loop {
             let n = &self.tree.nodes[node];
@@ -136,6 +181,22 @@ impl SeamGame {
                     labels.iter().position(|&l| l == want)
                         .or_else(|| labels.iter().position(|&l| l == 2 || l == 1 || l == 0))
                         .expect("mixed: no fallback action")
+                }
+                SeamPolicy::EquityRollout => {
+                    let labels: Vec<u8> =
+                        children.iter().map(|&c| self.tree.nodes[c as usize].action_label).collect();
+                    let has = |l: u8| labels.contains(&l);
+                    let street = self.tree.nodes[node].board_state as usize; // Flop0/Turn1/River2
+                    let revealed = &board[0..(3 + street).min(5)];
+                    let eq = self.equity(holes[p], revealed, self.live as usize - 1, rng, 60);
+                    // Honest hand-strength: open ⇒ bet good equity else check;
+                    // facing a bet ⇒ call decent equity else fold. No bluff/raise.
+                    let want: u8 = if has(1) {
+                        if eq > 0.55 && has(3) { 3 } else { 1 }
+                    } else if eq > 0.42 { 2 } else { 0 };
+                    labels.iter().position(|&l| l == want)
+                        .or_else(|| labels.iter().position(|&l| l == 1 || l == 2 || l == 0))
+                        .expect("rollout: no fallback action")
                 }
             };
             node = self.tree.node_children(node)[a] as usize;
@@ -197,7 +258,10 @@ impl SeamGame {
         &self, policies: &[SeamPolicy], holes: &[[u8; 2]], action_rng: &mut u64, runout_rng: &mut u64,
     ) -> (Vec<i64>, Vec<f64>, u8) {
         let np = self.live as usize;
-        let node = self.walk_to_terminal(policies, action_rng);
+        // play_aivat is for board-INDEPENDENT (synthetic) policies — actions
+        // must not depend on the runout (AIVAT fixes them and varies it).
+        let dummy = [self.flop[0], self.flop[1], self.flop[2], 0u8, 1u8];
+        let node = self.walk_to_terminal(policies, holes, &dummy, action_rng);
         let fold_mask = self.tree.get_folded_mask(node);
         let n_live = (0..np).filter(|&p| fold_mask & (1 << p) == 0).count();
         let mut blocked = self.flop.iter().fold(0u64, |m, &c| m | (1u64 << c));
