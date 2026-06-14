@@ -43,6 +43,40 @@ fn play_edge(game: &SeamGame, a: &SeamBlueprint, b: &SeamBlueprint, n_decks: usi
 }
 
 #[test]
+#[ignore = "round-robin non-transitivity check; --ignored --nocapture --release"]
+fn play_round_robin_consistency() {
+    // Is "fine loses to coarse" a clean ranking, or matchup-specific
+    // non-transitivity? Complete the round-robin (exact/fine/coarse, all three
+    // pairs) per family. Clean mis-rank ⇒ consistent fine<coarse everywhere +
+    // transitive within family. Matchup-specific ⇒ sign flips across families
+    // and/or a cycle (rock-paper-scissors) within one.
+    const NH: usize = 10;
+    let (nbc, nbf) = (5usize, 7);
+    const D: usize = 30_000;
+    eprintln!("\n═══ ROUND-ROBIN (mbb/100; +A>B): is the multiway head-to-head a clean ranking? ═══");
+    eprintln!("family | exact>fine | exact>coarse | fine>coarse | within-family order");
+    for live in 3u8..=5 {
+        let g = SeamGame::new(live, 2, 12, flop());
+        let exact = SeamBlueprint::solve_research(&g, NH, 700);
+        let coarse = SeamBlueprint::solve_research_bucketed(&g, NH, nbc, 500);
+        let fine = SeamBlueprint::solve_research_bucketed(&g, NH, nbf, 500);
+        let mut rng = 0x9Au64 ^ live as u64;
+        let ef = mbb100(play_edge(&g, &exact, &fine, D, &mut rng).mean());
+        let ec = mbb100(play_edge(&g, &exact, &coarse, D, &mut rng).mean());
+        let fc = mbb100(play_edge(&g, &fine, &coarse, D, &mut rng).mean());
+        // Derive the order: who beats whom. exact should top; fine vs coarse is
+        // the question; a cycle is exact>fine, fine>coarse, coarse>exact (etc).
+        let order = if ef > 0.0 && ec > 0.0 {
+            if fc > 0.0 { "exact>fine>coarse (transitive)" } else { "exact>coarse>fine (transitive, fine LAST)" }
+        } else { "CYCLE (non-transitive!)" };
+        eprintln!("  live-{live} | {ef:+8.0} | {ec:+8.0} | {fc:+8.0} | {order}");
+    }
+    eprintln!("\n→ fine<coarse sign FLIPS across families OR a cycle ⇒ head-to-head is matchup-specific,");
+    eprintln!("  not a clean ranking ⇒ exploitability didn't 'mis-rank', rather NO cheap proxy ranks for");
+    eprintln!("  deployment ⇒ the field is the only real measure (gated in for the clean reason).");
+}
+
+#[test]
 fn play_edge_self_is_zero() {
     // Control: A vs A must be ~0 (the mirrored duplicate cancels position;
     // a non-zero self-edge means uncancelled bias and the tournament numbers
