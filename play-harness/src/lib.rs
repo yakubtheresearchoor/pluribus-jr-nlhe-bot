@@ -42,3 +42,4 @@ pub mod blueprint;
 pub mod match_play;
 pub mod convert;
 pub mod experiment;
+pub mod v1_seam;

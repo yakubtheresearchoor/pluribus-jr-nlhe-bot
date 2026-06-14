@@ -43,6 +43,29 @@ pub fn mbb_per_100(chips_per_hand: f64, bb_chips: f64) -> f64 {
     chips_per_hand / bb_chips * 1000.0 * 100.0
 }
 
+/// A per-family measured edge (seeded game) with its true reach weight.
+pub struct FamilyEdge {
+    pub live: u8,
+    pub edge: f64,   // measured per-family edge (e.g. mbb/100), seeded
+    pub stderr: f64,
+    pub reach_weight: f64, // BANKED true reach×pot weight — NOT the seeded rate
+}
+
+/// Combine per-family seeded edges into the overall fidelity edge by TRUE
+/// reach weight. Load-bearing: seeding decouples the sampled per-family rate
+/// from how often the bot is actually in that family, so the overall verdict
+/// must weight by reality (banked reach×pot), not by how heavily each family
+/// was sampled — else the oversampled rare families are wildly overweighted.
+/// Returns (overall edge, propagated stderr).
+pub fn reach_weighted_overall(fams: &[FamilyEdge]) -> (f64, f64) {
+    let wsum: f64 = fams.iter().map(|f| f.reach_weight).sum();
+    assert!(wsum > 0.0, "reach weights sum to zero");
+    let edge = fams.iter().map(|f| f.reach_weight * f.edge).sum::<f64>() / wsum;
+    // Independent-family error propagation: Var = Σ (w_i/Σw)² σ_i².
+    let var = fams.iter().map(|f| (f.reach_weight / wsum).powi(2) * f.stderr * f.stderr).sum::<f64>();
+    (edge, var.sqrt())
+}
+
 /// Outcome of a mirrored A/B duplicate run.
 pub struct AbResult {
     /// RAW estimator: each seating's A−B edge as an independent sample (no
