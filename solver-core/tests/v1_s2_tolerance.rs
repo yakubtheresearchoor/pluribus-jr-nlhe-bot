@@ -292,6 +292,68 @@ fn s2_anchor_warmstart_diagnose() {
     }
 }
 
+/// CONTINUATION TOLERANCE — FINE SHAPE NEAR EXACT (2026-06-13): the coarse
+/// map showed tight-in-COMPRESSION-RATIO, but nesting's question is
+/// error-MAGNITUDE — where does the flop-search-delta cross zero in turn-
+/// error pt? Two points interpolate to ~15pt (loose: a ~1% searched-turn
+/// clears), but the near-exact shape is unknown and the tight ratio hints
+/// superlinearity. Map fine turn buckets near exact; report turn-error
+/// (raw(B)−raw(exact)) so the crossover is in the same pt units a searched
+/// turn lives in. nh=32 permits B up to 26 (alive-hand guard).
+#[test]
+#[ignore = "S2 continuation tolerance fine shape; --ignored --nocapture --release"]
+fn s2_continuation_tolerance_fine() {
+    let (live, commit, pot, nh) = (3u8, 7i32, 29i32, 32usize);
+    let tree = seam_tree(live, commit, pot);
+    const REF: u32 = 600;
+    const SEARCH_IT: u32 = 1500;
+    let fine = exact_solver(&tree, live, nh, REF);
+    let b8 = blueprint_solver(&tree, live, nh, Some(8), REF);
+    let k3: [(usize, f32); 3] = [(0, 0.0), (0, 0.6), (usize::MAX, 0.6)];
+    // raw(exact turn) reference for turn-error magnitude.
+    let raw_exact = {
+        let g2 = FlopStartGame::new(clean_table(live, nh));
+        let mut m = FlopStartVectorCfr::new(&tree, g2.table());
+        m.cum_strategy_flop_mut().copy_from_slice(b8.cum_strategy_flop());
+        m.cum_strategy_turn_mut().copy_from_slice(fine.cum_strategy_turn());
+        m.cum_strategy_river_mut().copy_from_slice(fine.cum_strategy_river());
+        expl_pct(&m, &tree, &g2, pot)
+    };
+    eprintln!("\n═══ S2 CONTINUATION TOLERANCE — FINE SHAPE (live-3 nh={nh}, river EXACT) ═══");
+    eprintln!("raw(exact turn)={raw_exact:.3}% | turn-err = raw(B)−raw(exact); crossover in pt = nesting margin");
+    eprintln!("turn (ratio) | turn-err pt | raw | searched | flop-Δ (− helps)");
+    for &bt in &[None, Some(26usize), Some(20), Some(16)] {
+        let turn_src = match bt {
+            None => exact_solver(&tree, live, nh, REF),
+            Some(b) => blueprint_solver(&tree, live, nh, Some(b), REF),
+        };
+        let raw = {
+            let g2 = FlopStartGame::new(clean_table(live, nh));
+            let mut m = FlopStartVectorCfr::new(&tree, g2.table());
+            m.cum_strategy_flop_mut().copy_from_slice(b8.cum_strategy_flop());
+            m.cum_strategy_turn_mut().copy_from_slice(turn_src.cum_strategy_turn());
+            m.cum_strategy_river_mut().copy_from_slice(fine.cum_strategy_river());
+            expl_pct(&m, &tree, &g2, pot)
+        };
+        let searched = {
+            let g2 = FlopStartGame::new(clean_table(live, nh));
+            let mut s = FlopStartVectorCfr::new(&tree, g2.table());
+            s.cum_strategy_turn_mut().copy_from_slice(turn_src.cum_strategy_turn());
+            s.cum_strategy_river_mut().copy_from_slice(fine.cum_strategy_river());
+            s.run_flop_search_two_sided(&tree, &g2, SEARCH_IT, &k3);
+            expl_pct(&s, &tree, &g2, pot)
+        };
+        let ratio = nh as f32 / bt.unwrap_or(nh) as f32;
+        let terr = raw - raw_exact;
+        let d = searched - raw;
+        let label = match bt { None => "exact".to_string(), Some(b) => format!("B={b}") };
+        eprintln!("  {label:>6} ({ratio:>4.2}:1) | {terr:6.2}pt | {raw:7.3}% | {searched:7.3}% | {d:+6.2} {}",
+            if d < 0.0 { "HELPS" } else { "HURTS" });
+    }
+    eprintln!("→ crossover turn-err (pt) vs searched-turn ~1pt: margin >> 1 ⇒ nesting clears (structure = anchor-gate);");
+    eprintln!("  margin ≲ 1 ⇒ build turn-search, test the SEARCHED-turn object directly before nesting.");
+}
+
 /// CONTINUATION-VALUE TOLERANCE MAP (2026-06-13, the corrected S2 question).
 /// Sizes the ONE real requirement the fork-reversal leaves: how accurate
 /// must the multiway blueprint's CONTINUATION VALUES be for flop-search to
