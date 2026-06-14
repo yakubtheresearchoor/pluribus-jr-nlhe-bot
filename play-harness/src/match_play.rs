@@ -22,6 +22,7 @@ pub fn splitmix64(x: &mut u64) -> u64 {
 }
 
 /// A seat's policy.
+#[derive(Clone, Copy)]
 pub enum Policy<'a> {
     /// Play the blueprint's normalized average strategy.
     Blueprint(&'a Blueprint),
@@ -110,6 +111,28 @@ impl<'a> MatchEnv<'a> {
     /// Returns None when the dealt hands block every sampled runout
     /// (audit mode rejection-samples such deals).
     pub fn play_hand(&self, policies: &[Policy], holes: &[[u8; 2]; 6], rng: &mut u64) -> Option<Vec<i64>> {
+        self.play_hand_live(policies, holes, rng, None).map(|(c, _)| c)
+    }
+
+    /// Draw a runout (turn index, river index) valid for `holes` — the
+    /// COMMON board a duplicate run replays across mirrored seatings so the
+    /// runout variance (the dominant swing for all-in lines) cancels too,
+    /// not just the hole-card luck.
+    pub fn draw_runout(&self, holes: &[[u8; 2]; 6], rng: &mut u64) -> Option<(usize, usize)> {
+        let blocked = |c: u8| holes.iter().any(|h| h[0] == c || h[1] == c);
+        let to: Vec<usize> = (0..self.bp.turns.len()).filter(|&t| !blocked(self.bp.turns[t])).collect();
+        if to.is_empty() { return None; }
+        let t = to[(splitmix64(rng) % to.len() as u64) as usize];
+        let ro: Vec<usize> = (0..self.bp.rivers[t].len()).filter(|&r| !blocked(self.bp.rivers[t][r])).collect();
+        if ro.is_empty() { return None; }
+        let r = ro[(splitmix64(rng) % ro.len() as u64) as usize];
+        Some((t, r))
+    }
+
+    /// Like `play_hand` but also returns the LIVE count at showdown (the
+    /// family stratification key). `runout` Some pins the board (for
+    /// duplicate-play common runouts); None draws it as in plain audit mode.
+    pub fn play_hand_live(&self, policies: &[Policy], holes: &[[u8; 2]; 6], rng: &mut u64, runout: Option<(usize, usize)>) -> Option<(Vec<i64>, u8)> {
         let blocked = |c: u8| holes.iter().any(|h| h[0] == c || h[1] == c);
         let mut node = 0usize;
         let (mut ti, mut ri): (Option<usize>, Option<usize>) = (None, None);
@@ -124,24 +147,30 @@ impl<'a> MatchEnv<'a> {
                 // AUDIT mode: draw uniformly from the sampled runouts
                 // that don't collide with any dealt hand.
                 if ti.is_none() {
-                    let opts: Vec<usize> = (0..self.bp.turns.len())
-                        .filter(|&t| !blocked(self.bp.turns[t]))
-                        .collect();
-                    if opts.is_empty() {
-                        return None;
-                    }
-                    let t = opts[(splitmix64(rng) % opts.len() as u64) as usize];
+                    let t = if let Some((ft, _)) = runout {
+                        if blocked(self.bp.turns[ft]) { return None; }
+                        ft
+                    } else {
+                        let opts: Vec<usize> = (0..self.bp.turns.len())
+                            .filter(|&t| !blocked(self.bp.turns[t]))
+                            .collect();
+                        if opts.is_empty() { return None; }
+                        opts[(splitmix64(rng) % opts.len() as u64) as usize]
+                    };
                     ti = Some(t);
                     board.push(self.bp.turns[t]);
                 } else {
                     let t = ti.unwrap();
-                    let opts: Vec<usize> = (0..self.bp.rivers[t].len())
-                        .filter(|&r| !blocked(self.bp.rivers[t][r]))
-                        .collect();
-                    if opts.is_empty() {
-                        return None;
-                    }
-                    let r = opts[(splitmix64(rng) % opts.len() as u64) as usize];
+                    let r = if let Some((_, fr)) = runout {
+                        if fr >= self.bp.rivers[t].len() || blocked(self.bp.rivers[t][fr]) { return None; }
+                        fr
+                    } else {
+                        let opts: Vec<usize> = (0..self.bp.rivers[t].len())
+                            .filter(|&r| !blocked(self.bp.rivers[t][r]))
+                            .collect();
+                        if opts.is_empty() { return None; }
+                        opts[(splitmix64(rng) % opts.len() as u64) as usize]
+                    };
                     ri = Some(r);
                     board.push(self.bp.rivers[t][r]);
                 }
@@ -209,7 +238,7 @@ impl<'a> MatchEnv<'a> {
                 }
             })
             .collect();
-        Some(settle_pots(&commits, &folded, &ranks, 0, (0, 0)))
+        Some((settle_pots(&commits, &folded, &ranks, 0, (0, 0)), live as u8))
     }
 
     /// Deal hole cards from the deck minus the flop (seeded).
