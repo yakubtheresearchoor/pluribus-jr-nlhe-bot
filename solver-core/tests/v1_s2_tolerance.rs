@@ -182,6 +182,66 @@ fn raw_expl(tree: &FlatTree, np: u8, nh: usize, bp: &FlopStartVectorCfr, pot: i3
     expl_pct(bp, tree, &game, pot)
 }
 
+// ─── S3 COST ARITHMETIC (before building nesting) ─────────────────────────
+
+/// Rule out (or in) nesting BY ARITHMETIC before the build (user-ordered):
+/// measure the per-iter wall cost of a gadget flop-search vs nh, fit the
+/// scaling, project to production nh=1176. The flop-search un-abstracts to
+/// FULL hand resolution, and the showdown terminal is O(nh^np) — the same
+/// wall that forced bucketing. If a single full-nh flop-search iter is
+/// already too slow, nesting is moot regardless of scheduling. Also reports
+/// n_boundaries (flop→turn transitions) for the naive-vs-once-per-boundary
+/// multiplication. Times the EXISTING two-sided gadget (the real cost unit).
+#[test]
+#[ignore = "S3 cost arithmetic; --ignored --nocapture --release"]
+fn s3_cost_arithmetic() {
+    use std::time::Instant;
+    let (live, commit, pot) = (3u8, 7i32, 29i32);
+    let tree = seam_tree(live, commit, pot);
+    let n_boundaries = {
+        // turn_chance_children count = flop→turn transitions. Build a solver
+        // to read it (it's derived at construction).
+        let g = FlopStartGame::new(clean_table(live, 12));
+        let s = FlopStartVectorCfr::new(&tree, g.table());
+        s.turn_chance_children().len()
+    };
+    eprintln!("\n═══ S3 COST ARITHMETIC (live-3, gadget flop-search) ═══");
+    eprintln!("n_boundaries (flop→turn transitions) = {n_boundaries}");
+    let k3: [(usize, f32); 3] = [(0, 0.0), (0, 0.6), (usize::MAX, 0.6)];
+    const TIMED_ITERS: u32 = 20;
+    let mut pts: Vec<(usize, f64)> = Vec::new();
+    for &nh in &[16usize, 24, 32, 48] {
+        let g = FlopStartGame::new(clean_table(live, nh));
+        let mut s = FlopStartVectorCfr::new(&tree, g.table());
+        // warm the continuation so the search does real work
+        let fine = exact_solver(&tree, live, nh, 100);
+        s.cum_strategy_turn_mut().copy_from_slice(fine.cum_strategy_turn());
+        s.cum_strategy_river_mut().copy_from_slice(fine.cum_strategy_river());
+        let t0 = Instant::now();
+        s.run_flop_search_two_sided(&tree, &g, TIMED_ITERS, &k3);
+        let ms_per_iter = t0.elapsed().as_secs_f64() * 1000.0 / TIMED_ITERS as f64;
+        eprintln!("  nh={nh:>3}: {ms_per_iter:8.3} ms/iter (gadget, K=3)");
+        pts.push((nh, ms_per_iter));
+    }
+    // Fit power law ms = a·nh^p from first and last point.
+    let (n0, t0) = pts[0];
+    let (n1, t1) = pts[pts.len() - 1];
+    let p = (t1 / t0).ln() / (n1 as f64 / n0 as f64).ln();
+    let a = t1 / (n1 as f64).powf(p);
+    let proj_1176 = a * 1176f64.powf(p);
+    eprintln!("  fitted scaling: ms/iter ≈ {a:.3e} · nh^{p:.2}");
+    eprintln!("  PROJECTED nh=1176: {proj_1176:.1} ms/iter = {:.2} s/iter", proj_1176 / 1000.0);
+    eprintln!("\n  ARITHMETIC vs 13s budget (per-iter × iters):");
+    let per = proj_1176 / 1000.0;
+    for &fi in &[100u32, 500, 1000] {
+        eprintln!("    flop-search alone, {fi} iters: {:.1} s", per * fi as f64);
+    }
+    eprintln!("  NAIVE nesting (×): flop_it × n_bound × turn_it × extra-K — multiplies, see report.");
+    eprintln!("  ONCE-PER-BOUNDARY (+): n_bound×turn_it + flop_it, added — the deployable form.");
+    eprintln!("→ if full-nh flop-search per-iter alone blows 13s, search un-abstraction is wall-limited");
+    eprintln!("  REGARDLESS of nesting; routes to option A or a resolution-bounded search.");
+}
+
 // ─── diagnostic ──────────────────────────────────────────────────────────
 
 /// Warm-start the search solver with the FULL fine equilibrium (flop +
