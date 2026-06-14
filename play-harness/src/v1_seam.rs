@@ -32,6 +32,12 @@ pub fn splitmix64(x: &mut u64) -> u64 {
 pub enum SeamPolicy {
     CheckFold,
     AlwaysAggressive,
+    /// Stochastic TAG-ish mix — a BALLPARK for real blueprint mixing (the
+    /// real variance depends on how much the actual blueprints mix, which is
+    /// unknown until they exist; this gives an order-of-magnitude estimate
+    /// far below the all-in upper bound). Open node: check 60% / bet 40%.
+    /// Facing a bet: fold 35% / call 50% / raise 15%.
+    Mixed,
 }
 
 /// One v1 seam family as a seeded game.
@@ -110,6 +116,22 @@ impl SeamGame {
             let a = match policies[p] {
                 SeamPolicy::AlwaysAggressive => pick(&[3, 4, 5, 2]), // bet/raise/allin else call
                 SeamPolicy::CheckFold => pick(&[1, 0]),              // check else fold
+                SeamPolicy::Mixed => {
+                    let labels: Vec<u8> =
+                        children.iter().map(|&c| self.tree.nodes[c as usize].action_label).collect();
+                    let has = |l: u8| labels.contains(&l);
+                    let x = (splitmix64(rng) % 1000) as f64 / 1000.0;
+                    let want: u8 = if has(1) {
+                        // open node (can check): check 60% / bet 40%.
+                        if x < 0.60 || !has(3) { 1 } else { 3 }
+                    } else {
+                        // facing a bet: fold 35% / call 50% / raise 15%.
+                        if x < 0.35 { 0 } else if x < 0.85 || !has(4) { 2 } else { 4 }
+                    };
+                    labels.iter().position(|&l| l == want)
+                        .or_else(|| labels.iter().position(|&l| l == 2 || l == 1 || l == 0))
+                        .expect("mixed: no fallback action")
+                }
             };
             node = self.tree.node_children(node)[a] as usize;
         }
