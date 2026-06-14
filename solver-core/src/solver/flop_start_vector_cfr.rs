@@ -193,6 +193,15 @@ pub struct FlopStartVectorCfr {
     regret_floor: f32,
     debug: bool,
     vanilla_mode: bool,  // If true, use alpha=beta=gamma=1
+    // DEPTH-LIMITED SEARCH (S2, 2026-06-13): when true, bottom_up_zone
+    // SKIPS the regret/cum update for Turn+River zones — those zones play
+    // a FROZEN blueprint strategy (loaded into strategy_turn/river scratch
+    // from the blueprint cum), while the Flop zone is SEARCHED normally.
+    // The CFV still propagates through turn/river under the frozen
+    // strategy, so the flop search sees "continue with blueprint" leaf
+    // values, range-correctly (CFV uses the searched flop reach). Default
+    // false → production run()/run_all_root_cfv untouched.
+    continuation_frozen: bool,
 }
 
 pub(crate) fn mark_descendants(tree: &FlatTree, node_idx: usize, below: &mut [bool]) {
@@ -409,6 +418,7 @@ impl FlopStartVectorCfr {
             regret_floor: -1e30,
             debug: false,
             vanilla_mode: false,
+            continuation_frozen: false,
         }
     }
 
@@ -1342,6 +1352,13 @@ impl FlopStartVectorCfr {
                     // Player decision node
                     let owner = node.player_id as usize;
                     let na = node.num_children as usize;
+                    // DEPTH-LIMITED SEARCH: Turn+River play a frozen
+                    // blueprint here — compute CFV under the frozen strategy
+                    // but DO NOT update regrets/cum (no learning in the
+                    // continuation). Flop is always searched (frozen=false).
+                    // Computed before the mutable get_mut_slices borrow.
+                    let frozen = self.continuation_frozen
+                        && (zone == Zone::Turn || zone == Zone::River);
                     let (regret_slice, strategy_slice, cum_slice) = self.get_mut_slices(zone, idx, tc, rc, na);
 
                     let mut cfv_avg = vec![0.0f32; nh];
@@ -1355,8 +1372,10 @@ impl FlopStartVectorCfr {
                             }
                         }
 
-                        // Regret update with DCFR discount
+                        // Regret update with DCFR discount (skipped for
+                        // frozen continuation zones).
                         for a in 0..na {
+                            if frozen { break; }
                             let child = tree.node_children(idx)[a] as usize;
                             for h in 0..nh {
                                 let inst_regret = cfv[child * nh + h] - cfv_avg[h];
@@ -1470,6 +1489,600 @@ impl FlopStartVectorCfr {
     pub fn max_river_outcomes(&self) -> usize { self.max_n_river }
     pub fn set_debug(&mut self, d: bool) { self.debug = d; }
     pub fn set_vanilla_mode(&mut self, v: bool) { self.vanilla_mode = v; }
+    pub fn set_continuation_frozen(&mut self, v: bool) { self.continuation_frozen = v; }
+
+    /// DEPTH-LIMITED FLOP SEARCH (S2, 2026-06-13). Searches the FLOP zone
+    /// while Turn+River play a FROZEN blueprint continuation. Preconditions:
+    /// `cum_strategy_turn` / `cum_strategy_river` already hold the blueprint
+    /// (e.g. copied from a lifted bucketed solve), and the flop regrets/cum
+    /// are at their fresh (zeroed) state so the flop is re-solved.
+    ///
+    /// Mirrors `run()` exactly EXCEPT: (1) turn/river strategy scratch is
+    /// populated by `freeze_average_strategy_for_{turn,river_pair}` (the
+    /// blueprint average) instead of regret-matched `compute_*_strategy`,
+    /// and (2) `continuation_frozen` gates off the turn/river regret/cum
+    /// update inside `bottom_up_zone`. The flop is searched normally.
+    ///
+    /// This is the S2 instrument: the blueprint's ROUGHNESS (the bucket
+    /// count it was solved at, lifted in here) is the tolerance knob;
+    /// `num_iterations` is the search-iteration axis; the scored
+    /// exploitability of the resulting profile (searched flop + frozen
+    /// blueprint turn/river) is the search-output quality. InMemory river
+    /// only (research-scale S2); asserts otherwise.
+    pub fn run_flop_search(
+        &mut self,
+        tree: &FlatTree,
+        game: &FlopStartGame,
+        num_iterations: u32,
+    ) {
+        assert!(matches!(self.river_mode, RiverPersistenceMode::InMemory),
+            "run_flop_search is research-scale (InMemory river) only");
+        let np = self.num_players as usize;
+        let nh = self.nh;
+        let nn = tree.num_nodes();
+        let table = game.table();
+        let turn_deck = &table.remaining_deck;
+        let prev_frozen = self.continuation_frozen;
+        self.continuation_frozen = true;
+
+        let mut flop_cfv = vec![0.0f32; nn * nh];
+        let mut river_cfv_accum = vec![0.0f32; nn * nh];
+        let mut cfv = vec![0.0f32; nn * nh];
+        let mut turn_cfv = vec![0.0f32; nn * nh];
+
+        for _ in 0..num_iterations {
+            let params = if self.vanilla_mode {
+                DcfrParams { alpha_t: 1.0, beta_t: 1.0, gamma_t: 1.0 }
+            } else {
+                DcfrParams::new(self.iteration)
+            };
+            self.iteration += 1;
+
+            for traverser in 0..np {
+                // Flop is SEARCHED: regret-match its current strategy.
+                self.compute_flop_strategy(tree);
+                let flop_reach = self.compute_reach_flop(tree, game);
+
+                for &child_id in &self.turn_chance_children {
+                    let off = child_id as usize * nh;
+                    for h in 0..nh { flop_cfv[off + h] = 0.0; }
+                }
+
+                for (ti, &tc) in turn_deck.iter().enumerate() {
+                    // FROZEN continuation: load the blueprint turn average
+                    // into the strategy scratch (NOT regret-matched).
+                    self.freeze_average_strategy_for_turn(tree, ti);
+                    let turn_reach = self.compute_reach_turn(tree, ti, &flop_reach);
+                    let n_river = self.river_deck_sizes[tc as usize];
+
+                    for &child_id in &self.river_chance_children {
+                        let off = child_id as usize * nh;
+                        for h in 0..nh { river_cfv_accum[off + h] = 0.0; }
+                    }
+
+                    for ri in 0..n_river {
+                        // FROZEN continuation: blueprint river average.
+                        self.freeze_average_strategy_for_river_pair(tree, ti, ri);
+                        let river_reach = self.compute_reach_river(tree, ti, ri, &turn_reach);
+                        self.bottom_up_zone(
+                            tree, table, traverser as u8, &river_reach, &mut cfv,
+                            Zone::River, Some(ti), Some(ri), &params,
+                        );
+                        for &child_id in &self.river_chance_children {
+                            for h in 0..nh {
+                                let cp = table.chance_probability_river(tc, ri, h);
+                                river_cfv_accum[child_id as usize * nh + h] +=
+                                    cp * cfv[child_id as usize * nh + h];
+                            }
+                        }
+                    }
+
+                    for &child_id in &self.river_chance_children {
+                        for h in 0..nh {
+                            turn_cfv[child_id as usize * nh + h] =
+                                river_cfv_accum[child_id as usize * nh + h];
+                        }
+                    }
+                    self.bottom_up_zone(
+                        tree, table, traverser as u8, &turn_reach, &mut turn_cfv,
+                        Zone::Turn, Some(ti), None, &params,
+                    );
+                    for &child_id in &self.turn_chance_children {
+                        for h in 0..nh {
+                            let cp = table.chance_probability_turn(ti, h);
+                            flop_cfv[child_id as usize * nh + h] +=
+                                cp * turn_cfv[child_id as usize * nh + h];
+                        }
+                    }
+                }
+
+                // Flop zone: SEARCHED (regret/cum update).
+                self.bottom_up_zone(
+                    tree, table, traverser as u8, &flop_reach, &mut flop_cfv,
+                    Zone::Flop, None, None, &params,
+                );
+            }
+        }
+        self.continuation_frozen = prev_frozen;
+    }
+
+    /// Per-OWNER continuation-variant freeze for the turn scratch (robust
+    /// gadget, S2). Opponent-owned turn nodes get the blueprint average
+    /// shifted toward `target_action` by `eps`; the traverser's own nodes
+    /// keep the pure blueprint. eps==0 ⇒ blueprint everywhere (≡
+    /// freeze_average_strategy_for_turn). target_action usize::MAX ⇒
+    /// aggressive (last child); else min(target_action, na-1).
+    fn freeze_variant_turn(
+        &mut self, tree: &FlatTree, tc: usize, traverser: usize, target_action: usize, eps: f32,
+    ) {
+        let nh = self.nh;
+        let base = tc * self.turn_stride;
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::Turn { continue; }
+            let local = self.turn_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let owner = tree.nodes[idx].player_id as usize;
+            let off_persist = base + local * MAX_NA_POSTFLOP * nh;
+            let off_scratch = local * MAX_NA_POSTFLOP * nh;
+            normalize_cum_into_strategy(
+                &self.cum_strategy_turn[off_persist..off_persist + na * nh],
+                na, nh,
+                &mut self.strategy_turn[off_scratch..off_scratch + na * nh],
+            );
+            if eps > 0.0 && owner != traverser {
+                let ta = if target_action == usize::MAX { na - 1 } else { target_action.min(na - 1) };
+                let s = &mut self.strategy_turn[off_scratch..off_scratch + na * nh];
+                for h in 0..nh {
+                    for a in 0..na {
+                        let one = if a == ta { 1.0 } else { 0.0 };
+                        s[a * nh + h] = (1.0 - eps) * s[a * nh + h] + eps * one;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-OWNER continuation-variant freeze for the river scratch (robust
+    /// gadget, S2). Same semantics as `freeze_variant_turn`. InMemory only.
+    fn freeze_variant_river(
+        &mut self, tree: &FlatTree, tc: usize, rc: usize, traverser: usize,
+        target_action: usize, eps: f32,
+    ) {
+        let nh = self.nh;
+        let base = (tc * self.max_n_river + rc) * self.river_stride;
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::River { continue; }
+            let local = self.river_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let owner = tree.nodes[idx].player_id as usize;
+            let off_persist = base + local * MAX_NA_POSTFLOP * nh;
+            let off_scratch = local * MAX_NA_POSTFLOP * nh;
+            normalize_cum_into_strategy(
+                &self.cum_strategy_river[off_persist..off_persist + na * nh],
+                na, nh,
+                &mut self.strategy_river[off_scratch..off_scratch + na * nh],
+            );
+            if eps > 0.0 && owner != traverser {
+                let ta = if target_action == usize::MAX { na - 1 } else { target_action.min(na - 1) };
+                let s = &mut self.strategy_river[off_scratch..off_scratch + na * nh];
+                for h in 0..nh {
+                    for a in 0..na {
+                        let one = if a == ta { 1.0 } else { 0.0 };
+                        s[a * nh + h] = (1.0 - eps) * s[a * nh + h] + eps * one;
+                    }
+                }
+            }
+        }
+    }
+
+    /// MULTI-CONTINUATION robust depth-limited flop search — a ONE-SIDED
+    /// PROXY for the gadget (S2, 2026-06-13). At the flop→turn boundary the
+    /// OPPONENT commits, per boundary node, to whichever of K precomputed
+    /// continuation variants (blueprint + per-owner biased) MINIMIZES the
+    /// searcher's aggregate value; the traverser's own continuation stays
+    /// the blueprint.
+    ///
+    /// INCONCLUSIVE / NOT THE FAITHFUL GADGET — DO NOT read its result as
+    /// "the gadget fails." This is ONE-SIDED: only the opponent gets a
+    /// continuation choice, so the searcher plays a strictly HARDER game
+    /// than the real one and the leaf is over-pessimistic — it diverges on
+    /// the warm-start diagnostic (per-hand min → 113%, per-node agg → 40%)
+    /// for that reason, NOT necessarily because depth-limited search is
+    /// broken multiway. The FAITHFUL test is the TWO-SIDED, CFR-solved
+    /// continuation-choice gadget (the S1 V_{k0,k1} construction, which
+    /// currently exists only on the toy CpuMccfr engine): both players'
+    /// per-boundary k-choice co-adapts under CFR, restoring balance. That
+    /// port (K^np continuation combos + a per-boundary k-choice regret
+    /// layer on this vectorized multi-street engine) is the real gate and
+    /// is a substantial build — deliberately NOT taken on faith. Kept here
+    /// as the banked one-sided probe + the per-owner variant-freeze
+    /// machinery the two-sided build will reuse. InMemory only.
+    pub fn run_flop_search_robust(
+        &mut self,
+        tree: &FlatTree,
+        game: &FlopStartGame,
+        num_iterations: u32,
+    ) {
+        assert!(matches!(self.river_mode, RiverPersistenceMode::InMemory),
+            "run_flop_search_robust is research-scale (InMemory river) only");
+        let np = self.num_players as usize;
+        let nh = self.nh;
+        let nn = tree.num_nodes();
+        let table = game.table();
+        let turn_deck = &table.remaining_deck;
+        // K continuation variants: (target_action, eps). (_, 0.0)=blueprint.
+        let variants: [(usize, f32); 3] =
+            [(0, 0.0), (0, 0.6), (usize::MAX, 0.6)]; // blueprint, passive, aggressive
+        let prev_frozen = self.continuation_frozen;
+        self.continuation_frozen = true;
+
+        let mut flop_cfv_min = vec![0.0f32; nn * nh];
+        let mut flop_cfv_k = vec![0.0f32; nn * nh];
+        let mut river_cfv_accum = vec![0.0f32; nn * nh];
+        let mut cfv = vec![0.0f32; nn * nh];
+        let mut turn_cfv = vec![0.0f32; nn * nh];
+
+        for _ in 0..num_iterations {
+            let params = if self.vanilla_mode {
+                DcfrParams { alpha_t: 1.0, beta_t: 1.0, gamma_t: 1.0 }
+            } else {
+                DcfrParams::new(self.iteration)
+            };
+            self.iteration += 1;
+
+            for traverser in 0..np {
+                self.compute_flop_strategy(tree);
+                let flop_reach = self.compute_reach_flop(tree, game);
+
+                // Robust boundary: opponent commits to ONE continuation
+                // variant PER BOUNDARY NODE (aggregate best-response — NOT
+                // per-hand omniscient, which over-punishes in multiplayer).
+                // best_agg[child] tracks the lowest reach-summed searcher
+                // value seen; the winning variant's full per-hand vector is
+                // copied in.
+                let mut best_agg = vec![f32::INFINITY; nn];
+                for &child_id in &self.turn_chance_children {
+                    let off = child_id as usize * nh;
+                    for h in 0..nh { flop_cfv_min[off + h] = 0.0; }
+                }
+
+                for &(ta, eps) in &variants {
+                    for &child_id in &self.turn_chance_children {
+                        let off = child_id as usize * nh;
+                        for h in 0..nh { flop_cfv_k[off + h] = 0.0; }
+                    }
+                    for (ti, &tc) in turn_deck.iter().enumerate() {
+                        self.freeze_variant_turn(tree, ti, traverser, ta, eps);
+                        let turn_reach = self.compute_reach_turn(tree, ti, &flop_reach);
+                        let n_river = self.river_deck_sizes[tc as usize];
+                        for &child_id in &self.river_chance_children {
+                            let off = child_id as usize * nh;
+                            for h in 0..nh { river_cfv_accum[off + h] = 0.0; }
+                        }
+                        for ri in 0..n_river {
+                            self.freeze_variant_river(tree, ti, ri, traverser, ta, eps);
+                            let river_reach = self.compute_reach_river(tree, ti, ri, &turn_reach);
+                            self.bottom_up_zone(
+                                tree, table, traverser as u8, &river_reach, &mut cfv,
+                                Zone::River, Some(ti), Some(ri), &params,
+                            );
+                            for &child_id in &self.river_chance_children {
+                                for h in 0..nh {
+                                    let cp = table.chance_probability_river(tc, ri, h);
+                                    river_cfv_accum[child_id as usize * nh + h] +=
+                                        cp * cfv[child_id as usize * nh + h];
+                                }
+                            }
+                        }
+                        for &child_id in &self.river_chance_children {
+                            for h in 0..nh {
+                                turn_cfv[child_id as usize * nh + h] =
+                                    river_cfv_accum[child_id as usize * nh + h];
+                            }
+                        }
+                        self.bottom_up_zone(
+                            tree, table, traverser as u8, &turn_reach, &mut turn_cfv,
+                            Zone::Turn, Some(ti), None, &params,
+                        );
+                        for &child_id in &self.turn_chance_children {
+                            for h in 0..nh {
+                                let cp = table.chance_probability_turn(ti, h);
+                                flop_cfv_k[child_id as usize * nh + h] +=
+                                    cp * turn_cfv[child_id as usize * nh + h];
+                            }
+                        }
+                    }
+                    // Opponent picks the variant minimizing the AGGREGATE
+                    // (reach-summed) searcher value at each boundary node.
+                    for &child_id in &self.turn_chance_children {
+                        let off = child_id as usize * nh;
+                        let agg: f32 = (0..nh).map(|h| flop_cfv_k[off + h]).sum();
+                        if agg < best_agg[child_id as usize] {
+                            best_agg[child_id as usize] = agg;
+                            for h in 0..nh { flop_cfv_min[off + h] = flop_cfv_k[off + h]; }
+                        }
+                    }
+                }
+
+                // Flop is SEARCHED against the robust (min) boundary value.
+                self.bottom_up_zone(
+                    tree, table, traverser as u8, &flop_reach, &mut flop_cfv_min,
+                    Zone::Flop, None, None, &params,
+                );
+            }
+        }
+        self.continuation_frozen = prev_frozen;
+    }
+
+    // ════ TWO-SIDED MULTI-CONTINUATION GADGET (S2 fixability gate) ════
+    // The faithful Brown-style gadget on the seam engine: at each
+    // flop→turn boundary EVERY player co-adapts a continuation-variant
+    // choice k under CFR (regret-matched per boundary × hand). Because the
+    // traverser's CFV is LINEAR in each opponent's reach, the opponents'
+    // k-choices marginalize by BLENDING their variant strategies (weighted
+    // by their current k-strategy) → one blended frozen opponent
+    // continuation, so a traverser pass costs only K continuation passes
+    // (one per the traverser's own pure variant), NOT K^np. Two-sided ⇒ no
+    // one-sided over-pessimism (the flaw that sank the proxy).
+
+    /// Map every Turn/River node to the dense index of the flop→turn
+    /// boundary (turn_chance_child) it descends from; MAX for non-cont
+    /// nodes. Boundaries are the turn_chance_children (flop's leaves).
+    fn build_node_boundary(&self, tree: &FlatTree) -> Vec<usize> {
+        let nn = tree.num_nodes();
+        let mut nb = vec![usize::MAX; nn];
+        for (dense, &broot) in self.turn_chance_children.iter().enumerate() {
+            // DFS the continuation subtree rooted at this boundary.
+            let mut stack = vec![broot as usize];
+            while let Some(idx) = stack.pop() {
+                if nb[idx] != usize::MAX { continue; }
+                if self.zones[idx] != Zone::Turn && self.zones[idx] != Zone::River { continue; }
+                nb[idx] = dense;
+                for &c in tree.node_children(idx) { stack.push(c as usize); }
+            }
+        }
+        nb
+    }
+
+    /// Two-sided continuation freeze for one zone scratch (turn or river).
+    /// Traverser-owned nodes play the PURE variant `k_p`; opponent-owned
+    /// nodes play the per-hand BLEND of variants weighted by their current
+    /// k-strategy `k_strat` at the node's boundary. k_strat index:
+    /// ((b*np + player)*K + k)*nh + h.
+    #[allow(clippy::too_many_arguments)]
+    fn freeze_two_sided_zone(
+        &mut self, tree: &FlatTree, zone: Zone, tc: usize, rc: usize,
+        traverser: usize, k_p: usize, k_strat: &[f32], node_boundary: &[usize],
+        variants: &[(usize, f32)],
+    ) {
+        let nh = self.nh;
+        let kk = variants.len();
+        let np = self.num_players as usize;
+        let base = match zone {
+            Zone::Turn => tc * self.turn_stride,
+            Zone::River => (tc * self.max_n_river + rc) * self.river_stride,
+            _ => return,
+        };
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != zone { continue; }
+            let local = match zone {
+                Zone::Turn => self.turn_local_offset[idx],
+                Zone::River => self.river_local_offset[idx],
+                _ => UNUSED,
+            };
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let owner = tree.nodes[idx].player_id as usize;
+            let off_persist = base + local * MAX_NA_POSTFLOP * nh;
+            let off_scratch = local * MAX_NA_POSTFLOP * nh;
+            let b = node_boundary[idx];
+            // Blueprint average for this node into a local (immutable
+            // borrow of cum, dropped before the mutable strategy write).
+            let mut bp = vec![0.0f32; na * nh];
+            {
+                let cum = match zone {
+                    Zone::Turn => &self.cum_strategy_turn,
+                    _ => &self.cum_strategy_river,
+                };
+                normalize_cum_into_strategy(&cum[off_persist..off_persist + na * nh], na, nh, &mut bp);
+            }
+            // Blend toward variant targets: traverser → pure variant k_p;
+            // opponent → per-hand mix by its k-strategy at boundary b.
+            let mut out = bp.clone();
+            if !(owner == traverser && k_p == 0) {
+                for h in 0..nh {
+                    let mut shift_total = 0.0f32;
+                    let mut add = [0.0f32; 8];
+                    for k in 1..kk {
+                        let (target, eps) = variants[k];
+                        if eps == 0.0 { continue; }
+                        let w = if owner == traverser {
+                            if k == k_p { 1.0 } else { 0.0 }
+                        } else {
+                            k_strat[((b * np + owner) * kk + k) * nh + h]
+                        };
+                        if w == 0.0 { continue; }
+                        let ta = if target == usize::MAX { na - 1 } else { target.min(na - 1) };
+                        add[ta] += w * eps;
+                        shift_total += w * eps;
+                    }
+                    if shift_total > 0.0 {
+                        for a in 0..na {
+                            out[a * nh + h] = (1.0 - shift_total) * bp[a * nh + h] + add[a];
+                        }
+                    }
+                }
+            }
+            let s = match zone {
+                Zone::Turn => &mut self.strategy_turn,
+                _ => &mut self.strategy_river,
+            };
+            s[off_scratch..off_scratch + na * nh].copy_from_slice(&out);
+        }
+    }
+
+    /// FAITHFUL two-sided multi-continuation depth-limited flop search
+    /// (S2 fixability gate, 2026-06-13). See module gadget comment. With
+    /// `variants` collapsed to a single blueprint entry it reproduces
+    /// `run_flop_search` (the control gate). InMemory only.
+    pub fn run_flop_search_two_sided(
+        &mut self,
+        tree: &FlatTree,
+        game: &FlopStartGame,
+        num_iterations: u32,
+        variants: &[(usize, f32)],
+    ) {
+        assert!(matches!(self.river_mode, RiverPersistenceMode::InMemory),
+            "run_flop_search_two_sided is research-scale (InMemory river) only");
+        let np = self.num_players as usize;
+        let nh = self.nh;
+        let nn = tree.num_nodes();
+        let kk = variants.len();
+        let table = game.table();
+        let turn_deck = &table.remaining_deck;
+        let node_boundary = self.build_node_boundary(tree);
+        let n_b = self.turn_chance_children.len();
+        // Boundary node id per dense index, for reading/writing flop_cfv.
+        let b_node: Vec<usize> = self.turn_chance_children.iter().map(|&c| c as usize).collect();
+
+        // Per-boundary, per-player, per-k, per-hand continuation-choice
+        // regret + cum (the gadget's k-choice CFR layer).
+        let kidx = |b: usize, p: usize, k: usize, h: usize| ((b * np + p) * kk + k) * nh + h;
+        let mut k_regret = vec![0.0f32; n_b * np * kk * nh];
+        let mut k_cum = vec![0.0f32; n_b * np * kk * nh];
+        let mut k_strat = vec![0.0f32; n_b * np * kk * nh];
+
+        let prev_frozen = self.continuation_frozen;
+        self.continuation_frozen = true;
+
+        let mut flop_cfv = vec![0.0f32; nn * nh];
+        let mut river_cfv_accum = vec![0.0f32; nn * nh];
+        let mut cfv = vec![0.0f32; nn * nh];
+        let mut turn_cfv = vec![0.0f32; nn * nh];
+        // V[b][k][h] = traverser boundary value under its pure variant k.
+        let mut vval = vec![0.0f32; n_b * kk * nh];
+
+        for _ in 0..num_iterations {
+            let params = if self.vanilla_mode {
+                DcfrParams { alpha_t: 1.0, beta_t: 1.0, gamma_t: 1.0 }
+            } else {
+                DcfrParams::new(self.iteration)
+            };
+            self.iteration += 1;
+
+            // Regret-match the k-choice strategy for ALL (b,p,k,h).
+            for b in 0..n_b {
+                for p in 0..np {
+                    for h in 0..nh {
+                        let mut pos = 0.0f32;
+                        for k in 0..kk { pos += k_regret[kidx(b, p, k, h)].max(0.0); }
+                        for k in 0..kk {
+                            k_strat[kidx(b, p, k, h)] = if pos > 0.0 {
+                                k_regret[kidx(b, p, k, h)].max(0.0) / pos
+                            } else { 1.0 / kk as f32 };
+                        }
+                    }
+                }
+            }
+
+            for traverser in 0..np {
+                self.compute_flop_strategy(tree);
+                let flop_reach = self.compute_reach_flop(tree, game);
+
+                // K continuation passes: traverser plays pure variant k_p,
+                // opponents play their blended (k_strat-weighted) variants.
+                for k_p in 0..kk {
+                    for &child_id in &self.turn_chance_children {
+                        let off = child_id as usize * nh;
+                        for h in 0..nh { flop_cfv[off + h] = 0.0; }
+                    }
+                    for (ti, &tc) in turn_deck.iter().enumerate() {
+                        self.freeze_two_sided_zone(tree, Zone::Turn, ti, 0, traverser, k_p,
+                            &k_strat, &node_boundary, variants);
+                        let turn_reach = self.compute_reach_turn(tree, ti, &flop_reach);
+                        let n_river = self.river_deck_sizes[tc as usize];
+                        for &child_id in &self.river_chance_children {
+                            let off = child_id as usize * nh;
+                            for h in 0..nh { river_cfv_accum[off + h] = 0.0; }
+                        }
+                        for ri in 0..n_river {
+                            self.freeze_two_sided_zone(tree, Zone::River, ti, ri, traverser, k_p,
+                                &k_strat, &node_boundary, variants);
+                            let river_reach = self.compute_reach_river(tree, ti, ri, &turn_reach);
+                            self.bottom_up_zone(
+                                tree, table, traverser as u8, &river_reach, &mut cfv,
+                                Zone::River, Some(ti), Some(ri), &params,
+                            );
+                            for &child_id in &self.river_chance_children {
+                                for h in 0..nh {
+                                    let cp = table.chance_probability_river(tc, ri, h);
+                                    river_cfv_accum[child_id as usize * nh + h] +=
+                                        cp * cfv[child_id as usize * nh + h];
+                                }
+                            }
+                        }
+                        for &child_id in &self.river_chance_children {
+                            for h in 0..nh {
+                                turn_cfv[child_id as usize * nh + h] =
+                                    river_cfv_accum[child_id as usize * nh + h];
+                            }
+                        }
+                        self.bottom_up_zone(
+                            tree, table, traverser as u8, &turn_reach, &mut turn_cfv,
+                            Zone::Turn, Some(ti), None, &params,
+                        );
+                        for &child_id in &self.turn_chance_children {
+                            for h in 0..nh {
+                                let cp = table.chance_probability_turn(ti, h);
+                                flop_cfv[child_id as usize * nh + h] +=
+                                    cp * turn_cfv[child_id as usize * nh + h];
+                            }
+                        }
+                    }
+                    // Stash this pure-variant boundary value.
+                    for b in 0..n_b {
+                        let off = b_node[b] * nh;
+                        for h in 0..nh { vval[(b * kk + k_p) * nh + h] = flop_cfv[off + h]; }
+                    }
+                }
+
+                // k-choice CFR at each boundary: mix V by the traverser's
+                // k-strategy → the boundary value the flop searches against;
+                // update the traverser's k-regret.
+                for b in 0..n_b {
+                    let off = b_node[b] * nh;
+                    for h in 0..nh {
+                        let mut mixed = 0.0f32;
+                        for k in 0..kk {
+                            mixed += k_strat[kidx(b, traverser, k, h)] * vval[(b * kk + k) * nh + h];
+                        }
+                        flop_cfv[off + h] = mixed;
+                        for k in 0..kk {
+                            let inst = vval[(b * kk + k) * nh + h] - mixed;
+                            let ri = kidx(b, traverser, k, h);
+                            let coef = if k_regret[ri] >= 0.0 { params.alpha_t } else { params.beta_t };
+                            k_regret[ri] = coef * k_regret[ri] + inst;
+                            k_cum[ri] = params.gamma_t * k_cum[ri]
+                                + k_strat[kidx(b, traverser, k, h)];
+                        }
+                    }
+                }
+
+                // Search the flop against the gadget boundary values.
+                self.bottom_up_zone(
+                    tree, table, traverser as u8, &flop_reach, &mut flop_cfv,
+                    Zone::Flop, None, None, &params,
+                );
+            }
+        }
+        let _ = &k_cum;
+        self.continuation_frozen = prev_frozen;
+    }
 
     pub fn best_response_value_debug(&self, tree: &FlatTree, game: &FlopStartGame, p: u8) -> Vec<f32> {
         self.best_response_value(tree, game, p)
