@@ -41,8 +41,9 @@ fn utg_action_ev_probe() {
     let tree = cap3();
     let nc = NUM_PREFLOP_CLASSES;
     let mut solver = PreflopVectorCfr::new(&tree);
-    // load converged blob
-    let p = format!("{}/../preflop_out_v1/preflop.blob", env!("CARGO_MANIFEST_DIR"));
+    // load converged blob (PF_BLOB overrides the default).
+    let p = std::env::var("PF_BLOB")
+        .unwrap_or_else(|_| format!("{}/../preflop_out_v1/preflop.blob", env!("CARGO_MANIFEST_DIR")));
     let b = std::fs::read(&p).unwrap();
     let n1 = b.iter().position(|&x| x==b'\n').unwrap();
     let n2 = n1+1+b[n1+1..].iter().position(|&x| x==b'\n').unwrap();
@@ -77,7 +78,7 @@ fn utg_action_ev_probe() {
         } else {
             let cell = SeamCell::at_chance_node(&tree, c, np);
             let key = cell.bucket_key(spec.stack);
-            cc_real[c] = match by_key.get(&key) {
+            let v = match by_key.get(&key) {
                 Some(v) => v.clone(),
                 None => {
                     let v = solver.compute_chance_node_cfv_with_expansion_for_cell(c, t, &reach, &table, &mut oracle, cell, mask);
@@ -85,6 +86,10 @@ fn utg_action_ev_probe() {
                     v
                 }
             };
+            // Layer-2 (2026-06-17): reach-weight the live continuation, as the
+            // production iteration now does, so the decomposition reflects the
+            // FIXED behavior (not the ×136,700-amplified pre-fix injection).
+            cc_real[c] = solver.weight_continuation(c, t, &reach, v);
         }
     }
     // zeroed: postflop (live-UTG) chance nodes → 0; folded-UTG keep term_fn.

@@ -161,12 +161,11 @@ impl FlatNode {
 // alone implied. ACTION-ABSTRACTION change: justified by the banked
 // usage above, verified by the gates re-run on the leaner tree.
 //
-// RE-RAISED 8→16 (2026-06-16): the joint cold-CFR factory retries the
-// full na=16 preflop ladder. The ~28.6 GB cap-3 buffer is now RUN UNDER
-// the RSS memory guard (mem_guard.rs) so an overshoot aborts cleanly
-// instead of OOM-killing the box — i.e. we measure whether it fits
-// rather than assume it doesn't. Reverts the shrink above for that test.
-pub const MAX_NA_PREFLOP: usize = 16;
+// RE-RAISED 8→16 (2026-06-16) for the joint factory; REVERTED to 8
+// (2026-06-17) for the preflop-looseness investigation — the deployed v1
+// preflop.blob is na=8, so the analysis tree must match it. (joint_solve
+// runs fine at either na; flip back to 16 before the full joint run.)
+pub const MAX_NA_PREFLOP: usize = 8;
 pub const MAX_NA_POSTFLOP: usize = 4;
 
 pub const VCFR_NO_INFOSET: u32 = u32::MAX;

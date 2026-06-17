@@ -83,6 +83,10 @@ pub struct PreflopVectorCfr {
     /// failed). Used to anchor the fold value vs its trivial truth (UTG folds
     /// nothing → ~0) before the continuation-value question.
     pub debug_emit: Option<(usize, Vec<usize>)>,
+    /// Class×class non-blocking-fraction matrix (built once). Used to
+    /// reach-weight the LIVE-traverser continuation into a counterfactual value
+    /// on the SAME scale as the fold terminals — see `weight_continuation`.
+    blocking_matrix: Vec<f32>,
 }
 
 impl PreflopVectorCfr {
@@ -146,6 +150,7 @@ impl PreflopVectorCfr {
             regrets: vec![0.0f32; total],
             cum_strategy: vec![0.0f32; total],
             debug_emit: None,
+            blocking_matrix: crate::solver::preflop_terminal::build_class_blocking_matrix(),
         }
     }
 
@@ -330,9 +335,23 @@ impl PreflopVectorCfr {
                 reach[p][0..n_classes].copy_from_slice(&ir[p]);
             }
         } else {
+            // ROOT-CAUSE FIX (2026-06-17): the default opponent reach must be a
+            // sum-1 PROBABILITY (uniform range = 1/n_classes per class), NOT 1.0
+            // counts. The multiway fold/showdown terminal CFV is a reach-weighted
+            // SUM over joint opponent class tuples (preflop_fold_terminal_cfv_
+            // multiway): with 1.0 counts it scales as chip_delta × n_classes^
+            // num_opp (≈169^5 ≈ 1.4e11), a HAND-INDEPENDENT mass that drowns the
+            // chip-scale, hand-DIFFERENTIATED postflop continuation (which the
+            // oracle already delivers as an opponent-reach-normalized per-hand EV).
+            // The preflop then saw AA ≈ 72o (only the ~0.3% card-blocking ripple
+            // survived) and degenerated to an undifferentiated all-raise — the
+            // unusable loose preflop. A sum-1 reach makes ΣΠ reach ≈ 1, so the
+            // fold terminal is chip-scale and matches the continuation (the
+            // invariant the chance-expansion comment assumed but did not hold).
+            let u = 1.0 / n_classes as f32;
             for p in 0..np {
                 for c in 0..n_classes {
-                    reach[p][c] = 1.0;
+                    reach[p][c] = u;
                 }
             }
         }
@@ -442,9 +461,11 @@ impl PreflopVectorCfr {
         }
         let cell =
             crate::solver::postflop_oracle::SeamCell::at_chance_node(tree, chance_idx, np);
-        self.compute_chance_node_cfv_with_expansion_for_cell(
+        let v = self.compute_chance_node_cfv_with_expansion_for_cell(
             chance_idx, traverser, reach, table, oracle, cell, mask,
-        )
+        );
+        // Reach-weight the live-traverser continuation onto the terminals' scale.
+        self.weight_continuation(chance_idx, traverser, reach, v)
     }
 
     /// SEAM-CELL-AWARE variant (2026-06-12, v1 pot-bucket-keyed
@@ -474,6 +495,45 @@ impl PreflopVectorCfr {
             oracle,
             Some((cell, folded_mask)),
         )
+    }
+
+    /// Convert a LIVE-traverser continuation — the oracle's reach-INDEPENDENT
+    /// per-hand EV `v[c]` at chance node `chance_idx` — into a COUNTERFACTUAL
+    /// value on the SAME scale as the fold/showdown terminals, by multiplying
+    /// element-wise by the per-class multiway opponent-reach factor the terminals
+    /// use (`preflop_fold_terminal_cfv_multiway_pairwise` with unit chip_delta),
+    /// over the opponent reaches at THIS chance node.
+    ///
+    /// WHY (2026-06-17, the Layer-2 fix): the factored bottom-up sums each leaf
+    /// over every opponent-action path (the opponent's strategy lives in `reach`,
+    /// so leaves must be reach-weighted for the sum to be an expectation). The
+    /// fold TERMINALS are reach-weighted (`terminal_value_fn` × opp reach); the
+    /// continuation was injected reach-UNWEIGHTED, so the sum over-counted it by
+    /// the (action-dependent) path count — measured ×1 to ×136,700 — making the
+    /// solver LIMP everything (limp keeps the most opponents in → most paths →
+    /// biggest over-count). Reach-weighting here puts the continuation on the
+    /// terminals' counterfactual scale. Same-node-same-weight holds by
+    /// construction: identical function, identical opp-reach inputs (all p≠t).
+    /// The oracle's frozen reach-INDEPENDENT contract is unchanged — this is the
+    /// CONSUMER applying its live reach, the correct division of responsibility.
+    pub fn weight_continuation(
+        &self,
+        chance_idx: usize,
+        traverser: u8,
+        reach: &[Vec<f32>],
+        v: Vec<f32>,
+    ) -> Vec<f32> {
+        let nc = NUM_PREFLOP_CLASSES;
+        let np = self.num_players as usize;
+        let base = chance_idx * nc;
+        let opp: Vec<&[f32]> = (0..np)
+            .filter(|&p| p != traverser as usize)
+            .map(|p| &reach[p][base..base + nc])
+            .collect();
+        let w = crate::solver::preflop_terminal::preflop_fold_terminal_cfv_multiway_pairwise(
+            &opp, 1.0, &self.blocking_matrix,
+        );
+        (0..nc).map(|c| v[c] * w[c]).collect()
     }
 
     fn chance_cfv_expansion_inner(
@@ -1060,7 +1120,9 @@ impl PreflopVectorCfr {
                         v
                     }
                 };
-                cfv[chance_idx] = v;
+                // Reach-weight the (collapsed, reach-independent) oracle
+                // continuation into a counterfactual value on the terminals' scale.
+                cfv[chance_idx] = self.weight_continuation(chance_idx, t, &reach, v);
             }
 
             self.bottom_up_preflop_for_traverser(
@@ -1139,7 +1201,9 @@ impl PreflopVectorCfr {
                         v
                     }
                 };
-                cfv[chance_idx] = v;
+                // Reach-weight the (cached, reach-independent) oracle continuation
+                // into a counterfactual value on the terminals' scale.
+                cfv[chance_idx] = self.weight_continuation(chance_idx, t, &reach, v);
             }
 
             self.bottom_up_preflop_for_traverser(

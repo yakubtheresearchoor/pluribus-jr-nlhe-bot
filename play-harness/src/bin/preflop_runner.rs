@@ -82,9 +82,13 @@ fn main() {
         use solver_core::abstraction::preflop_class::PreflopClass;
         use solver_core::card::card_from_str;
         let cl = |a: &str, b: &str| PreflopClass::from_combo(card_from_str(a).unwrap(), card_from_str(b).unwrap()).index();
-        // emit per-action cfv at the UTG node (0) for AA, KK, 72o, 32o
-        solver.debug_emit = Some((0, vec![cl("Ac","Ad"), cl("Kc","Kd"), cl("7c","2d"), cl("3c","2d")]));
-        eprintln!("PF_DEBUG_UTG: emitting UTG action-cfv for AA,KK,72o,32o");
+        // emit per-action cfv at the UTG node (0) for AA, KK, T9s, 72o, 32o.
+        // T9s included to decompose WHY the premium (AA) limps but the marginal
+        // (T9s) raises — call-vs-raise gap + its SIZE distinguishes a genuine
+        // frozen-oracle consequence (big AA call≫raise) from a Layer-2 residual
+        // investment-bias (tiny AA call≳raise).
+        solver.debug_emit = Some((0, vec![cl("Ac","Ad"), cl("Kc","Kd"), cl("Tc","9c"), cl("7c","2d"), cl("3c","2d")]));
+        eprintln!("PF_DEBUG_UTG: emitting UTG action-cfv for AA,KK,T9s,72o,32o");
     }
 
     eprintln!(
@@ -126,6 +130,40 @@ fn main() {
                 ),
                 None => (f32::INFINITY, f32::INFINITY),
             };
+            // UTG open-frequency trajectory (the looseness signal): does trash
+            // fold off as the average converges?
+            {
+                use solver_core::abstraction::preflop_class::PreflopClass;
+                use solver_core::card::card_from_str;
+                let nc = NUM_PREFLOP_CLASSES;
+                let local = solver.local_offset[0];
+                let na = tree.nodes[0].num_children as usize;
+                let off = local * MAX_NA_PREFLOP * nc;
+                let labels: Vec<u8> =
+                    tree.node_children(0).iter().map(|&c| tree.nodes[c as usize].action_label).collect();
+                // (raise%, fold%) per class from the average strategy: raise =
+                // label 4, fold = label 0. Sane preflop ⇒ AA raises, 72o folds.
+                let rf = |cl: usize, want: u8| -> f32 {
+                    let s: f32 = (0..na).map(|a| avg[off + a * nc + cl].max(0.0)).sum();
+                    if s <= 0.0 {
+                        return 0.0;
+                    }
+                    let r: f32 =
+                        (0..na).filter(|&a| labels[a] == want).map(|a| avg[off + a * nc + cl].max(0.0)).sum();
+                    r / s
+                };
+                let ix = |a: &str, b: &str| {
+                    PreflopClass::from_combo(card_from_str(a).unwrap(), card_from_str(b).unwrap()).index()
+                };
+                let pr = |a: &str, b: &str| (rf(ix(a, b), 4) * 100.0, rf(ix(a, b), 0) * 100.0);
+                let (aa_r, aa_f) = pr("Ac", "Ad");
+                let (t9_r, t9_f) = pr("Tc", "9c");
+                let (o72_r, o72_f) = pr("7c", "2d");
+                let (o32_r, o32_f) = pr("3c", "2d");
+                eprintln!(
+                    "    UTG raise/fold%: AA {aa_r:.0}/{aa_f:.0} | T9s {t9_r:.0}/{t9_f:.0} | 72o {o72_r:.0}/{o72_f:.0} | 32o {o32_r:.0}/{o32_f:.0}",
+                );
+            }
             prev_avg = Some(avg);
             eprintln!(
                 "  iter {it:>3}: conv(reach-wt) {conv:.4e} | raw-max {raw_max:.4e} | {train_s:.1}s/iter | {:.1} min",

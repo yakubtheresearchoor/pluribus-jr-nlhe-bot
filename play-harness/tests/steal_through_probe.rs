@@ -26,7 +26,10 @@ fn steal_through_probe() {
     let tree = cap3();
     let nc = NUM_PREFLOP_CLASSES;
     let mut solver = PreflopVectorCfr::new(&tree);
-    let p = format!("{}/../preflop_out_v1/preflop.blob", env!("CARGO_MANIFEST_DIR"));
+    // PF_BLOB overrides the default, so the FIXED strategy can be measured
+    // without clobbering the old broken-strategy blob.
+    let p = std::env::var("PF_BLOB")
+        .unwrap_or_else(|_| format!("{}/../preflop_out_v1/preflop.blob", env!("CARGO_MANIFEST_DIR")));
     let b = std::fs::read(&p).unwrap();
     let n1 = b.iter().position(|&x| x==b'\n').unwrap();
     let n2 = n1+1+b[n1+1..].iter().position(|&x| x==b'\n').unwrap();
