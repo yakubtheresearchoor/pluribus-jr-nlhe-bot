@@ -63,6 +63,9 @@ fn main() {
     let post_iters: u32 =
         std::env::var("JOINT_POST_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(34);
     let nb: usize = std::env::var("JOINT_B").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    // count-only: skip the GPU solve, return zeros — measures the per-iteration
+    // unique (key,canonical) solve COUNT (the work scale) without the wall.
+    let count_only = std::env::var("JOINT_COUNT_ONLY").is_ok();
     let spec = production_game_v1();
 
     // ---- guard ARMED before any big allocation -----------------------------
@@ -177,6 +180,11 @@ fn main() {
         let n_so_far = gpu_count_src.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n_so_far % 200 == 0 {
             eprintln!("    [{n_so_far} solves so far | live {:.1} GB]", guard_src.peak_gb());
+        }
+        if count_only {
+            let pl = vec![vec![0.0f32; flop_combo_layout(canonical).len()]; live_seats.len()];
+            src_cache.insert((key, canonical), pl.clone());
+            return pl[trav_live].clone();
         }
 
         let fi = *flop_index.get(&canonical).expect("canonical flop in list");
