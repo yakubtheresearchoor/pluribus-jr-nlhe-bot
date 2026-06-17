@@ -110,6 +110,11 @@ fn main() {
     let gpu_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let gpu_count_src = gpu_count.clone();
     let guard_src = guard.clone(); // live progress readout
+    // per-path solve counters (the by-player-count split): [0]=live-2 exact,
+    // [1]=live-3 B15, [2]=live-4 B15, [3]=live-5 B8, [4]=live-6/all-in rollout.
+    let path_counts: Arc<Vec<std::sync::atomic::AtomicU64>> =
+        Arc::new((0..5).map(|_| std::sync::atomic::AtomicU64::new(0)).collect());
+    let path_counts_src = path_counts.clone();
     // Per-(key,canonical) cache: solve a subgame ONCE per preflop iteration and
     // serve all traversers (the oracle's per-traverser cache would re-solve
     // np×). Cleared each iter via `epoch` — range-dependent values can't
@@ -178,8 +183,23 @@ fn main() {
             return pl[trav_live].clone();
         }
         let n_so_far = gpu_count_src.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if n_so_far % 200 == 0 {
-            eprintln!("    [{n_so_far} solves so far | live {:.1} GB]", guard_src.peak_gb());
+        {
+            let pidx = if cell.live == 2 {
+                0
+            } else if key.1 == i64::MIN || cell.live == 6 {
+                4 // all-in (any live) or live-6 → rollout path
+            } else {
+                match cell.live { 3 => 1, 4 => 2, 5 => 3, _ => 4 }
+            };
+            path_counts_src[pidx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if n_so_far % 5000 == 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            let c: Vec<u64> = (0..5).map(|i| path_counts_src[i].load(Relaxed)).collect();
+            eprintln!(
+                "    [{n_so_far} solves | L2 {} | L3 {} L4 {} L5 {} | L6/allin {} | {:.1} GB]",
+                c[0], c[1], c[2], c[3], c[4], guard_src.peak_gb()
+            );
         }
         if count_only {
             let pl = vec![vec![0.0f32; flop_combo_layout(canonical).len()]; live_seats.len()];
@@ -293,6 +313,28 @@ fn main() {
             guard.peak_gb(),
         );
     }
+
+    // ---- per-player-count solve breakdown (count AND wall-time) ----
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let labels = ["live-2 exact", "live-3 B15", "live-4 B15", "live-5 B8", "live-6/allin"];
+        // s/subgame from joint_probe (34 iters); live-6/all-in is the cheap
+        // check-only rollout, NOT probed → conservative estimate, flagged.
+        let times = [11.4f64, 0.15, 1.46, 4.70, 0.05];
+        eprintln!("\n=== per-iteration solve breakdown (by player count / path) ===");
+        eprintln!("{:<14} {:>10} {:>11} {:>16}", "path", "count", "s/subgame", "wall h (serial)");
+        let (mut tot_n, mut tot_s) = (0u64, 0.0f64);
+        for i in 0..5 {
+            let c = path_counts[i].load(Relaxed);
+            let wall = c as f64 * times[i];
+            tot_n += c;
+            tot_s += wall;
+            eprintln!("{:<14} {:>10} {:>11.2} {:>16.2}", labels[i], c, times[i], wall / 3600.0);
+        }
+        eprintln!("{:<14} {:>10} {:>11} {:>16.2}", "TOTAL/iter", tot_n, "", tot_s / 3600.0);
+        eprintln!("(wall = count × s/subgame, SERIAL 1-stream; live-6/allin s is a rollout estimate)");
+    }
+
     let avg = solver.average_strategy(&tree);
     let finite = avg.iter().all(|x| x.is_finite());
     let (mn, mx) = avg.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
