@@ -14,17 +14,18 @@
 //! equity board-by-board → the extraction is fine and the single-board flatness
 //! was a range-neutral board (finding collapses).
 
-use solver_core::card::{card_from_str, card_pair_to_index, Card, NUM_POSSIBLE_HANDS};
+use solver_core::abstraction::preflop_class::NUM_PREFLOP_CLASSES;
+use solver_core::card::{card_pair_to_index, index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use solver_core::hand::eval::Hand;
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
-use solver_core::solver::preflop_start_game::extract_v_flop_root_from_cum;
+use solver_core::solver::preflop_start_game::{extract_v_flop_root_from_cum, PreflopChanceTable};
 use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions};
 use solver_core::tree::builder::build_tree;
 use solver_core::tree::flat::FlatTree;
 
-fn b(s: &str) -> Card {
-    card_from_str(s).unwrap()
+fn maxabs1(a: &[f32]) -> f64 {
+    a.iter().map(|x| (*x as f64).abs()).fold(0.0, f64::max)
 }
 
 fn mean_abs(a: &[f32], c: &[f32]) -> f64 {
@@ -54,14 +55,31 @@ fn main() {
     }
     let opp_range = |r1: &[f32]| -> Vec<Vec<f32>> { vec![uniform_r.clone(), r1.to_vec()] };
 
-    let boards: [(&str, [Card; 3]); 3] = [
-        ("DRY    Kc7d2h", [b("Kc"), b("7d"), b("2h")]),
-        ("WET    9c8c7d", [b("9c"), b("8c"), b("7d")]),
-        ("PAIRED Kc Kd7h", [b("Kc"), b("Kd"), b("7h")]),
-    ];
+    // CANONICAL flops only (non-canonical → empty chance table → all-zero CFV,
+    // which would masquerade as range-flat). Pick one dry/wet/paired canonical.
+    let ptable = PreflopChanceTable::new(
+        6,
+        vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6],
+    );
+    let canon = ptable.canonical_flops.clone();
+    let texture = |f: &[Card; 3]| -> &'static str {
+        let r: Vec<u8> = f.iter().map(|&c| c >> 2).collect();
+        let s: Vec<u8> = f.iter().map(|&c| c & 3).collect();
+        let paired = r[0] == r[1] || r[1] == r[2] || r[0] == r[2];
+        let suited2 = s[0] == s[1] || s[1] == s[2] || s[0] == s[2];
+        let mut rs = r.clone();
+        rs.sort();
+        let connected = rs[2] - rs[0] <= 4;
+        if paired { "PAIRED" } else if suited2 || connected { "WET" } else { "DRY" }
+    };
+    let pick = |want: &str| -> [Card; 3] {
+        *canon.iter().find(|f| texture(f) == want).expect("canonical board of texture")
+    };
+    let boards: [(&str, [Card; 3]); 3] =
+        [("DRY", pick("DRY")), ("WET", pick("WET")), ("PAIRED", pick("PAIRED"))];
 
     eprintln!("raw-equity control: HU, {iters} solve-iters, opp uniform vs tight (pairs+broadway)\n");
-    eprintln!("{:<16} {:>12} {:>12} {:>12} {:>12}   verdict", "board", "RAW mean|Δ|", "RAW max|Δ|", "EXT mean|Δ|", "EXT max|Δ|");
+    eprintln!("{:<8} {:>10} {:>10} {:>10} {:>10} {:>10}   verdict", "board", "RAW mean", "RAW max", "EXT mean", "EXT max", "EXT|mag|");
 
     let mut any_flattener = false;
     for (label, flop) in boards {
@@ -164,21 +182,31 @@ fn main() {
             s.run(&tree, &game, iters);
             extract_v_flop_root_from_cum(&mut s, &tree, &game, 0).0
         };
+        if std::env::var("TRACE_SD").is_ok() {
+            eprintln!("--- {label} UNIFORM ---");
+        }
         let cfv_u = solve(&opp_range(&uniform_r));
+        if std::env::var("TRACE_SD").is_ok() {
+            eprintln!("--- {label} TIGHT ---");
+        }
         let cfv_t = solve(&opp_range(&tight_r));
         let ext_m = mean_abs(&cfv_u, &cfv_t);
         let ext_x = max_abs(&cfv_u, &cfv_t);
 
-        // verdict: board is range-sensitive (raw moves) but extraction flat?
-        let v = if raw_m > 0.02 && ext_m < 0.1 * raw_m {
+        // ANCHOR: extraction must return NON-ZERO CFVs, else "flat" is the
+        // all-zero artifact (non-canonical board), not range-insensitivity.
+        let ext_mag = maxabs1(&cfv_u).max(maxabs1(&cfv_t));
+        let v = if ext_mag < 1e-3 {
+            "EXT≈0 (zeros artifact) → INVALID"
+        } else if raw_m > 0.02 && ext_m < 0.1 * raw_m {
             any_flattener = true;
             "RAW MOVES, EXT FLAT → flattener"
         } else if raw_m <= 0.02 {
-            "range-neutral board (raw flat too)"
+            "range-neutral board"
         } else {
-            "extraction tracks raw"
+            "EXT TRACKS raw → no flattener"
         };
-        eprintln!("{label:<16} {raw_m:>12.4} {raw_x:>12.4} {ext_m:>12.4} {ext_x:>12.4}   {v}");
+        eprintln!("{label:<8} {raw_m:>10.4} {raw_x:>10.4} {ext_m:>10.4} {ext_x:>10.4} {ext_mag:>10.3}   {v}");
     }
 
     eprintln!();

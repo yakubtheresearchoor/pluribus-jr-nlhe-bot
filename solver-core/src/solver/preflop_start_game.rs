@@ -945,6 +945,19 @@ pub fn extract_v_flop_root_from_cum(
                     cp * turn_cfv[child_id as usize * nh + h];
             }
         }
+
+        if std::env::var("TRACE_AGG").is_ok() {
+            let (mut tc_sq, mut fc_sq) = (0.0f32, 0.0f32);
+            for &c in solver.turn_chance_children() {
+                for h in 0..nh {
+                    let t = turn_cfv[c as usize * nh + h];
+                    tc_sq += t * t;
+                    let f = flop_cfv[c as usize * nh + h];
+                    fc_sq += f * f;
+                }
+            }
+            eprintln!("TRACE_AGG ti {ti}: turn_cfv@tcc sumsq {tc_sq:.6} | flop_cfv@tcc(accum) sumsq {fc_sq:.6}");
+        }
     }
 
     for &child_id in solver.turn_chance_children() {
@@ -957,6 +970,11 @@ pub fn extract_v_flop_root_from_cum(
         flop_tree, table_ref, traverser, &flop_reach, &mut cfv,
         Zone::Flop, None, None, &params,
     );
+
+    if std::env::var("TRACE_AGG").is_ok() {
+        let root_sq: f32 = (0..nh).map(|h| cfv[h] * cfv[h]).sum();
+        eprintln!("TRACE_AGG root cfv sumsq {root_sq:.6}");
+    }
 
     let root_cfv = cfv[0..nh].to_vec();
     (root_cfv, layout)

@@ -1209,6 +1209,7 @@ impl FlopStartVectorCfr {
         let np = self.num_players as usize;
         let max_depth = tree.max_depth as usize;
         let num_opp = np - 1;
+        let mut traced = false; // TRACE_SD: one-shot showdown data trace
 
         // Collect node IDs for this zone/level before borrowing self mutably
         // (zone_nodes borrows self, so we must extract the data before get_mut_slices)
@@ -1337,6 +1338,17 @@ impl FlopStartVectorCfr {
                         for h in 0..nh { cfv[idx * nh + h] = cfv_out[h] / nc; }
                     } else {
                         for h in 0..nh { cfv[idx * nh + h] = cfv_out[h]; }
+                    }
+
+                    if !traced && matches!(zone, Zone::River) && std::env::var("TRACE_SD").is_ok() {
+                        traced = true;
+                        let rsum: f32 = opp_reach[0].iter().sum();
+                        let rsq: f32 = opp_reach[0].iter().map(|x| x * x).sum();
+                        let coutsq: f32 = cfv_out.iter().map(|x| x * x).sum();
+                        let csq: f32 = (0..nh).map(|h| cfv[idx * nh + h] * cfv[idx * nh + h]).sum();
+                        eprintln!(
+                            "TRACE_SD river-term {idx}: opp_reach[sum {rsum:.5} sumsq {rsq:.7}] | cfv_out sumsq {coutsq:.5} | cfv(/nc) sumsq {csq:.7} | nc {nc:.1}"
+                        );
                     }
 
                 } else if node.is_chance() {
