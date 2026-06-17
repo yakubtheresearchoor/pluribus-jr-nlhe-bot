@@ -22,7 +22,9 @@ use solver_core::abstraction::preflop_class::NUM_PREFLOP_CLASSES;
 use solver_core::card::{card_pair_to_index, index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
-use solver_core::solver::preflop_start_game::{extract_v_flop_root_from_cum, PreflopChanceTable};
+use solver_core::solver::preflop_start_game::{
+    compute_v_flop_at_root_converged, extract_v_flop_root_from_cum, PreflopChanceTable,
+};
 use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions};
 use solver_core::tree::builder::build_tree;
 
@@ -107,6 +109,23 @@ fn main() {
     let total = t_drift + t_hold;
     eprintln!("warm-start probe: HU exact, drift {t_drift} + hold {t_hold} = {total} iters\n");
 
+    // INJECTION ANCHOR (probe-independent): did the range actually reach the
+    // table's opponent initial_weights? If uniform and tight differ here, the
+    // injection works and any CFV flatness is a REAL downstream property; if
+    // they're identical, the probe never varied the range (artifact).
+    {
+        let gu = build_game(&opp_range(&uniform_r));
+        let gt = build_game(&opp_range(&tight_r));
+        let wu = &gu.table().initial_weights[1];
+        let wt = &gt.table().initial_weights[1];
+        let inrange = |w: &[f32]| w.iter().filter(|&&x| x > 0.5).count();
+        let sum = |w: &[f32]| w.iter().sum::<f32>();
+        eprintln!(
+            "INJECTION ANCHOR opp initial_weight: uniform[sum {:.1}, inrange {}/{}]  tight[sum {:.1}, inrange {}/{}]  differ={}",
+            sum(wu), inrange(wu), wu.len(), sum(wt), inrange(wt), wt.len(), wu != wt
+        );
+    }
+
     // references (1×1 sampled — what the fill/joint solve use)
     let v_cold_final = solve_cold(&opp_range(&tight_r), total);
     let v_cold_start = solve_cold(&opp_range(&uniform_r), total);
@@ -124,6 +143,14 @@ fn main() {
     let fb_iters: u32 = std::env::var("WS_FB_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
     let v_fb_final = solve_cold_full(&opp_range(&tight_r), fb_iters);
     let v_fb_start = solve_cold_full(&opp_range(&uniform_r), fb_iters);
+
+    // DIFFERENTIAL: the OTHER extraction (compute_v_flop_at_root_converged — what
+    // range_dependence_probe found range-SENSITIVE) on the SAME full-board ranges.
+    // If it moves and ours doesn't, the flattener is definitively the extraction.
+    let (va_final, _) = compute_v_flop_at_root_converged(canonical, &tree, &opp_range(&tight_r), 0, fb_iters);
+    let (va_start, _) = compute_v_flop_at_root_converged(canonical, &tree, &opp_range(&uniform_r), 0, fb_iters);
+    let amin = va_final.iter().cloned().fold(f32::INFINITY, f32::min);
+    let amax = va_final.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
     // WARM: one solver, drift then hold, regrets accumulating.
     let game0 = build_game(&opp_range(&uniform_r));
@@ -153,7 +180,9 @@ fn main() {
     let (warm_mad, warm_mx) = dist(&v_warm, &v_cold_final);
     let ratio = warm_mad / range_mad.max(1e-9);
 
-    eprintln!("FULL-BOARD range effect (control, {fb_iters} it): mean {fb_mad:.4}  max {fb_mx:.4}");
+    let (alt_mad, alt_mx) = dist(&va_start, &va_final);
+    eprintln!("ALT-EXTRACTION (compute_v_flop_at_root_converged) range effect: mean {alt_mad:.4}  max {alt_mx:.4}  [anchor: va_final range {amin:.3}..{amax:.3}]");
+    eprintln!("FULL-BOARD range effect (our extraction, {fb_iters} it): mean {fb_mad:.4}  max {fb_mx:.4}");
     eprintln!("RANGE EFFECT  (cold@uniform vs cold@tight): mean {range_mad:.4}  max {range_mx:.4}");
     eprintln!("WARM-START    (warm        vs cold@tight):  mean {warm_mad:.4}  max {warm_mx:.4}");
     eprintln!("ratio warm/range = {ratio:.3}\n");
