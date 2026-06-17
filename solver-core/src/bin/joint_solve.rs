@@ -106,7 +106,16 @@ fn main() {
     let mut rollout_trees: HashMap<(u8, i32, i32), Arc<FlatTree>> = HashMap::new();
     let gpu_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let gpu_count_src = gpu_count.clone();
-    let guard_src = guard.clone(); // live RSS readout during the long first iter
+    let guard_src = guard.clone(); // live progress readout
+    // Per-(key,canonical) cache: solve a subgame ONCE per preflop iteration and
+    // serve all traversers (the oracle's per-traverser cache would re-solve
+    // np×). Cleared each iter via `epoch` — range-dependent values can't
+    // persist across iters. `gpu_count` = cache misses = actual subgame solves.
+    let epoch = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let epoch_src = epoch.clone();
+    let mut src_cache: std::collections::HashMap<((u8, i64), [Card; 3]), Vec<Vec<f32>>> =
+        std::collections::HashMap::new();
+    let mut last_epoch = u32::MAX;
 
     // seeded 1×1 runout (matches the fill convention so the live solve uses the
     // same single-runout subgame the banked path priced).
@@ -153,9 +162,25 @@ fn main() {
         let live_seats: Vec<usize> = (0..np).filter(|&p| (folded_mask >> p) & 1 == 0).collect();
         let trav_live =
             live_seats.iter().position(|&p| p == traverser as usize).expect("traverser live");
+        let key = cell.bucket_key(stack);
+
+        // per-iteration cache: clear on epoch change, then serve all traversers
+        // of this (key, canonical) from one solve.
+        let ep = epoch_src.get();
+        if ep != last_epoch {
+            src_cache.clear();
+            last_epoch = ep;
+        }
+        if let Some(pl) = src_cache.get(&(key, canonical)) {
+            return pl[trav_live].clone();
+        }
+        let n_so_far = gpu_count_src.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n_so_far % 200 == 0 {
+            eprintln!("    [{n_so_far} solves so far | live {:.1} GB]", guard_src.peak_gb());
+        }
+
         let fi = *flop_index.get(&canonical).expect("canonical flop in list");
         let (turns, river_decks) = seeded_1x1(canonical, fi);
-        let key = cell.bucket_key(stack);
         let is_allin = key.1 == i64::MIN;
 
         // per-live layout-ordered CFV (one vec per live seat)
@@ -175,7 +200,6 @@ fn main() {
             let tbl = FlopChanceTable::build_full_nh_sampled(canonical, 2, &turns, &river_decks);
             let (per_trav, lay_tbl) =
                 compute_v_flop_root_gpu_per_traverser(&ctx, tbl, &bt, 2, post_iters);
-            gpu_count_src.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut pos: HashMap<(Card, Card), usize> = HashMap::new();
             for (i, &(a, b)) in lay_tbl.iter().enumerate() {
                 pos.insert((a.min(b), a.max(b)), i);
@@ -227,13 +251,15 @@ fn main() {
             solver.cum_strategy_flop_mut().copy_from_slice(n.cum_strategy_flop());
             solver.cum_strategy_turn_mut().copy_from_slice(n.cum_strategy_turn());
             solver.cum_strategy_river_mut().copy_from_slice(n.cum_strategy_river());
-            let nsolved = gpu_count_src.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if nsolved % 50 == 0 {
-                eprintln!("    [{nsolved} GPU subgame solves | live RSS {:.2} GB]", guard_src.peak_gb());
-            }
             let root_all = solver.root_cfv_from_avg(&bt, &game, &bk);
             root_all.iter().map(|ph| perm.iter().map(|&h| ph[h]).collect()).collect()
         };
+        // garbage-catcher: a non-finite CFV would silently corrupt the preflop.
+        assert!(
+            per_live.iter().all(|v| v.iter().all(|x| x.is_finite())),
+            "non-finite CFV — cell {cell:?} flop {canonical:?}"
+        );
+        src_cache.insert((key, canonical), per_live.clone());
         per_live[trav_live].clone()
     };
 
@@ -248,15 +274,25 @@ fn main() {
             eprintln!("MEM_GUARD soft abort at preflop iter {it} — peak RSS {:.2} GB; exiting clean", guard.peak_gb());
             break;
         }
+        epoch.set(it + 1); // new iteration ⇒ source clears its per-iter cache
+        let prev = gpu_count.load(std::sync::atomic::Ordering::Relaxed);
         let t0 = Instant::now();
         solver.run_one_iteration(&tree, &table, &mut oracle, &term_fn);
+        let this_iter = gpu_count.load(std::sync::atomic::Ordering::Relaxed) - prev;
         eprintln!(
-            "  preflop iter {it}: {:.1}s | peak RSS {:.2} GB | {} GPU subgame solves cumulative",
+            "  preflop iter {it}: {:.1}s | {this_iter} unique subgame solves | peak RSS {:.2} GB",
             t0.elapsed().as_secs_f64(),
             guard.peak_gb(),
-            gpu_count.load(std::sync::atomic::Ordering::Relaxed),
         );
     }
+    let avg = solver.average_strategy(&tree);
+    let finite = avg.iter().all(|x| x.is_finite());
+    let (mn, mx) = avg.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+    eprintln!(
+        "DIAGNOSTIC: preflop avg strategy finite={finite}, range [{mn:.4}, {mx:.4}], {} entries",
+        avg.len()
+    );
+    assert!(finite, "preflop avg strategy NON-FINITE — garbage produced");
     eprintln!(
         "DONE: {} preflop iters in {:.1} min | PEAK RSS {:.2} GB (soft {:.0} / hard {:.0})",
         pf_cap,
