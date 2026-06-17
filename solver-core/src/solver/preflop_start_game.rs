@@ -848,6 +848,169 @@ pub fn compute_v_flop_at_root_converged_with_table(
     (root_cfv, layout)
 }
 
+/// Extract the flop-root CFV per hand (traverser) from a solver whose
+/// `cum_strategy_*` is ALREADY the converged time-average — the gated
+/// extraction tail shared by the CPU path (after `solver.run`) and the GPU
+/// path (after injecting `MetalFlopStartSolver`'s downloaded cum). Identical
+/// to the body of `compute_v_flop_at_root_converged_with_table` post-run:
+/// freeze avg → per-zone reach + bottom-up CFV → opponent-reach-sum-1
+/// normalization (so live-2 is on the same chip scale as the live-3/4/5 banked
+/// path and the rollouts).
+pub fn extract_v_flop_root_from_cum(
+    solver: &mut FlopStartVectorCfr,
+    flop_tree: &FlatTree,
+    game: &FlopStartGame,
+    traverser: u8,
+) -> (Vec<f32>, Vec<(Card, Card)>) {
+    let table_ref = game.table();
+    let nh = table_ref.num_valid;
+    let layout: Vec<(Card, Card)> = (0..nh)
+        .map(|i| (table_ref.hand_cards[i * 2], table_ref.hand_cards[i * 2 + 1]))
+        .collect();
+
+    solver.freeze_average_strategy_flop(flop_tree);
+
+    let nn = flop_tree.num_nodes();
+    let turn_deck = table_ref.remaining_deck.clone();
+    let params = crate::solver::flop_start_vector_cfr::DcfrParams::new(0);
+    use crate::solver::flop_start_vector_cfr::Zone;
+
+    let mut flop_reach = solver.compute_reach_flop(flop_tree, game);
+    let np_eval = flop_reach.len() / (nn * nh);
+    crate::solver::bucketed_flop_cfr::normalize_opponent_reach(
+        &mut flop_reach,
+        np_eval,
+        nh,
+        traverser as usize,
+    );
+
+    let mut cfv = vec![0.0f32; nn * nh];
+    let mut river_cfv_accum = vec![0.0f32; nn * nh];
+    let mut turn_cfv = vec![0.0f32; nn * nh];
+    let mut flop_cfv = vec![0.0f32; nn * nh];
+
+    for &child_id in solver.turn_chance_children() {
+        let off = child_id as usize * nh;
+        for h in 0..nh {
+            flop_cfv[off + h] = 0.0;
+        }
+    }
+
+    for (ti, &tc_card) in turn_deck.iter().enumerate() {
+        solver.freeze_average_strategy_for_turn(flop_tree, ti);
+        let turn_reach = solver.compute_reach_turn(flop_tree, ti, &flop_reach);
+        let river_deck = &table_ref.river_decks[tc_card as usize];
+
+        for &child_id in solver.river_chance_children() {
+            let off = child_id as usize * nh;
+            for h in 0..nh {
+                river_cfv_accum[off + h] = 0.0;
+            }
+        }
+
+        for ri in 0..river_deck.len() {
+            solver.load_river_pair(ti, ri).expect("load_river_pair (extract_from_cum)");
+            solver.freeze_average_strategy_for_river_pair(flop_tree, ti, ri);
+            let river_reach = solver.compute_reach_river(flop_tree, ti, ri, &turn_reach);
+            solver.bottom_up_zone(
+                flop_tree, table_ref, traverser, &river_reach, &mut cfv,
+                Zone::River, Some(ti), Some(ri), &params,
+            );
+            solver.save_river_pair(ti, ri).expect("save_river_pair (extract_from_cum)");
+            for &child_id in solver.river_chance_children() {
+                for h in 0..nh {
+                    let cp = table_ref.chance_probability_river(tc_card, ri, h);
+                    river_cfv_accum[child_id as usize * nh + h] +=
+                        cp * cfv[child_id as usize * nh + h];
+                }
+            }
+        }
+
+        for &child_id in solver.river_chance_children() {
+            for h in 0..nh {
+                turn_cfv[child_id as usize * nh + h] =
+                    river_cfv_accum[child_id as usize * nh + h];
+            }
+        }
+
+        solver.bottom_up_zone(
+            flop_tree, table_ref, traverser, &turn_reach, &mut turn_cfv,
+            Zone::Turn, Some(ti), None, &params,
+        );
+
+        for &child_id in solver.turn_chance_children() {
+            for h in 0..nh {
+                let cp = table_ref.chance_probability_turn(ti, h);
+                flop_cfv[child_id as usize * nh + h] +=
+                    cp * turn_cfv[child_id as usize * nh + h];
+            }
+        }
+    }
+
+    for &child_id in solver.turn_chance_children() {
+        for h in 0..nh {
+            cfv[child_id as usize * nh + h] = flop_cfv[child_id as usize * nh + h];
+        }
+    }
+
+    solver.bottom_up_zone(
+        flop_tree, table_ref, traverser, &flop_reach, &mut cfv,
+        Zone::Flop, None, None, &params,
+    );
+
+    let root_cfv = cfv[0..nh].to_vec();
+    (root_cfv, layout)
+}
+
+/// GPU exact live-2 (HU): solve the flop-start subgame on `MetalFlopStartSolver`
+/// (the measured bottleneck — the 34-iter exact showdown sweep moves to GPU),
+/// then extract per-traverser flop-root CFVs via the gated CPU extraction by
+/// injecting the GPU's converged cum into a CPU solver (same ZoneDims layout,
+/// [flop|turn|river] contiguous). ONE GPU solve, then re-inject the clean cum
+/// before each traverser's extraction (bottom_up_zone mutates cum). Returns
+/// per-traverser CFV (table/layout order) + the shared combo layout.
+#[cfg(feature = "metal")]
+pub fn compute_v_flop_root_gpu_per_traverser(
+    ctx: &crate::gpu_metal::context::MetalContext,
+    table: FlopChanceTable,
+    flop_tree: &FlatTree,
+    np: u8,
+    num_postflop_iters: u32,
+) -> (Vec<Vec<f32>>, Vec<(Card, Card)>) {
+    use crate::gpu_metal::flop_solver::MetalFlopStartSolver;
+    let game = FlopStartGame::new(table);
+    let mut cpu = FlopStartVectorCfr::new(flop_tree, game.table());
+    let mut gpu = MetalFlopStartSolver::new(ctx, flop_tree, &game, &cpu);
+    gpu.run(ctx, flop_tree, &game, num_postflop_iters);
+
+    let cum = gpu.download_cum_strategy();
+    let nf = cpu.cum_strategy_flop().len();
+    let nt = cpu.cum_strategy_turn().len();
+    let nr = cpu.cum_strategy_river().len();
+    assert_eq!(
+        nf + nt + nr,
+        cum.len(),
+        "GPU cum length {} != CPU flop+turn+river {}+{}+{}",
+        cum.len(), nf, nt, nr
+    );
+
+    let mut layout = Vec::new();
+    let per_trav: Vec<Vec<f32>> = (0..np)
+        .map(|t| {
+            // re-inject the clean converged cum (extraction mutates it).
+            cpu.cum_strategy_flop_mut().copy_from_slice(&cum[0..nf]);
+            cpu.cum_strategy_turn_mut().copy_from_slice(&cum[nf..nf + nt]);
+            cpu.cum_strategy_river_mut().copy_from_slice(&cum[nf + nt..]);
+            let (v, lay) = extract_v_flop_root_from_cum(&mut cpu, flop_tree, &game, t);
+            if layout.is_empty() {
+                layout = lay;
+            }
+            v
+        })
+        .collect();
+    (per_trav, layout)
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // P1.5.5a runtime-shape function (test target for P2.5a)
 // ─────────────────────────────────────────────────────────────────────
