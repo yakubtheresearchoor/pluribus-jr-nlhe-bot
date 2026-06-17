@@ -743,7 +743,14 @@ pub fn compute_v_flop_at_root_converged_with_table(
     use crate::solver::flop_start_vector_cfr::Zone;
 
     // Flop reach (frozen strategy_flop populated by freeze above).
-    let flop_reach = solver.compute_reach_flop(flop_tree, &game);
+    let mut flop_reach = solver.compute_reach_flop(flop_tree, &game);
+    // Per-hand EV: normalize the opponent's reach to sum 1 (HU has one
+    // opponent; the terminal is linear in its reach) so the live-2 CFV is on
+    // the SAME chip scale as the live-3/4/5 banked path (root_cfv_from_avg) and
+    // the rollouts. Without this, live-2's CFV is ~nh× too large and the
+    // preflop can't compare HU against multiway. Reach: [node][player][hand].
+    let np_eval = flop_reach.len() / (nn * nh);
+    crate::solver::bucketed_flop_cfr::normalize_opponent_reach(&mut flop_reach, np_eval, nh, traverser as usize);
 
     // Buffers — mirror run()'s zone-separated accumulator pattern.
     let mut cfv = vec![0.0f32; nn * nh];

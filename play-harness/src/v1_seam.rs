@@ -409,6 +409,52 @@ impl SeamBlueprint {
             &board, &ranges, np, &chosen, &turn_cards, &river_decks)
     }
 
+    /// NESTED runout grid: 4×4 ⊇ 2×2 ⊇ 1×1 in BOTH turns and rivers, so each
+    /// coarser grid is a SUBSET of the finer reference. Fixes the
+    /// sample-choice confound in `research_table_grid` (rivers there started
+    /// at offset `nt`, so 1×1/2×2/4×4 drew DISJOINT river cards and the Δσ vs
+    /// 4×4 measured card choice, not runout resolution — the sign-flip tell).
+    /// Turns = avail[0..nt] (nested prefix); rivers = avail[MAXT..MAXT+nr]
+    /// with MAXT=4 (max nt in the sweep), a FIXED base so finer grids only ADD.
+    fn research_table_grid_nested(game: &SeamGame, nh: usize, nt: usize, nr: usize) -> FlopChanceTable {
+        const MAXT: usize = 4;
+        let board = game.flop;
+        let bmask = board.iter().fold(0u64, |m, &c| m | (1u64 << c));
+        let valid: Vec<u16> = (0..NUM_POSSIBLE_HANDS)
+            .filter(|&i| { let (a, b) = index_to_card_pair(i); bmask & ((1u64 << a) | (1u64 << b)) == 0 })
+            .map(|i| i as u16)
+            .collect();
+        let step = (valid.len() / nh).max(1);
+        let chosen: Vec<u16> = (0..nh).map(|i| valid[i * step]).collect();
+        let np = game.live;
+        let ranges: Vec<Vec<f32>> = (0..np)
+            .map(|_| {
+                let mut r = vec![0.0f32; NUM_POSSIBLE_HANDS];
+                for &h in &chosen { r[h as usize] = 1.0; }
+                r
+            })
+            .collect();
+        let avail: Vec<u8> = (0..52u8).filter(|&c| bmask & (1u64 << c) == 0).collect();
+        assert!(avail.len() >= MAXT + nr, "need {} avail cards for nested grid", MAXT + nr);
+        let turn_cards: Vec<u8> = avail[0..nt].to_vec();        // nested prefix
+        let rivers: Vec<u8> = avail[MAXT..MAXT + nr].to_vec();  // nested prefix, FIXED base
+        let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+        for &tc in &turn_cards { river_decks[tc as usize] = rivers.clone(); }
+        FlopChanceTable::compute_flop_start_subset_with_decks(
+            &board, &ranges, np, &chosen, &turn_cards, &river_decks)
+    }
+
+    /// Solve EXACTLY (per-hand) on a NESTED runout grid — the controlled
+    /// 1×1 vs 2×2 vs 4×4 comparison (each coarser grid ⊂ the finer one).
+    pub fn solve_research_grid_nested(game: &SeamGame, nh: usize, nt: usize, nr: usize, iters: u32) -> Self {
+        let table = Self::research_table_grid_nested(game, nh, nt, nr);
+        let (hand_of, turn_of, river_of, hands, runouts, nhv) = Self::maps_from(&table);
+        let game_fsg = FlopStartGame::new(table);
+        let mut solver = FlopStartVectorCfr::new(&game.tree, game_fsg.table());
+        solver.run(&game.tree, &game_fsg, iters);
+        SeamBlueprint { solver, hand_of, turn_of, river_of, hands, runouts, nh: nhv }
+    }
+
     #[allow(clippy::type_complexity)]
     fn maps_from(table: &FlopChanceTable) -> (
         HashMap<(u8, u8), usize>, HashMap<u8, usize>, HashMap<(u8, u8), usize>,
@@ -526,6 +572,32 @@ impl SeamBlueprint {
         for p in 0..np {
             let br = self.solver.best_response_value_debug(&game.tree, &fsg, p as u8);
             let sv = self.solver.strategy_value_debug(&game.tree, &fsg, p as u8);
+            for h in 0..br.len().min(sv.len()) { total += (br[h] - sv[h]).max(0.0); }
+        }
+        total / pot as f32 * 100.0
+    }
+
+    /// Δ-EV of a coarse runout grid (the DECISION measure for 1×1 vs 2×2,
+    /// distinct from `flop_sigma_delta`'s Δσ): deploy THIS blueprint's FLOP
+    /// strategy with `cont`'s converged turn+river continuation, scored in the
+    /// nested 4×4 "real" runout game, and return exploitability (% pot). The
+    /// EXCESS over the reference's own (`bref.deploy_exploitability(&bref,…)`)
+    /// is the EV the coarse runout training costs — Δσ shows the strategy
+    /// moves; THIS shows whether the movement costs EV.
+    pub fn deploy_exploitability(&self, cont: &SeamBlueprint, game: &SeamGame, nh: usize, pot: u32) -> f32 {
+        let fsg = FlopStartGame::new(Self::research_table_grid_nested(game, nh, 4, 4));
+        let mut s = FlopStartVectorCfr::new(&game.tree, fsg.table());
+        // Flop = the grid under test; turn+river = the converged 4×4 continuation.
+        // Flop infosets are runout-independent (same tree+nh), so the flop buffer
+        // copies across grids; the turn/river buffers come from the 4×4 reference.
+        s.cum_strategy_flop_mut().copy_from_slice(self.solver.cum_strategy_flop());
+        s.cum_strategy_turn_mut().copy_from_slice(cont.solver.cum_strategy_turn());
+        s.cum_strategy_river_mut().copy_from_slice(cont.solver.cum_strategy_river());
+        let np = game.live as usize;
+        let mut total = 0.0f32;
+        for p in 0..np {
+            let br = s.best_response_value_debug(&game.tree, &fsg, p as u8);
+            let sv = s.strategy_value_debug(&game.tree, &fsg, p as u8);
             for h in 0..br.len().min(sv.len()) { total += (br[h] - sv[h]).max(0.0); }
         }
         total / pot as f32 * 100.0

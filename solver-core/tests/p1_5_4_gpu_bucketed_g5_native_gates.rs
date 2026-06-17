@@ -296,6 +296,64 @@ fn gate_n2_native_divergent_dims_trajectory() {
     );
 }
 
+/// Gate N3 (2026-06-14, cap-raise 16→32): the terminal kernel's
+/// threadgroup arrays grew to 32×32; validate the NEW B>16 range is
+/// still GPU==CPU within the N2 accumulated-rounding standard (1e-3).
+/// Uniform B=32 on the np=6 divergent tree (S=1 since 32/32=1), nh=48
+/// so every runout has ≥32 alive hands for the quantile maps.
+///
+/// DO NOT RUN AS-IS: this exact configuration HUNG THE GPU and crashed
+/// the machine (2026-06-14). #[ignore]'d. A B>16 re-attempt must step up
+/// cautiously from B20 with a TINY fixture and low iters — not jump to
+/// the B32 occupancy cliff with nh=48/8-iter. Requires MAX_BUCKETS_GPU>16.
+#[test]
+#[ignore = "crashed the GPU at B32/nh48/8it — re-attempt cautiously from B20, tiny fixture"]
+fn gate_n3_native_b32_drift() {
+    const NH: usize = 48;
+    const ITERS: u32 = 8;
+    const B: usize = 32;
+    const S: u32 = 1; // 32 / max(nb)=32
+    let ctx = MetalContext::new().expect("Metal");
+    let tree = build_divergent_tree();
+
+    let game_a = FlopStartGame::new(build_table(NH));
+    let (fm, tm, rm) = quantile_maps(game_a.table(), B, B, B);
+    let bk_a = FlopBucketing::from_maps(game_a.table(), B, B, B, fm, tm, rm);
+    let solver_a = BucketedFlopCfr::new(&tree, game_a.table(), &bk_a);
+    let mut native =
+        BucketedNativeGpu::new(&ctx, &tree, game_a.table(), &bk_a, &solver_a, S)
+            .expect("native gpu");
+    let root_gpu = native.run(ITERS);
+
+    let game_b = FlopStartGame::new(build_table(NH));
+    let (fm, tm, rm) = quantile_maps(game_b.table(), B, B, B);
+    let bk_b = FlopBucketing::from_maps(game_b.table(), B, B, B, fm, tm, rm);
+    let mut cpu = BucketedFlopCfr::new(&tree, game_b.table(), &bk_b);
+    cpu.set_terminal_design(TerminalDesign::Design1Collapsed);
+    let root_cpu = cpu.run(&tree, &game_b, &bk_b, ITERS);
+
+    let scale = |xs: &[f32]| xs.iter().map(|v| v.abs()).fold(0.0f32, f32::max) as f64;
+    let mut max_drift = 0.0f64;
+    for ((label, ga), (_, ca)) in gpu_buffers(&native).iter().zip(cpu_buffers(&cpu).iter()) {
+        assert_eq!(ga.len(), ca.len(), "{label} length");
+        let s = scale(ca).max(1e-30);
+        let d = ga.iter().zip(ca.iter())
+            .map(|(a, b)| (*a as f64 - *b as f64).abs() / s)
+            .fold(0.0, f64::max);
+        eprintln!("gate N3 (B32) {label}: max rel drift {d:.2e}");
+        max_drift = max_drift.max(d);
+    }
+    let root_d = root_gpu.iter().zip(&root_cpu)
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .fold(0.0, f64::max) / scale(&root_cpu).max(1e-30);
+    eprintln!("gate N3 (B32) root: {root_d:.2e}");
+    assert!(
+        max_drift.max(root_d) < 1e-3,
+        "B32 native trajectory drift {max_drift:.2e} beyond accumulated-rounding scale — \
+         the cap-raise broke the terminal kernel"
+    );
+}
+
 /// Gate N1-SHARED (2026-06-12, big-tree unlock): the SHARED-BUFFER
 /// SEQUENTIAL pass (one nn-sized reach/cfv buffer, walks serialized by
 /// encode order, per-outcome incremental chance accumulation) must be

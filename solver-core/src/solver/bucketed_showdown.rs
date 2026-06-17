@@ -129,12 +129,22 @@ pub const REL_FOLDED: u8 = 3; // relation never read (blocking only)
 /// (state = beaten + tie-counts 0..=num_opp → length MAX_OPP + 2).
 pub const MAX_OPP: usize = 9;
 
-/// GPU bucket-count cap. SIZED, not arbitrary: the terminal kernel
-/// holds all four fraction tables in threadgroup memory
-/// (4 × B² × 4 bytes = 4 KB at B=16) alongside the per-hand opp-reach
-/// block (23.5 KB at nh=1176) and the bucket map (2.4 KB) — 30.5 KB
-/// against the 32 KB threadgroup budget. B > 16 (calibration
-/// territory) stays on the CPU path, where it already lived.
+/// GPU bucket-count cap. SIZED against the M4 Max 32 KB threadgroup
+/// budget. The bucketed_vcfr terminal kernel's threadgroup footprint is
+/// 16·B² + 40·B + 128 bytes (bucket_reach 9·B + the four B² fraction
+/// tables + partials[32] + cfv_bucket[B], ×4 B/float) — per-hand reach
+/// is REDUCED directly into bucket_reach and never staged, so it does
+/// NOT count here. That is 4,864 B at B=16 and 17,792 B at B=32; the
+/// hard memory wall (fits 32,768 B) is B=43.
+///
+/// CAUTION (2026-06-14): a trial raise to 32 + a full nh=48/8-iter B32
+/// gate run HUNG THE GPU and crashed the machine. The occupancy cliff
+/// (~1 threadgroup/core) starts near B=28-32, and at that edge the
+/// terminal kernel is not just slow — it destabilised the device. So
+/// the ceiling stays 16 (GPU-stable, validated) until a B>16 raise is
+/// re-attempted CAUTIOUSLY: tiny fixture, low iters, stepping B up one
+/// safe level at a time (B20 = 7.2 KB / ~4 tg/core is the first safe
+/// step), never jumping to the cliff. B>16 still falls back to CPU.
 pub const MAX_BUCKETS_GPU: usize = 16;
 
 /// Design-1 bucketed mirror of `side_pot_showdown_cfv_with_rake` for

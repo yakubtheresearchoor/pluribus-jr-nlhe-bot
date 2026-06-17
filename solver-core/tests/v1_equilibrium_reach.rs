@@ -102,6 +102,45 @@ fn cap3_preflop_tree() -> FlatTree {
     build_tree_preflop_only(&cfg).expect("cap-3 tree")
 }
 
+/// PRODUCTION PER-ITER (2026-06-14): time the SHARED-CHANCE COLLAPSE
+/// iteration on the cap-3 tree at MAX_NA_PREFLOP=8, using a CHEAP STUB
+/// postflop source so we measure the preflop traversal cost (chance
+/// collapse + fold terminals + infoset updates) WITHOUT the >41 min
+/// exact-fill trap. The real fill is the postflop seam fill, priced
+/// separately. Buffer ~10.6 GB after the 16→8 stride cut (was 28.6 GB).
+#[test]
+#[ignore = "production preflop per-iter (collapsed, stub source, ~10.6 GB); --ignored --nocapture --release"]
+fn eq_reach_collapsed_periter_stub() {
+    let spec = production_game_v1();
+    let tree = cap3_preflop_tree();
+    let table = PreflopChanceTable::new(6, vec![vec![1.0f32; NUM_PREFLOP_CLASSES]; 6]);
+    let term_fn = make_bootstrap_terminal_value_fn_multiway_pairwise(&tree);
+    // Cheap synthetic CFVs (cost is traversal+lookup, not the values).
+    let stub = |_cell: SeamCell, _mask: u16, canonical: [Card; 3], _r: &[Vec<f32>], _t: u8| -> Vec<f32> {
+        flop_combo_layout(canonical).iter().enumerate().map(|(i, _)| (i as f32 * 1e-4).sin()).collect()
+    };
+    let mut oracle = BucketKeyedOracle::new(spec.stack, 6, 0, stub);
+    let mut solver = PreflopVectorCfr::new(&tree);
+    eprintln!(
+        "cap-3 tree: {} infosets; buffer ≈ {:.1} GB (3 × infosets × {} × {} × 4B)",
+        solver.infoset_count(),
+        3.0 * solver.infoset_count() as f64 * 8.0 * NUM_PREFLOP_CLASSES as f64 * 4.0 / 1e9,
+        8, NUM_PREFLOP_CLASSES,
+    );
+    let t0 = Instant::now();
+    let kf = PreflopVectorCfr::seam_bucket_chance_key(&tree, 6, spec.stack);
+    solver.run_one_iteration_shared_chance(&tree, &table, &mut oracle, &term_fn, kf);
+    let fill = t0.elapsed().as_secs_f64();
+    let t0 = Instant::now();
+    let kf = PreflopVectorCfr::seam_bucket_chance_key(&tree, 6, spec.stack);
+    solver.run_one_iteration_shared_chance(&tree, &table, &mut oracle, &term_fn, kf);
+    let cached = t0.elapsed().as_secs_f64();
+    eprintln!("COLLAPSED per-iter (stub): fill {fill:.1}s, cached {cached:.1}s, {} distinct chance keys", oracle.cache_len());
+    for n in [50u32, 100, 200] {
+        eprintln!("  {n}-iter preflop bootstrap ≈ {:.1} min (cached-dominated)", n as f64 * cached / 60.0);
+    }
+}
+
 #[test]
 #[ignore = "equilibrium-reach COST PROBE (times 1 fill iter + 1 cached); --ignored --nocapture --release"]
 fn eq_reach_cost_probe() {

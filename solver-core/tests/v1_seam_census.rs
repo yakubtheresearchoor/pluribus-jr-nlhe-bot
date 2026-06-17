@@ -287,3 +287,140 @@ fn v1_cell_width_analysis() {
         multi
     );
 }
+
+/// PRODUCTION FILL PRICING (2026-06-14): price the reach-weighted per-family
+/// blueprint over the ACTUAL SPR-cell set the v1 preflop reaches. For each
+/// (live, log2-SPR/w) SOLVE bucket (all-in cells are free rollout), the
+/// production fill solves ONE representative cell (the tree-shape collapse
+/// above justifies one per bucket) across 1755 flops. Per-flop GPU solve time
+/// is modelled t(nodes) = a + b·nodes, calibrated per family from MEASURED
+/// 3-flop probes on this exact runner (live-3/4 @ B15, live-5 @ B8, the
+/// reach-weighted fidelity allocation; live-6 = rollout/no-solve, live-2 = HU
+/// exact path priced elsewhere):
+///   live-3: (102n,0.2s)(597n,0.3s)   live-4: (279n,0.5s)(2635n,1.0s)
+///   live-5: (708n,0.7s)(11153n,2.5s)
+/// Reports hours per family and the matrix total at SPR widths 0.5 and 0.25.
+#[test]
+#[ignore = "pricing instrument (builds rep trees, ~seconds); run with --ignored --nocapture"]
+fn v1_production_fill_pricing() {
+    use solver_core::tree::action::BetCap;
+    use std::collections::BTreeMap;
+    let spec = production_game_v1();
+    let mut cfg = spec.preflop_tree_config(preflop_bets());
+    cfg.max_bets_per_street = BetCap::all(3);
+    let tree = build_tree_preflop_only(&cfg).expect("v1 preflop tree (cap 3)");
+    let np = spec.num_players as usize;
+    let flop_bets = BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    const FLOPS: f64 = 1755.0;
+
+    // Per-family per-flop GPU time model t(B, n) = a(B) + slope(B)·n (sec),
+    // calibrated from runner probes on THIS GPU path (deep/shallow cells at
+    // B8/12/16). live-3 is overhead-bound (flat ~0.10s, B-independent);
+    // live-4 scales ~B^1.3 (a∝B^1.58, slope∝B^0.72 from the B8/12/16 fit);
+    // live-5 is held at B8 (B15 would be gigantic — its tree is 10× live-4's).
+    // B>16 is a PROJECTION: the GPU bucketed kernel caps at MAX_BUCKETS_GPU=16,
+    // so B20/24/32 require raising that cap (shader recompile + bit-exact
+    // re-gate; threadgroup memory bounds it near B32).
+    let model = |live: u8, b: usize, n: usize| -> Option<f64> {
+        match live {
+            3 => Some(0.103),                              // flat, B-independent
+            4 => {
+                let bf = b as f64;
+                let a = 0.525 * (bf / 16.0).powf(1.58);
+                let slope = 1.42e-4 * (bf / 16.0).powf(0.72);
+                Some(a + slope * n as f64)
+            }
+            5 => Some(0.578 + 1.72e-4 * n as f64),         // B8 fixed
+            _ => None, // live-2 HU exact, live-6 rollout
+        }
+    };
+    // Bucket levels to price live-3/4 at (16 = GPU max today; >16 = cap-raised).
+    let blevels = [16usize, 20, 24, 32];
+
+    // (live, commit, pot) -> multiplicity (structural reach proxy).
+    let mut cells: BTreeMap<(u8, i32, i32), usize> = BTreeMap::new();
+    for idx in 0..tree.nodes.len() {
+        let n = &tree.nodes[idx];
+        if n.node_type != NODE_TYPE_CHANCE || n.board_state != BoardState::Flop as u8 {
+            continue;
+        }
+        let mask = tree.get_folded_mask(idx);
+        let contribs: Vec<i32> = (0..np).map(|p| tree.get_contribution(idx, p as u8)).collect();
+        let live: Vec<usize> = (0..np).filter(|&p| mask & (1 << p) == 0).collect();
+        let pot: i32 = contribs.iter().sum();
+        *cells.entry((live.len() as u8, contribs[live[0]], pot)).or_default() += 1;
+    }
+
+    // Per (width, live): SPR-bucket representatives (highest-multiplicity), tree built once.
+    let mut reps: BTreeMap<(u64, u8), Vec<(u8, i32, i32)>> = BTreeMap::new();
+    let mut allin: BTreeMap<(u64, u8), usize> = BTreeMap::new();
+    let widths = [0.5f64, 0.25];
+    for (wi, &w) in widths.iter().enumerate() {
+        let mut rep: BTreeMap<(u8, i64), (usize, (u8, i32, i32))> = BTreeMap::new();
+        for (&(live, commit, pot), &mult) in &cells {
+            let behind = spec.stack - commit;
+            if behind <= 0 {
+                *allin.entry((wi as u64, live)).or_default() += 1;
+                continue;
+            }
+            let bkey = (live, ((behind as f64 / pot as f64).log2() / w).floor() as i64);
+            let e = rep.entry(bkey).or_insert((0, (live, commit, pot)));
+            if mult > e.0 { *e = (mult, (live, commit, pot)); }
+        }
+        for (&(live, _), &(_, cell)) in &rep {
+            reps.entry((wi as u64, live)).or_default().push(cell);
+        }
+    }
+    // Sum hours for one family at one bucket level over its SPR-bucket reps.
+    let fam_hours = |wi: usize, live: u8, b: usize| -> f64 {
+        reps.get(&(wi as u64, live)).map(|cells| {
+            cells.iter().map(|&(l, c, p)| {
+                let ft = build_tree(&spec.flop_seam_config(l, c, p, flop_bets.clone())).unwrap();
+                model(live, b, ft.nodes.len()).unwrap() * FLOPS / 3600.0
+            }).sum()
+        }).unwrap_or(0.0)
+    };
+
+    eprintln!("\n══════ PRODUCTION FILL: live-3/4 finer buckets × SPR width (live-5 @ B8 fixed) ══════");
+    for (wi, &w) in widths.iter().enumerate() {
+        let n3 = reps.get(&(wi as u64, 3)).map(|v| v.len()).unwrap_or(0);
+        let n4 = reps.get(&(wi as u64, 4)).map(|v| v.len()).unwrap_or(0);
+        let n5 = reps.get(&(wi as u64, 5)).map(|v| v.len()).unwrap_or(0);
+        let h5 = fam_hours(wi, 5, 8); // live-5 fixed at B8
+        eprintln!(
+            "\n── SPR width {w}  (live-3: {n3} cells, live-4: {n4} cells, live-5: {n5} cells) ──"
+        );
+        eprintln!("  live-5 @ B8 (fixed): {h5:.2} h");
+        eprintln!("  B(3&4) | live-3 h | live-4 h | 3+4 h | +live-5 = TOTAL h (days) | GPU?");
+        for &b in &blevels {
+            let h3 = fam_hours(wi, 3, b);
+            let h4 = fam_hours(wi, 4, b);
+            let total = h3 + h4 + h5;
+            let gpu = if b <= 16 { "GPU now" } else { "cap-raise" };
+            eprintln!(
+                "  B{b:<5}| {h3:7.2}  | {h4:7.2}  | {:5.2} | {total:6.2} h ({:.2} d)        | {gpu}",
+                h3 + h4, total / 24.0
+            );
+        }
+    }
+    let _ = &allin;
+
+    // ── PRODUCTION CELL LIST (width 0.25) for the fill runner: one line per
+    // (live, SPR-bucket) representative, machine-parseable. live-3/4 @ B15,
+    // live-5 @ B8 (the reach-weighted allocation). live-2 = HU/exact and
+    // live-6 = rollout are deployment paths, NOT solved here.
+    eprintln!("\n══ PRODUCTION CELL LIST (SPR width 0.25, reach-weighted B) ══");
+    let mut n_cells = 0usize;
+    for live in 3..=5u8 {
+        if let Some(cells) = reps.get(&(1u64, live)) {
+            let b = if live == 5 { 8 } else { 15 };
+            let mut sorted = cells.clone();
+            sorted.sort_by_key(|&(_, c, p)| (c, p));
+            for &(l, c, p) in &sorted {
+                eprintln!("CELL live={l} commit={c} pot={p} b={b}");
+                n_cells += 1;
+            }
+        }
+    }
+    eprintln!("CELLS_TOTAL {n_cells}");
+}

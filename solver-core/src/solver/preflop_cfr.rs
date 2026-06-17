@@ -77,6 +77,12 @@ pub struct PreflopVectorCfr {
     /// Cumulative strategy (for time-averaging at the end). Same shape.
     /// Initialized to zero.
     pub cum_strategy: Vec<f32>,
+    /// DEBUG (2026-06-16): when Some((node, classes)), emit the per-action cfv
+    /// at `node` for each listed class after that node's traverser pass — the
+    /// in-solver action-EV dump (correct by construction; external probes
+    /// failed). Used to anchor the fold value vs its trivial truth (UTG folds
+    /// nothing → ~0) before the continuation-value question.
+    pub debug_emit: Option<(usize, Vec<usize>)>,
 }
 
 impl PreflopVectorCfr {
@@ -139,6 +145,7 @@ impl PreflopVectorCfr {
             strategy,
             regrets: vec![0.0f32; total],
             cum_strategy: vec![0.0f32; total],
+            debug_emit: None,
         }
     }
 
@@ -188,6 +195,81 @@ impl PreflopVectorCfr {
                 &mut self.strategy[off..off + na * n_classes],
             );
         }
+    }
+
+    /// The NORMALIZED average strategy (the deployed object): per (infoset,
+    /// class), `cum_strategy` normalized to sum 1 over actions (uniform if the
+    /// cum mass is 0). Same flat layout as `strategy`/`cum_strategy`. Use its
+    /// max change between iterations as the convergence signal — unlike the
+    /// current regret-matched strategy (which oscillates / pure-flips in CFR),
+    /// the average converges monotonically.
+    pub fn average_strategy(&self, tree: &FlatTree) -> Vec<f32> {
+        let n_classes = NUM_PREFLOP_CLASSES;
+        let mut avg = vec![0.0f32; self.cum_strategy.len()];
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            let local = self.local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            if na == 0 { continue; }
+            let off = local * MAX_NA_PREFLOP * n_classes;
+            for c in 0..n_classes {
+                let mut sum = 0.0f32;
+                for a in 0..na {
+                    sum += self.cum_strategy[off + a * n_classes + c];
+                }
+                if sum > 0.0 {
+                    for a in 0..na {
+                        avg[off + a * n_classes + c] = self.cum_strategy[off + a * n_classes + c] / sum;
+                    }
+                } else {
+                    let u = 1.0 / na as f32;
+                    for a in 0..na {
+                        avg[off + a * n_classes + c] = u;
+                    }
+                }
+            }
+        }
+        avg
+    }
+
+    /// Reach-weighted change in the normalized average strategy — the canonical
+    /// CFR convergence measure. The PLAIN max |Δ avg| is useless here: it's
+    /// dominated by near-zero-reach (infoset, class) spots whose normalized
+    /// average is pure noise (it bounces ~1.0 forever). Weighting each spot by
+    /// the acting player's reach there zeroes that noise, so this → 0 as the
+    /// *reached* average converges. `reach` from `compute_preflop_reach`; `avg`
+    /// / `prev_avg` from `average_strategy` at this and the previous check.
+    /// Returns the reach-weighted mean of |Δ avg| over (node, action, class).
+    pub fn avg_reach_weighted_delta(
+        &self,
+        tree: &FlatTree,
+        reach: &[Vec<f32>],
+        avg: &[f32],
+        prev_avg: &[f32],
+    ) -> f32 {
+        let nc = NUM_PREFLOP_CLASSES;
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            let local = self.local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            if na == 0 { continue; }
+            let pl = tree.nodes[idx].player_id as usize;
+            let off = local * MAX_NA_PREFLOP * nc;
+            for c in 0..nc {
+                let w = reach[pl][idx * nc + c] as f64;
+                if w <= 0.0 { continue; }
+                for a in 0..na {
+                    let i = off + a * nc + c;
+                    num += w * (avg[i] - prev_avg[i]).abs() as f64;
+                }
+                den += w;
+            }
+        }
+        if den > 0.0 { (num / den) as f32 } else { 0.0 }
     }
 
     /// Number of preflop player decision infosets in this tree.
@@ -437,7 +519,16 @@ impl PreflopVectorCfr {
                 "oracle returned v_combo of length {}, layout has {} entries \
                  (canonical {:?})", v_combo.len(), layout.len(), f_canon);
 
-            // Reduce per-combo → per-class via anchored P5b.
+            // Reduce per-combo → per-class via anchored P5b. The CFV is now a
+            // per-traverser-hand EV: the opponent-reach normalization that makes
+            // it so lives in the CFV EXTRACTION (root_cfv_from_avg / run_all_
+            // root_cfv / the live-2 path normalize each opponent's reach to sum
+            // 1), so a SUM over opponent combos became an EXPECTATION — in chip
+            // units, comparable across live counts AND matching the (unnormalized)
+            // fold terminal scale. (A constant mass^num_opp divide here was an
+            // approximation that over-corrected; the bucketed terminal's effective
+            // opponent mass is nonlinear, so normalization must be applied to the
+            // reach going INTO the terminal, not post-hoc.)
             let v_class = reduce_cfv_combo_to_class(f_canon, &v_combo, &layout);
             per_canonical_v_class.push(v_class);
         }
@@ -975,6 +1066,99 @@ impl PreflopVectorCfr {
             self.bottom_up_preflop_for_traverser(
                 tree, t, &chance_nodes, &reach, &terminal_value_fn, &mut cfv, &params,
             );
+        }
+
+        oracle.end_preflop_iter(self.iteration);
+        self.iteration += 1;
+    }
+
+    /// FROZEN-ORACLE iteration with the LIVE-traverser chance CFV CACHED ACROSS
+    /// ITERATIONS (2026-06-15). Same result as `run_one_iteration_shared_chance`
+    /// but the expensive per-(key) chance-node expansion — which, for a frozen
+    /// reach-independent oracle, is BIT-IDENTICAL every iteration (the basis of
+    /// the shared-chance collapse, gated by p1_5_4_blueprint_preflop_cost) — is
+    /// computed once and reused. Profiled: that expansion is ~all the per-iter
+    /// cost at full scale (~280 s), so caching turns iters 2+ into just the
+    /// bottom-up pass. The FOLDED-traverser value is reach-dependent and stays
+    /// per-iter (cheap, no expansion).
+    ///
+    /// CONTRACT: `oracle` MUST be frozen (refresh_every = 0) and reach-
+    /// independent — otherwise the cached chance values go stale. `cache` is
+    /// owned by the caller across the iteration loop; pass the same `Vec`
+    /// (start it empty). Gated bit-exact vs the uncached method by
+    /// `preflop_chance_cache_gate`.
+    pub fn run_one_iteration_shared_chance_cached(
+        &mut self,
+        tree: &FlatTree,
+        table: &PreflopChanceTable,
+        oracle: &mut impl PostflopValueOracle,
+        terminal_value_fn: impl Fn(usize, u8, &[Vec<f32>]) -> Vec<f32>,
+        chance_key: impl Fn(usize) -> u64,
+        cache: &mut Vec<std::collections::HashMap<u64, Vec<f32>>>,
+    ) {
+        let n_classes = NUM_PREFLOP_CLASSES;
+        let nn = tree.num_nodes();
+        let np = self.num_players;
+
+        self.compute_preflop_strategy(tree);
+        let reach = self.compute_preflop_reach(tree, None);
+        let chance_nodes = self.preflop_chance_node_indices(tree);
+        let params = DcfrParams::new(self.iteration);
+
+        if cache.len() != np as usize {
+            *cache = vec![std::collections::HashMap::new(); np as usize];
+        }
+
+        oracle.begin_preflop_iter(self.iteration);
+
+        for t in 0..np {
+            let mut cfv: Vec<Vec<f32>> = vec![vec![0.0_f32; n_classes]; nn];
+            for &chance_idx in &chance_nodes {
+                let mask = tree.get_folded_mask(chance_idx);
+                if (mask >> t) & 1 == 1 {
+                    // FOLDED traverser: reach-DEPENDENT → recompute (cheap).
+                    let base = chance_idx * n_classes;
+                    let reach_at: Vec<Vec<f32>> = (0..np as usize)
+                        .map(|p| reach[p][base..base + n_classes].to_vec())
+                        .collect();
+                    cfv[chance_idx] = terminal_value_fn(chance_idx, t, &reach_at);
+                    continue;
+                }
+                // LIVE traverser: reach-INDEPENDENT → cache across iterations.
+                let key = chance_key(chance_idx);
+                let v = match cache[t as usize].get(&key) {
+                    Some(v) => v.clone(),
+                    None => {
+                        let cell = crate::solver::postflop_oracle::SeamCell::at_chance_node(
+                            tree, chance_idx, np as usize,
+                        );
+                        let v = self.compute_chance_node_cfv_with_expansion_for_cell(
+                            chance_idx, t, &reach, table, oracle, cell, mask,
+                        );
+                        cache[t as usize].insert(key, v.clone());
+                        v
+                    }
+                };
+                cfv[chance_idx] = v;
+            }
+
+            self.bottom_up_preflop_for_traverser(
+                tree, t, &chance_nodes, &reach, &terminal_value_fn, &mut cfv, &params,
+            );
+
+            // DEBUG action-EV emit: when this traverser owns the emit node,
+            // print the per-action cfv (fold/call/raise…) for each class — the
+            // in-solver dump. cfv here is the SAME value the regret update uses.
+            if let Some((dn, classes)) = self.debug_emit.clone() {
+                if tree.nodes[dn].player_id == t && tree.nodes[dn].is_player() {
+                    let kids = tree.node_children(dn);
+                    let labs: Vec<u8> = kids.iter().map(|&k| tree.nodes[k as usize].action_label).collect();
+                    for &cl in &classes {
+                        let vals: Vec<f32> = kids.iter().map(|&k| cfv[k as usize][cl]).collect();
+                        eprintln!("[EMIT iter {} node {dn} t{t} class {cl}] labels {labs:?} cfv {vals:?}", self.iteration);
+                    }
+                }
+            }
         }
 
         oracle.end_preflop_iter(self.iteration);

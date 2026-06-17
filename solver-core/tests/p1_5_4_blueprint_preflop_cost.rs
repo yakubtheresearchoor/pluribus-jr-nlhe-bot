@@ -77,16 +77,20 @@ const PROJECTION_BUDGET_S: f64 = 900.0;
 /// its 2026-06-10 numbers (239,467 nodes / 7,466 infosets / 3.4s
 /// shared-chance iter) also predate the fold-continuation tree fix.
 fn build_rich_preflop_tree() -> FlatTree {
-    use solver_core::tree::action::production_game_v1;
+    use solver_core::tree::action::{production_game_v1, BetCap};
     use solver_core::tree::builder::build_tree_preflop_only;
     let max_raise_count = MAX_NA_PREFLOP.saturating_sub(2);
     let raises: Vec<BetSize> = (0..max_raise_count)
         .map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64))
         .collect();
-    let pre_cfg = production_game_v1().preflop_tree_config(BetSizeOptions {
+    let mut pre_cfg = production_game_v1().preflop_tree_config(BetSizeOptions {
         bet: vec![BetSize::PotRelative(1.0)],
         raise: raises,
     });
+    // PRODUCTION cap = 3 (v1_depth_cap_ab: smallest defense-complete). The
+    // earlier 3.4s number was UNCAPPED + pre-fold-fix (7,466 infosets); the
+    // real production tree is cap-3 (~654k infosets at MAX_NA_PREFLOP=8).
+    pre_cfg.max_bets_per_street = BetCap::all(3);
     build_tree_preflop_only(&pre_cfg).expect("v1 preflop tree builds")
 }
 

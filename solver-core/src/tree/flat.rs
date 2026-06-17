@@ -147,7 +147,20 @@ impl FlatNode {
 // (pairwise fold-terminal blocking, sampled+shared+frozen postflop CFVs —
 // see the bootstrap file docstring); menu floor is 0.5×p, so sub-0.5×p
 // raise demand is unobserved.
-pub const MAX_NA_PREFLOP: usize = 16;
+//
+// SHRUNK 16→8 (2026-06-14): preflop memory DID matter — the dense stride
+// × NUM_PREFLOP_CLASSES gave a ~28.6 GB cap-3 CFR buffer (3 × 9.55 GB),
+// 74% of a 38.7 GB machine and an OOM/crash risk. The production ladder
+// derives from this const (`saturating_sub(2)`), so 8 ⇒ 6 raise sizes =
+// 0.5× / 1.0× / 1.5× / 2.0× / 2.5× / 3.0× pot, carrying ~99% of raise
+// mass (top-4 ≈ 97.6%); the dropped 3.5×–7.0× tail is <0.5% each, ≈0.
+// Cascades to the buffer stride (preflop_cfr), the tree-builder action
+// cap (builder.rs assert), and the codegen'd Metal header (build.rs).
+// Dropping those sizes also prunes raise-war branches, so the tree
+// itself shrinks — the buffer lands well under the ~14 GB the stride cut
+// alone implied. ACTION-ABSTRACTION change: justified by the banked
+// usage above, verified by the gates re-run on the leaner tree.
+pub const MAX_NA_PREFLOP: usize = 8;
 pub const MAX_NA_POSTFLOP: usize = 4;
 
 pub const VCFR_NO_INFOSET: u32 = u32::MAX;

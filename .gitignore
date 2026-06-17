@@ -19,3 +19,7 @@
 *~
 .env
 .env.*
+
+# Solver output artifacts (multi-GB blueprints — never commit)
+blueprint_out*/
+preflop_out*/

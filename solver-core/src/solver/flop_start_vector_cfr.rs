@@ -2105,6 +2105,7 @@ impl FlopStartVectorCfr {
     pub fn cum_strategy_turn_mut(&mut self) -> &mut [f32] { &mut self.cum_strategy_turn }
     pub fn river_chance_children(&self) -> &[u32] { &self.river_chance_children }
     pub fn turn_chance_children(&self) -> &[u32] { &self.turn_chance_children }
+    pub fn flop_stride(&self) -> usize { self.flop_stride }
 
     /// Local infoset offset for a player decision node within its zone's
     /// strategy/regret/cum_strategy buffers. Returns None if the node has

@@ -1331,6 +1331,167 @@ impl BucketedFlopCfr {
         root_all
     }
 
+    /// Per-bucket renormalize a node's cum slice into a strategy slice
+    /// (action-major `a*nb + b` layout; uniform where the bucket mass is 0).
+    fn norm_avg(cum: &[f32], strat: &mut [f32], na: usize, nb: usize) {
+        for b in 0..nb {
+            let mut s = 0.0f32;
+            for a in 0..na { s += cum[a * nb + b]; }
+            if s > 0.0 {
+                for a in 0..na { strat[a * nb + b] = cum[a * nb + b] / s; }
+            } else {
+                let u = 1.0 / na as f32;
+                for a in 0..na { strat[a * nb + b] = u; }
+            }
+        }
+    }
+
+    fn load_avg_flop(&mut self, tree: &FlatTree, bk: &FlopBucketing, saved: &[f32]) {
+        let nb = bk.nb_flop;
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::Flop { continue; }
+            let local = self.flop_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let off = local * MAX_NA_POSTFLOP * nb;
+            Self::norm_avg(&saved[off..off + na * nb], &mut self.strategy_flop[off..off + na * nb], na, nb);
+        }
+    }
+
+    fn load_avg_turn(&mut self, tree: &FlatTree, bk: &FlopBucketing, tc: usize, saved: &[f32]) {
+        let nb = bk.nb_turn;
+        let base = tc * self.turn_stride;
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::Turn { continue; }
+            let local = self.turn_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let off_p = base + local * MAX_NA_POSTFLOP * nb;
+            let off_s = local * MAX_NA_POSTFLOP * nb;
+            Self::norm_avg(&saved[off_p..off_p + na * nb], &mut self.strategy_turn[off_s..off_s + na * nb], na, nb);
+        }
+    }
+
+    fn load_avg_river(&mut self, tree: &FlatTree, bk: &FlopBucketing, tc: usize, rc: usize, saved: &[f32]) {
+        let nb = bk.nb_river;
+        let base = (tc * self.max_n_river + rc) * self.river_stride;
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            if self.zones[idx] != Zone::River { continue; }
+            let local = self.river_local_offset[idx];
+            if local == UNUSED { continue; }
+            let na = tree.nodes[idx].num_children as usize;
+            let off_p = base + local * MAX_NA_POSTFLOP * nb;
+            let off_s = local * MAX_NA_POSTFLOP * nb;
+            Self::norm_avg(&saved[off_p..off_p + na * nb], &mut self.strategy_river[off_s..off_s + na * nb], na, nb);
+        }
+    }
+
+    /// Root CFV of the LOADED AVERAGE strategy (`cum_strategy_*`, e.g. set
+    /// from a banked .bp), in ONE collapsed pass per traverser — the
+    /// read-banked oracle's CFV extractor. Unlike `run_all_root_cfv` (which
+    /// regret-matches the *current* strategy and iterates to converge), this
+    /// normalizes the banked cum into the strategy scratch and evaluates it
+    /// once. `bottom_up_zone` mutates cum/regrets as a side effect, so the
+    /// banked cum is saved up front and re-normalized per traverser from the
+    /// saved copy. Returns `[traverser][hand]` root CFV.
+    pub fn root_cfv_from_avg(
+        &mut self,
+        tree: &FlatTree,
+        game: &FlopStartGame,
+        bk: &FlopBucketing,
+    ) -> Vec<Vec<f32>> {
+        let np = self.num_players as usize;
+        let nh = self.nh;
+        let nn = tree.num_nodes();
+        let table = game.table();
+        let turn_deck = table.remaining_deck.clone();
+
+        // Snapshot the banked avg (bottom_up_zone clobbers cum/regrets).
+        let saved_flop = self.cum_strategy_flop.clone();
+        let saved_turn = self.cum_strategy_turn.clone();
+        let saved_river = self.cum_strategy_river.clone();
+        let params = DcfrParams::new(self.iteration);
+
+        let mut root_all = vec![vec![0.0f32; nh]; np];
+        let mut flop_cfv = vec![0.0f32; nn * nh];
+        let mut river_cfv_accum = vec![0.0f32; nn * nh];
+        let mut cfv = vec![0.0f32; nn * nh];
+        let mut turn_cfv = vec![0.0f32; nn * nh];
+
+        for traverser in 0..np {
+            self.load_avg_flop(tree, bk, &saved_flop);
+            let mut flop_reach = self.compute_reach_flop(tree, game, bk);
+            // PER-HAND EV NORMALIZATION (2026-06-16): normalize each OPPONENT's
+            // reach to sum 1 at the root so the terminal CFV is an EXPECTATION
+            // over opponents (chip-unit per-hand EV), not an unnormalized SUM
+            // that scales ~nh^num_opp with live count. Without this the preflop
+            // never raised (multiway's huge magnitude dominated); a constant
+            // divide over-corrected (bucketed terminal mass is nonlinear), so we
+            // normalize the reach GOING INTO the terminal. Reach propagates
+            // linearly, so scaling the root opponent reach scales every zone.
+            normalize_opponent_reach(&mut flop_reach, np, nh, traverser);
+
+            for &child_id in &self.turn_chance_children {
+                let off = child_id as usize * nh;
+                for h in 0..nh { flop_cfv[off + h] = 0.0; }
+            }
+
+            for (ti, &tc) in turn_deck.iter().enumerate() {
+                self.load_avg_turn(tree, bk, ti, &saved_turn);
+                let turn_reach = self.compute_reach_turn(tree, bk, ti, &flop_reach);
+                let n_river = self.river_deck_sizes[tc as usize];
+
+                for &child_id in &self.river_chance_children {
+                    let off = child_id as usize * nh;
+                    for h in 0..nh { river_cfv_accum[off + h] = 0.0; }
+                }
+
+                for ri in 0..n_river {
+                    self.load_avg_river(tree, bk, ti, ri, &saved_river);
+                    let river_reach = self.compute_reach_river(tree, bk, ti, ri, &turn_reach);
+                    self.bottom_up_zone(
+                        tree, table, bk, traverser as u8, &river_reach, &mut cfv,
+                        Zone::River, Some(ti), Some(ri), &params,
+                    );
+                    for &child_id in &self.river_chance_children {
+                        for h in 0..nh {
+                            let cp = table.chance_probability_river(tc, ri, h);
+                            river_cfv_accum[child_id as usize * nh + h] +=
+                                cp * cfv[child_id as usize * nh + h];
+                        }
+                    }
+                }
+                for &child_id in &self.river_chance_children {
+                    for h in 0..nh {
+                        turn_cfv[child_id as usize * nh + h] =
+                            river_cfv_accum[child_id as usize * nh + h];
+                    }
+                }
+                self.bottom_up_zone(
+                    tree, table, bk, traverser as u8, &turn_reach, &mut turn_cfv,
+                    Zone::Turn, Some(ti), None, &params,
+                );
+                for &child_id in &self.turn_chance_children {
+                    for h in 0..nh {
+                        let cp = table.chance_probability_turn(ti, h);
+                        flop_cfv[child_id as usize * nh + h] +=
+                            cp * turn_cfv[child_id as usize * nh + h];
+                    }
+                }
+            }
+
+            self.bottom_up_zone(
+                tree, table, bk, traverser as u8, &flop_reach, &mut flop_cfv,
+                Zone::Flop, None, None, &params,
+            );
+            for h in 0..nh { root_all[traverser][h] = flop_cfv[h]; }
+        }
+        root_all
+    }
+
     /// `run` with the G4 batched-terminal prepass: per traverser, all
     /// walks' reaches are computed UP FRONT (reaches depend only on
     /// strategies, which are fixed within a traverser pass — values
@@ -1849,5 +2010,31 @@ impl BucketedFlopCfr {
     pub fn river_local_offset_at(&self, idx: usize) -> Option<usize> {
         let v = self.river_local_offset[idx];
         if v == UNUSED { None } else { Some(v) }
+    }
+}
+
+/// Normalize each OPPONENT's reach (player ≠ traverser) to sum 1 at the root,
+/// scaling every node's slice uniformly (reach propagates linearly, so a root
+/// rescale rescales all zones). This turns the flop-root terminal CFV from an
+/// unnormalized opponent SUM (which scales ~nh^num_opp with live count, biasing
+/// the preflop to keep everyone in and never raise) into a per-traverser-hand
+/// EXPECTATION in chip units — comparable across live counts and matching the
+/// (unnormalized) fold-terminal scale. Reach layout: [node][player][hand].
+pub(crate) fn normalize_opponent_reach(reach: &mut [f32], np: usize, nh: usize, traverser: usize) {
+    let nn = reach.len() / (np * nh);
+    for p in 0..np {
+        if p == traverser {
+            continue;
+        }
+        let mass: f32 = (0..nh).map(|h| reach[p * nh + h]).sum();
+        if mass > 0.0 {
+            let inv = 1.0 / mass;
+            for node in 0..nn {
+                let base = node * np * nh + p * nh;
+                for h in 0..nh {
+                    reach[base + h] *= inv;
+                }
+            }
+        }
     }
 }

@@ -44,8 +44,9 @@ use solver_core::solver::bucketed_flop_cfr::{
     BucketedFlopCfr, FlopBucketing, TerminalDesign, NO_BUCKET,
 };
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
-use solver_core::solver::preflop_start_game::PreflopChanceTable;
-use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
+use solver_core::solver::postflop_oracle::SeamCell;
+use solver_core::solver::preflop_start_game::{table_hand_to_layout_perm, PreflopChanceTable};
+use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree;
 use solver_core::tree::flat::FlatTree;
 use std::io::Write;
@@ -79,6 +80,25 @@ fn build_oracle_tree() -> FlatTree {
             max_bets_per_street: None,
     };
     build_tree(&cfg).expect("oracle tree builds")
+}
+
+/// Per-FAMILY seam tree (the reach-weighted production arm): a flop-start
+/// subgame with `live` players, each having committed `commit` into a `pot`,
+/// derived from the v1 production game class (same single source of truth the
+/// harness fidelity experiments used). This is the deployable per-player-count
+/// blueprint — selected at play time by the live-player count — NOT a subtree
+/// of the np=6 oracle. The lean MAX_NA=4 action set (1×pot bet, no raises)
+/// matches the oracle so the cost/fidelity rows compare like-for-like.
+fn build_seam_tree(live: u8, commit: i32, pot: i32) -> FlatTree {
+    use solver_core::tree::action::production_game_v1;
+    let spec = production_game_v1();
+    let cfg = spec.flop_seam_config(
+        live,
+        commit,
+        pot,
+        BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
+    );
+    build_tree(&cfg).expect("seam tree builds")
 }
 
 fn quantile_maps(
@@ -191,6 +211,9 @@ fn solve_and_bank(
     fi: usize,
     flop: [Card; 3],
     tree: &FlatTree,
+    np: usize,
+    commit: i32,
+    pot: i32,
     nb: usize,
     iters: u32,
     nt: usize,
@@ -225,12 +248,17 @@ fn solve_and_bank(
     }
 
     let t0 = Instant::now();
-    let table = FlopChanceTable::build_full_nh_sampled(flop, 6, &turn_cards, &river_decks);
+    let table = FlopChanceTable::build_full_nh_sampled(flop, np as u8, &turn_cards, &river_decks);
     let (fm, tm, rm) = quantile_maps(&table, nb);
     let game = FlopStartGame::new(table);
     let bk = FlopBucketing::from_maps(game.table(), nb, nb, nb, fm, tm, rm);
     let mut solver = BucketedFlopCfr::new(tree, game.table(), &bk);
-    solver.set_terminal_design(TerminalDesign::Design1Collapsed);
+    // Design1Collapsed asserts np≥3; HU (live-2) uses the exact brute terminal.
+    solver.set_terminal_design(if np >= 3 {
+        TerminalDesign::Design1Collapsed
+    } else {
+        TerminalDesign::Design1Brute
+    });
     // Convergence stat: mean |delta sigma_flop| between the last two
     // iterations (normalized rows) — the per-flop "convergence reached"
     // number the harness reads without re-solving.
@@ -299,7 +327,7 @@ fn solve_and_bank(
              \"turn\":[{turns_json}],\"rivers\":[{rivers_json}],\
              \"runout_seed\":\"chained splitmix64 w/o replacement; turn x0=fi; river x0=fi^0xDEADBEEF^(tc<<40)\",\
              \"iters\":{iters},\"conv_mean_dsigma_last_iter\":{conv:.6},\
-             \"tree\":{{\"np\":6,\"pot\":12,\"stacks\":94,\"contribs\":0,\"bets\":[1.0],\"raises\":[]}},\
+             \"tree\":{{\"np\":{np},\"bets\":[1.0],\"raises\":[]}},\
              \"nh\":{},\"terminal\":\"design1_collapsed\",\"maps\":\"quantile-strength\",\
              \"gpu\":{gpu_flag},\"code\":\"{code}\",\"secs\":{secs:.1}}}",
             flop[0], flop[1], flop[2],
@@ -317,6 +345,31 @@ fn solve_and_bank(
         f.flush()?;
     }
     std::fs::rename(&tmp, &path)?;
+
+    // CFV BANK (np≥3): emit the flop-root CFV alongside the strategy, in the
+    // same layout the preflop oracle reads ({out_dir}/cfv/L{live}_S{bin}/
+    // cfv_NNNN.f32, per-live × layout f32-LE). Load the just-solved avg into
+    // `solver` (GPU path leaves it empty) and extract once via root_cfv_from_avg.
+    // This eliminates the separate ~hour CFV pre-bank pass for future
+    // blueprints (live-2 uses the exact path, not this np≥3 collapsed one).
+    if np >= 3 {
+        solver.cum_strategy_flop_mut().copy_from_slice(&cum_flop);
+        solver.cum_strategy_turn_mut().copy_from_slice(&cum_turn);
+        solver.cum_strategy_river_mut().copy_from_slice(&cum_river);
+        let root_all = solver.root_cfv_from_avg(tree, &game, &bk);
+        let perm =
+            table_hand_to_layout_perm(&game.table().hand_cards, game.table().num_valid, flop);
+        let key = SeamCell { live: np as u8, commit, pot }.bucket_key(production_game_v1().stack);
+        let cdir = format!("{out_dir}/cfv/L{}_S{}", key.0, key.1);
+        std::fs::create_dir_all(&cdir)?;
+        let mut bytes = Vec::with_capacity(np * perm.len() * 4);
+        for t in 0..np {
+            for &h in &perm {
+                bytes.extend_from_slice(&root_all[t][h].to_le_bytes());
+            }
+        }
+        std::fs::write(format!("{cdir}/cfv_{fi:04}.f32"), bytes)?;
+    }
     Ok(secs)
 }
 
@@ -341,8 +394,17 @@ fn main() {
             it.next().and_then(|s| s.parse().ok()).expect("BP_RUNOUTS NTxNR"),
         )
     };
-    let role = std::env::var("BP_ROLE").unwrap_or_else(|_| {
-        "bootstrap-config-baseline (oracle-shape tree; NOT the production blueprint)".into()
+    // Reach-weighted per-family arm: BP_LIVE set => solve the per-player-count
+    // seam family (deployable blueprint, selected at play time by live count)
+    // instead of the np=6 oracle bootstrap. BP_COMMIT/BP_POT pick the SPR cell
+    // (default = the harness fidelity representative: 1bb commit, 6bb pot).
+    let live: Option<u8> = std::env::var("BP_LIVE").ok().and_then(|s| s.parse().ok());
+    let commit: i32 = std::env::var("BP_COMMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let pot: i32 = std::env::var("BP_POT").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+    let np: usize = live.map(|l| l as usize).unwrap_or(6);
+    let role = std::env::var("BP_ROLE").unwrap_or_else(|_| match live {
+        Some(l) => format!("per-family seam blueprint (live-{l}, commit={commit}, pot={pot})"),
+        None => "bootstrap-config-baseline (oracle-shape tree; NOT the production blueprint)".into(),
     });
     std::fs::create_dir_all(&out_dir).expect("create out dir");
     // Run-level manifest: the artifact set is self-describing as a whole.
@@ -353,7 +415,7 @@ fn main() {
             mf,
             "{{\"role\":\"{role}\",\
              \"cell\":\"1755 x seeded {nt}x{nr}\",\"b\":{nb},\"iters\":{iters},\"gpu\":{gpu},\
-             \"tree\":{{\"np\":6,\"pot\":12,\"stacks\":94,\"contribs\":0,\"bets\":[1.0],\"raises\":[]}},\
+             \"tree\":{{\"np\":{np},\"commit\":{commit},\"pot\":{pot},\"bets\":[1.0],\"raises\":[]}},\
              \"terminal\":\"design1_collapsed\",\"maps\":\"quantile-strength\",\
              \"runout_seed\":\"chained splitmix64 w/o replacement; turn x0=fi; river x0=fi^0xDEADBEEF^(tc<<40)\",\
              \"code\":\"{code}\",\"format\":1}}"
@@ -372,9 +434,12 @@ fn main() {
     let canon = ptable.canonical_flops.clone();
     let end: usize =
         std::env::var("BP_END").ok().and_then(|s| s.parse().ok()).unwrap_or(canon.len());
-    let tree = build_oracle_tree();
+    let tree = match live {
+        Some(l) => build_seam_tree(l, commit, pot),
+        None => build_oracle_tree(),
+    };
     eprintln!(
-        "{} canonical flops [{start}..{end}), tree {} nodes, {} threads, out={out_dir}",
+        "{} canonical flops [{start}..{end}), np={np} tree {} nodes, {} threads, out={out_dir}",
         canon.len(),
         tree.num_nodes(),
         threads
@@ -405,6 +470,9 @@ fn main() {
                     fi,
                     canon[fi],
                     &tree,
+                    np,
+                    commit,
+                    pot,
                     nb,
                     iters,
                     nt,

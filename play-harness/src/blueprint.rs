@@ -19,6 +19,7 @@ pub struct Blueprint {
     pub flop: [u8; 3],
     pub turns: Vec<u8>,
     pub rivers: Vec<Vec<u8>>, // per turn (same order as `turns`)
+    pub np: usize,            // players at the flop (oracle=6, per-family seam=live)
     pub nb: usize,
     pub nh: usize,
     pub cum_flop: Vec<f32>,
@@ -130,14 +131,17 @@ impl Blueprint {
             .collect();
         let nb = ints(json_array_body(&header, "b"))[0] as usize;
         let nh = json_int(&header, "nh") as usize;
+        // Players at the flop: header `"tree":{"np":N,...}`. Old oracle
+        // artifacts carry np=6; per-family seam cells carry np=live (3/4/5).
+        let np = json_int(&header, "np") as usize;
 
         // Rebuild the table from pinned runouts (same constructor the
-        // runner used) and the bucketing from the banked maps.
+        // runner used, at the cell's np) and bucketing from banked maps.
         let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
         for (ti, &tc) in turns.iter().enumerate() {
             river_decks[tc as usize] = rivers[ti].clone();
         }
-        let table = FlopChanceTable::build_full_nh_sampled(flop, 6, &turns, &river_decks);
+        let table = FlopChanceTable::build_full_nh_sampled(flop, np as u8, &turns, &river_decks);
         assert_eq!(table.num_valid, nh, "rebuilt table nh mismatch");
         let game = FlopStartGame::new(table);
 
@@ -166,6 +170,7 @@ impl Blueprint {
             flop,
             turns,
             rivers,
+            np,
             nb,
             nh,
             cum_flop: f32s("cum_flop"),
