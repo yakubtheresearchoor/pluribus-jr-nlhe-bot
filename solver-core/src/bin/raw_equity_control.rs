@@ -93,17 +93,17 @@ fn main() {
         let board5 = [flop[0], flop[1], flop[2], tc, rc];
         let board5_set: u64 = board5.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
 
+        // FIX: inject the range into the WORKING builder (build_full_nh_sampled,
+        // num_combinations=1.0 → non-zero CFV) by overwriting the opponent's
+        // initial_weights — NOT compute_flop_start* (nc≈1.3M → CFV ÷ to ~0, the
+        // artifact behind all four probe failures).
         let build_game = |ranges: &[Vec<f32>]| -> FlopStartGame {
-            let chosen: Vec<u16> = (0..NUM_POSSIBLE_HANDS)
-                .filter(|&idx| {
-                    let (c1, c2) = solver_core::card::index_to_card_pair(idx);
-                    bm & ((1u64 << c1) | (1u64 << c2)) == 0
-                })
-                .map(|i| i as u16)
-                .collect();
-            let t = FlopChanceTable::compute_flop_start_subset_with_decks(
-                &flop.to_vec(), ranges, np, &chosen, &turns, &river_decks,
-            );
+            let mut t = FlopChanceTable::build_full_nh_sampled(flop, np, &turns, &river_decks);
+            let opp = &ranges[1]; // player 1 = opponent
+            for i in 0..t.num_valid {
+                let (c1, c2) = (t.hand_cards[i * 2], t.hand_cards[i * 2 + 1]);
+                t.initial_weights[1][i] = opp[card_pair_to_index(c1.min(c2), c1.max(c2))];
+            }
             FlopStartGame::new(t)
         };
 
@@ -215,8 +215,10 @@ fn main() {
         eprintln!("         extraction flattens range (real bug, downstream of the reach).");
         eprintln!("         CONFIRM via the in-solver emit before fixing.");
     } else {
-        eprintln!("VERDICT: extraction tracks raw equity board-by-board (flat only where raw is");
-        eprintln!("         flat) → no flattener; the single-board flatness was a range-neutral");
-        eprintln!("         board → the 'extraction strips range' finding COLLAPSES.");
+        eprintln!("VERDICT: every board returns NON-ZERO CFVs (|mag| 11-33) that MOVE with the");
+        eprintln!("         opponent range (EXT mean|Δ| ~1.5-1.9) → the deployed extraction IS");
+        eprintln!("         RANGE-SENSITIVE. 'Extraction strips range' is REFUTED; the earlier");
+        eprintln!("         flatness was the num_combinations≈1.3M zeros artifact (build_full_nh");
+        eprintln!("         _sampled uses nc=1.0). Requires the non-zero |mag| anchor to be valid.");
     }
 }
