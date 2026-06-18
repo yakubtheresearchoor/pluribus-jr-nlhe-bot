@@ -692,6 +692,35 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
         }
         return;
     }
+    // MC_NODECMP: per-ACTION cv at top fold nodes, anchor vs DCFR's internal
+    // bottom_up cfv (turn_cfv[child]). Pins WHICH action's cv carries the
+    // non-cancelling (floor) error — fold vs call ratio is the tell.
+    if std::env::var("MC_NODECMP").is_ok() {
+        let mut s = BucketedFlopCfr::new(&g.tree, g.game.table(), &g.bk);
+        s.set_terminal_design(TerminalDesign::Design1Collapsed);
+        s.run(&g.tree, &g.game, &g.bk, 1024);
+        let sigma = s.average_strategy_canonical(&g.tree, &g.bk);
+        let _ = anchor.exploitability(&g.tree, &sigma, MAX_NA_POSTFLOP); // populates node_action_cv
+        let tcfv = s.debug_turn_cfv(&g.tree, &g.game, &g.bk, 0); // DCFR per-node cfv, evaluee 0
+        let acv = anchor.node_action_cv.borrow();
+        let nh = anchor.nh;
+        println!("PER-ACTION cv: anchor vs DCFR internal (evaluee 0). fold/call ratio = the tell.");
+        for &node in &[468usize, 506, 369, 329, 230] {
+            let n = &g.tree.nodes[node];
+            if n.player_id != 0 { continue; } // DCFR cfv is for traverser 0
+            let kids = g.tree.node_children(node);
+            println!(" node {node} street {} p{}:", n.board_state, n.player_id);
+            for (a, &c) in kids.iter().enumerate() {
+                let dcfr: f32 = anchor.valid.iter().map(|&h| tcfv[c as usize * nh + h]).sum();
+                let anc = acv[node].get(a).copied().unwrap_or(0.0);
+                let lbl = g.tree.nodes[c as usize].action_label;
+                let term = g.tree.nodes[c as usize].is_terminal();
+                println!("   a{a} (label {lbl}{}) anchor {anc:>11.3e}  DCFR {dcfr:>11.3e}  ratio {:>8.4}",
+                    if term { ",T" } else { "" }, anc / dcfr);
+            }
+        }
+        return;
+    }
     let iter_list: Vec<u32> = if std::env::var("MC_FAST").is_ok() { vec![256] } else { vec![1, 64, 1024] };
     for iters in iter_list {
         let mut s = BucketedFlopCfr::new(&g.tree, g.game.table(), &g.bk);

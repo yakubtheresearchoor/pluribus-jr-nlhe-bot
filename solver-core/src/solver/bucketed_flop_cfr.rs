@@ -1492,6 +1492,58 @@ impl BucketedFlopCfr {
         root_all
     }
 
+    /// DEBUG: per-node TURN-zone cfv [nn*nh] for `traverser`, single 1×1 runout
+    /// (turn ti=0, river ri=0). Lets a probe read DCFR's per-ACTION cv at a turn
+    /// decision node (turn_cfv[child*nh+h]) to compare against an external anchor.
+    pub fn debug_turn_cfv(
+        &mut self,
+        tree: &FlatTree,
+        game: &FlopStartGame,
+        bk: &FlopBucketing,
+        traverser: u8,
+    ) -> Vec<f32> {
+        let nh = self.nh;
+        let nn = tree.num_nodes();
+        let table = game.table();
+        let turn_deck = table.remaining_deck.clone();
+        let saved_flop = self.cum_strategy_flop.clone();
+        let saved_turn = self.cum_strategy_turn.clone();
+        let saved_river = self.cum_strategy_river.clone();
+        let params = DcfrParams::new(self.iteration);
+        let mut river_cfv_accum = vec![0.0f32; nn * nh];
+        let mut cfv = vec![0.0f32; nn * nh];
+        let mut turn_cfv = vec![0.0f32; nn * nh];
+
+        self.load_avg_flop(tree, bk, &saved_flop);
+        let mut flop_reach = self.compute_reach_flop(tree, game, bk);
+        normalize_opponent_reach(&mut flop_reach, self.num_players as usize, nh, traverser as usize);
+        let ti = 0usize;
+        let tc = turn_deck[ti];
+        self.load_avg_turn(tree, bk, ti, &saved_turn);
+        let turn_reach = self.compute_reach_turn(tree, bk, ti, &flop_reach);
+        let n_river = self.river_deck_sizes[tc as usize];
+        for &child_id in &self.river_chance_children {
+            let off = child_id as usize * nh;
+            for h in 0..nh { river_cfv_accum[off + h] = 0.0; }
+        }
+        for ri in 0..n_river {
+            self.load_avg_river(tree, bk, ti, ri, &saved_river);
+            let river_reach = self.compute_reach_river(tree, bk, ti, ri, &turn_reach);
+            self.bottom_up_zone(tree, table, bk, traverser, &river_reach, &mut cfv, Zone::River, Some(ti), Some(ri), &params);
+            for &child_id in &self.river_chance_children {
+                for h in 0..nh {
+                    let cp = table.chance_probability_river(tc, ri, h);
+                    river_cfv_accum[child_id as usize * nh + h] += cp * cfv[child_id as usize * nh + h];
+                }
+            }
+        }
+        for &child_id in &self.river_chance_children {
+            for h in 0..nh { turn_cfv[child_id as usize * nh + h] = river_cfv_accum[child_id as usize * nh + h]; }
+        }
+        self.bottom_up_zone(tree, table, bk, traverser, &turn_reach, &mut turn_cfv, Zone::Turn, Some(ti), None, &params);
+        turn_cfv
+    }
+
     /// `run` with the G4 batched-terminal prepass: per traverser, all
     /// walks' reaches are computed UP FRONT (reaches depend only on
     /// strategies, which are fixed within a traverser pass — values
