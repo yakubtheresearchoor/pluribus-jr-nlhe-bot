@@ -539,17 +539,22 @@ impl FlopChanceTable {
                 chosen.push(idx as u16);
             }
         }
-        // MC_HANDCAP (opt-in, test-only): cap the valid-hand set to a small
-        // strided subset so identity bucketing (nb=nh) is tractable — lets a
-        // probe run the EXACT small game where converged CFR reaches true Nash
-        // and a correct anchor MUST read ~0. Strided (not truncated) for rank
-        // diversity → a non-degenerate Nash. No effect unless the env is set.
+        // MC_HANDCAP (opt-in, test-only): cap the valid-hand set. NESTED design:
+        // order ALL hands once by a FIXED diverse key (hash of the hand index),
+        // then take the first `cap`. So cap=128 ⊂ cap=192 ⊂ … (each larger set
+        // CONTAINS the smaller) — isolates hand-COUNT from subset-IDENTITY, which
+        // the old strided (step_by(nh/cap)) version did NOT: different caps gave
+        // different subsets → a non-monotonic, contaminated residual-vs-handset
+        // curve. The hash spreads across ranks (non-degenerate). Identity-gate
+        // tractability is unaffected (still a small diverse subset). No effect
+        // unless the env is set.
         if let Ok(c) = std::env::var("MC_HANDCAP") {
             if let Ok(cap) = c.parse::<usize>() {
                 let cap = cap.min(chosen.len());
                 if cap > 0 {
-                    let stride = (chosen.len() / cap).max(1);
-                    chosen = chosen.iter().step_by(stride).take(cap).copied().collect();
+                    let mut ordered = chosen.clone();
+                    ordered.sort_by_key(|&h| (h as u64).wrapping_mul(0x9E3779B97F4A7C15));
+                    chosen = ordered.into_iter().take(cap).collect();
                 }
             }
         }
