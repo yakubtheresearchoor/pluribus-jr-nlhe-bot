@@ -135,7 +135,9 @@ struct Mccfr {
     tbl: solver_core::solver::bucketed_showdown::BucketedRunoutTables,
     // valid hands (no board/runout conflict) + their 2 cards.
     hand_cards: Vec<(u8, u8)>,
-    valid: Vec<usize>, // hands with a real bucket on every street
+    valid: Vec<usize>, // FLOP-live hands (deal set) — per-street death handled in traverse
+    turn_card: u8,
+    river_card: u8,
     rng: u64,
 }
 
@@ -162,11 +164,13 @@ impl Mccfr {
         let hand_cards: Vec<(u8, u8)> =
             (0..nh).map(|h| (table.hand_cards[h * 2], table.hand_cards[h * 2 + 1])).collect();
         let no = u16::MAX;
-        let valid: Vec<usize> = (0..nh)
-            .filter(|&h| {
-                g.bk.flop_map[h] != no && g.bk.turn_map[0][h] != no && g.bk.river_map[0][0][h] != no
-            })
-            .collect();
+        // PER-STREET (mirror DCFR): deal from FLOP-live hands (incl. runout-
+        // colliders, which are turn/river-live until their card appears). A
+        // collider DIES at its collision street (handled in traverse: 0 from
+        // there) — a sampled tuple containing a collider is an impossible world
+        // → 0, which reproduces DCFR's river-valid-weighted CFV in expectation
+        // (no reweighting: sampling already weights by the flop-valid distrib).
+        let valid: Vec<usize> = (0..nh).filter(|&h| g.bk.flop_map[h] != no).collect();
         let _ = BoardState::Flop;
         Mccfr {
             node_local,
@@ -182,8 +186,25 @@ impl Mccfr {
             tbl,
             hand_cards,
             valid,
+            turn_card: table.remaining_deck[0],
+            river_card: table.river_decks[table.remaining_deck[0] as usize][0],
             rng: 0x9E3779B97F4A7C15,
         }
+    }
+
+    /// hand is live at street `bs` iff it doesn't hold a board card dealt by then
+    /// (flop already excluded at deal). Mirrors DCFR's per-street card removal.
+    #[inline]
+    fn alive(&self, hand: usize, bs: u8) -> bool {
+        use solver_core::tree::action::BoardState;
+        let (c1, c2) = self.hand_cards[hand];
+        if bs >= BoardState::Turn as u8 && (c1 == self.turn_card || c2 == self.turn_card) {
+            return false;
+        }
+        if bs >= BoardState::River as u8 && (c1 == self.river_card || c2 == self.river_card) {
+            return false;
+        }
+        true
     }
 
     #[inline]
@@ -266,6 +287,12 @@ impl Mccfr {
         let player = n.player_id as usize;
         let na = kids.len();
         let bs = n.board_state;
+        // per-street death: the acting player's hand is impossible at this street
+        // (holds a board card dealt by now) → impossible world → 0. Also guards the
+        // NO_BUCKET strategy index under quantile.
+        if !self.alive(hands[player], bs) {
+            return 0.0;
+        }
         let local = self.node_local[node] as usize;
         let bucket = self.bucket_of(bs, hands[player]);
         let mut strat = [0.0f32; 16];
@@ -279,7 +306,9 @@ impl Mccfr {
             }
             let base = (local * self.nb + bucket) * self.max_na;
             for a in 0..na {
-                self.regret[base + a] += cv[a] - v;
+                // CFR+: floor cumulative regret at 0 (converges far faster than
+                // vanilla, which let regrets drift and the average stay ~uniform).
+                self.regret[base + a] = (self.regret[base + a] + cv[a] - v).max(0.0);
                 self.cum[base + a] += strat[a];
             }
             v
@@ -302,8 +331,18 @@ impl Mccfr {
     /// Terminal value for the traverser: fold payoff or the per-tuple bucketed
     /// showdown (the recurse_eq_buckets DP run once for the sampled tuple).
     fn terminal(&self, tree: &FlatTree, node: usize, traverser: usize, hands: &[usize]) -> f32 {
+        let bs = tree.nodes[node].board_state;
         let fold_mask = tree.get_folded_mask(node);
         let np = self.np;
+        // per-street death at the terminal: any ACTIVE player (traverser or a non-
+        // folded opponent) whose hand is impossible at this board → impossible
+        // world → 0 (catches showdowns reached without a river action). Mirrors
+        // DCFR: collider tuples have 0 reach.
+        for p in 0..np {
+            if (fold_mask >> p) & 1 == 0 && !self.alive(hands[p], bs) {
+                return 0.0;
+            }
+        }
         let contribs: Vec<i32> = (0..np).map(|p| tree.get_contribution(node, p as u8)).collect();
         let c_t = contribs[traverser];
         let half_pot = tree.starting_pot as f32 / np as f32 + c_t as f32;
@@ -699,6 +738,46 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
     let live: u8 = std::env::var("MC_LIVE").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     let g = build_shrunk(live, nb, nt, nr);
     let anchor = Anchor::new(&g);
+    // MC_MCCONV: convergence of the MCCFR AVERAGE (per-street engine) measured by
+    // the trusted anchor. Two-way gate: identity → ~0 (per-street implemented
+    // right), nb=6 → DCFR's per-family residual (same game). Run BOTH before any
+    // speed comparison (same-residual proves same game; speed is the verdict).
+    if std::env::var("MC_MCCONV").is_ok() {
+        let nn = g.tree.num_nodes();
+        let nb_a = anchor.nb;
+        let mut m = Mccfr::new(&g);
+        println!("MCCFR CONVERGENCE — true-BR exploit of the MCCFR average, live-{live}, nb={nb}");
+        println!("{:>10} {:>18}", "traj", "true-BR exploit");
+        let batch = 8192usize;
+        let mut total = 0usize;
+        for &target in &[8192usize, 65536, 262144, 1048576, 4194304] {
+            while total < target { m.run_iter(&g.tree, batch); total += batch; }
+            let mut sigma = vec![0.0f32; nn * MAX_NA_POSTFLOP * nb_a];
+            for node in 0..nn {
+                if !g.tree.nodes[node].is_player() { continue; }
+                let local = m.node_local[node] as usize;
+                let na = g.tree.nodes[node].num_children as usize;
+                let off = node * MAX_NA_POSTFLOP * nb_a;
+                let use_current = std::env::var("MC_CURRENT").is_ok();
+                for bb in 0..nb_a {
+                    let base = (local * m.nb + bb) * m.max_na;
+                    let val = |a: usize| -> f32 {
+                        if use_current { m.regret[base + a].max(0.0) } else { m.cum[base + a] }
+                    };
+                    let sum: f32 = (0..na).map(val).sum();
+                    if sum > 0.0 {
+                        for a in 0..na { sigma[off + a * nb_a + bb] = val(a) / sum; }
+                    } else {
+                        let u = 1.0 / na as f32;
+                        for a in 0..na { sigma[off + a * nb_a + bb] = u; }
+                    }
+                }
+            }
+            let expl = anchor.exploitability(&g.tree, &sigma, MAX_NA_POSTFLOP);
+            println!("{total:>10} {expl:>18.5e}");
+        }
+        return;
+    }
     println!("ANCHOR VALIDATION — true-BR exploitability of the DCFR average, live-{live}, nb={nb}");
     println!("two-sided test: under-converged → HIGH & FALLING (catches exploitation, no under-report);");
     println!("converged → ~0 (no over-report — the normalize_opponent_reach-seam test). pass = both.\n");
