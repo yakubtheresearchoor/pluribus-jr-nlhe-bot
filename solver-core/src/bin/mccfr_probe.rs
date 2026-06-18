@@ -167,6 +167,13 @@ struct Mccfr {
     prune_this: bool,
     pruned_nodes: u64, // diagnostics: subtrees skipped (compute saved)
     visited_nodes: u64,
+    // VR-MCCFR (MC_VR): control-variate baseline b(opp-infoset, action) — a running
+    // estimate of the value returned by sampling that opponent action. At an opp
+    // node the returned value = Σ σ(j)·b(j) + (sampled − b(a*)) — UNBIASED (the
+    // control variate), lower-variance if b is well-fit. Same layout as regret/cum.
+    vr: bool,
+    vr_alpha: f32,
+    baseline: Vec<f32>,
 }
 
 impl Mccfr {
@@ -224,6 +231,9 @@ impl Mccfr {
             prune_this: false,
             pruned_nodes: 0,
             visited_nodes: 0,
+            vr: std::env::var("MC_VR").is_ok(),
+            vr_alpha: std::env::var("MC_VR_ALPHA").ok().and_then(|s| s.parse().ok()).unwrap_or(0.05),
+            baseline: vec![0.0; n_info * nb * max_na],
         }
     }
 
@@ -373,7 +383,26 @@ impl Mccfr {
                     break;
                 }
             }
-            self.traverse(tree, kids[a] as usize, traverser, hands)
+            let sampled = self.traverse(tree, kids[a] as usize, traverser, hands);
+            if self.vr {
+                // VR-MCCFR control variate: value = Σ σ(j)·b(j) + (sampled − b(a*)).
+                // Unbiased regardless of b; lower variance when b tracks the value.
+                // The value is the TRAVERSER's, so index b by the TRAVERSER's bucket
+                // bt (not the opponent's) — captures the opponent-action variance for
+                // THIS traverser hand. σ is the opponent's strategy (per opp bucket).
+                let bt = self.bucket_of(bs, hands[traverser]);
+                if bt >= self.nb {
+                    sampled // traverser hand invalid this street → no VR
+                } else {
+                    let base = (local * self.nb + bt) * self.max_na;
+                    let bexp: f32 = (0..na).map(|j| strat[j] * self.baseline[base + j]).sum();
+                    let corrected = bexp + (sampled - self.baseline[base + a]);
+                    self.baseline[base + a] += self.vr_alpha * (sampled - self.baseline[base + a]);
+                    corrected
+                }
+            } else {
+                sampled
+            }
         }
     }
 
