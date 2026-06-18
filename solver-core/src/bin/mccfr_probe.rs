@@ -664,7 +664,36 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
     println!("two-sided test: under-converged → HIGH & FALLING (catches exploitation, no under-report);");
     println!("converged → ~0 (no over-report — the normalize_opponent_reach-seam test). pass = both.\n");
     println!("{:>6} {:>18}", "DCFR iters", "true-BR exploit");
-    for iters in [1u32, 64, 1024] {
+    // MC_ROOTCMP: is the anchor's value model = DCFR's? Compare anchor on-policy
+    // root value V_i (per hand) vs DCFR's root_cfv_from_avg. Constant ratio ⇒
+    // value model matches (floor is not a value-model bug); varying ratio ⇒
+    // value-model divergence (the bug).
+    if std::env::var("MC_ROOTCMP").is_ok() {
+        use solver_core::tree::flat::MAX_NA_POSTFLOP;
+        let mut s = BucketedFlopCfr::new(&g.tree, g.game.table(), &g.bk);
+        s.set_terminal_design(TerminalDesign::Design1Collapsed);
+        s.run(&g.tree, &g.game, &g.bk, 1024);
+        let sigma = s.average_strategy_canonical(&g.tree, &g.bk);
+        let dcfr_root = s.root_cfv_from_avg(&g.tree, &g.game, &g.bk); // [np][nh]
+        let nv = anchor.valid.len();
+        let w = 1.0 / nv as f32;
+        let mut reach = vec![vec![0.0f32; anchor.nh]; anchor.np];
+        for p in 0..anchor.np { for &h in &anchor.valid { reach[p][h] = w; } }
+        let v_on = anchor.walk(&g.tree, 0, 0, false, &sigma, MAX_NA_POSTFLOP, &reach);
+        println!("ROOT VALUE CMP (evaluee 0): anchor on-policy vs DCFR root_cfv_from_avg");
+        println!("{:>6} {:>14} {:>14} {:>10}", "hand", "anchor", "DCFR", "ratio");
+        let mut shown = 0;
+        for &h in anchor.valid.iter() {
+            let (a, d) = (v_on[h], dcfr_root[0][h]);
+            if d.abs() > 1e-6 && shown < 16 {
+                println!("{h:>6} {a:>14.5e} {d:>14.5e} {:>10.4}", a / d);
+                shown += 1;
+            }
+        }
+        return;
+    }
+    let iter_list: Vec<u32> = if std::env::var("MC_FAST").is_ok() { vec![256] } else { vec![1, 64, 1024] };
+    for iters in iter_list {
         let mut s = BucketedFlopCfr::new(&g.tree, g.game.table(), &g.bk);
         s.set_terminal_design(TerminalDesign::Design1Collapsed);
         s.run(&g.tree, &g.game, &g.bk, iters);
@@ -672,6 +701,7 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
         let expl = anchor.exploitability(&g.tree, &sigma, MAX_NA_POSTFLOP);
         println!("{iters:>6} {expl:>18.5e}");
     }
+    if std::env::var("MC_NOLOC").is_ok() { return; }
     // ── FLOOR LOCALIZATION: where does the BR diverge on converged DCFR? ──
     let mut s = BucketedFlopCfr::new(&g.tree, g.game.table(), &g.bk);
     s.set_terminal_design(TerminalDesign::Design1Collapsed);
