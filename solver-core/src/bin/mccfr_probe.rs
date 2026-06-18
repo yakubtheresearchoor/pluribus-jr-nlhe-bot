@@ -359,7 +359,18 @@ impl Mccfr {
         // minus rake minus the traverser's own investment (=half_pot). The old
         // half_pot*(active_count) only equalled this when contribs were symmetric and
         // nobody folded — at fold terminals it mis-counted the dead money.
-        let rake = (total_pot as f32 * tree.rake_rate as f32).min(tree.rake_cap as f32).max(0.0);
+        // Rake the MAIN pot only (design1_collapsed convention): unmatched bets are
+        // returned, not raked. main_pot = levels[0]×(#contrib ≥ levels[0]) + starting_pot
+        // (levels = sorted-distinct contributions). Engine previously raked total_pot.
+        let mut levels: Vec<i32> = (0..np).map(|p| contribs[p]).collect();
+        levels.sort();
+        levels.dedup();
+        let main_pot = if levels.is_empty() {
+            tree.starting_pot
+        } else {
+            levels[0] * (0..np).filter(|&p| contribs[p] >= levels[0]).count() as i32 + tree.starting_pot
+        };
+        let rake = (main_pot as f32 * tree.rake_rate as f32).min(tree.rake_cap as f32).max(0.0);
         let net_pot = total_pot as f32 - rake;
         if active_opp.is_empty() {
             // everyone else folded → traverser wins the whole pot uncontested.
