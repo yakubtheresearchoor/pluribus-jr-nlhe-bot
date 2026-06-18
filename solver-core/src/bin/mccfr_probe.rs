@@ -354,18 +354,20 @@ impl Mccfr {
         // active opponents (not folded, not traverser)
         let active_opp: Vec<usize> =
             (0..np).filter(|&p| p != traverser && (fold_mask >> p) & 1 == 0).collect();
+        // POT ACCOUNTING (reconciled to design1_collapsed 2026-06-18): the win is the
+        // ACTUAL pot (starting_pot + ALL contribs, incl FOLDED players' dead money)
+        // minus rake minus the traverser's own investment (=half_pot). The old
+        // half_pot*(active_count) only equalled this when contribs were symmetric and
+        // nobody folded — at fold terminals it mis-counted the dead money.
+        let rake = (total_pot as f32 * tree.rake_rate as f32).min(tree.rake_cap as f32).max(0.0);
+        let net_pot = total_pot as f32 - rake;
         if active_opp.is_empty() {
-            // everyone else folded → traverser wins the pot (rake if flop seen)
-            let rake = (total_pot as f32 * tree.rake_rate as f32).min(tree.rake_cap as f32).max(0.0);
-            // win net = pot - own stake, in half_pot units: k = num_opp_folded share
-            return half_pot * (np as f32 - 1.0) - rake; // approx: collect others' equal stakes
+            // everyone else folded → traverser wins the whole pot uncontested.
+            return net_pot - half_pot;
         }
         // showdown: per-tuple DP over the SAMPLED opponent river buckets.
         let nb = self.tbl.nb; // river table stride
         let bt = self.river_b[hands[traverser]] as usize;
-        let k = active_opp.len() as f32;
-        let rake = (total_pot as f32 * tree.rake_rate as f32).min(tree.rake_cap as f32).max(0.0);
-        let rake_per_unit = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
         // state-carrying (beaten, ties) DP, ONE tuple.
         let mut state = vec![0.0f32; np + 2];
         state[1] = 1.0;
@@ -391,24 +393,18 @@ impl Mccfr {
             }
             state = ns;
         }
-        let mut net = 0.0f32;
-        if state[0] != 0.0 {
-            net += state[0] * -1.0;
-        }
+        // value = E[winnings] − investment. winnings = net_pot/t for a t-way tie
+        // (t=1 = outright win), 0 for a loss. investment = half_pot.
+        let mut value = state[0] * (-half_pot); // beaten → forfeit own investment
         for j in 0..np {
             let s = state[1 + j];
             if s == 0.0 {
                 continue;
             }
-            let net_unit = if j == 0 {
-                k - rake_per_unit
-            } else {
-                let t_f = (j + 1) as f32;
-                (k + 1.0 - t_f) / t_f - rake_per_unit / t_f
-            };
-            net += s * net_unit;
+            let t = (j + 1) as f32; // tied players including the traverser
+            value += s * (net_pot / t - half_pot);
         }
-        half_pot * net
+        value
     }
 
     fn run_iter(&mut self, tree: &FlatTree, batch: usize) {
@@ -738,6 +734,62 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
     let live: u8 = std::env::var("MC_LIVE").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     let g = build_shrunk(live, nb, nt, nr);
     let anchor = Anchor::new(&g);
+    // MC_TERMCMP: per-tuple terminal value, ENGINE vs design1_collapsed, at IDENTITY
+    // (singletons → binary fractions → matched conditioning, so a divergence is a
+    // REAL value bug not a representation artifact). Aim: pot/dead-money accounting
+    // (engine half_pot*(np-1) win vs design1_collapsed's pot handling).
+    if std::env::var("MC_TERMCMP").is_ok() {
+        use solver_core::solver::bucketed_showdown::bucketed_showdown_cfv_design1_collapsed;
+        use solver_core::tree::action::BoardState;
+        let m = Mccfr::new(&g);
+        let np = g.live as usize;
+        // a full-showdown river terminal (all active, no folds)
+        // np distinct river-valid hands (no shared cards)
+        let mut hands: Vec<usize> = Vec::new();
+        let mut used = 0u64;
+        for &h in &anchor.valid_river {
+            let (c1, c2) = m.hand_cards[h];
+            let mask = (1u64 << c1) | (1u64 << c2);
+            if used & mask == 0 { used |= mask; hands.push(h); if hands.len() == np { break; } }
+        }
+        let inv_nc = if anchor.nc > 0.0 { 1.0 / anchor.nc } else { 1.0 };
+        println!("TERMINAL CMP (identity): np={np} starting_pot={} hands={hands:?} — DIVERGENT terminals only:", anchor.starting_pot);
+        let mut shown = 0;
+        let mut checked = 0;
+        for node in 0..g.tree.num_nodes() {
+            let n = &g.tree.nodes[node];
+            if !n.is_terminal() { continue; }
+            // only RIVER terminals (river tables) where the active players hold our hands
+            if n.board_state != BoardState::River as u8 { continue; }
+            checked += 1;
+            let fold_mask = g.tree.get_folded_mask(node);
+            let contribs: Vec<i32> = (0..np).map(|p| g.tree.get_contribution(node, p as u8)).collect();
+            for trav in 0..np {
+                if (fold_mask >> trav) & 1 == 1 { continue; } // traverser folded → engine returns -half_pot, skip (no showdown)
+                let eng = m.terminal(&g.tree, node, trav, &hands);
+                let mut reach = vec![vec![0.0f32; anchor.nb]; np - 1];
+                let mut oi = 0;
+                for p in 0..np {
+                    if p == trav { continue; }
+                    reach[oi][anchor.rmap[hands[p]] as usize] = 1.0;
+                    oi += 1;
+                }
+                let views: Vec<&[f32]> = reach.iter().map(|v| v.as_slice()).collect();
+                let cfv = bucketed_showdown_cfv_design1_collapsed(
+                    &views, &anchor.rtbl, &contribs, fold_mask, trav, np as u8,
+                    anchor.starting_pot, anchor.rake_rate, anchor.rake_cap, true,
+                );
+                let bt = anchor.rmap[hands[trav]] as usize;
+                let d1 = cfv[bt] * inv_nc;
+                if (eng - d1).abs() > 0.01 && shown < 14 {
+                    println!("  node {node:>4} fold_mask {fold_mask:#05b} contribs {contribs:?} trav {trav}: ENGINE {eng:>9.3}  design1 {d1:>9.3}  diff {:>9.3}", eng - d1);
+                    shown += 1;
+                }
+            }
+        }
+        println!("  ({shown} divergent of {checked} river terminals checked × {np} travs)");
+        return;
+    }
     // MC_MCCONV: convergence of the MCCFR AVERAGE (per-street engine) measured by
     // the trusted anchor. Two-way gate: identity → ~0 (per-street implemented
     // right), nb=6 → DCFR's per-family residual (same game). Run BOTH before any
