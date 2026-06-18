@@ -422,7 +422,9 @@ struct Anchor {
     starting_pot: i32,
     rake_rate: f32,
     rake_cap: f32,
-    valid: Vec<usize>, // hands valid on every street
+    valid: Vec<usize>,       // flop-live hands (board-3 excluded) — root set
+    valid_turn: Vec<usize>,  // flop-live minus turn-card colliders
+    valid_river: Vec<usize>, // turn-live minus river-card colliders
     nc: f32,           // num_combinations — DCFR divides the showdown by this
     // per-node one-step regret accumulator (localization: WHERE the BR diverges
     // from on-policy on converged DCFR — the floor-contributing nodes).
@@ -436,22 +438,31 @@ impl Anchor {
         let table = g.game.table();
         let nh = table.num_valid;
         let no = u16::MAX;
-        // Card-remove the SAMPLED runout independent of the bucketing. DCFR zeros
-        // runout-conflicting hands via the river chance-probability; the anchor
-        // must too. Relying on map!=NO_BUCKET worked under quantile (which
-        // NO_BUCKETs conflicts) but FAILS under identity (maps every hand → impossible
-        // hands like one holding the turn/river card survive, get garbage cfv, and
-        // pollute opponent reach). Exclude by card so `valid` = the true live set.
+        // PER-STREET card removal, mirroring DCFR's reach convention. DCFR's
+        // compute_reach_turn only zeros TURN-conflicts (via turn_map); a river-
+        // collider (e.g. holds the river card) carries full reach into TURN
+        // terminals and is zeroed only at the RIVER (river_map / chance-prob). So
+        // the anchor must be per-street too: a hand is live at a street iff it
+        // doesn't collide with the board DEALT SO FAR. All-street `valid` excluded
+        // river-colliders at turn terminals where DCFR includes them — the cap-
+        // independent residual. Card-check (not just map!=NO_BUCKET) so it also
+        // holds under identity bucketing, which never emits NO_BUCKET.
         let turn_card = table.remaining_deck[0] as usize;
         let river_card = table.river_decks[turn_card][0] as usize;
-        let runout_mask: u64 = (1u64 << turn_card) | (1u64 << river_card);
-        let valid: Vec<usize> = (0..nh)
-            .filter(|&h| {
-                let c1 = table.hand_cards[h * 2] as usize;
-                let c2 = table.hand_cards[h * 2 + 1] as usize;
-                runout_mask & ((1u64 << c1) | (1u64 << c2)) == 0
-                    && g.bk.flop_map[h] != no && g.bk.turn_map[0][h] != no && g.bk.river_map[0][0][h] != no
-            })
+        let hcards = |h: usize| -> u64 {
+            (1u64 << table.hand_cards[h * 2]) | (1u64 << table.hand_cards[h * 2 + 1])
+        };
+        let tmask = 1u64 << turn_card;
+        let rmask = 1u64 << river_card;
+        // flop-valid: every dealt hand (board-3 already excluded at build time).
+        let valid: Vec<usize> = (0..nh).filter(|&h| g.bk.flop_map[h] != no).collect();
+        // turn-valid: flop-valid, not colliding the turn card.
+        let valid_turn: Vec<usize> = valid.iter().copied()
+            .filter(|&h| hcards(h) & tmask == 0 && g.bk.turn_map[0][h] != no)
+            .collect();
+        // river-valid: turn-valid, not colliding the river card.
+        let valid_river: Vec<usize> = valid_turn.iter().copied()
+            .filter(|&h| hcards(h) & rmask == 0 && g.bk.river_map[0][0][h] != no)
             .collect();
         Anchor {
             nb: g.bk.nb_flop.max(g.bk.nb_turn).max(g.bk.nb_river),
@@ -467,10 +478,22 @@ impl Anchor {
             rake_rate: g.tree.rake_rate as f32,
             rake_cap: g.tree.rake_cap as f32,
             valid,
+            valid_turn,
+            valid_river,
             nc: table.num_combinations as f32,
             node_regret: std::cell::RefCell::new(vec![0.0; g.tree.num_nodes()]),
             node_action_cv: std::cell::RefCell::new(vec![Vec::new(); g.tree.num_nodes()]),
         }
+    }
+
+    /// hands live at a street = not colliding the board dealt so far (mirrors
+    /// DCFR's per-street reach: river-colliders are live through the turn).
+    #[inline]
+    fn valid_at(&self, bs: u8) -> &[usize] {
+        use solver_core::tree::action::BoardState;
+        if bs == BoardState::Flop as u8 { &self.valid }
+        else if bs == BoardState::Turn as u8 { &self.valid_turn }
+        else { &self.valid_river }
     }
 
     #[inline]
@@ -534,6 +557,7 @@ impl Anchor {
         let na = kids.len();
         let bs = n.board_state;
         let map = self.street_map(bs);
+        let vh = self.valid_at(bs); // per-street live hands
         let off = node * max_na * self.nb;
         if player == i {
             let cvs: Vec<Vec<f32>> =
@@ -544,7 +568,7 @@ impl Anchor {
                 let mut best_a = vec![0usize; self.nb];
                 let mut best_v = vec![f32::NEG_INFINITY; self.nb];
                 let mut sum = vec![vec![0.0f32; self.nb]; na];
-                for &h in &self.valid {
+                for &h in vh {
                     let b = map[h] as usize;
                     if b >= self.nb { continue; }
                     for a in 0..na { sum[a][b] += cvs[a][h]; }
@@ -554,7 +578,7 @@ impl Anchor {
                         if sum[a][b] > best_v[b] { best_v[b] = sum[a][b]; best_a[b] = a; }
                     }
                 }
-                for &h in &self.valid {
+                for &h in vh {
                     let b = map[h] as usize;
                     if b >= self.nb { continue; }
                     v[h] = cvs[best_a[b]][h];
@@ -562,7 +586,7 @@ impl Anchor {
             } else {
                 // per-bucket aggregates for v + the one-step regret localization.
                 let mut sum_ab = vec![vec![0.0f32; self.nb]; na];
-                for &h in &self.valid {
+                for &h in vh {
                     let b = map[h] as usize;
                     if b >= self.nb { continue; }
                     for a in 0..na { sum_ab[a][b] += cvs[a][h]; }
@@ -578,7 +602,7 @@ impl Anchor {
                 // the evaluee-0 pass is inspected, overwrite is fine.
                 let agg: Vec<f32> = (0..na).map(|a| (0..self.nb).map(|b| sum_ab[a][b]).sum()).collect();
                 self.node_action_cv.borrow_mut()[node] = agg;
-                for &h in &self.valid {
+                for &h in vh {
                     let b = map[h] as usize;
                     if b >= self.nb { continue; }
                     let mut acc = 0.0;
@@ -594,13 +618,13 @@ impl Anchor {
             let mut v = vec![0.0f32; self.nh];
             for a in 0..na {
                 let mut r2 = reach.to_vec();
-                for &h in &self.valid {
+                for &h in vh {
                     let b = map[h] as usize;
                     if b >= self.nb { r2[p][h] = 0.0; }
                     else { r2[p][h] *= sigma[off + a * self.nb + b]; }
                 }
                 let cv = self.walk(tree, kids[a] as usize, i, br, sigma, max_na, &r2);
-                for &h in &self.valid { v[h] += cv[h]; }
+                for &h in vh { v[h] += cv[h]; }
             }
             v
         }
@@ -612,6 +636,7 @@ impl Anchor {
         let bs = tree.nodes[node].board_state;
         let map = self.street_map(bs);
         let tbl = self.street_tbl(bs);
+        let vh = self.valid_at(bs); // per-street live hands
         let fold_mask = tree.get_folded_mask(node);
         let np = self.np;
         // opponents' bucket reach (all p≠i), reduced from hand reach.
@@ -619,7 +644,7 @@ impl Anchor {
         let mut oi = 0;
         for p in 0..np {
             if p == i as usize { continue; }
-            for &h in &self.valid {
+            for &h in vh {
                 let b = map[h] as usize;
                 if b < self.nb { bucket_reach[oi][b] += reach[p][h]; }
             }
@@ -636,7 +661,7 @@ impl Anchor {
         // exploitability magnitude is interpretable and side-1 reads true ~0).
         let inv_nc = if self.nc > 0.0 { 1.0 / self.nc } else { 1.0 };
         let mut v = vec![0.0f32; self.nh];
-        for &h in &self.valid {
+        for &h in vh {
             let b = map[h] as usize;
             if b < self.nb { v[h] = cfv[b] * inv_nc; }
         }
