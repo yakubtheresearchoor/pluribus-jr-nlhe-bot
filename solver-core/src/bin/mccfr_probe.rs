@@ -427,6 +427,8 @@ struct Anchor {
     // per-node one-step regret accumulator (localization: WHERE the BR diverges
     // from on-policy on converged DCFR — the floor-contributing nodes).
     node_regret: std::cell::RefCell<Vec<f32>>,
+    // per-node per-action aggregated cv (which ACTION the BR over-values).
+    node_action_cv: std::cell::RefCell<Vec<Vec<f32>>>,
 }
 
 impl Anchor {
@@ -453,6 +455,7 @@ impl Anchor {
             valid,
             nc: table.num_combinations as f32,
             node_regret: std::cell::RefCell::new(vec![0.0; g.tree.num_nodes()]),
+            node_action_cv: std::cell::RefCell::new(vec![Vec::new(); g.tree.num_nodes()]),
         }
     }
 
@@ -557,6 +560,10 @@ impl Anchor {
                     node_reg += (mx - onp).max(0.0);
                 }
                 self.node_regret.borrow_mut()[node] += node_reg;
+                // aggregated per-action cv (sum over buckets+valid hands) — only
+                // the evaluee-0 pass is inspected, overwrite is fine.
+                let agg: Vec<f32> = (0..na).map(|a| (0..self.nb).map(|b| sum_ab[a][b]).sum()).collect();
+                self.node_action_cv.borrow_mut()[node] = agg;
                 for &h in &self.valid {
                     let b = map[h] as usize;
                     if b >= self.nb { continue; }
@@ -677,12 +684,21 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
     idx.sort_by(|&a, &b| nr[b].partial_cmp(&nr[a]).unwrap());
     println!("\nFLOOR LOCALIZATION (converged DCFR) — top one-step-regret nodes:");
     println!("(if concentrated at a node TYPE — street/terminal-adjacent/na — that's the bug locus)");
-    for &node in idx.iter().take(12) {
+    let acv = anchor.node_action_cv.borrow();
+    for &node in idx.iter().take(10) {
         let n = &g.tree.nodes[node];
-        let term_adj = g.tree.node_children(node).iter().any(|&c| g.tree.nodes[c as usize].is_terminal());
         let labels: Vec<u8> = g.tree.node_children(node).iter().map(|&c| g.tree.nodes[c as usize].action_label).collect();
-        println!("  node {node:>6}: regret {:>10.4e} | street {} | player {} | labels {labels:?} | term-adj {term_adj}",
-            nr[node], n.board_state, n.player_id);
+        // per-action cv + which child is a terminal (fold→forfeit) with its contribs.
+        let kids = g.tree.node_children(node);
+        let kid_info: Vec<String> = kids.iter().map(|&c| {
+            let cn = &g.tree.nodes[c as usize];
+            if cn.is_terminal() {
+                format!("T(c_p{}={})", n.player_id, g.tree.get_contribution(c as usize, n.player_id))
+            } else { "·".into() }
+        }).collect();
+        let cv: Vec<String> = acv[node].iter().map(|v| format!("{v:+.2e}")).collect();
+        println!("  node {node:>6} street {} p{} labels {labels:?}: cv [{}] kids [{}]",
+            n.board_state, n.player_id, cv.join(", "), kid_info.join(", "));
     }
     let nonzero: usize = nr.iter().filter(|&&r| r > 1e-3).count();
     println!("  ({nonzero} nodes with regret > 1e-3; total = {:.4e})", nr.iter().sum::<f32>());
