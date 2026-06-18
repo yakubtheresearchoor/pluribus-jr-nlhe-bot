@@ -189,8 +189,8 @@ pub fn bucketed_showdown_cfv(
     // np = 2 stays out of scope (HU sweep is the production path and
     // exact HU is genuinely cheap).
     assert!(
-        np >= 3,
-        "bucketed_showdown_cfv: np = {np} < 3 (HU stays on the exact sweep path)"
+        np >= 2,
+        "bucketed_showdown_cfv: np = {np} < 2"
     );
     assert!(num_opp == np - 1, "one reach slice per opponent slot");
     assert!(num_opp <= MAX_OPP);
@@ -601,7 +601,7 @@ pub fn bucketed_showdown_cfv_design1_collapsed(
 
     // np ≥ 3 since 2026-06-12 (same scope extension as Design 1 brute;
     // see the scope comment there + np3_bucketed_terminal_gate).
-    assert!(np >= 3, "design1_collapsed: np ≥ 3 (HU stays exact)");
+    assert!(np >= 2, "design1_collapsed: np ≥ 2 (HU absorbed into the bucketed engine for the unified-engine probe; validated by the np=2 identity gate)");
     assert!(num_opp == np - 1);
     assert!(num_opp <= MAX_OPP);
 
