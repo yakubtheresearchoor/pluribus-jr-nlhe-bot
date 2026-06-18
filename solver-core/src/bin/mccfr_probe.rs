@@ -869,8 +869,11 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
         println!("{:>10} {:>18}", "traj", "true-BR exploit");
         let batch = 8192usize;
         let mut total = 0usize;
+        let mut run_secs = 0.0f64; // time spent in run_iter only (NOT the anchor evals)
         for &target in &[8192usize, 65536, 262144, 1048576, 4194304] {
+            let t_run = Instant::now();
             while total < target { m.run_iter(&g.tree, batch); total += batch; }
+            run_secs += t_run.elapsed().as_secs_f64();
             let mut sigma = vec![0.0f32; nn * MAX_NA_POSTFLOP * nb_a];
             for node in 0..nn {
                 if !g.tree.nodes[node].is_player() { continue; }
@@ -903,8 +906,9 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
             // (the per-trajectory compute saved). 0 when MC_PRUNE is off.
             let total_actions = m.pruned_nodes + m.visited_nodes;
             let prune_frac = if total_actions > 0 { m.pruned_nodes as f64 / total_actions as f64 } else { 0.0 };
-            println!("{total:>10} {expl:>18.5e}   maxR/T {:>10.4e}  prune_frac {:>7.4}",
-                maxr as f64 / total as f64, prune_frac);
+            let us_traj = run_secs / total as f64 * 1e6; // decoupled MCCFR µs/traj
+            println!("{total:>10} {expl:>18.5e}   maxR/T {:>10.4e}  prune_frac {:>7.4}  µs/traj {:>7.3}",
+                maxr as f64 / total as f64, prune_frac, us_traj);
         }
         return;
     }
