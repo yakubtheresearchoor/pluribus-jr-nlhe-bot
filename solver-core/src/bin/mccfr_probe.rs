@@ -75,6 +75,40 @@ pub fn build_shrunk(live: u8, nb: usize, nt: usize, nr: usize) -> ShrunkGame {
 // convergence anchor + the garbage check are the explicitly-next milestone,
 // so the convergence/quality of this engine is NOT yet trusted.
 // ─────────────────────────────────────────────────────────────────────
+/// Pluribus negative-regret ("deep") pruning config — Brown & Sandholm 2019,
+/// Science Supplement, Algorithm 1 (MCCFR with Negative-Regret Pruning).
+/// VERBATIM PARAMS (absolute, Pluribus-scale): prune traverser actions with
+/// regret < -300,000,000 AND their whole subtree, in 95% of iters, EXCEPT the
+/// last betting round and actions immediately leading to a terminal; regret
+/// floor -310,000,000 (below the prune threshold so pruned actions can recover);
+/// warm-up before pruning starts; Linear-CFR discount d=(t/DI)/(t/DI+1) for
+/// t<LCFR_Threshold. The absolute -300M/-310M are tuned to Pluribus's regret
+/// magnitude (trillions of iters); they do NOT transfer to the shrunk game
+/// (measured max|regret| ~1e6 here), so we carry them as game-scaled knobs and
+/// SWEEP the threshold (it trades the speed and the quality being measured) —
+/// per the convergence-measurement discipline. NOT yet wired into the traversal;
+/// recorded so the convergence runs match Pluribus exactly, not from memory.
+#[derive(Clone, Copy)]
+struct PruneConfig {
+    /// prune threshold C (game-scaled; default a multiple of the regret scale).
+    c: f32,
+    /// regret floor (must be < c so pruned actions can climb back to un-prune).
+    floor: f32,
+    /// probability an iteration prunes (Pluribus: 0.95).
+    prune_prob: f32,
+    /// iterations of warm-up before pruning engages.
+    warmup: u32,
+    /// never prune on the final betting round or terminal-adjacent actions.
+    protect_last_round: bool,
+}
+
+impl Default for PruneConfig {
+    fn default() -> Self {
+        // Defaults scaled to the shrunk game's regret magnitude; SWEEP c.
+        PruneConfig { c: -3.0e5, floor: -3.1e5, prune_prob: 0.95, warmup: 0, protect_last_round: true }
+    }
+}
+
 struct Mccfr {
     node_local: Vec<i32>, // [nn], dense player-node index or -1
     n_info: usize,
