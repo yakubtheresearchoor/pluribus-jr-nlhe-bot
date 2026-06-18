@@ -155,6 +155,18 @@ struct Mccfr {
     turn_card: u8,
     river_card: u8,
     rng: u64,
+    // Pluribus pruning (MC_PRUNE): in prune_prob of trajectories, skip traverser
+    // actions whose cumulative regret ≤ prune_c (CFR+ floors bad actions to 0, so
+    // ≤0 captures the negative-regret-pruning effect) and their subtrees — the
+    // compute saving. 5% full traversal lets pruned actions recover; the last
+    // betting round (river) is never pruned; warmup before pruning engages.
+    prune: bool,
+    prune_c: f32,
+    prune_warmup: u64,
+    iter: u64,
+    prune_this: bool,
+    pruned_nodes: u64, // diagnostics: subtrees skipped (compute saved)
+    visited_nodes: u64,
 }
 
 impl Mccfr {
@@ -205,6 +217,13 @@ impl Mccfr {
             turn_card: table.remaining_deck[0],
             river_card: table.river_decks[table.remaining_deck[0] as usize][0],
             rng: 0x9E3779B97F4A7C15,
+            prune: std::env::var("MC_PRUNE").is_ok(),
+            prune_c: std::env::var("MC_PRUNE_C").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            prune_warmup: std::env::var("MC_PRUNE_WARMUP").ok().and_then(|s| s.parse().ok()).unwrap_or(100_000),
+            iter: 0,
+            prune_this: false,
+            pruned_nodes: 0,
+            visited_nodes: 0,
         }
     }
 
@@ -314,16 +333,30 @@ impl Mccfr {
         let mut strat = [0.0f32; 16];
         self.strategy(local, bucket, na, &mut strat[..na]);
         if player == traverser {
+            let base = (local * self.nb + bucket) * self.max_na;
+            // PLURIBUS PRUNING: in a prune trajectory, skip the subtrees of actions
+            // whose cumulative regret ≤ prune_c (≈0-probability under regret-match,
+            // CFR+ floors bad actions to 0). Protect the last betting round (river):
+            // never prune there. Skipped actions contribute ≈0 to v (strat≈0) so the
+            // value is ≈unbiased; the saving is the un-recursed subtree.
+            let river = solver_core::tree::action::BoardState::River as u8;
+            let prunable = self.prune_this && bs != river;
             let mut cv = [0.0f32; 16];
             let mut v = 0.0f32;
+            let mut pruned = [false; 16];
             for a in 0..na {
+                if prunable && self.regret[base + a] <= self.prune_c {
+                    pruned[a] = true; // skip subtree
+                    self.pruned_nodes += 1;
+                    continue;
+                }
+                self.visited_nodes += 1;
                 cv[a] = self.traverse(tree, kids[a] as usize, traverser, hands);
                 v += strat[a] * cv[a];
             }
-            let base = (local * self.nb + bucket) * self.max_na;
             for a in 0..na {
-                // CFR+: floor cumulative regret at 0 (converges far faster than
-                // vanilla, which let regrets drift and the average stay ~uniform).
+                if pruned[a] { continue; } // pruned actions: regret/cum unchanged this traj
+                // CFR+: floor cumulative regret at 0.
                 self.regret[base + a] = (self.regret[base + a] + cv[a] - v).max(0.0);
                 self.cum[base + a] += strat[a];
             }
@@ -436,6 +469,13 @@ impl Mccfr {
 
     fn run_iter(&mut self, tree: &FlatTree, batch: usize) {
         for b in 0..batch {
+            self.iter += 1;
+            // Pluribus 95/5: this trajectory prunes iff pruning is on, past warmup,
+            // and a 95% coin lands. The 5% full-traversal trajectories let pruned
+            // actions recover (get explored + regret-updated).
+            self.prune_this = self.prune
+                && self.iter > self.prune_warmup
+                && (self.rand() as f64 / u64::MAX as f64) < 0.95;
             let traverser = b % self.np;
             let hands = self.sample_deal();
             self.traverse(tree, 0, traverser, &hands);
@@ -859,9 +899,12 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
             // maxR/T FLAT ⇒ regrets grow linearly ⇒ dynamics don't converge to any
             // equilibrium (terminal reconciliation would be premature).
             let maxr = m.regret.iter().cloned().fold(0.0f32, f32::max);
-            let meanr: f64 = m.regret.iter().map(|&r| r.max(0.0) as f64).sum::<f64>() / m.regret.len() as f64;
-            println!("{total:>10} {expl:>18.5e}   maxR {maxr:>11.3e}  maxR/T {:>10.4e}  meanR/T {:>10.4e}",
-                maxr as f64 / total as f64, meanr / total as f64);
+            // pruning diagnostics: fraction of traverser-action recursions skipped
+            // (the per-trajectory compute saved). 0 when MC_PRUNE is off.
+            let total_actions = m.pruned_nodes + m.visited_nodes;
+            let prune_frac = if total_actions > 0 { m.pruned_nodes as f64 / total_actions as f64 } else { 0.0 };
+            println!("{total:>10} {expl:>18.5e}   maxR/T {:>10.4e}  prune_frac {:>7.4}",
+                maxr as f64 / total as f64, prune_frac);
         }
         return;
     }
