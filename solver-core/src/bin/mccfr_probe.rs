@@ -774,7 +774,15 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
                 }
             }
             let expl = anchor.exploitability(&g.tree, &sigma, MAX_NA_POSTFLOP);
-            println!("{total:>10} {expl:>18.5e}");
+            // SELF-CONSISTENT convergence signal (the discriminator): the engine's
+            // own CFR+ regret bound. maxR/T → 0 ⇒ engine converges to SOME Nash by
+            // its OWN values (so a high anchor reading = terminal/value mismatch).
+            // maxR/T FLAT ⇒ regrets grow linearly ⇒ dynamics don't converge to any
+            // equilibrium (terminal reconciliation would be premature).
+            let maxr = m.regret.iter().cloned().fold(0.0f32, f32::max);
+            let meanr: f64 = m.regret.iter().map(|&r| r.max(0.0) as f64).sum::<f64>() / m.regret.len() as f64;
+            println!("{total:>10} {expl:>18.5e}   maxR {maxr:>11.3e}  maxR/T {:>10.4e}  meanR/T {:>10.4e}",
+                maxr as f64 / total as f64, meanr / total as f64);
         }
         return;
     }
