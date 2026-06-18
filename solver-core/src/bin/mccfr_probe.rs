@@ -18,13 +18,13 @@
 
 use std::time::Instant;
 
-use solver_core::abstraction::preflop_class::NUM_PREFLOP_CLASSES;
+use solver_core::abstraction::preflop_class::{PreflopClass, NUM_PREFLOP_CLASSES};
 use solver_core::card::Card;
 use solver_core::solver::bucketed_flop_cfr::{BucketedFlopCfr, FlopBucketing, TerminalDesign};
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::preflop_start_game::PreflopChanceTable;
 use solver_core::tree::action::{production_game_v1, BetCap, BetSize, BetSizeOptions};
-use solver_core::tree::builder::build_tree;
+use solver_core::tree::builder::{build_tree, build_tree_preflop_only};
 use solver_core::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
 
 /// The shrunk game for one live-count: small bucketed flop→river subgame on a
@@ -39,6 +39,12 @@ pub struct ShrunkGame {
 }
 
 pub fn build_shrunk(live: u8, nb: usize, nt: usize, nr: usize) -> ShrunkGame {
+    build_shrunk_cell(live, 2, 12, nb, nt, nr)
+}
+
+/// Build the shrunk postflop subgame for an explicit seam cell (commit/pot), so a
+/// connected solve can match the postflop subgame to the preflop line that enters it.
+pub fn build_shrunk_cell(live: u8, commit: i32, pot: i32, nb: usize, nt: usize, nr: usize) -> ShrunkGame {
     let spec = production_game_v1();
     // MC_REAL: the PRODUCTION action set — bet=pot, raise={0.5,1.0,...}pot (mrc =
     // MAX_NA_POSTFLOP-2), cap-3 (BetCap::all(3)). A bigger tree (re-raise sequences,
@@ -71,7 +77,7 @@ pub fn build_shrunk(live: u8, nb: usize, nt: usize, nr: usize) -> ShrunkGame {
         let rp: &[usize] = match nr { 1 => &[10], 2 => &[10, 30], _ => &[10] };
         river_decks[tc as usize] = rp.iter().map(|&p| rd[p]).collect();
     }
-    let mut cfg = spec.flop_seam_config(live, 2, 12, bets);
+    let mut cfg = spec.flop_seam_config(live, commit, pot, bets);
     if real { cfg.max_bets_per_street = BetCap::all(3); }
     let tree = build_tree(&cfg).unwrap();
     let table = FlopChanceTable::build_full_nh_sampled(canonical, live, &turns, &river_decks);
@@ -1061,7 +1067,349 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
     println!("  ({nonzero} nodes with regret > 1e-3; total = {:.4e})", nr.iter().sum::<f32>());
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// CONNECTED MCCFR (the probe the branch was NAMED for, finally run).
+// External-sampling MCCFR over the WHOLE game: preflop betting → flop deal →
+// postflop, ONE trajectory updating regret at BOTH the preflop (169-class)
+// infosets AND the postflop (bucket) infosets. This structurally AVOIDS the
+// DCFR co-solve's N×fill wall: the postflop subgame co-adapts with preflop along
+// sampled trajectories — there is no "re-solve every subgame to convergence each
+// preflop iteration". Pluribus pruning runs on BOTH layers.
+//
+// MILESTONE 1 (this): HU, a single fixed canonical flop, call/fold-only preflop
+// ⇒ ONE seam cell (both call → flop pot=4, commit=2; or SB folds → blinds). Real
+// cap-3 postflop. Gated by preflop-strength MONOTONICITY + postflop plateau
+// (NOT a full connected BR yet). Known reduction: single fixed runout (nt=nr=1)
+// makes turn/river-colliding holes die postflop — a clairvoyance-flavored artifact
+// shared with the subgame probe; used directionally, not as exact equity.
+// ─────────────────────────────────────────────────────────────────────
+struct ConnectedHu {
+    pre_tree: FlatTree,
+    pre_local: Vec<i32>, // [nn] preflop player-node → infoset idx, else -1
+    pre_max_na: usize,
+    pre_regret: Vec<f32>, // [pre_ninfo * NUM_PREFLOP_CLASSES * pre_max_na]
+    pre_cum: Vec<f32>,
+    post: Mccfr,           // postflop engine (one cell, fixed flop) — co-adapting
+    post_tree: FlatTree,
+    card_to_hand: Vec<i32>, // [52*52] (c1,c2)→postflop hand idx, -1 invalid
+    deck: Vec<u8>,          // 49 non-flop cards (the preflop deal pool)
+    rng: u64,
+    prune: bool,
+    prune_c: f32,
+    prune_warmup: u64,
+    iter: u64,
+    prune_this: bool,
+}
+
+impl ConnectedHu {
+    fn new(nb: usize) -> Self {
+        // HU postflop cell entered by both calling: commit=2 (1bb each), pot=4.
+        let g = build_shrunk_cell(2, 2, 4, nb, 1, 1);
+        let post_tree = g.tree.clone();
+        let post = Mccfr::new(&g);
+        // (c1,c2) → postflop hand index, both orders.
+        let mut card_to_hand = vec![-1i32; 52 * 52];
+        for (h, &(a, b)) in post.hand_cards.iter().enumerate() {
+            card_to_hand[a as usize * 52 + b as usize] = h as i32;
+            card_to_hand[b as usize * 52 + a as usize] = h as i32;
+        }
+        // The fixed flop = the 3 cards excluded from every valid hand. Recover it
+        // as the cards never appearing in any hand's 2-card combo.
+        let mut on_board = [true; 52];
+        for &(a, b) in &post.hand_cards {
+            on_board[a as usize] = false;
+            on_board[b as usize] = false;
+        }
+        // flop ∪ turn ∪ river are "never in a flop-live hand"; the preflop deal
+        // pool excludes the FLOP cards only (turn/river collide per-street in post).
+        // Conservative: exclude everything not appearing — the deal pool is the
+        // cards that DO appear in some hand (flop-compatible). That's exactly the
+        // hands' card support.
+        let deck: Vec<u8> = (0..52u8).filter(|&c| !on_board[c as usize]).collect();
+
+        // preflop HU tree: fold/call only (no raises) ⇒ single seam cell.
+        let mut spec = production_game_v1();
+        spec.num_players = 2; // HU
+        let bets = BetSizeOptions { bet: vec![], raise: vec![] };
+        let cfg = spec.preflop_tree_config(bets);
+        let pre_tree = build_tree_preflop_only(&cfg).expect("preflop HU tree");
+        let nn = pre_tree.num_nodes();
+        let mut pre_local = vec![-1i32; nn];
+        let mut pre_ninfo = 0usize;
+        let mut pre_max_na = 0usize;
+        for i in 0..nn {
+            if pre_tree.nodes[i].is_player() {
+                pre_local[i] = pre_ninfo as i32;
+                pre_ninfo += 1;
+                pre_max_na = pre_max_na.max(pre_tree.nodes[i].num_children as usize);
+            }
+        }
+        let stride = NUM_PREFLOP_CLASSES * pre_max_na.max(1);
+        ConnectedHu {
+            pre_tree,
+            pre_local,
+            pre_max_na: pre_max_na.max(1),
+            pre_regret: vec![0.0; pre_ninfo * stride],
+            pre_cum: vec![0.0; pre_ninfo * stride],
+            post,
+            post_tree,
+            card_to_hand,
+            deck,
+            rng: 0xD1B54A32D192ED03,
+            prune: std::env::var("MC_PRUNE").is_ok(),
+            prune_c: std::env::var("MC_PRUNE_C").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            prune_warmup: std::env::var("MC_PRUNE_WARMUP").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+            iter: 0,
+            prune_this: false,
+        }
+    }
+
+    #[inline]
+    fn rand(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    /// preflop regret-match into out[..na] for (infoset local, class).
+    fn pre_strategy(&self, local: usize, class: usize, na: usize, out: &mut [f32]) {
+        let base = (local * NUM_PREFLOP_CLASSES + class) * self.pre_max_na;
+        let mut sum = 0.0f32;
+        for a in 0..na {
+            let r = self.pre_regret[base + a].max(0.0);
+            out[a] = r;
+            sum += r;
+        }
+        if sum > 0.0 {
+            for a in 0..na {
+                out[a] /= sum;
+            }
+        } else {
+            let u = 1.0 / na as f32;
+            for a in 0..na {
+                out[a] = u;
+            }
+        }
+    }
+
+    /// Preflop fold terminal value for the traverser (HU uncontested; no rake — the
+    /// preflop has no flop-seen drop). Mirrors the postflop half_pot convention.
+    fn pre_terminal(&self, node: usize, traverser: usize) -> f32 {
+        let np = 2usize;
+        let fold_mask = self.pre_tree.get_folded_mask(node);
+        let contribs: Vec<i32> =
+            (0..np).map(|p| self.pre_tree.get_contribution(node, p as u8)).collect();
+        let half_pot = self.pre_tree.starting_pot as f32 / np as f32 + contribs[traverser] as f32;
+        if (fold_mask >> traverser) & 1 == 1 {
+            return -half_pot; // folded: forfeit own stake
+        }
+        let total: i32 = self.pre_tree.starting_pot + contribs.iter().sum::<i32>();
+        total as f32 - half_pot // uncontested win (opponent folded)
+    }
+
+    /// Connected external-sampling traverse over the preflop tree; at the flop-entry
+    /// chance leaf it recurses into the (co-adapting) postflop engine.
+    /// `class[p]` = preflop class index, `hand[p]` = postflop hand index.
+    fn traverse_pre(&mut self, node: usize, traverser: usize, class: &[usize], hand: &[usize]) -> f32 {
+        let n = &self.pre_tree.nodes[node];
+        if n.is_terminal() {
+            return self.pre_terminal(node, traverser);
+        }
+        if n.is_chance() {
+            // FLOP-ENTRY SEAM: recurse into the postflop subgame with this trajectory's
+            // concrete hands. Share the prune decision across the seam.
+            self.post.prune_this = self.prune_this;
+            return self.post.traverse(&self.post_tree, 0, traverser, hand);
+        }
+        let kids: Vec<u32> = self.pre_tree.node_children(node).to_vec();
+        let na = kids.len();
+        let player = n.player_id as usize;
+        let local = self.pre_local[node] as usize;
+        let cls = class[player];
+        let mut strat = [0.0f32; 16];
+        self.pre_strategy(local, cls, na, &mut strat[..na]);
+        if player == traverser {
+            let base = (local * NUM_PREFLOP_CLASSES + cls) * self.pre_max_na;
+            let mut cv = [0.0f32; 16];
+            let mut v = 0.0f32;
+            let mut pruned = [false; 16];
+            for a in 0..na {
+                if self.prune_this && self.pre_regret[base + a] <= self.prune_c {
+                    pruned[a] = true;
+                    continue;
+                }
+                cv[a] = self.traverse_pre(kids[a] as usize, traverser, class, hand);
+                v += strat[a] * cv[a];
+            }
+            for a in 0..na {
+                if pruned[a] {
+                    continue;
+                }
+                self.pre_regret[base + a] = (self.pre_regret[base + a] + cv[a] - v).max(0.0);
+                self.pre_cum[base + a] += strat[a];
+            }
+            v
+        } else {
+            // sample opponent action
+            let r = (self.rand() as f64 / u64::MAX as f64) as f32;
+            let mut acc = 0.0;
+            let mut a = na - 1;
+            for (i, &p) in strat[..na].iter().enumerate() {
+                acc += p;
+                if r <= acc {
+                    a = i;
+                    break;
+                }
+            }
+            self.traverse_pre(kids[a] as usize, traverser, class, hand)
+        }
+    }
+
+    /// Sample HU hole cards (4 distinct cards from the flop-compatible deck), return
+    /// per-player (preflop class, postflop hand index).
+    fn deal(&mut self) -> ([usize; 2], [usize; 2]) {
+        let nd = self.deck.len();
+        let mut used = [255u8; 4];
+        let mut cards = [0u8; 4];
+        let mut k = 0;
+        while k < 4 {
+            let idx = (self.rand() as usize) % nd;
+            let c = self.deck[idx];
+            if used[..k].iter().any(|&u| u == c) {
+                continue;
+            }
+            used[k] = c;
+            cards[k] = c;
+            k += 1;
+        }
+        let mut class = [0usize; 2];
+        let mut hand = [0usize; 2];
+        for p in 0..2 {
+            let (c1, c2) = (cards[2 * p], cards[2 * p + 1]);
+            class[p] = PreflopClass::from_combo(c1 as Card, c2 as Card).index();
+            hand[p] = self.card_to_hand[c1 as usize * 52 + c2 as usize] as usize;
+        }
+        (class, hand)
+    }
+
+    fn run_iter(&mut self, batch: usize) {
+        for b in 0..batch {
+            self.iter += 1;
+            self.prune_this = self.prune
+                && self.iter > self.prune_warmup
+                && (self.rand() as f64 / u64::MAX as f64) < 0.95;
+            let traverser = b % 2;
+            let (class, hand) = self.deal();
+            self.traverse_pre(0, traverser, &class, &hand);
+        }
+    }
+
+    /// The preflop fold/call DECISION node, detected structurally: the player node
+    /// that has a terminal child in which the acting player is folded. Returns
+    /// (node_idx, fold_action_idx).
+    fn fold_decision_node(&self) -> Option<(usize, usize)> {
+        for i in 0..self.pre_tree.num_nodes() {
+            let n = &self.pre_tree.nodes[i];
+            if !n.is_player() {
+                continue;
+            }
+            let actor = n.player_id;
+            let kids: Vec<u32> = self.pre_tree.node_children(i).to_vec();
+            for (a, &k) in kids.iter().enumerate() {
+                let kn = &self.pre_tree.nodes[k as usize];
+                if kn.is_terminal() && (self.pre_tree.get_folded_mask(k as usize) >> actor) & 1 == 1 {
+                    return Some((i, a));
+                }
+            }
+        }
+        None
+    }
+
+    /// preflop CALL (= non-fold) frequency for a given class at the fold/call node.
+    fn pre_call_freq(&self, class: usize) -> Option<f32> {
+        let (node, fold_a) = self.fold_decision_node()?;
+        let local = self.pre_local[node];
+        if local < 0 {
+            return None;
+        }
+        let na = self.pre_tree.nodes[node].num_children as usize;
+        let base = (local as usize * NUM_PREFLOP_CLASSES + class) * self.pre_max_na;
+        let sum: f32 = (0..na).map(|a| self.pre_cum[base + a]).sum();
+        if sum <= 0.0 {
+            return None;
+        }
+        Some(1.0 - self.pre_cum[base + fold_a] / sum)
+    }
+}
+
+fn connected_probe(nb: usize) {
+    let iters: usize = std::env::var("MC_CITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let batch: usize = std::env::var("MC_B").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let mut c = ConnectedHu::new(nb);
+    println!(
+        "CONNECTED MCCFR (HU, fixed flop, fold/call preflop, real cap-3 postflop, nb={nb})\n\
+         pruning={} prune_c={} | {iters}×{batch} traj batches\n",
+        c.prune, c.prune_c
+    );
+    println!("pre infosets={} (×{} classes), post infosets={}",
+        c.pre_local.iter().filter(|&&x| x >= 0).count(), NUM_PREFLOP_CLASSES,
+        c.post.n_info);
+    if std::env::var("MC_CDBG").is_ok() {
+        println!("\n-- preflop tree dump --");
+        for i in 0..c.pre_tree.num_nodes() {
+            let n = &c.pre_tree.nodes[i];
+            let kind = if n.is_terminal() { "TERM" } else if n.is_chance() { "CHANCE" } else { "PLAYER" };
+            let kids: Vec<u32> = c.pre_tree.node_children(i).to_vec();
+            let contribs: Vec<i32> = (0..2).map(|p| c.pre_tree.get_contribution(i, p as u8)).collect();
+            println!("  node {i}: {kind} player={} bs={} nkids={} fold_mask={:02b} contribs={:?} kids={:?}",
+                n.player_id, n.board_state, n.num_children, c.pre_tree.get_folded_mask(i), contribs, kids);
+        }
+        println!("-- end dump --\n");
+    }
+
+    // warm + timed run with periodic plateau read
+    let t0 = Instant::now();
+    let mut last_aa = 0.0f32;
+    for it in 0..iters {
+        c.run_iter(batch);
+        if it == iters / 4 || it == iters / 2 || it == iters - 1 {
+            let aa = c.pre_call_freq(PreflopClass::from_combo(48, 49).index()).unwrap_or(-1.0);
+            println!("  [{:>4}/{}] AA call-freq = {:.4} (Δ {:+.4})", it + 1, iters, aa, aa - last_aa);
+            last_aa = aa;
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let total_traj = (iters * batch) as f64;
+    println!("\nwall {:.2}s | {:.3} µs/traj | post pruned {} / visited {} ({:.0}% skipped)",
+        secs, secs / total_traj * 1e6, c.post.pruned_nodes, c.post.visited_nodes,
+        100.0 * c.post.pruned_nodes as f64 / (c.post.pruned_nodes + c.post.visited_nodes).max(1) as f64);
+
+    // MONOTONICITY GATE: call-freq should rise with hand strength.
+    println!("\nPREFLOP CALL-FREQ by class (monotonicity gate):");
+    let probes: [(&str, u8, u8); 7] = [
+        ("AA", 48, 49), ("KK", 44, 45), ("QQ", 40, 41),
+        ("AKs", 48, 44), ("87s", 24, 20), ("72o", 20, 0), ("32o", 4, 0),
+    ];
+    for (name, a, b) in probes {
+        let cl = PreflopClass::from_combo(a as Card, b as Card).index();
+        match c.pre_call_freq(cl) {
+            Some(f) => println!("  {name:<5} call={f:.4}"),
+            None => println!("  {name:<5} (unvisited)"),
+        }
+    }
+    println!("\nGATE: call-freq should be MONOTONE in strength (AA≥KK≥…≥72o) and AA call-freq should");
+    println!("PLATEAU (Δ→0). Caveat: single fixed runout ⇒ directional, not exact equity.");
+}
+
 fn main() {
+    if std::env::var("MC_CONNECTED").is_ok() {
+        let nb: usize = std::env::var("MC_NB").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+        connected_probe(nb);
+        return;
+    }
     let nb: usize = std::env::var("MC_NB").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
     let nt: usize = std::env::var("MC_NT").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let nr: usize = std::env::var("MC_NR").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
