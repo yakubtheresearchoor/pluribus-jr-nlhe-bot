@@ -69,12 +69,24 @@ pub fn build_shrunk_cell(live: u8, commit: i32, pot: i32, nb: usize, nt: usize, 
     let bm: u64 = canonical.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
     let deck: Vec<u8> = (0..52u8).filter(|c| bm & (1u64 << c) == 0).collect();
     // nt turn samples, nr river samples per turn (deterministic positions).
-    let tp: &[usize] = match nt { 1 => &[12], 2 => &[12, 36], _ => &[12] };
+    // Evenly-spaced distinct turns/rivers for arbitrary nt/nr (preserve the
+    // anchor-certified 1× and 2× positions exactly; general arm for runout sampling).
+    let nd = deck.len();
+    let tp: Vec<usize> = match nt {
+        1 => vec![12],
+        2 => vec![12, 36],
+        n => (0..n).map(|i| i * nd / n).collect(),
+    };
     let turns: Vec<Card> = tp.iter().map(|&p| deck[p]).collect();
     let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
     for &tc in &turns {
         let rd: Vec<u8> = deck.iter().copied().filter(|&c| c != tc).collect();
-        let rp: &[usize] = match nr { 1 => &[10], 2 => &[10, 30], _ => &[10] };
+        let nrd = rd.len();
+        let rp: Vec<usize> = match nr {
+            1 => vec![10],
+            2 => vec![10, 30],
+            n => (0..n).map(|j| j * nrd / n).collect(),
+        };
         river_decks[tc as usize] = rp.iter().map(|&p| rd[p]).collect();
     }
     let mut cfg = spec.flop_seam_config(live, commit, pot, bets);
@@ -152,14 +164,23 @@ struct Mccfr {
     regret: Vec<f32>, // [n_info * nb * max_na]
     cum: Vec<f32>,
     flop_b: Vec<u16>,
-    turn_b: Vec<u16>,
-    river_b: Vec<u16>,
-    tbl: solver_core::solver::bucketed_showdown::BucketedRunoutTables,
+    // FULL runout set (indexed by sampled turn/river outcome): turn_maps[ti],
+    // river_maps[ti][ri], river_tabs[ti][ri]. Single-runout (nt=nr=1) ⇒ len-1 vecs
+    // ⇒ behaviour identical to the prior fixed-runout engine (anchor-certified).
+    turn_maps: Vec<Vec<u16>>,
+    river_maps: Vec<Vec<Vec<u16>>>,
+    river_tabs: Vec<Vec<solver_core::solver::bucketed_showdown::BucketedRunoutTables>>,
+    remaining_deck: Vec<u8>,    // turn candidate cards (ti → card)
+    river_decks: Vec<Vec<u8>>,  // [turn_card] → river candidate cards (ri → card)
+    nh: usize,
+    // RUNOUT SAMPLING: each trajectory pre-samples one (turn,river) at deal time
+    // (chance is independent of betting ⇒ standard external sampling). All bucket/
+    // showdown lookups for the trajectory use (cur_ti, cur_ri).
+    cur_ti: usize,
+    cur_ri: usize,
     // valid hands (no board/runout conflict) + their 2 cards.
     hand_cards: Vec<(u8, u8)>,
     valid: Vec<usize>, // FLOP-live hands (deal set) — per-street death handled in traverse
-    turn_card: u8,
-    river_card: u8,
     rng: u64,
     // Pluribus pruning (MC_PRUNE): in prune_prob of trajectories, skip traverser
     // actions whose cumulative regret ≤ prune_c (CFR+ floors bad actions to 0, so
@@ -198,7 +219,6 @@ impl Mccfr {
             }
         }
         // tables + maps straight from the bucketing (identical game as DCFR).
-        let tbl = clone_tables(&g.bk.river_tables[0][0]);
         let nb = g.bk.nb_flop.max(g.bk.nb_turn).max(g.bk.nb_river);
         let table = g.game.table();
         let nh = table.num_valid;
@@ -222,13 +242,21 @@ impl Mccfr {
             regret: vec![0.0; n_info * nb * max_na],
             cum: vec![0.0; n_info * nb * max_na],
             flop_b: g.bk.flop_map.clone(),
-            turn_b: g.bk.turn_map[0].clone(),
-            river_b: g.bk.river_map[0][0].clone(),
-            tbl,
+            turn_maps: g.bk.turn_map.clone(),
+            river_maps: g.bk.river_map.clone(),
+            river_tabs: g
+                .bk
+                .river_tables
+                .iter()
+                .map(|rv| rv.iter().map(clone_tables).collect())
+                .collect(),
+            remaining_deck: table.remaining_deck.clone(),
+            river_decks: table.river_decks.clone(),
+            nh,
+            cur_ti: 0,
+            cur_ri: 0,
             hand_cards,
             valid,
-            turn_card: table.remaining_deck[0],
-            river_card: table.river_decks[table.remaining_deck[0] as usize][0],
             rng: 0x9E3779B97F4A7C15,
             prune: std::env::var("MC_PRUNE").is_ok(),
             prune_c: std::env::var("MC_PRUNE_C").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0),
@@ -246,16 +274,44 @@ impl Mccfr {
     /// hand is live at street `bs` iff it doesn't hold a board card dealt by then
     /// (flop already excluded at deal). Mirrors DCFR's per-street card removal.
     #[inline]
+    fn turn_card(&self) -> u8 {
+        self.remaining_deck[self.cur_ti]
+    }
+    #[inline]
+    fn river_card(&self) -> u8 {
+        self.river_decks[self.turn_card() as usize][self.cur_ri]
+    }
+
+    #[inline]
     fn alive(&self, hand: usize, bs: u8) -> bool {
         use solver_core::tree::action::BoardState;
         let (c1, c2) = self.hand_cards[hand];
-        if bs >= BoardState::Turn as u8 && (c1 == self.turn_card || c2 == self.turn_card) {
-            return false;
+        if bs >= BoardState::Turn as u8 {
+            let tc = self.turn_card();
+            if c1 == tc || c2 == tc {
+                return false;
+            }
         }
-        if bs >= BoardState::River as u8 && (c1 == self.river_card || c2 == self.river_card) {
-            return false;
+        if bs >= BoardState::River as u8 {
+            let rc = self.river_card();
+            if c1 == rc || c2 == rc {
+                return false;
+            }
         }
         true
+    }
+
+    /// Pre-sample this trajectory's runout (turn,river) uniformly over the in-table
+    /// outcomes. nt=nr=1 ⇒ always (0,0). Hands colliding with the sampled board die
+    /// per-street via `alive` (matches the fixed-runout convention the anchor certified;
+    /// validated against DCFR on the identical table).
+    #[inline]
+    fn sample_runout(&mut self) {
+        let nt = self.remaining_deck.len();
+        self.cur_ti = (self.rand() as usize) % nt;
+        let tc = self.remaining_deck[self.cur_ti] as usize;
+        let nr = self.river_decks[tc].len();
+        self.cur_ri = (self.rand() as usize) % nr;
     }
 
     #[inline]
@@ -272,12 +328,12 @@ impl Mccfr {
     #[inline]
     fn bucket_of(&self, board_state: u8, hand: usize) -> usize {
         use solver_core::tree::action::BoardState;
-        let m = if board_state == BoardState::Flop as u8 {
+        let m: &[u16] = if board_state == BoardState::Flop as u8 {
             &self.flop_b
         } else if board_state == BoardState::Turn as u8 {
-            &self.turn_b
+            &self.turn_maps[self.cur_ti]
         } else {
-            &self.river_b
+            &self.river_maps[self.cur_ti][self.cur_ri]
         };
         m[hand] as usize
     }
@@ -303,8 +359,10 @@ impl Mccfr {
         }
     }
 
-    /// Sample one distinct hand per player (no shared cards), valid for the runout.
+    /// Sample one distinct hand per player (no shared cards), and pre-sample the
+    /// trajectory's runout.
     fn sample_deal(&mut self) -> Vec<usize> {
+        self.sample_runout();
         let nv = self.valid.len();
         let mut hands = vec![0usize; self.np];
         let mut used: u64 = 0;
@@ -460,17 +518,20 @@ impl Mccfr {
             // everyone else folded → traverser wins the whole pot uncontested.
             return net_pot - half_pot;
         }
-        // showdown: per-tuple DP over the SAMPLED opponent river buckets.
-        let nb = self.tbl.nb; // river table stride
-        let bt = self.river_b[hands[traverser]] as usize;
+        // showdown: per-tuple DP over the SAMPLED opponent river buckets, on this
+        // trajectory's sampled runout (cur_ti, cur_ri).
+        let tbl = &self.river_tabs[self.cur_ti][self.cur_ri];
+        let river_b = &self.river_maps[self.cur_ti][self.cur_ri];
+        let nb = tbl.nb; // river table stride
+        let bt = river_b[hands[traverser]] as usize;
         // state-carrying (beaten, ties) DP, ONE tuple.
         let mut state = vec![0.0f32; np + 2];
         state[1] = 1.0;
         for &op in &active_opp {
-            let bo = self.river_b[hands[op]] as usize;
+            let bo = river_b[hands[op]] as usize;
             let i = bt * nb + bo;
-            let (fw, ft, fl) = (self.tbl.f_w[i], self.tbl.f_t[i], self.tbl.f_l[i]);
-            let fn_ = self.tbl.f_n[i];
+            let (fw, ft, fl) = (tbl.f_w[i], tbl.f_t[i], tbl.f_l[i]);
+            let fn_ = tbl.f_n[i];
             let norm = if fn_ > 0.0 { fn_ } else { 1.0 };
             let (pw, pt, pl) = (fw / norm, ft / norm, fl / norm); // condition on compatible
             let mut ns = vec![0.0f32; np + 2];
@@ -1104,7 +1165,10 @@ struct ConnectedHu {
 impl ConnectedHu {
     fn new(nb: usize) -> Self {
         // HU postflop cell entered by both calling: commit=2 (1bb each), pot=4.
-        let g = build_shrunk_cell(2, 2, 4, nb, 1, 1);
+        // Runout sampled (MC_NT turns × MC_NR rivers) to de-clairvoyant the showdown.
+        let nt: usize = std::env::var("MC_NT").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        let nr: usize = std::env::var("MC_NR").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        let g = build_shrunk_cell(2, 2, 4, nb, nt, nr);
         let post_tree = g.tree.clone();
         let post = Mccfr::new(&g);
         // (c1,c2) → postflop hand index, both orders.
@@ -1302,6 +1366,7 @@ impl ConnectedHu {
                 && self.iter > self.prune_warmup
                 && (self.rand() as f64 / u64::MAX as f64) < 0.95;
             let traverser = b % 2;
+            self.post.sample_runout(); // sample this trajectory's turn+river
             let (class, hand) = self.deal();
             self.traverse_pre(0, traverser, &class, &hand);
         }
@@ -1357,6 +1422,17 @@ fn connected_probe(nb: usize) {
     println!("pre infosets={} (×{} classes), post infosets={}",
         c.pre_local.iter().filter(|&&x| x >= 0).count(), NUM_PREFLOP_CLASSES,
         c.post.n_info);
+    {
+        // fixed flop = the 3 cards in no flop-live hand (complement of the deal deck).
+        let in_deck = |x: u8| c.deck.contains(&x);
+        let flop: Vec<u8> = (0..52u8).filter(|&x| !in_deck(x)).collect();
+        let rc = ['2','3','4','5','6','7','8','9','T','J','Q','K','A'];
+        let sc = ['c','d','h','s'];
+        let s: Vec<String> = flop.iter().map(|&x| format!("{}{}", rc[(x/4) as usize], sc[(x%4) as usize])).collect();
+        println!("FIXED FLOP: {:?} (cards {:?})  [runout sampled {}×{}]",
+            s, flop, c.post.remaining_deck.len(),
+            c.post.river_decks.iter().map(|v| v.len()).max().unwrap_or(0));
+    }
     if std::env::var("MC_CDBG").is_ok() {
         println!("\n-- preflop tree dump --");
         for i in 0..c.pre_tree.num_nodes() {
