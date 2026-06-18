@@ -1952,6 +1952,50 @@ impl BucketedFlopCfr {
     pub fn max_river_outcomes(&self) -> usize { self.max_n_river }
     pub fn regrets_flop(&self) -> &[f32] { &self.regrets_flop }
     pub fn cum_strategy_flop(&self) -> &[f32] { &self.cum_strategy_flop }
+    /// READ-ONLY (does not touch the solve): the time-average strategy in a
+    /// canonical node-major layout `[node * MAX_NA_POSTFLOP * nb + a * nb + b]`,
+    /// normalized per (node, bucket). For the single 1×1 runout (tc=rc=0). Used
+    /// by the mccfr-cosolve-probe true-BR exploitability anchor so it can consume
+    /// the EXACT DCFR strategy and the MCCFR strategy through one interface.
+    pub fn average_strategy_canonical(&self, tree: &FlatTree, bk: &FlopBucketing) -> Vec<f32> {
+        let nb = bk.nb_flop.max(bk.nb_turn).max(bk.nb_river);
+        let nn = tree.num_nodes();
+        let mut out = vec![0.0f32; nn * MAX_NA_POSTFLOP * nb];
+        for &nid in &tree.decision_node_ids {
+            let idx = nid as usize;
+            let na = tree.nodes[idx].num_children as usize;
+            let (cum, off): (&[f32], usize) = match self.zones[idx] {
+                Zone::Flop => {
+                    let l = self.flop_local_offset[idx];
+                    if l == UNUSED { continue; }
+                    (&self.cum_strategy_flop, l * MAX_NA_POSTFLOP * nb)
+                }
+                Zone::Turn => {
+                    let l = self.turn_local_offset[idx];
+                    if l == UNUSED { continue; }
+                    (&self.cum_strategy_turn, l * MAX_NA_POSTFLOP * nb)
+                }
+                Zone::River => {
+                    let l = self.river_local_offset[idx];
+                    if l == UNUSED { continue; }
+                    (&self.cum_strategy_river, l * MAX_NA_POSTFLOP * nb)
+                }
+                _ => continue,
+            };
+            let dst = idx * MAX_NA_POSTFLOP * nb;
+            for b in 0..nb {
+                let s: f32 = (0..na).map(|a| cum[off + a * nb + b].max(0.0)).sum();
+                for a in 0..na {
+                    out[dst + a * nb + b] = if s > 0.0 {
+                        cum[off + a * nb + b].max(0.0) / s
+                    } else {
+                        1.0 / na as f32
+                    };
+                }
+            }
+        }
+        out
+    }
     pub fn regrets_turn(&self) -> &[f32] { &self.regrets_turn }
     pub fn cum_strategy_turn(&self) -> &[f32] { &self.cum_strategy_turn }
     pub fn regrets_river(&self) -> &[f32] { &self.regrets_river }
