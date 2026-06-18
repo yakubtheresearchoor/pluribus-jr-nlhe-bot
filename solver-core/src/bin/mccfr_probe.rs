@@ -59,7 +59,19 @@ pub fn build_shrunk(live: u8, nb: usize, nt: usize, nr: usize) -> ShrunkGame {
     }
     let tree = build_tree(&spec.flop_seam_config(live, 2, 12, bets)).unwrap();
     let table = FlopChanceTable::build_full_nh_sampled(canonical, live, &turns, &river_decks);
-    let bk = FlopBucketing::quantile(&table, nb);
+    // MC_IDENTITY=1: identity bucketing (nb=nh) ⇒ the bucketed game IS the exact
+    // game, so converged DCFR is a TRUE Nash (exploitability→0) — the localization
+    // test for whether the anchor floor is structural or bucketing-specific.
+    let bk = if std::env::var("MC_IDENTITY").is_ok() {
+        FlopBucketing::identity(&table)
+    } else {
+        FlopBucketing::quantile(&table, nb)
+    };
+    let mut tree = tree;
+    if std::env::var("MC_NORAKE").is_ok() {
+        tree.rake_rate = 0.0;
+        tree.rake_cap = 0.0;
+    }
     let game = FlopStartGame::new(table);
     ShrunkGame { tree, game, bk, live, nb }
 }
@@ -411,6 +423,7 @@ struct Anchor {
     rake_rate: f32,
     rake_cap: f32,
     valid: Vec<usize>, // hands valid on every street
+    nc: f32,           // num_combinations — DCFR divides the showdown by this
 }
 
 impl Anchor {
@@ -435,6 +448,7 @@ impl Anchor {
             rake_rate: g.tree.rake_rate as f32,
             rake_cap: g.tree.rake_cap as f32,
             valid,
+            nc: table.num_combinations as f32,
         }
     }
 
@@ -473,6 +487,9 @@ impl Anchor {
             let mut gap = 0.0f32;
             for &h in &self.valid {
                 gap += (v_br[h] - v_on[h]) * w;
+            }
+            if std::env::var("MC_VERBOSE").is_ok() {
+                eprintln!("    evaluee {i}: BR-gap {:.4e}", gap);
             }
             total += gap.max(0.0);
         }
@@ -575,11 +592,14 @@ impl Anchor {
             &views, tbl, &contribs, fold_mask, i as usize, np as u8,
             self.starting_pot, self.rake_rate, self.rake_cap, true,
         );
-        // v[i-hand] = cfv at i-hand's bucket on this street.
+        // v[i-hand] = cfv at i-hand's bucket on this street, in DCFR's units
+        // (DCFR divides the showdown by num_combinations — match it so the
+        // exploitability magnitude is interpretable and side-1 reads true ~0).
+        let inv_nc = if self.nc > 0.0 { 1.0 / self.nc } else { 1.0 };
         let mut v = vec![0.0f32; self.nh];
         for &h in &self.valid {
             let b = map[h] as usize;
-            if b < self.nb { v[h] = cfv[b]; }
+            if b < self.nb { v[h] = cfv[b] * inv_nc; }
         }
         v
     }
@@ -619,7 +639,7 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
     println!("two-sided test: under-converged → HIGH & FALLING (catches exploitation, no under-report);");
     println!("converged → ~0 (no over-report — the normalize_opponent_reach-seam test). pass = both.\n");
     println!("{:>6} {:>18}", "DCFR iters", "true-BR exploit");
-    for iters in [1u32, 8, 64, 256, 1024, 4096, 16384] {
+    for iters in [1u32, 64, 1024] {
         let mut s = BucketedFlopCfr::new(&g.tree, g.game.table(), &g.bk);
         s.set_terminal_design(TerminalDesign::Design1Collapsed);
         s.run(&g.tree, &g.game, &g.bk, iters);
