@@ -381,6 +381,210 @@ fn clone_tables(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// TRUE best-response exploitability anchor (step 3). EXACT, full-tree,
+// re-optimizing the deviation at every evaluee node (NOT one-step CFV reads —
+// one-step is blind to chained pruning holes). Models DCFR's bucketed game BY
+// CONSTRUCTION: per-hand reach with σ read via the bucket map (matching
+// propagate_player_reach), the bucketed showdown at terminals. The opponents'
+// counterfactual reach is computed ONCE per evaluee and SHARED between the BR
+// and on-policy passes, so the gap is a consistent exploitability regardless of
+// the absolute normalization — taming the normalize_opponent_reach seam.
+// MULTIWAY (live≥3) only here (bucketed_showdown_cfv asserts np≥3); live-2 (the
+// 6-max two-handed SUBGAME) folds in later via the exact HU showdown.
+// VALIDATION (two-sided, the acceptance test): converged DCFR must read ~0
+// (no over-report — the normalization-seam test) AND under-converged DCFR must
+// read HIGH-and-FALLING (catches real exploitation — no under-report).
+// ─────────────────────────────────────────────────────────────────────
+struct Anchor {
+    nb: usize,
+    np: usize,
+    nh: usize,
+    // per-street hand→bucket maps for the 1×1 runout.
+    fmap: Vec<u16>,
+    tmap: Vec<u16>,
+    rmap: Vec<u16>,
+    ftbl: solver_core::solver::bucketed_showdown::BucketedRunoutTables,
+    ttbl: solver_core::solver::bucketed_showdown::BucketedRunoutTables,
+    rtbl: solver_core::solver::bucketed_showdown::BucketedRunoutTables,
+    starting_pot: i32,
+    rake_rate: f32,
+    rake_cap: f32,
+    valid: Vec<usize>, // hands valid on every street
+}
+
+impl Anchor {
+    fn new(g: &ShrunkGame) -> Self {
+        let table = g.game.table();
+        let nh = table.num_valid;
+        let no = u16::MAX;
+        let valid: Vec<usize> = (0..nh)
+            .filter(|&h| g.bk.flop_map[h] != no && g.bk.turn_map[0][h] != no && g.bk.river_map[0][0][h] != no)
+            .collect();
+        Anchor {
+            nb: g.bk.nb_flop.max(g.bk.nb_turn).max(g.bk.nb_river),
+            np: g.live as usize,
+            nh,
+            fmap: g.bk.flop_map.clone(),
+            tmap: g.bk.turn_map[0].clone(),
+            rmap: g.bk.river_map[0][0].clone(),
+            ftbl: clone_tables(&g.bk.flop_tables),
+            ttbl: clone_tables(&g.bk.turn_tables[0]),
+            rtbl: clone_tables(&g.bk.river_tables[0][0]),
+            starting_pot: g.tree.starting_pot,
+            rake_rate: g.tree.rake_rate as f32,
+            rake_cap: g.tree.rake_cap as f32,
+            valid,
+        }
+    }
+
+    #[inline]
+    fn street_map(&self, bs: u8) -> &[u16] {
+        use solver_core::tree::action::BoardState;
+        if bs == BoardState::Flop as u8 { &self.fmap }
+        else if bs == BoardState::Turn as u8 { &self.tmap }
+        else { &self.rmap }
+    }
+    #[inline]
+    fn street_tbl(&self, bs: u8) -> &solver_core::solver::bucketed_showdown::BucketedRunoutTables {
+        use solver_core::tree::action::BoardState;
+        if bs == BoardState::Flop as u8 { &self.ftbl }
+        else if bs == BoardState::Turn as u8 { &self.ttbl }
+        else { &self.rtbl }
+    }
+
+    /// total exploitability = Σ_i (BR_i − onpolicy_i), σ in canonical
+    /// node-major layout [node*MAX_NA*nb + a*nb + b] (MAX_NA = max_na arg).
+    fn exploitability(&self, tree: &FlatTree, sigma: &[f32], max_na: usize) -> f32 {
+        let mut total = 0.0f32;
+        for i in 0..self.np {
+            // opponents' counterfactual reach at the root: sum-1 per opponent
+            // over valid hands (i's slot carried but unused for the gap).
+            let w = 1.0 / self.valid.len() as f32;
+            let mut reach = vec![vec![0.0f32; self.nh]; self.np];
+            for p in 0..self.np {
+                for &h in &self.valid {
+                    reach[p][h] = w;
+                }
+            }
+            let v_br = self.walk(tree, 0, i as u8, true, sigma, max_na, &reach);
+            let v_on = self.walk(tree, 0, i as u8, false, sigma, max_na, &reach);
+            // V_i = mean over valid i-hands (uniform prior).
+            let mut gap = 0.0f32;
+            for &h in &self.valid {
+                gap += (v_br[h] - v_on[h]) * w;
+            }
+            total += gap.max(0.0);
+        }
+        total
+    }
+
+    fn walk(&self, tree: &FlatTree, node: usize, i: u8, br: bool, sigma: &[f32], max_na: usize, reach: &[Vec<f32>]) -> Vec<f32> {
+        let n = &tree.nodes[node];
+        if n.is_terminal() {
+            return self.terminal(tree, node, i, reach);
+        }
+        let kids: Vec<u32> = tree.node_children(node).to_vec();
+        if n.is_chance() {
+            // 1×1: single child; remove hands conflicting the dealt card. The
+            // hand identity persists (no bucket-transition matrix). Card-removal
+            // is captured by the next street's map (NO_BUCKET handled at showdown
+            // + here we simply carry reach forward — the map zeroes conflicts).
+            return self.walk(tree, kids[0] as usize, i, br, sigma, max_na, reach);
+        }
+        let player = n.player_id;
+        let na = kids.len();
+        let bs = n.board_state;
+        let map = self.street_map(bs);
+        let off = node * max_na * self.nb;
+        if player == i {
+            let cvs: Vec<Vec<f32>> =
+                kids.iter().map(|&c| self.walk(tree, c as usize, i, br, sigma, max_na, reach)).collect();
+            let mut v = vec![0.0f32; self.nh];
+            if br {
+                // per-bucket argmax (uniform prior over hands in the bucket).
+                let mut best_a = vec![0usize; self.nb];
+                let mut best_v = vec![f32::NEG_INFINITY; self.nb];
+                let mut sum = vec![vec![0.0f32; self.nb]; na];
+                for &h in &self.valid {
+                    let b = map[h] as usize;
+                    if b >= self.nb { continue; }
+                    for a in 0..na { sum[a][b] += cvs[a][h]; }
+                }
+                for b in 0..self.nb {
+                    for a in 0..na {
+                        if sum[a][b] > best_v[b] { best_v[b] = sum[a][b]; best_a[b] = a; }
+                    }
+                }
+                for &h in &self.valid {
+                    let b = map[h] as usize;
+                    if b >= self.nb { continue; }
+                    v[h] = cvs[best_a[b]][h];
+                }
+            } else {
+                for &h in &self.valid {
+                    let b = map[h] as usize;
+                    if b >= self.nb { continue; }
+                    let mut acc = 0.0;
+                    for a in 0..na { acc += sigma[off + a * self.nb + b] * cvs[a][h]; }
+                    v[h] = acc;
+                }
+            }
+            v
+        } else {
+            // opponent: split this opponent's reach by σ into each child, recurse,
+            // SUM the evaluee values (factored convention — reach carries σ).
+            let p = player as usize;
+            let mut v = vec![0.0f32; self.nh];
+            for a in 0..na {
+                let mut r2 = reach.to_vec();
+                for &h in &self.valid {
+                    let b = map[h] as usize;
+                    if b >= self.nb { r2[p][h] = 0.0; }
+                    else { r2[p][h] *= sigma[off + a * self.nb + b]; }
+                }
+                let cv = self.walk(tree, kids[a] as usize, i, br, sigma, max_na, &r2);
+                for &h in &self.valid { v[h] += cv[h]; }
+            }
+            v
+        }
+    }
+
+    /// evaluee value per i-hand at a terminal via the bucketed showdown.
+    fn terminal(&self, tree: &FlatTree, node: usize, i: u8, reach: &[Vec<f32>]) -> Vec<f32> {
+        use solver_core::solver::bucketed_showdown::bucketed_showdown_cfv_design1_collapsed;
+        let bs = tree.nodes[node].board_state;
+        let map = self.street_map(bs);
+        let tbl = self.street_tbl(bs);
+        let fold_mask = tree.get_folded_mask(node);
+        let np = self.np;
+        // opponents' bucket reach (all p≠i), reduced from hand reach.
+        let mut bucket_reach: Vec<Vec<f32>> = vec![vec![0.0f32; self.nb]; np - 1];
+        let mut oi = 0;
+        for p in 0..np {
+            if p == i as usize { continue; }
+            for &h in &self.valid {
+                let b = map[h] as usize;
+                if b < self.nb { bucket_reach[oi][b] += reach[p][h]; }
+            }
+            oi += 1;
+        }
+        let views: Vec<&[f32]> = bucket_reach.iter().map(|v| v.as_slice()).collect();
+        let contribs: Vec<i32> = (0..np).map(|p| tree.get_contribution(node, p as u8)).collect();
+        let cfv = bucketed_showdown_cfv_design1_collapsed(
+            &views, tbl, &contribs, fold_mask, i as usize, np as u8,
+            self.starting_pot, self.rake_rate, self.rake_cap, true,
+        );
+        // v[i-hand] = cfv at i-hand's bucket on this street.
+        let mut v = vec![0.0f32; self.nh];
+        for &h in &self.valid {
+            let b = map[h] as usize;
+            if b < self.nb { v[h] = cfv[b]; }
+        }
+        v
+    }
+}
+
 /// DCFR per-iter timing. live==2 is exact HU (FlopStartVectorCfr, O(nh^2)
 /// showdown — the bucketed designs force HU to exact); live>=3 is the bucketed
 /// multiway wall (BucketedFlopCfr Design1Collapsed, O(nb^num_opp) showdown).
@@ -402,11 +606,38 @@ fn dcfr_per_iter(g: &ShrunkGame, iters: u32) -> (f64, usize) {
     (t0.elapsed().as_secs_f64() / iters as f64, nn)
 }
 
+/// Two-sided anchor validation: DCFR avg at increasing iters. The anchor passes
+/// iff exploitability is HIGH at low iters and FALLS toward ~0 as DCFR converges
+/// (converged ~0 = no over-report / normalization-seam OK; high-and-falling =
+/// catches real exploitation / no under-report). One-sided would pass a liar.
+fn anchor_validation(nb: usize, nt: usize, nr: usize) {
+    use solver_core::tree::flat::MAX_NA_POSTFLOP;
+    let live: u8 = std::env::var("MC_LIVE").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let g = build_shrunk(live, nb, nt, nr);
+    let anchor = Anchor::new(&g);
+    println!("ANCHOR VALIDATION — true-BR exploitability of the DCFR average, live-{live}, nb={nb}");
+    println!("two-sided test: under-converged → HIGH & FALLING (catches exploitation, no under-report);");
+    println!("converged → ~0 (no over-report — the normalize_opponent_reach-seam test). pass = both.\n");
+    println!("{:>6} {:>18}", "DCFR iters", "true-BR exploit");
+    for iters in [1u32, 8, 64, 256, 1024, 4096, 16384] {
+        let mut s = BucketedFlopCfr::new(&g.tree, g.game.table(), &g.bk);
+        s.set_terminal_design(TerminalDesign::Design1Collapsed);
+        s.run(&g.tree, &g.game, &g.bk, iters);
+        let sigma = s.average_strategy_canonical(&g.tree, &g.bk);
+        let expl = anchor.exploitability(&g.tree, &sigma, MAX_NA_POSTFLOP);
+        println!("{iters:>6} {expl:>18.5e}");
+    }
+}
+
 fn main() {
     let nb: usize = std::env::var("MC_NB").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
-    let iters: u32 = std::env::var("MC_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
     let nt: usize = std::env::var("MC_NT").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let nr: usize = std::env::var("MC_NR").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    if std::env::var("MC_ANCHOR").is_ok() {
+        anchor_validation(nb, nt, nr);
+        return;
+    }
+    let iters: u32 = std::env::var("MC_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
 
     let batch: usize = std::env::var("MC_B").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
     let mc_iters: usize = std::env::var("MC_MCITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
