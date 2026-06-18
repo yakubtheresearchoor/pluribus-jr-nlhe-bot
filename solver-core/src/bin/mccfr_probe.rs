@@ -424,6 +424,9 @@ struct Anchor {
     rake_cap: f32,
     valid: Vec<usize>, // hands valid on every street
     nc: f32,           // num_combinations — DCFR divides the showdown by this
+    // per-node one-step regret accumulator (localization: WHERE the BR diverges
+    // from on-policy on converged DCFR — the floor-contributing nodes).
+    node_regret: std::cell::RefCell<Vec<f32>>,
 }
 
 impl Anchor {
@@ -449,6 +452,7 @@ impl Anchor {
             rake_cap: g.tree.rake_cap as f32,
             valid,
             nc: table.num_combinations as f32,
+            node_regret: std::cell::RefCell::new(vec![0.0; g.tree.num_nodes()]),
         }
     }
 
@@ -539,6 +543,20 @@ impl Anchor {
                     v[h] = cvs[best_a[b]][h];
                 }
             } else {
+                // per-bucket aggregates for v + the one-step regret localization.
+                let mut sum_ab = vec![vec![0.0f32; self.nb]; na];
+                for &h in &self.valid {
+                    let b = map[h] as usize;
+                    if b >= self.nb { continue; }
+                    for a in 0..na { sum_ab[a][b] += cvs[a][h]; }
+                }
+                let mut node_reg = 0.0f32;
+                for b in 0..self.nb {
+                    let onp: f32 = (0..na).map(|a| sigma[off + a * self.nb + b] * sum_ab[a][b]).sum();
+                    let mx = (0..na).map(|a| sum_ab[a][b]).fold(f32::NEG_INFINITY, f32::max);
+                    node_reg += (mx - onp).max(0.0);
+                }
+                self.node_regret.borrow_mut()[node] += node_reg;
                 for &h in &self.valid {
                     let b = map[h] as usize;
                     if b >= self.nb { continue; }
@@ -647,6 +665,27 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
         let expl = anchor.exploitability(&g.tree, &sigma, MAX_NA_POSTFLOP);
         println!("{iters:>6} {expl:>18.5e}");
     }
+    // ── FLOOR LOCALIZATION: where does the BR diverge on converged DCFR? ──
+    let mut s = BucketedFlopCfr::new(&g.tree, g.game.table(), &g.bk);
+    s.set_terminal_design(TerminalDesign::Design1Collapsed);
+    s.run(&g.tree, &g.game, &g.bk, 2048);
+    let sigma = s.average_strategy_canonical(&g.tree, &g.bk);
+    anchor.node_regret.borrow_mut().iter_mut().for_each(|x| *x = 0.0);
+    let _ = anchor.exploitability(&g.tree, &sigma, MAX_NA_POSTFLOP);
+    let nr = anchor.node_regret.borrow().clone();
+    let mut idx: Vec<usize> = (0..nr.len()).filter(|&i| nr[i] > 1e-3).collect();
+    idx.sort_by(|&a, &b| nr[b].partial_cmp(&nr[a]).unwrap());
+    println!("\nFLOOR LOCALIZATION (converged DCFR) — top one-step-regret nodes:");
+    println!("(if concentrated at a node TYPE — street/terminal-adjacent/na — that's the bug locus)");
+    for &node in idx.iter().take(12) {
+        let n = &g.tree.nodes[node];
+        let term_adj = g.tree.node_children(node).iter().any(|&c| g.tree.nodes[c as usize].is_terminal());
+        let labels: Vec<u8> = g.tree.node_children(node).iter().map(|&c| g.tree.nodes[c as usize].action_label).collect();
+        println!("  node {node:>6}: regret {:>10.4e} | street {} | player {} | labels {labels:?} | term-adj {term_adj}",
+            nr[node], n.board_state, n.player_id);
+    }
+    let nonzero: usize = nr.iter().filter(|&&r| r > 1e-3).count();
+    println!("  ({nonzero} nodes with regret > 1e-3; total = {:.4e})", nr.iter().sum::<f32>());
 }
 
 fn main() {
