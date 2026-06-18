@@ -721,7 +721,9 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
         }
         return;
     }
-    let iter_list: Vec<u32> = if std::env::var("MC_FAST").is_ok() { vec![256] } else { vec![1, 64, 1024] };
+    let iter_list: Vec<u32> = if let Ok(s) = std::env::var("MC_ITERS") {
+        s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
+    } else if std::env::var("MC_FAST").is_ok() { vec![256] } else { vec![1, 64, 1024] };
     for iters in iter_list {
         let mut s = BucketedFlopCfr::new(&g.tree, g.game.table(), &g.bk);
         s.set_terminal_design(TerminalDesign::Design1Collapsed);

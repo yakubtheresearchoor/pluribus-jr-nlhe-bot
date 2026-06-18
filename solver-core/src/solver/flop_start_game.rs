@@ -539,6 +539,20 @@ impl FlopChanceTable {
                 chosen.push(idx as u16);
             }
         }
+        // MC_HANDCAP (opt-in, test-only): cap the valid-hand set to a small
+        // strided subset so identity bucketing (nb=nh) is tractable — lets a
+        // probe run the EXACT small game where converged CFR reaches true Nash
+        // and a correct anchor MUST read ~0. Strided (not truncated) for rank
+        // diversity → a non-degenerate Nash. No effect unless the env is set.
+        if let Ok(c) = std::env::var("MC_HANDCAP") {
+            if let Ok(cap) = c.parse::<usize>() {
+                let cap = cap.min(chosen.len());
+                if cap > 0 {
+                    let stride = (chosen.len() / cap).max(1);
+                    chosen = chosen.iter().step_by(stride).take(cap).copied().collect();
+                }
+            }
+        }
         let nh = chosen.len();
         let mut hand_cards = vec![0u8; nh * 2];
         for (i, &hi) in chosen.iter().enumerate() {
