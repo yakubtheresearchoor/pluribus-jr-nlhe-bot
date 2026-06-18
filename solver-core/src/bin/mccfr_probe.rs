@@ -23,9 +23,9 @@ use solver_core::card::Card;
 use solver_core::solver::bucketed_flop_cfr::{BucketedFlopCfr, FlopBucketing, TerminalDesign};
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::preflop_start_game::PreflopChanceTable;
-use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions};
+use solver_core::tree::action::{production_game_v1, BetCap, BetSize, BetSizeOptions};
 use solver_core::tree::builder::build_tree;
-use solver_core::tree::flat::FlatTree;
+use solver_core::tree::flat::{FlatTree, MAX_NA_POSTFLOP};
 
 /// The shrunk game for one live-count: small bucketed flop→river subgame on a
 /// single canonical flop with an nt×nr runout. Returns the tree + table +
@@ -40,7 +40,21 @@ pub struct ShrunkGame {
 
 pub fn build_shrunk(live: u8, nb: usize, nt: usize, nr: usize) -> ShrunkGame {
     let spec = production_game_v1();
-    let bets = BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    // MC_REAL: the PRODUCTION action set — bet=pot, raise={0.5,1.0,...}pot (mrc =
+    // MAX_NA_POSTFLOP-2), cap-3 (BetCap::all(3)). A bigger tree (re-raise sequences,
+    // more terminal types) than the simple single-bet tree — Phase-0 re-certifies
+    // the anchor on THIS, since the card-removal/per-street bugs were found on the
+    // simpler tree and the real tree must be re-checked.
+    let real = std::env::var("MC_REAL").is_ok();
+    let bets = if real {
+        let mrc = MAX_NA_POSTFLOP.saturating_sub(2);
+        BetSizeOptions {
+            bet: vec![BetSize::PotRelative(1.0)],
+            raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
+        }
+    } else {
+        BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] }
+    };
     let ptable = PreflopChanceTable::new(
         6,
         vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6],
@@ -57,7 +71,9 @@ pub fn build_shrunk(live: u8, nb: usize, nt: usize, nr: usize) -> ShrunkGame {
         let rp: &[usize] = match nr { 1 => &[10], 2 => &[10, 30], _ => &[10] };
         river_decks[tc as usize] = rp.iter().map(|&p| rd[p]).collect();
     }
-    let tree = build_tree(&spec.flop_seam_config(live, 2, 12, bets)).unwrap();
+    let mut cfg = spec.flop_seam_config(live, 2, 12, bets);
+    if real { cfg.max_bets_per_street = BetCap::all(3); }
+    let tree = build_tree(&cfg).unwrap();
     let table = FlopChanceTable::build_full_nh_sampled(canonical, live, &turns, &river_decks);
     // MC_IDENTITY=1: identity bucketing (nb=nh) ⇒ the bucketed game IS the exact
     // game, so converged DCFR is a TRUE Nash (exploitability→0) — the localization
