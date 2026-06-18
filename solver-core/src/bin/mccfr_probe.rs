@@ -436,8 +436,22 @@ impl Anchor {
         let table = g.game.table();
         let nh = table.num_valid;
         let no = u16::MAX;
+        // Card-remove the SAMPLED runout independent of the bucketing. DCFR zeros
+        // runout-conflicting hands via the river chance-probability; the anchor
+        // must too. Relying on map!=NO_BUCKET worked under quantile (which
+        // NO_BUCKETs conflicts) but FAILS under identity (maps every hand → impossible
+        // hands like one holding the turn/river card survive, get garbage cfv, and
+        // pollute opponent reach). Exclude by card so `valid` = the true live set.
+        let turn_card = table.remaining_deck[0] as usize;
+        let river_card = table.river_decks[turn_card][0] as usize;
+        let runout_mask: u64 = (1u64 << turn_card) | (1u64 << river_card);
         let valid: Vec<usize> = (0..nh)
-            .filter(|&h| g.bk.flop_map[h] != no && g.bk.turn_map[0][h] != no && g.bk.river_map[0][0][h] != no)
+            .filter(|&h| {
+                let c1 = table.hand_cards[h * 2] as usize;
+                let c2 = table.hand_cards[h * 2 + 1] as usize;
+                runout_mask & ((1u64 << c1) | (1u64 << c2)) == 0
+                    && g.bk.flop_map[h] != no && g.bk.turn_map[0][h] != no && g.bk.river_map[0][0][h] != no
+            })
             .collect();
         Anchor {
             nb: g.bk.nb_flop.max(g.bk.nb_turn).max(g.bk.nb_river),
@@ -681,12 +695,27 @@ fn anchor_validation(nb: usize, nt: usize, nr: usize) {
         for p in 0..anchor.np { for &h in &anchor.valid { reach[p][h] = w; } }
         let v_on = anchor.walk(&g.tree, 0, 0, false, &sigma, MAX_NA_POSTFLOP, &reach);
         println!("ROOT VALUE CMP (evaluee 0): anchor on-policy vs DCFR root_cfv_from_avg");
-        println!("{:>6} {:>14} {:>14} {:>10}", "hand", "anchor", "DCFR", "ratio");
+        // card-removal diagnostic: print each hand's cards + the board/runout so
+        // the sign-flipped vs exact contrast can be read (does the wrong hand
+        // share a card with board/runout?).
+        let cs = |c: u8| -> String {
+            let r = "23456789TJQKA".as_bytes()[(c >> 2) as usize] as char;
+            let s = "cdhs".as_bytes()[(c & 3) as usize] as char;
+            format!("{r}{s}")
+        };
+        let tbl_hc = &g.game.table().hand_cards;
+        let turn = g.game.table().remaining_deck.clone();
+        let tc = turn[0];
+        let rc = g.game.table().river_decks[tc as usize][0];
+        println!("board: turn {} river {}  (flop = canonical[0])", cs(tc), cs(rc));
+        println!("{:>6} {:>7} {:>14} {:>14} {:>10}", "hand", "cards", "anchor", "DCFR", "ratio");
         let mut shown = 0;
         for &h in anchor.valid.iter() {
             let (a, d) = (v_on[h], dcfr_root[0][h]);
             if d.abs() > 1e-6 && shown < 16 {
-                println!("{h:>6} {a:>14.5e} {d:>14.5e} {:>10.4}", a / d);
+                let cards = format!("{}{}", cs(tbl_hc[h * 2]), cs(tbl_hc[h * 2 + 1]));
+                let flag = if (a / d) < 0.0 { " <-SIGN-FLIP" } else if (a - d).abs() < 1e-3 { " <-exact" } else { "" };
+                println!("{h:>6} {cards:>7} {a:>14.5e} {d:>14.5e} {:>10.4}{flag}", a / d);
                 shown += 1;
             }
         }
