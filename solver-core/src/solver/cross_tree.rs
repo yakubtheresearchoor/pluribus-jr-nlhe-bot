@@ -1049,6 +1049,7 @@ mod tests {
             merging_threshold: 0.0,
             button_player: None,
             max_bets_per_street: None,
+            no_open_limp: false,
         }
     }
 

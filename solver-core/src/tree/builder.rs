@@ -845,7 +845,15 @@ impl<'a> TreeBuilder<'a> {
                 // Owes chips this street: legal = {FOLD, CALL/ALLIN, raises if !allin_flag}.
                 // CHECK is NOT legal (cannot pass when owing).
                 actions.push(Action::Fold);
-                actions.push(Action::Call);
+                // RAISE-OR-FOLD opens: when `no_open_limp` is set, suppress CALL at an
+                // OPEN (facing only the forced blind ⇒ num_bets==0, preflop) — open-
+                // limping is strictly dominated in 6-max GTO and is otherwise an
+                // attractor the static EQR terminal can't price. Calling a RAISE
+                // (num_bets>=1) is still allowed.
+                let is_open_limp = self.config.no_open_limp && info.num_bets == 0;
+                if !is_open_limp {
+                    actions.push(Action::Call);
+                }
 
                 if !info.allin_flag && may_aggress {
                     for &bet_size in &bet_options.raise {

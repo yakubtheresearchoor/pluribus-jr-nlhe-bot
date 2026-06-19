@@ -169,6 +169,7 @@ impl GameSpec {
             merging_threshold: 0.0,
             button_player: Some(self.num_players - 1),
             max_bets_per_street: None,
+            no_open_limp: false,
         }
     }
 
@@ -204,6 +205,7 @@ impl GameSpec {
             merging_threshold: 0.0,
             button_player: None,
             max_bets_per_street: None,
+            no_open_limp: false,
         }
     }
 }
@@ -286,6 +288,11 @@ pub struct TreeConfig {
     /// preflop street via the harness head-to-head once the four-zone
     /// preflop runtime exists (named proxy caveat).
     pub max_bets_per_street: Option<BetCap>,
+    /// RAISE-OR-FOLD opens: when true, the forced-blind open decision offers only
+    /// FOLD and RAISE (no open-limp / open-call). Open-limping is strictly dominated
+    /// in 6-max GTO; suppressing it removes a branch a static (non-adaptive) terminal
+    /// can't price. Calling a raise is unaffected. Default false (legacy behavior).
+    pub no_open_limp: bool,
 }
 
 /// See `TreeConfig::max_bets_per_street`.

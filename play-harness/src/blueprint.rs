@@ -46,6 +46,7 @@ pub fn build_oracle_tree() -> FlatTree {
         merging_threshold: 0.0,
         button_player: None,
             max_bets_per_street: None,
+            no_open_limp: false,
     };
     build_tree(&cfg).expect("oracle tree")
 }

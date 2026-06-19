@@ -32,6 +32,7 @@ fn cap3_preflop_tree(spec: &GameSpec, n_raises: usize) -> FlatTree {
         raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
     });
     cfg.max_bets_per_street = BetCap::all(3);
+    cfg.no_open_limp = true; // raise-or-fold opens (open-limping is dominated in 6-max)
     build_tree_preflop_only(&cfg).expect("cap-3 preflop tree")
 }
 
@@ -171,7 +172,7 @@ fn main() {
     // a restart reads every already-filled (cell, flop) instead of recomputing.
     let base = std::env::var("EQR_CACHE").unwrap_or_else(|_| "eqr_cache".into());
     let tag = format!(
-        "ed1_nr{}_r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
+        "rof_nr{}_r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
         n_raises, (spec.rake_rate * 1000.0) as i32, spec.rake_cap, spec.stack, spec.ante,
         (policy.bet_frac * 100.0) as i32, policy.use_draws as u8, policy.continue_min_made, policy.mc_samples
     );
@@ -255,8 +256,13 @@ fn main() {
 
     let mt = std::env::var("MC_MT").map(|v| v != "0").unwrap_or(true);
     eprintln!("CFR: {} (MC_MT=0 to force serial)", if mt { "PARALLEL (per-traverser)" } else { "serial" });
+    // CONVERGENCE STOP: run to a cap, but halt early when the REACH-WEIGHTED change
+    // in the average strategy stops moving (the canonical CFR convergence measure;
+    // plain max|Δ| bounces on near-zero-reach infosets). PF_EPS=0 ⇒ run to PF_ITERS.
+    let eps: f32 = env_f("PF_EPS", 0.002);
     let t0 = std::time::Instant::now();
     let mut chance_cache: Vec<HashMap<u64, Vec<f32>>> = Vec::new();
+    let mut prev_avg: Option<Vec<f32>> = None;
     for it in 1..=iters {
         let key_fn = PreflopVectorCfr::seam_bucket_chance_key(&tree, 6, spec.stack);
         if mt {
@@ -266,6 +272,17 @@ fn main() {
         }
         if it == 1 || it % check == 0 {
             print_ranges(&solver, &tree, it, t0.elapsed().as_secs_f64());
+            let reach = solver.compute_preflop_reach(&tree, None);
+            let avg = solver.average_strategy(&tree);
+            if let Some(p) = &prev_avg {
+                let conv = solver.avg_reach_weighted_delta(&tree, &reach, &avg, p);
+                eprintln!("    conv(reach-wt Δavg) {conv:.5}");
+                if eps > 0.0 && conv < eps && it > 20 {
+                    eprintln!("CONVERGED: reach-wt Δavg {conv:.5} < eps {eps} at iter {it}");
+                    break;
+                }
+            }
+            prev_avg = Some(avg);
         }
     }
     eprintln!("\ndone in {:.1}s", t0.elapsed().as_secs_f64());
