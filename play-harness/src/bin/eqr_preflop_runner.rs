@@ -253,11 +253,17 @@ fn main() {
         );
     }
 
+    let mt = std::env::var("MC_MT").map(|v| v != "0").unwrap_or(true);
+    eprintln!("CFR: {} (MC_MT=0 to force serial)", if mt { "PARALLEL (per-traverser)" } else { "serial" });
     let t0 = std::time::Instant::now();
     let mut chance_cache: Vec<HashMap<u64, Vec<f32>>> = Vec::new();
     for it in 1..=iters {
         let key_fn = PreflopVectorCfr::seam_bucket_chance_key(&tree, 6, spec.stack);
-        solver.run_one_iteration_shared_chance_cached(&tree, &table, &mut oracle, &term_fn, key_fn, &mut chance_cache);
+        if mt {
+            solver.run_one_iteration_shared_chance_cached_par(&tree, &table, &mut oracle, &term_fn, key_fn, &mut chance_cache);
+        } else {
+            solver.run_one_iteration_shared_chance_cached(&tree, &table, &mut oracle, &term_fn, key_fn, &mut chance_cache);
+        }
         if it == 1 || it % check == 0 {
             print_ranges(&solver, &tree, it, t0.elapsed().as_secs_f64());
         }

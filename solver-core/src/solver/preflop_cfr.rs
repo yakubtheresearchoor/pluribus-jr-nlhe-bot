@@ -1229,6 +1229,169 @@ impl PreflopVectorCfr {
         self.iteration += 1;
     }
 
+    /// PARALLEL variant of `run_one_iteration_shared_chance_cached`. Phase A
+    /// (serial): fill each traverser's chance-node CFVs via the oracle/cache — the
+    /// part that mutates the shared oracle, can't race. Phase B (parallel): the
+    /// expensive bottom-up walk + regret/cum update, run concurrently across the
+    /// np traversers. SAFE because each traverser writes ONLY nodes where
+    /// `player_id == traverser` (disjoint `local_offset` ranges) — proven-disjoint
+    /// writes via raw pointers; `strategy`/`local_offset`/`reach` are read-only.
+    /// Gate: output must equal the serial version.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_one_iteration_shared_chance_cached_par(
+        &mut self,
+        tree: &FlatTree,
+        table: &PreflopChanceTable,
+        oracle: &mut impl PostflopValueOracle,
+        terminal_value_fn: impl Fn(usize, u8, &[Vec<f32>]) -> Vec<f32> + Sync,
+        chance_key: impl Fn(usize) -> u64,
+        cache: &mut Vec<std::collections::HashMap<u64, Vec<f32>>>,
+    ) {
+        use rayon::prelude::*;
+        let n_classes = NUM_PREFLOP_CLASSES;
+        let nn = tree.num_nodes();
+        let np = self.num_players;
+
+        self.compute_preflop_strategy(tree);
+        let reach = self.compute_preflop_reach(tree, None);
+        let chance_nodes = self.preflop_chance_node_indices(tree);
+        let params = DcfrParams::new(self.iteration);
+        if cache.len() != np as usize {
+            *cache = vec![std::collections::HashMap::new(); np as usize];
+        }
+        oracle.begin_preflop_iter(self.iteration);
+
+        // PHASE A (serial): per-traverser chance-node CFVs (oracle/cache + fold terms).
+        let mut cfvs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(np as usize);
+        for t in 0..np {
+            let mut cfv: Vec<Vec<f32>> = vec![vec![0.0_f32; n_classes]; nn];
+            for &chance_idx in &chance_nodes {
+                let mask = tree.get_folded_mask(chance_idx);
+                if (mask >> t) & 1 == 1 {
+                    let base = chance_idx * n_classes;
+                    let reach_at: Vec<Vec<f32>> = (0..np as usize)
+                        .map(|p| reach[p][base..base + n_classes].to_vec())
+                        .collect();
+                    cfv[chance_idx] = terminal_value_fn(chance_idx, t, &reach_at);
+                    continue;
+                }
+                let key = chance_key(chance_idx);
+                let v = match cache[t as usize].get(&key) {
+                    Some(v) => v.clone(),
+                    None => {
+                        let cell = crate::solver::postflop_oracle::SeamCell::at_chance_node(
+                            tree, chance_idx, np as usize,
+                        );
+                        let v = self.compute_chance_node_cfv_with_expansion_for_cell(
+                            chance_idx, t, &reach, table, oracle, cell, mask,
+                        );
+                        cache[t as usize].insert(key, v.clone());
+                        v
+                    }
+                };
+                cfv[chance_idx] = self.weight_continuation(chance_idx, t, &reach, v);
+            }
+            cfvs.push(cfv);
+        }
+
+        // PHASE B (parallel): disjoint per-traverser regret/cum writes via raw ptrs.
+        let regrets_ptr = self.regrets.as_mut_ptr() as usize;
+        let cum_ptr = self.cum_strategy.as_mut_ptr() as usize;
+        let strategy: &[f32] = &self.strategy;
+        let local_offset: &[usize] = &self.local_offset;
+        let npu = np as usize;
+        let chance_nodes_ref = &chance_nodes;
+        let reach_ref = &reach;
+        let tvf = &terminal_value_fn;
+        let params_ref = &params;
+        cfvs.into_par_iter().enumerate().for_each(|(t, mut cfv)| {
+            let is_chance_leaf = |idx: usize| chance_nodes_ref.binary_search(&idx).is_ok();
+            let regrets = regrets_ptr as *mut f32;
+            let cum = cum_ptr as *mut f32;
+            Self::bottom_up_recursive_par(
+                tree, 0, t as u8, &is_chance_leaf, reach_ref, tvf, &mut cfv, params_ref,
+                strategy, local_offset, npu, regrets, cum,
+            );
+        });
+
+        oracle.end_preflop_iter(self.iteration);
+        self.iteration += 1;
+    }
+
+    /// Raw-pointer bottom-up for the parallel path: identical update to
+    /// `bottom_up_recursive`, but reads `strategy`/`local_offset` by shared ref and
+    /// writes `regrets`/`cum` through raw pointers — sound because a single
+    /// traverser only ever writes its own (disjoint) `local_offset` ranges.
+    #[allow(clippy::too_many_arguments)]
+    fn bottom_up_recursive_par(
+        tree: &FlatTree,
+        node_idx: usize,
+        traverser: u8,
+        is_chance_leaf: &impl Fn(usize) -> bool,
+        reach: &[Vec<f32>],
+        terminal_value_fn: &(impl Fn(usize, u8, &[Vec<f32>]) -> Vec<f32> + Sync),
+        cfv: &mut [Vec<f32>],
+        params: &DcfrParams,
+        strategy: &[f32],
+        local_offset: &[usize],
+        np: usize,
+        regrets: *mut f32,
+        cum: *mut f32,
+    ) {
+        if is_chance_leaf(node_idx) {
+            return;
+        }
+        let node = &tree.nodes[node_idx];
+        let n_classes = NUM_PREFLOP_CLASSES;
+        if node.is_terminal() {
+            let base = node_idx * n_classes;
+            let reach_at: Vec<Vec<f32>> =
+                (0..np).map(|p| reach[p][base..base + n_classes].to_vec()).collect();
+            cfv[node_idx] = terminal_value_fn(node_idx, traverser, &reach_at);
+            return;
+        }
+        let children: Vec<u32> = tree.node_children(node_idx).to_vec();
+        for &ch in &children {
+            Self::bottom_up_recursive_par(
+                tree, ch as usize, traverser, is_chance_leaf, reach, terminal_value_fn,
+                cfv, params, strategy, local_offset, np, regrets, cum,
+            );
+        }
+        let local = local_offset[node_idx];
+        let off = local * MAX_NA_PREFLOP * n_classes;
+        let mut cfv_avg = vec![0.0_f32; n_classes];
+        if node.player_id == traverser {
+            for (a, &ch) in children.iter().enumerate() {
+                let child = ch as usize;
+                let s_base = off + a * n_classes;
+                for c in 0..n_classes {
+                    cfv_avg[c] += strategy[s_base + c] * cfv[child][c];
+                }
+            }
+            for (a, &ch) in children.iter().enumerate() {
+                let child = ch as usize;
+                for c in 0..n_classes {
+                    let inst_regret = cfv[child][c] - cfv_avg[c];
+                    let ridx = off + a * n_classes + c;
+                    unsafe {
+                        let old_r = *regrets.add(ridx);
+                        let coef = if old_r >= 0.0 { params.alpha_t() } else { params.beta_t() };
+                        *regrets.add(ridx) = coef * old_r + inst_regret;
+                        *cum.add(ridx) = params.gamma_t() * *cum.add(ridx) + strategy[ridx];
+                    }
+                }
+            }
+        } else {
+            for &ch in &children {
+                let child = ch as usize;
+                for c in 0..n_classes {
+                    cfv_avg[c] += cfv[child][c];
+                }
+            }
+        }
+        cfv[node_idx] = cfv_avg;
+    }
+
     /// Helper: propagate reach from `node_idx` to its children, then
     /// recurse. Stops propagation if a child is NOT in the preflop zone
     /// (zone boundary is the preflop→flop chance edge; children of that
