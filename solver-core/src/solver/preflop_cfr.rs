@@ -1261,6 +1261,7 @@ impl PreflopVectorCfr {
         }
         oracle.begin_preflop_iter(self.iteration);
 
+        let _ta = std::time::Instant::now();
         // PHASE A (serial): per-traverser chance-node CFVs (oracle/cache + fold terms).
         let mut cfvs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(np as usize);
         for t in 0..np {
@@ -1294,6 +1295,8 @@ impl PreflopVectorCfr {
             cfvs.push(cfv);
         }
 
+        let phase_a = _ta.elapsed().as_secs_f64();
+        let _tb = std::time::Instant::now();
         // PHASE B (parallel): disjoint per-traverser regret/cum writes via raw ptrs.
         let regrets_ptr = self.regrets.as_mut_ptr() as usize;
         let cum_ptr = self.cum_strategy.as_mut_ptr() as usize;
@@ -1313,6 +1316,9 @@ impl PreflopVectorCfr {
                 strategy, local_offset, npu, regrets, cum,
             );
         });
+        if std::env::var("MC_PHASE").is_ok() {
+            eprintln!("    [iter {} phaseA(serial) {:.1}s | phaseB(par) {:.1}s]", self.iteration, phase_a, _tb.elapsed().as_secs_f64());
+        }
 
         oracle.end_preflop_iter(self.iteration);
         self.iteration += 1;
