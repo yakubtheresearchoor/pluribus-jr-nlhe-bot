@@ -24,12 +24,12 @@ use solver_core::tree::builder::build_tree_preflop_only;
 use solver_core::tree::flat::{FlatTree, MAX_NA_PREFLOP};
 
 fn cap3_preflop_tree(spec: &GameSpec, n_raises: usize) -> FlatTree {
-    // n_raises raise SIZES per decision (production uses MAX_NA_PREFLOP-2=6; fewer
-    // sizes ⇒ far smaller tree for a fast range-shape gate, same raise/limp logic).
+    // n_raises raise SIZES per decision; default = MAX_NA_PREFLOP-2 (=14 at na=16),
+    // a rich big-action menu 0.5×..7.0× pot. Depth stays shallow via cap-3.
     let mrc = n_raises.min(MAX_NA_PREFLOP.saturating_sub(2)).max(1);
     let mut cfg = spec.preflop_tree_config(BetSizeOptions {
         bet: vec![BetSize::PotRelative(1.0)],
-        raise: (0..mrc).map(|i| BetSize::PotRelative(1.0 + 1.0 * i as f64)).collect(),
+        raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
     });
     cfg.max_bets_per_street = BetCap::all(3);
     build_tree_preflop_only(&cfg).expect("cap-3 preflop tree")
@@ -154,7 +154,7 @@ fn main() {
     let iters = env_u("PF_ITERS", 60) as u32;
     let check = env_u("PF_CHECK", 10) as u32;
 
-    let n_raises = env_u("PF_RAISES", 2);
+    let n_raises = env_u("PF_RAISES", MAX_NA_PREFLOP.saturating_sub(2)); // default full na=16 menu
     let tree = cap3_preflop_tree(&spec, n_raises);
     let table = PreflopChanceTable::new(
         6,
@@ -171,8 +171,8 @@ fn main() {
     // a restart reads every already-filled (cell, flop) instead of recomputing.
     let base = std::env::var("EQR_CACHE").unwrap_or_else(|_| "eqr_cache".into());
     let tag = format!(
-        "ed1_r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
-        (spec.rake_rate * 1000.0) as i32, spec.rake_cap, spec.stack, spec.ante,
+        "ed1_nr{}_r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
+        n_raises, (spec.rake_rate * 1000.0) as i32, spec.rake_cap, spec.stack, spec.ante,
         (policy.bet_frac * 100.0) as i32, policy.use_draws as u8, policy.continue_min_made, policy.mc_samples
     );
     let dir = format!("{base}/{tag}");

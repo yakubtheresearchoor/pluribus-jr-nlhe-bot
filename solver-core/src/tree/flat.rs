@@ -165,7 +165,7 @@ impl FlatNode {
 // (2026-06-17) for the preflop-looseness investigation — the deployed v1
 // preflop.blob is na=8, so the analysis tree must match it. (joint_solve
 // runs fine at either na; flip back to 16 before the full joint run.)
-pub const MAX_NA_PREFLOP: usize = 8;
+pub const MAX_NA_PREFLOP: usize = 16;
 pub const MAX_NA_POSTFLOP: usize = 4;
 
 pub const VCFR_NO_INFOSET: u32 = u32::MAX;
