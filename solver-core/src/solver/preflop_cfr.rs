@@ -1244,7 +1244,7 @@ impl PreflopVectorCfr {
         table: &PreflopChanceTable,
         oracle: &mut impl PostflopValueOracle,
         terminal_value_fn: impl Fn(usize, u8, &[Vec<f32>]) -> Vec<f32> + Sync,
-        chance_key: impl Fn(usize) -> u64,
+        chance_key: impl Fn(usize) -> u64 + Sync,
         cache: &mut Vec<std::collections::HashMap<u64, Vec<f32>>>,
     ) {
         use rayon::prelude::*;
@@ -1262,60 +1262,71 @@ impl PreflopVectorCfr {
         oracle.begin_preflop_iter(self.iteration);
 
         let _ta = std::time::Instant::now();
+        // PHASE A0 (serial, SMALL): fill the chance cache for live-traverser keys —
+        // the ONLY part that touches the &mut oracle. ~732 unique computes on iter-1,
+        // 0 thereafter; the per-(node,traverser) loop is O(1) contains_key checks.
         let mut _misses = 0u64;
-        let mut _hits = 0u64;
-        let mut _folds = 0u64;
-        // PHASE A (serial): per-traverser chance-node CFVs (oracle/cache + fold terms).
-        let mut cfvs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(np as usize);
         for t in 0..np {
-            let mut cfv: Vec<Vec<f32>> = vec![vec![0.0_f32; n_classes]; nn];
             for &chance_idx in &chance_nodes {
                 let mask = tree.get_folded_mask(chance_idx);
                 if (mask >> t) & 1 == 1 {
-                    _folds += 1;
-                    let base = chance_idx * n_classes;
-                    let reach_at: Vec<Vec<f32>> = (0..np as usize)
-                        .map(|p| reach[p][base..base + n_classes].to_vec())
-                        .collect();
-                    cfv[chance_idx] = terminal_value_fn(chance_idx, t, &reach_at);
-                    continue;
+                    continue; // folded traverser ⇒ no oracle
                 }
                 let key = chance_key(chance_idx);
-                let v = match cache[t as usize].get(&key) {
-                    Some(v) => {
-                        _hits += 1;
-                        v.clone()
-                    }
-                    None => {
-                        _misses += 1;
-                        let cell = crate::solver::postflop_oracle::SeamCell::at_chance_node(
-                            tree, chance_idx, np as usize,
-                        );
-                        let v = self.compute_chance_node_cfv_with_expansion_for_cell(
-                            chance_idx, t, &reach, table, oracle, cell, mask,
-                        );
-                        cache[t as usize].insert(key, v.clone());
-                        v
-                    }
-                };
-                cfv[chance_idx] = self.weight_continuation(chance_idx, t, &reach, v);
+                if !cache[t as usize].contains_key(&key) {
+                    _misses += 1;
+                    let cell = crate::solver::postflop_oracle::SeamCell::at_chance_node(
+                        tree, chance_idx, np as usize,
+                    );
+                    let v = self.compute_chance_node_cfv_with_expansion_for_cell(
+                        chance_idx, t, &reach, table, oracle, cell, mask,
+                    );
+                    cache[t as usize].insert(key, v);
+                }
             }
-            cfvs.push(cfv);
         }
-
         let phase_a = _ta.elapsed().as_secs_f64();
+
         let _tb = std::time::Instant::now();
-        // PHASE B (parallel): disjoint per-traverser regret/cum writes via raw ptrs.
+        // PHASE B (parallel across traversers): build each traverser's chance CFVs —
+        // folded-traverser fold-terminals (the 2.7M O(169²) cost) AND live-traverser
+        // reach-weighting (the 2.5M O(169²) cost, cache now read-only) — then the
+        // bottom-up walk. All read-only except the disjoint regret/cum raw-ptr writes.
         let regrets_ptr = self.regrets.as_mut_ptr() as usize;
         let cum_ptr = self.cum_strategy.as_mut_ptr() as usize;
         let strategy: &[f32] = &self.strategy;
         let local_offset: &[usize] = &self.local_offset;
+        let blocking = &self.blocking_matrix;
         let npu = np as usize;
+        let nc = n_classes;
+        let cache_ref: &Vec<std::collections::HashMap<u64, Vec<f32>>> = cache;
         let chance_nodes_ref = &chance_nodes;
         let reach_ref = &reach;
         let tvf = &terminal_value_fn;
+        let key_fn = &chance_key;
         let params_ref = &params;
-        cfvs.into_par_iter().enumerate().for_each(|(t, mut cfv)| {
+        (0..npu).into_par_iter().for_each(|t| {
+            let mut cfv: Vec<Vec<f32>> = vec![vec![0.0_f32; nc]; nn];
+            for &chance_idx in chance_nodes_ref {
+                let mask = tree.get_folded_mask(chance_idx);
+                let base = chance_idx * nc;
+                if (mask >> t) & 1 == 1 {
+                    // folded traverser: fold-terminal value.
+                    let reach_at: Vec<Vec<f32>> =
+                        (0..npu).map(|p| reach_ref[p][base..base + nc].to_vec()).collect();
+                    cfv[chance_idx] = tvf(chance_idx, t as u8, &reach_at);
+                } else {
+                    // live traverser: cached (reach-independent) continuation × opp-reach weight.
+                    let key = key_fn(chance_idx);
+                    let v = cache_ref[t].get(&key).expect("chance key filled in phase A0");
+                    let opp: Vec<&[f32]> =
+                        (0..npu).filter(|&p| p != t).map(|p| &reach_ref[p][base..base + nc]).collect();
+                    let w = crate::solver::preflop_terminal::preflop_fold_terminal_cfv_multiway_pairwise(
+                        &opp, 1.0, blocking,
+                    );
+                    cfv[chance_idx] = (0..nc).map(|c| v[c] * w[c]).collect();
+                }
+            }
             let is_chance_leaf = |idx: usize| chance_nodes_ref.binary_search(&idx).is_ok();
             let regrets = regrets_ptr as *mut f32;
             let cum = cum_ptr as *mut f32;
@@ -1325,8 +1336,8 @@ impl PreflopVectorCfr {
             );
         });
         if std::env::var("MC_PHASE").is_ok() {
-            eprintln!("    [iter {} phaseA(serial) {:.1}s (chance miss {} hit {} fold {}) | phaseB(par) {:.1}s]",
-                self.iteration, phase_a, _misses, _hits, _folds, _tb.elapsed().as_secs_f64());
+            eprintln!("    [iter {} A0(serial,oracle) {:.1}s miss {} | parallel(fold+weight+bottomup) {:.1}s]",
+                self.iteration, phase_a, _misses, _tb.elapsed().as_secs_f64());
         }
 
         oracle.end_preflop_iter(self.iteration);
