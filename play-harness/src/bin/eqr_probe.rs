@@ -90,7 +90,8 @@ fn main() {
             for fi in 0..n_flops {
                 let flop = rand_flop(&mut s, hole);
                 let seed = s ^ ((fi as u64).wrapping_mul(0x9E3779B97F4A7C15));
-                rev += realized_ev_on_flop(hole, flop, live, pot, rake_rate, rake_cap, policy, seed);
+                let opp_tier = env_u("MC_OPPTIER", policy.continue_min_made as usize) as u8;
+                rev += realized_ev_on_flop(hole, flop, live, pot, rake_rate, rake_cap, policy, opp_tier, seed);
                 aeq += allin_equity_on_flop(hole, flop, live, 600, seed ^ 0xABCD);
             }
             rev /= n_flops as f32;

@@ -137,14 +137,18 @@ fn realized_ev_sample(
     rake_rate: f32,
     rake_cap: f32,
     min_made: u8,
+    opp_min_made: u8,
     use_draws: bool,
 ) -> f32 {
     let half_pot = pot / live as f32; // showdown-convention investment baseline
-    if !flop_continue(my_hole, flop, min_made, use_draws) {
+    // Folding is only coherent when there's a BET to fold to. At bet=0 nobody folds
+    // (free showdown) — otherwise the sim hands the dead pot to strong hands for free.
+    let folding = bet > 0.0;
+    if folding && !flop_continue(my_hole, flop, min_made, use_draws) {
         return -half_pot; // fold the flop: forfeit pot share, save the bet
     }
     let continuers: Vec<usize> = (0..opp_holes.len())
-        .filter(|&j| flop_continue(opp_holes[j], flop, min_made, use_draws))
+        .filter(|&j| !folding || flop_continue(opp_holes[j], flop, opp_min_made, use_draws))
         .collect();
     let n_cont = continuers.len() + 1; // including me
     if n_cont == 1 {
@@ -190,6 +194,7 @@ pub fn realized_ev_on_flop(
     rake_rate: f32,
     rake_cap: f32,
     policy: EqrPolicy,
+    opp_min_made: u8,
     seed: u64,
 ) -> f32 {
     let mut s = seed | 1;
@@ -212,7 +217,7 @@ pub fn realized_ev_on_flop(
         let river = draw_card(&mut s, &mut used);
         acc += realized_ev_sample(
             my_hole, &opp, flop, turn, river, pot, live, bet, rake_rate, rake_cap,
-            policy.continue_min_made, policy.use_draws,
+            policy.continue_min_made, opp_min_made, policy.use_draws,
         ) as f64;
     }
     (acc / policy.mc_samples as f64) as f32
@@ -233,6 +238,8 @@ pub fn realized_ev_table_on_flop(
     rake_rate: f32,
     rake_cap: f32,
     policy: EqrPolicy,
+    opp_min_made: u8, // EQUITY-DENIAL: opponents' continue tier (SPR-driven; raised
+    // pots ⇒ higher ⇒ self-selected stronger field). Hero keeps policy.continue_min_made.
     seed: u64,
 ) -> Vec<f32> {
     // SERIAL per table: parallelism lives ACROSS tables (the pre-fill pass runs
@@ -243,6 +250,7 @@ pub fn realized_ev_table_on_flop(
     let mut cnt = vec![0u32; n];
     let half_pot = pot / live as f32;
     let bet = policy.bet_frac * pot;
+    let folding = bet > 0.0; // no bet ⇒ no folding (free showdown), else dead-money leak
     let flop_mask = (1u64 << flop[0]) | (1u64 << flop[1]) | (1u64 << flop[2]);
     {
         for i in 0..policy.mc_samples {
@@ -263,7 +271,7 @@ pub fn realized_ev_table_on_flop(
         let mut max_opp = clean_rules::HandRank(0);
         let mut any_opp = false;
         for j in 0..live - 1 {
-            opp_cont[j] = flop_continue(opp[j], flop, policy.continue_min_made, policy.use_draws);
+            opp_cont[j] = !folding || flop_continue(opp[j], flop, opp_min_made, policy.use_draws);
             opp_rank[j] = rank7(opp[j], board);
             if opp_cont[j] {
                 n_opp_cont += 1;
@@ -278,7 +286,7 @@ pub fn realized_ev_table_on_flop(
             if dealt & cm != 0 {
                 continue; // my combo conflicts with this sample's cards
             }
-            if !flop_continue([a, b], flop, policy.continue_min_made, policy.use_draws) {
+            if folding && !flop_continue([a, b], flop, policy.continue_min_made, policy.use_draws) {
                 sum[ci] += (-half_pot) as f64;
                 cnt[ci] += 1;
                 continue;
@@ -358,6 +366,21 @@ pub fn allin_equity_on_flop(
         }
     }
     (acc / samples as f64) as f32
+}
+
+/// EQUITY-DENIAL: opponents' continue tier from the pot's SPR. Raised / 3-bet pots
+/// (low SPR) ⇒ the opponents who continue are self-selected stronger ⇒ a higher
+/// (tighter) tier; limped / deep pots (high SPR) ⇒ the looser `base` tier. This is
+/// the real effect (calling a raise self-selects a stronger range) and it varies
+/// the terminal naturally across the SPR space the CFR tree already routes through.
+pub fn spr_to_opp_tier(spr: f32, base: u8) -> u8 {
+    if spr >= 8.0 {
+        base // limped / deep — looser field
+    } else if spr >= 3.0 {
+        (base + 1).min(3) // single-raised — tighter
+    } else {
+        3 // 3-bet / near-all-in — tightest self-selected field
+    }
 }
 
 /// Two concrete cards for a 169-class probe (suits chosen non-conflicting).

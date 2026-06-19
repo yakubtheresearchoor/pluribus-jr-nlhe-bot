@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use play_harness::eqr::{realized_ev_table_on_flop, EqrPolicy};
+use play_harness::eqr::{realized_ev_table_on_flop, spr_to_opp_tier, EqrPolicy};
 use solver_core::abstraction::preflop_class::{PreflopClass, NUM_PREFLOP_CLASSES};
 use solver_core::card::{card_from_str, Card};
 use solver_core::solver::postflop_oracle::{BucketKeyedOracle, SeamCell};
@@ -108,8 +108,10 @@ fn eqr_source(
                     ^ ((canonical[1] as u64) << 32)
                     ^ ((canonical[2] as u64) << 40),
             );
+            let spr = (stack - cell.commit) as f32 / (cell.pot as f32).max(1.0);
+            let opp_tier = spr_to_opp_tier(spr, policy.continue_min_made);
             let t = realized_ev_table_on_flop(
-                &layout, flop, cell.live as usize, cell.pot as f32, rake_rate, rake_cap, policy, seed,
+                &layout, flop, cell.live as usize, cell.pot as f32, rake_rate, rake_cap, policy, opp_tier, seed,
             );
             write_eqr(&dir, key, fi, &t);
             computed += 1;
@@ -169,7 +171,7 @@ fn main() {
     // a restart reads every already-filled (cell, flop) instead of recomputing.
     let base = std::env::var("EQR_CACHE").unwrap_or_else(|_| "eqr_cache".into());
     let tag = format!(
-        "r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
+        "ed1_r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
         (spec.rake_rate * 1000.0) as i32, spec.rake_cap, spec.stack, spec.ante,
         (policy.bet_frac * 100.0) as i32, policy.use_draws as u8, policy.continue_min_made, policy.mc_samples
     );
@@ -177,7 +179,7 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("mkdir eqr cache base");
     eprintln!("EQR table cache: {dir} (rerunnable — restart reads filled tables)");
 
-    let source = eqr_source(dir, flop_index, spec.stack, spec.rake_rate as f32, spec.rake_cap as f32, policy);
+    let source = eqr_source(dir.clone(), flop_index, spec.stack, spec.rake_rate as f32, spec.rake_cap as f32, policy);
     let mut oracle = BucketKeyedOracle::new(spec.stack, 6, 0, source);
     let mut solver = PreflopVectorCfr::new(&tree);
 
@@ -228,9 +230,11 @@ fn main() {
                     ^ ((canonical[1] as u64) << 32)
                     ^ ((canonical[2] as u64) << 40),
             );
+            let spr = (spec.stack - cell.commit) as f32 / (cell.pot as f32).max(1.0);
+            let opp_tier = spr_to_opp_tier(spr, policy.continue_min_made);
             let vals = realized_ev_table_on_flop(
                 &layout, [canonical[0], canonical[1], canonical[2]], cell.live as usize,
-                cell.pot as f32, spec.rake_rate as f32, spec.rake_cap as f32, policy, seed,
+                cell.pot as f32, spec.rake_rate as f32, spec.rake_cap as f32, policy, opp_tier, seed,
             );
             write_eqr(&dir, key, fi, &vals);
             let d = done.fetch_add(1, Ordering::Relaxed) + 1;
