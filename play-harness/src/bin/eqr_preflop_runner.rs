@@ -317,13 +317,46 @@ fn print_ranges(solver: &PreflopVectorCfr, tree: &FlatTree, it: u32, secs: f64) 
         ("T9s", "Tc", "9c"), ("87s", "8c", "7c"), ("A5o", "Ac", "5d"),
         ("KJo", "Kc", "Jd"), ("72o", "7c", "2d"), ("32o", "3c", "2d"),
     ];
-    eprintln!("  iter {it:>3} ({secs:.0}s) — UTG raise%/fold% (avg strategy):");
-    let mut line = String::new();
-    for (name, a, b) in hands {
-        let (r, f) = pr(a, b);
-        line.push_str(&format!("{name} {r:.0}/{f:.0}   "));
+    // ALL OPENING POSITIONS via the fold-chain (UTG → HJ → CO → BTN → SB): each
+    // opener is the fold-child of the prior (everyone before folded). BB closes the
+    // action — it has no open, only defense. raise% (label 4 or all-in 5) per hand.
+    eprintln!("  iter {it:>3} ({secs:.0}s) — OPEN raise% by position:");
+    let pos_names = ["UTG", "HJ", "CO", "BTN", "SB "];
+    let mut pnode = 0usize;
+    for pname in pos_names {
+        if !tree.nodes[pnode].is_player() {
+            break;
+        }
+        let plocal = solver.local_offset[pnode];
+        let pna = tree.nodes[pnode].num_children as usize;
+        let poff = plocal * MAX_NA_PREFLOP * nc;
+        let plabels: Vec<u8> =
+            tree.node_children(pnode).iter().map(|&c| tree.nodes[c as usize].action_label).collect();
+        let praise = |cl: usize| -> f32 {
+            let s: f32 = (0..pna).map(|a| avg[poff + a * nc + cl].max(0.0)).sum();
+            if s <= 0.0 {
+                return 0.0;
+            }
+            let r: f32 = (0..pna)
+                .filter(|&a| plabels[a] == 4 || plabels[a] == 5)
+                .map(|a| avg[poff + a * nc + cl].max(0.0))
+                .sum();
+            r / s
+        };
+        let mut pline = format!("    {pname}");
+        for (name, a, b) in hands {
+            pline.push_str(&format!(" {name} {:.0}", praise(ix(a, b)) * 100.0));
+        }
+        eprintln!("{pline}");
+        match tree
+            .node_children(pnode)
+            .iter()
+            .find(|&&k| tree.nodes[k as usize].action_label == 0 && tree.nodes[k as usize].is_player())
+        {
+            Some(&fc) => pnode = fc as usize,
+            None => break,
+        }
     }
-    eprintln!("    {line}");
 
     // FACING-A-RAISE / 3-BET gate: the next player after UTG's open-raise. Follow a
     // mid-size raise child of node 0 to the player who now faces it; report
