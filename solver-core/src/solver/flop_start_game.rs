@@ -1064,6 +1064,10 @@ impl FlopStartGame {
 
     pub fn table(&self) -> &FlopChanceTable { &self.table }
 
+    /// Mutable table access — used to inject a per-refresh entry range (calling
+    /// range) into `initial_weights` for a connected DCFR co-solve.
+    pub fn table_mut(&mut self) -> &mut FlopChanceTable { &mut self.table }
+
     pub fn set_turn_card(&self, card: u8) {
         self.current_turn_card.set(Some(card));
     }

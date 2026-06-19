@@ -65,7 +65,8 @@ pub fn build_shrunk_cell(live: u8, commit: i32, pot: i32, nb: usize, nt: usize, 
         6,
         vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6],
     );
-    let canonical = ptable.canonical_flops[0];
+    let flop_idx: usize = std::env::var("MC_FLOP").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let canonical = ptable.canonical_flops[flop_idx.min(ptable.canonical_flops.len() - 1)];
     let bm: u64 = canonical.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
     let deck: Vec<u8> = (0..52u8).filter(|c| bm & (1u64 << c) == 0).collect();
     // nt turn samples, nr river samples per turn (deterministic positions).
@@ -1480,8 +1481,185 @@ fn connected_probe(nb: usize) {
     println!("PLATEAU (Δ→0). Caveat: single fixed runout ⇒ directional, not exact equity.");
 }
 
+/// First canonical-flop index that is rainbow + 3 distinct ranks + disconnected
+/// (no two ranks within 2) — a representative non-degenerate board for the verdict.
+fn representative_flop_idx() -> usize {
+    use solver_core::abstraction::flop_isomorphism::enumerate_canonical_flops;
+    let flops = enumerate_canonical_flops();
+    for (i, f) in flops.iter().enumerate() {
+        let r = [f[0] >> 2, f[1] >> 2, f[2] >> 2];
+        let s = [f[0] & 3, f[1] & 3, f[2] & 3];
+        let distinct = r[0] != r[1] && r[1] != r[2] && r[0] != r[2];
+        let rainbow = s[0] != s[1] && s[1] != s[2] && s[0] != s[2];
+        let mut rr = r;
+        rr.sort();
+        let disc = rr[1] - rr[0] > 2 && rr[2] - rr[1] > 2;
+        if distinct && rainbow && disc {
+            return i;
+        }
+    }
+    0
+}
+
+/// DCFR CO-SOLVE of the identical HU connected game (the N×fill baseline the
+/// connected-MCCFR verdict must beat) — postflop fills dispatched on the GPU
+/// (BucketedNativeGpu, the production fill engine), as the real co-solve runs.
+/// Alternates: inject the SB calling range as the postflop entry weights → run K
+/// WARM GPU iters → take per-hand SB root CFV (run()'s return) → regret-match SB's
+/// preflop fold/call per class. Measures N = refreshes to plateau. CHEAP TEST: small
+/// warm N ⇒ N×fill modest ⇒ connected-MCCFR case weakens (cheap-test-first).
+#[cfg(not(feature = "metal"))]
+fn dcfr_cosolve(_nb: usize) {
+    eprintln!("dcfr_cosolve requires --features metal (the co-solve fills dispatch on the GPU).");
+}
+
+#[cfg(feature = "metal")]
+fn dcfr_cosolve(nb: usize) {
+    use solver_core::gpu_metal::bucketed_native::BucketedNativeGpu;
+    use solver_core::gpu_metal::context::MetalContext;
+
+    let k: u32 = std::env::var("MC_K").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    let max_refresh: usize = std::env::var("MC_REFRESH").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+    let tol: f32 = std::env::var("MC_TOL").ok().and_then(|s| s.parse().ok()).unwrap_or(2e-3);
+    let nt: usize = std::env::var("MC_NT").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    let nr: usize = std::env::var("MC_NR").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    // MULTIWAY: live-k limped pot (each posts 1 blind, plays=commit 2 ⇒ pot=2k), so
+    // the GPU bucketed engine (np≥3) drives the fill — the real co-solve dispatch.
+    let live: u8 = std::env::var("MC_LIVE").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let np = live as usize;
+
+    let g = build_shrunk_cell(live, 2, 2 * live as i32, nb, nt, nr);
+    let ShrunkGame { tree, mut game, bk, .. } = g;
+    let mut cpu = {
+        let mut s = BucketedFlopCfr::new(&tree, game.table(), &bk);
+        s.set_terminal_design(TerminalDesign::Design1Collapsed);
+        s
+    };
+    let ctx = MetalContext::new().expect("Metal context (set OUT_DIR to dir holding solver.metallib)");
+    let stripes = ((32 / nb).max(1)) as u32;
+    let mut gpu = BucketedNativeGpu::new(&ctx, &tree, game.table(), &bk, &cpu, stripes).expect("native gpu");
+
+    let nh = game.table().num_valid;
+    let hand_class: Vec<usize> = (0..nh)
+        .map(|h| {
+            let c1 = game.table().hand_cards[h * 2];
+            let c2 = game.table().hand_cards[h * 2 + 1];
+            PreflopClass::from_combo(c1 as Card, c2 as Card).index()
+        })
+        .collect();
+
+    println!(
+        "DCFR CO-SOLVE [GPU BucketedNativeGpu] (live-{live} multiway, flop idx={}, play/fold preflop, real cap-3, nb={nb})\n\
+         WARM | K={k} GPU iters/refresh | runout {nt}×{nr} | tol={tol} | wall=nb^{} = {}\n",
+        representative_flop_idx(),
+        np - 1,
+        (nb as u64).pow((np - 1) as u32)
+    );
+
+    let mut rc = vec![0.0f32; NUM_PREFLOP_CLASSES];
+    let mut rf = vec![0.0f32; NUM_PREFLOP_CLASSES];
+    let mut call_now = vec![1.0f32; NUM_PREFLOP_CLASSES];
+    let mut cum_call = vec![0.0f32; NUM_PREFLOP_CLASSES];
+    let mut cum_w = 0.0f32;
+    let fold_ev = -1.0f32; // SB folds ⇒ loses posted SB blind (1 unit)
+
+    let t0 = Instant::now();
+    let mut prev_avg = vec![1.0f32; NUM_PREFLOP_CLASSES];
+    let mut n_used = 0usize;
+    for refresh in 0..max_refresh {
+        // entry range: ALL k players share the symmetric playing range (limped k-way
+        // pot; range co-adapts with the postflop). Set it on BOTH the GPU reach buffer
+        // (for the warm GPU solve) and the game table (for the normalized CPU extract).
+        let mut flat = vec![0.0f32; np * nh];
+        for p in 0..np {
+            for h in 0..nh {
+                let w = call_now[hand_class[h]];
+                flat[p * nh + h] = w;
+                game.table_mut().initial_weights[p][h] = w;
+            }
+        }
+        gpu.set_initial_weights(&flat);
+        gpu.run(k); // warm GPU solve (device regrets/cum persist)
+
+        // NORMALIZED per-hand EV: copy the GPU's converged cum → CPU solver, extract
+        // root_cfv_from_avg (does normalize_opponent_reach ⇒ true per-hand EV, NOT the
+        // reach-weighted CFV the GPU run() returns). This is the gated extraction path.
+        cpu.cum_strategy_flop_mut().copy_from_slice(gpu.cum_strategy_flop());
+        cpu.cum_strategy_turn_mut().copy_from_slice(gpu.cum_strategy_turn());
+        cpu.cum_strategy_river_mut().copy_from_slice(gpu.cum_strategy_river());
+        let cfv = cpu.root_cfv_from_avg(&tree, &game, &bk); // [np][nh] normalized
+
+        let mut sum = vec![0.0f32; NUM_PREFLOP_CLASSES];
+        let mut cnt = vec![0u32; NUM_PREFLOP_CLASSES];
+        for h in 0..nh {
+            sum[hand_class[h]] += cfv[0][h];
+            cnt[hand_class[h]] += 1;
+        }
+        for cl in 0..NUM_PREFLOP_CLASSES {
+            if cnt[cl] == 0 {
+                continue;
+            }
+            let ev_call = sum[cl] / cnt[cl] as f32;
+            let v = call_now[cl] * ev_call + (1.0 - call_now[cl]) * fold_ev;
+            rc[cl] = (rc[cl] + ev_call - v).max(0.0);
+            rf[cl] = (rf[cl] + fold_ev - v).max(0.0);
+            let s = rc[cl] + rf[cl];
+            call_now[cl] = if s > 0.0 { rc[cl] / s } else { 0.5 };
+        }
+        let wt = (refresh + 1) as f32;
+        cum_w += wt;
+        for cl in 0..NUM_PREFLOP_CLASSES {
+            cum_call[cl] += wt * call_now[cl];
+        }
+        let avg: Vec<f32> = (0..NUM_PREFLOP_CLASSES).map(|c| cum_call[c] / cum_w).collect();
+        let delta = (0..NUM_PREFLOP_CLASSES).map(|c| (avg[c] - prev_avg[c]).abs()).fold(0.0f32, f32::max);
+        n_used = refresh + 1;
+        if refresh == 0 || (refresh + 1) % 10 == 0 {
+            let aa = avg[PreflopClass::from_combo(48, 49).index()];
+            println!("  refresh {:>3} | avg-strat Δ {:.5} | AA call {:.4}", refresh + 1, delta, aa);
+        }
+        if delta < tol && refresh > 3 {
+            break;
+        }
+        prev_avg = avg;
+    }
+    let secs = t0.elapsed().as_secs_f64();
+
+    let avg: Vec<f32> = (0..NUM_PREFLOP_CLASSES).map(|c| cum_call[c] / cum_w).collect();
+    println!(
+        "\n⇒ DCFR co-solve PLATEAU at N = {n_used} refreshes (×{k} GPU iters = {} total) | wall {:.2}s | GPU busy {:.2}s",
+        n_used as u32 * k,
+        secs,
+        gpu.gpu_busy_seconds()
+    );
+    println!("\nCALLING RANGE (avg strategy) — signature classes:");
+    let probes: [(&str, u8, u8); 7] = [
+        ("AA", 48, 49), ("KK", 44, 45), ("QQ", 40, 41),
+        ("AKs", 48, 44), ("87s", 24, 20), ("76o", 20, 17), ("32o", 4, 1),
+    ];
+    for (name, a, b) in probes {
+        let cl = PreflopClass::from_combo(a as Card, b as Card).index();
+        println!("  {name:<5} call={:.4}", avg[cl]);
+    }
+    println!("\nCHEAP-TEST READ: small warm N (few refreshes) ⇒ N×fill modest ⇒ connected-MCCFR's");
+    println!("N×fill-avoidance advantage is small (per-traj capped ~2×) ⇒ DCFR co-solve feasible.");
+    println!("Large N ⇒ N×fill brutal ⇒ connected MCCFR's case strong, full comparison warranted.");
+}
+
 fn main() {
+    if std::env::var("MC_DCFR_COSOLVE").is_ok() {
+        // representative flop for the verdict (overridable via MC_FLOP).
+        if std::env::var("MC_FLOP").is_err() {
+            std::env::set_var("MC_FLOP", representative_flop_idx().to_string());
+        }
+        let nb: usize = std::env::var("MC_NB").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        dcfr_cosolve(nb);
+        return;
+    }
     if std::env::var("MC_CONNECTED").is_ok() {
+        if std::env::var("MC_FLOP").is_err() {
+            std::env::set_var("MC_FLOP", representative_flop_idx().to_string());
+        }
         let nb: usize = std::env::var("MC_NB").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
         connected_probe(nb);
         return;

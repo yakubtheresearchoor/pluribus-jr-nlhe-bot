@@ -1119,6 +1119,22 @@ impl BucketedNativeGpu {
         }
     }
 
+    /// Inject a new per-player entry range (flat `[np*nh]`, player-major) into the
+    /// reach-seed buffer — for a connected DCFR co-solve that refreshes the range
+    /// (e.g. the preflop calling range) between WARM GPU solves. Device regrets
+    /// persist; only the flop-root reach seed changes.
+    pub fn set_initial_weights(&mut self, flat: &[f32]) {
+        assert!(self.inflight.is_empty(), "set_initial_weights while passes in flight");
+        assert_eq!(flat.len(), self.np * self.nh, "weights must be flat [np*nh]");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                flat.as_ptr(),
+                self.weights_buf.contents() as *mut f32,
+                flat.len(),
+            );
+        }
+    }
+
     /// G6 lever-1 toggle passthrough (specialized terminal pipeline).
     pub fn set_use_specialized(&mut self, on: bool) {
         self.term.set_use_specialized(on);

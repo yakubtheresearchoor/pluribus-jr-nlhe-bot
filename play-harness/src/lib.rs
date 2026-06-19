@@ -39,6 +39,7 @@
 //! test; nothing else may convert ad hoc.
 
 pub mod blueprint;
+pub mod eqr;
 pub mod preflop_oracle;
 pub mod live2_bank;
 pub mod match_play;
