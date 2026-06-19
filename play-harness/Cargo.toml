@@ -10,3 +10,4 @@ edition = "2021"
 [dependencies]
 clean-rules = { path = "../clean-rules" }
 solver-core = { path = "../solver-core" }
+rayon = "1.8"

@@ -192,6 +192,112 @@ pub fn realized_ev_on_flop(
     (acc / policy.mc_samples as f64) as f32
 }
 
+/// Realized EV for ALL combos in `layout` on one `flop`, AMORTIZED MC: deal
+/// opponents + runout once per sample, evaluate every non-conflicting combo
+/// against that shared sample. Returns per-combo realized EV in layout order, on
+/// the SAME chip scale as `root_cfv_from_avg` (net vs flop-start, baseline
+/// pot/live). This is what the EQR oracle returns per (cell, canonical flop); the
+/// preflop CFR then marginalizes over flops automatically.
+#[allow(clippy::too_many_arguments)]
+pub fn realized_ev_table_on_flop(
+    layout: &[(u8, u8)],
+    flop: [u8; 3],
+    live: usize,
+    pot: f32,
+    rake_rate: f32,
+    rake_cap: f32,
+    policy: EqrPolicy,
+    seed: u64,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let n = layout.len();
+    let half_pot = pot / live as f32;
+    let bet = policy.bet_frac * pot;
+    let flop_mask = (1u64 << flop[0]) | (1u64 << flop[1]) | (1u64 << flop[2]);
+    // Parallel over samples: each sample is independent with its own seeded RNG;
+    // fold into per-thread (sum,cnt) accumulators, then reduce.
+    let (sum, cnt) = (0..policy.mc_samples)
+        .into_par_iter()
+        .fold(
+            || (vec![0.0f64; n], vec![0u32; n]),
+            |(mut sum, mut cnt), i| {
+                let mut s = (seed ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15)) | 1;
+                let mut used = flop_mask;
+        let mut opp = [[0u8; 2]; 6];
+        for o in opp.iter_mut().take(live - 1) {
+            *o = [draw_card(&mut s, &mut used), draw_card(&mut s, &mut used)];
+        }
+        let turn = draw_card(&mut s, &mut used);
+        let river = draw_card(&mut s, &mut used);
+        let dealt = used;
+        let board = [flop[0], flop[1], flop[2], turn, river];
+        // precompute opponent continue + final rank (combo-independent).
+        let mut opp_cont = [false; 6];
+        let mut opp_rank = [clean_rules::HandRank(0); 6];
+        let mut n_opp_cont = 0usize;
+        let mut max_opp = clean_rules::HandRank(0);
+        let mut any_opp = false;
+        for j in 0..live - 1 {
+            opp_cont[j] = flop_continue(opp[j], flop, policy.use_draws);
+            opp_rank[j] = rank7(opp[j], board);
+            if opp_cont[j] {
+                n_opp_cont += 1;
+                if !any_opp || opp_rank[j] > max_opp {
+                    max_opp = opp_rank[j];
+                    any_opp = true;
+                }
+            }
+        }
+        for (ci, &(a, b)) in layout.iter().enumerate() {
+            let cm = (1u64 << a) | (1u64 << b);
+            if dealt & cm != 0 {
+                continue; // my combo conflicts with this sample's cards
+            }
+            if !flop_continue([a, b], flop, policy.use_draws) {
+                sum[ci] += (-half_pot) as f64;
+                cnt[ci] += 1;
+                continue;
+            }
+            let n_cont = n_opp_cont + 1;
+            if n_cont == 1 {
+                let rake = (pot * rake_rate).min(rake_cap).max(0.0);
+                sum[ci] += ((pot - rake) - half_pot) as f64;
+                cnt[ci] += 1;
+                continue;
+            }
+            let my_rank = rank7([a, b], board);
+            let maxr = if any_opp { my_rank.max(max_opp) } else { my_rank };
+            let me_wins = my_rank == maxr;
+            let mut winners = if me_wins { 1u32 } else { 0 };
+            for j in 0..live - 1 {
+                if opp_cont[j] && opp_rank[j] == maxr {
+                    winners += 1;
+                }
+            }
+            let contested = pot + n_cont as f32 * bet;
+            let rake = (contested * rake_rate).min(rake_cap).max(0.0);
+            let net = contested - rake;
+            let my_invest = half_pot + bet;
+            let ev = if me_wins { net / winners as f32 - my_invest } else { -my_invest };
+            sum[ci] += ev as f64;
+            cnt[ci] += 1;
+        }
+                (sum, cnt)
+            },
+        )
+        .reduce(
+            || (vec![0.0f64; n], vec![0u32; n]),
+            |(mut sa, mut ca), (sb, cb)| {
+                for i in 0..n {
+                    sa[i] += sb[i];
+                    ca[i] += cb[i];
+                }
+                (sa, ca)
+            },
+        );
+    (0..n).map(|i| if cnt[i] > 0 { (sum[i] / cnt[i] as f64) as f32 } else { -half_pot }).collect()
+}
+
 /// All-in / showdown equity (share of pot won, no folding) — the DUMB baseline
 /// the realization model must beat, for the EQR comparison.
 pub fn allin_equity_on_flop(
