@@ -1262,6 +1262,9 @@ impl PreflopVectorCfr {
         oracle.begin_preflop_iter(self.iteration);
 
         let _ta = std::time::Instant::now();
+        let mut _misses = 0u64;
+        let mut _hits = 0u64;
+        let mut _folds = 0u64;
         // PHASE A (serial): per-traverser chance-node CFVs (oracle/cache + fold terms).
         let mut cfvs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(np as usize);
         for t in 0..np {
@@ -1269,6 +1272,7 @@ impl PreflopVectorCfr {
             for &chance_idx in &chance_nodes {
                 let mask = tree.get_folded_mask(chance_idx);
                 if (mask >> t) & 1 == 1 {
+                    _folds += 1;
                     let base = chance_idx * n_classes;
                     let reach_at: Vec<Vec<f32>> = (0..np as usize)
                         .map(|p| reach[p][base..base + n_classes].to_vec())
@@ -1278,8 +1282,12 @@ impl PreflopVectorCfr {
                 }
                 let key = chance_key(chance_idx);
                 let v = match cache[t as usize].get(&key) {
-                    Some(v) => v.clone(),
+                    Some(v) => {
+                        _hits += 1;
+                        v.clone()
+                    }
                     None => {
+                        _misses += 1;
                         let cell = crate::solver::postflop_oracle::SeamCell::at_chance_node(
                             tree, chance_idx, np as usize,
                         );
@@ -1317,7 +1325,8 @@ impl PreflopVectorCfr {
             );
         });
         if std::env::var("MC_PHASE").is_ok() {
-            eprintln!("    [iter {} phaseA(serial) {:.1}s | phaseB(par) {:.1}s]", self.iteration, phase_a, _tb.elapsed().as_secs_f64());
+            eprintln!("    [iter {} phaseA(serial) {:.1}s (chance miss {} hit {} fold {}) | phaseB(par) {:.1}s]",
+                self.iteration, phase_a, _misses, _hits, _folds, _tb.elapsed().as_secs_f64());
         }
 
         oracle.end_preflop_iter(self.iteration);
