@@ -25,14 +25,65 @@ pub struct EqrPolicy {
     pub bet_frac: f32,
     /// Count flush / open-ended straight draws as continue (so 87s realizes > A5o).
     pub use_draws: bool,
+    /// Minimum MADE-HAND strength to continue (the SELECTION STRENGTH / opponent
+    /// looseness): 1 = any pair (loose, ≈ vs-random field — over-realizes strong
+    /// hands), 2 = top-pair-or-better / overpair (realistic default), 3 = two-pair+.
+    /// Higher ⇒ the continuing field is more board-connected ⇒ conditional equity of
+    /// a static overpair drops on wet boards (the physics that makes AA NOT love
+    /// family pots). The threshold is a legit parameter, not a hack.
+    pub continue_min_made: u8,
     /// Monte-Carlo samples (opponents × runout) per (hand, flop, cell).
     pub mc_samples: usize,
 }
 
 impl Default for EqrPolicy {
     fn default() -> Self {
-        EqrPolicy { bet_frac: 1.0, use_draws: true, mc_samples: 3000 }
+        EqrPolicy { bet_frac: 1.0, use_draws: true, continue_min_made: 2, mc_samples: 3000 }
     }
+}
+
+/// Made-hand strength using a hand's OWN cards on the flop:
+/// 0 = no pair, 1 = weak pair (under/middle/bottom), 2 = top pair or overpair,
+/// 3 = two pair or better. (Determines selection into the continuing field.)
+fn made_strength(hole: [u8; 2], flop: [u8; 3]) -> u8 {
+    let cat = best5(&[hole[0], hole[1], flop[0], flop[1], flop[2]]).category();
+    if cat >= 2 {
+        return 3; // two pair, trips, straight, flush, ...
+    }
+    if cat == 1 {
+        let (h0, h1) = (rank_of(hole[0]), rank_of(hole[1]));
+        let top = rank_of(flop[0]).max(rank_of(flop[1])).max(rank_of(flop[2]));
+        if h0 == h1 && h0 > top {
+            return 2; // overpair
+        }
+        if h0 == top || h1 == top {
+            return 2; // top pair
+        }
+        return 1; // weak pair
+    }
+    0
+}
+
+/// Strong draw on the flop: flush draw (4+ of a suit) or open-ended straight draw.
+fn strong_draw(hole: [u8; 2], flop: [u8; 3]) -> bool {
+    let cards = [hole[0], hole[1], flop[0], flop[1], flop[2]];
+    let mut suits = [0u8; 4];
+    for &c in &cards {
+        suits[suit_of(c) as usize] += 1;
+    }
+    if suits.iter().any(|&n| n >= 4) {
+        return true;
+    }
+    let mut present = [false; 13];
+    for &c in &cards {
+        present[rank_of(c) as usize] = true;
+    }
+    for lo in 1..=8usize {
+        if present[lo] && present[lo + 1] && present[lo + 2] && present[lo + 3] {
+            return true;
+        }
+    }
+    false
 }
 
 #[inline]
@@ -56,41 +107,14 @@ fn draw_card(s: &mut u64, used: &mut u64) -> u8 {
     }
 }
 
-/// Flop-visible continue test: paired WITH MY cards (pocket pair or hit the board),
-/// or — if draws on — a flush draw (4+ of a suit) or open-ended straight draw.
+/// Flop-visible continue test, parameterized by the SELECTION STRENGTH
+/// `min_made` (1=any pair, 2=top-pair+/overpair, 3=two-pair+). A continuer must
+/// either reach `min_made` made-hand strength OR (if draws on) hold a strong draw.
+/// Tighter `min_made` ⇒ the continuing field is more board-connected, so a static
+/// overpair's CONDITIONAL equity vs that field drops on wet boards.
 #[inline]
-fn flop_continue(hole: [u8; 2], flop: [u8; 3], use_draws: bool) -> bool {
-    let (h0, h1) = (rank_of(hole[0]), rank_of(hole[1]));
-    if h0 == h1 {
-        return true; // pocket pair
-    }
-    let br = [rank_of(flop[0]), rank_of(flop[1]), rank_of(flop[2])];
-    if br.contains(&h0) || br.contains(&h1) {
-        return true; // paired the board with a hole card
-    }
-    if !use_draws {
-        return false;
-    }
-    let cards = [hole[0], hole[1], flop[0], flop[1], flop[2]];
-    // flush draw: 4+ of one suit among the 5 known cards.
-    let mut suits = [0u8; 4];
-    for &c in &cards {
-        suits[suit_of(c) as usize] += 1;
-    }
-    if suits.iter().any(|&n| n >= 4) {
-        return true;
-    }
-    // open-ended straight draw: 4 distinct consecutive ranks, both ends extendable.
-    let mut present = [false; 13];
-    for &c in &cards {
-        present[rank_of(c) as usize] = true;
-    }
-    for lo in 1..=8usize {
-        if present[lo] && present[lo + 1] && present[lo + 2] && present[lo + 3] {
-            return true;
-        }
-    }
-    false
+fn flop_continue(hole: [u8; 2], flop: [u8; 3], min_made: u8, use_draws: bool) -> bool {
+    made_strength(hole, flop) >= min_made || (use_draws && strong_draw(hole, flop))
 }
 
 #[inline]
@@ -112,14 +136,15 @@ fn realized_ev_sample(
     bet: f32,
     rake_rate: f32,
     rake_cap: f32,
+    min_made: u8,
     use_draws: bool,
 ) -> f32 {
     let half_pot = pot / live as f32; // showdown-convention investment baseline
-    if !flop_continue(my_hole, flop, use_draws) {
+    if !flop_continue(my_hole, flop, min_made, use_draws) {
         return -half_pot; // fold the flop: forfeit pot share, save the bet
     }
     let continuers: Vec<usize> = (0..opp_holes.len())
-        .filter(|&j| flop_continue(opp_holes[j], flop, use_draws))
+        .filter(|&j| flop_continue(opp_holes[j], flop, min_made, use_draws))
         .collect();
     let n_cont = continuers.len() + 1; // including me
     if n_cont == 1 {
@@ -186,7 +211,8 @@ pub fn realized_ev_on_flop(
         let turn = draw_card(&mut s, &mut used);
         let river = draw_card(&mut s, &mut used);
         acc += realized_ev_sample(
-            my_hole, &opp, flop, turn, river, pot, live, bet, rake_rate, rake_cap, policy.use_draws,
+            my_hole, &opp, flop, turn, river, pot, live, bet, rake_rate, rake_cap,
+            policy.continue_min_made, policy.use_draws,
         ) as f64;
     }
     (acc / policy.mc_samples as f64) as f32
@@ -209,18 +235,17 @@ pub fn realized_ev_table_on_flop(
     policy: EqrPolicy,
     seed: u64,
 ) -> Vec<f32> {
-    use rayon::prelude::*;
+    // SERIAL per table: parallelism lives ACROSS tables (the pre-fill pass runs
+    // many (cell,flop) tables concurrently — full core utilization — vs spreading
+    // one table's few samples across cores, which wastes them).
     let n = layout.len();
+    let mut sum = vec![0.0f64; n];
+    let mut cnt = vec![0u32; n];
     let half_pot = pot / live as f32;
     let bet = policy.bet_frac * pot;
     let flop_mask = (1u64 << flop[0]) | (1u64 << flop[1]) | (1u64 << flop[2]);
-    // Parallel over samples: each sample is independent with its own seeded RNG;
-    // fold into per-thread (sum,cnt) accumulators, then reduce.
-    let (sum, cnt) = (0..policy.mc_samples)
-        .into_par_iter()
-        .fold(
-            || (vec![0.0f64; n], vec![0u32; n]),
-            |(mut sum, mut cnt), i| {
+    {
+        for i in 0..policy.mc_samples {
                 let mut s = (seed ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15)) | 1;
                 let mut used = flop_mask;
         let mut opp = [[0u8; 2]; 6];
@@ -238,7 +263,7 @@ pub fn realized_ev_table_on_flop(
         let mut max_opp = clean_rules::HandRank(0);
         let mut any_opp = false;
         for j in 0..live - 1 {
-            opp_cont[j] = flop_continue(opp[j], flop, policy.use_draws);
+            opp_cont[j] = flop_continue(opp[j], flop, policy.continue_min_made, policy.use_draws);
             opp_rank[j] = rank7(opp[j], board);
             if opp_cont[j] {
                 n_opp_cont += 1;
@@ -253,7 +278,7 @@ pub fn realized_ev_table_on_flop(
             if dealt & cm != 0 {
                 continue; // my combo conflicts with this sample's cards
             }
-            if !flop_continue([a, b], flop, policy.use_draws) {
+            if !flop_continue([a, b], flop, policy.continue_min_made, policy.use_draws) {
                 sum[ci] += (-half_pot) as f64;
                 cnt[ci] += 1;
                 continue;
@@ -282,19 +307,8 @@ pub fn realized_ev_table_on_flop(
             sum[ci] += ev as f64;
             cnt[ci] += 1;
         }
-                (sum, cnt)
-            },
-        )
-        .reduce(
-            || (vec![0.0f64; n], vec![0u32; n]),
-            |(mut sa, mut ca), (sb, cb)| {
-                for i in 0..n {
-                    sa[i] += sb[i];
-                    ca[i] += cb[i];
-                }
-                (sa, ca)
-            },
-        );
+        }
+    }
     (0..n).map(|i| if cnt[i] > 0 { (sum[i] / cnt[i] as f64) as f32 } else { -half_pot }).collect()
 }
 

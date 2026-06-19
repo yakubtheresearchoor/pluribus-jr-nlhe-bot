@@ -54,6 +54,7 @@ fn main() {
     let policy = EqrPolicy {
         bet_frac: env_f("MC_BET", 1.0),
         use_draws: std::env::var("MC_NODRAWS").is_err(),
+        continue_min_made: env_u("MC_TIER", 2) as u8,
         mc_samples: env_u("MC_SAMPLES", 1500),
     };
 

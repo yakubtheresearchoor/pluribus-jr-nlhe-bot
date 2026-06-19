@@ -23,11 +23,13 @@ use solver_core::tree::action::{production_game_v1, BetCap, BetSize, BetSizeOpti
 use solver_core::tree::builder::build_tree_preflop_only;
 use solver_core::tree::flat::{FlatTree, MAX_NA_PREFLOP};
 
-fn cap3_preflop_tree(spec: &GameSpec) -> FlatTree {
-    let mrc = MAX_NA_PREFLOP.saturating_sub(2);
+fn cap3_preflop_tree(spec: &GameSpec, n_raises: usize) -> FlatTree {
+    // n_raises raise SIZES per decision (production uses MAX_NA_PREFLOP-2=6; fewer
+    // sizes ⇒ far smaller tree for a fast range-shape gate, same raise/limp logic).
+    let mrc = n_raises.min(MAX_NA_PREFLOP.saturating_sub(2)).max(1);
     let mut cfg = spec.preflop_tree_config(BetSizeOptions {
         bet: vec![BetSize::PotRelative(1.0)],
-        raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
+        raise: (0..mrc).map(|i| BetSize::PotRelative(1.0 + 1.0 * i as f64)).collect(),
     });
     cfg.max_bets_per_street = BetCap::all(3);
     build_tree_preflop_only(&cfg).expect("cap-3 preflop tree")
@@ -143,13 +145,15 @@ fn main() {
     let policy = EqrPolicy {
         bet_frac: env_f("MC_BET", 1.0),
         use_draws: std::env::var("MC_NODRAWS").is_err(),
+        continue_min_made: env_u("MC_TIER", 2) as u8,
         mc_samples: env_u("MC_SAMPLES", 120),
     };
     let n_flops = env_u("PF_FLOPS", 120);
     let iters = env_u("PF_ITERS", 60) as u32;
     let check = env_u("PF_CHECK", 10) as u32;
 
-    let tree = cap3_preflop_tree(&spec);
+    let n_raises = env_u("PF_RAISES", 2);
+    let tree = cap3_preflop_tree(&spec, n_raises);
     let table = PreflopChanceTable::new(
         6,
         vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6],
@@ -165,9 +169,9 @@ fn main() {
     // a restart reads every already-filled (cell, flop) instead of recomputing.
     let base = std::env::var("EQR_CACHE").unwrap_or_else(|_| "eqr_cache".into());
     let tag = format!(
-        "r{}_c{}_s{}_a{}_b{}_d{}_m{}",
+        "r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
         (spec.rake_rate * 1000.0) as i32, spec.rake_cap, spec.stack, spec.ante,
-        (policy.bet_frac * 100.0) as i32, policy.use_draws as u8, policy.mc_samples
+        (policy.bet_frac * 100.0) as i32, policy.use_draws as u8, policy.continue_min_made, policy.mc_samples
     );
     let dir = format!("{base}/{tag}");
     std::fs::create_dir_all(&dir).expect("mkdir eqr cache base");
@@ -184,6 +188,66 @@ fn main() {
         policy.bet_frac, policy.use_draws, policy.mc_samples, iters,
         tree.num_nodes(), solver.infoset_count
     );
+
+    // ── PARALLEL PRE-FILL: every (SPR-cell × flop) EQR table, across ALL cores ──
+    // (each table serial, many tables concurrent = full utilization). Skips tables
+    // already on disk, so it's rerunnable. Then the CFR oracle just reads.
+    {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut cells: HashMap<(u8, i64), SeamCell> = HashMap::new();
+        for i in 0..tree.num_nodes() {
+            if tree.nodes[i].is_chance() {
+                let cell = SeamCell::at_chance_node(&tree, i, 6);
+                cells.entry(cell.bucket_key(spec.stack)).or_insert(cell);
+            }
+        }
+        let jobs: Vec<((u8, i64), SeamCell, usize, [Card; 3])> = cells
+            .iter()
+            .flat_map(|(&k, &c)| {
+                table.canonical_flops.iter().enumerate().map(move |(fi, &f)| (k, c, fi, f))
+            })
+            .collect();
+        let total = jobs.len();
+        eprintln!(
+            "PRE-FILL: {} cells × {} flops = {total} tables, parallel across cores",
+            cells.len(),
+            table.canonical_flops.len()
+        );
+        let done = AtomicUsize::new(0);
+        let tf = std::time::Instant::now();
+        jobs.par_iter().for_each(|&(key, cell, fi, canonical)| {
+            let layout: Vec<(u8, u8)> = flop_combo_layout(canonical);
+            if read_eqr(&dir, key, fi, layout.len()).is_some() {
+                return; // already filled — rerunnable
+            }
+            let seed = splitmix(
+                (key.0 as u64)
+                    ^ ((key.1 as u64) << 8)
+                    ^ ((canonical[0] as u64) << 24)
+                    ^ ((canonical[1] as u64) << 32)
+                    ^ ((canonical[2] as u64) << 40),
+            );
+            let vals = realized_ev_table_on_flop(
+                &layout, [canonical[0], canonical[1], canonical[2]], cell.live as usize,
+                cell.pot as f32, spec.rake_rate as f32, spec.rake_cap as f32, policy, seed,
+            );
+            write_eqr(&dir, key, fi, &vals);
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if d % 5000 == 0 {
+                eprintln!(
+                    "  [pre-fill] {d} computed | {:.0}/s | {:.1} min",
+                    d as f64 / tf.elapsed().as_secs_f64().max(1e-3),
+                    tf.elapsed().as_secs_f64() / 60.0
+                );
+            }
+        });
+        eprintln!(
+            "PRE-FILL done: {} fresh tables in {:.1}s (rest already cached)",
+            done.load(Ordering::Relaxed),
+            tf.elapsed().as_secs_f64()
+        );
+    }
 
     let t0 = std::time::Instant::now();
     let mut chance_cache: Vec<HashMap<u64, Vec<f32>>> = Vec::new();
