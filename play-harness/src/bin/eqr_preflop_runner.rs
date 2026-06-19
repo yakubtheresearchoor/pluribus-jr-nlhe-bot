@@ -33,6 +33,7 @@ fn cap3_preflop_tree(spec: &GameSpec, n_raises: usize) -> FlatTree {
     });
     cfg.max_bets_per_street = BetCap::all(3);
     cfg.no_open_limp = true; // raise-or-fold opens (open-limping is dominated in 6-max)
+    cfg.threebet_or_fold = true; // 3bet-or-fold facing an open (no flat, no jam — sized 3bet plays the EQR postflop)
     build_tree_preflop_only(&cfg).expect("cap-3 preflop tree")
 }
 
@@ -172,7 +173,7 @@ fn main() {
     // a restart reads every already-filled (cell, flop) instead of recomputing.
     let base = std::env::var("EQR_CACHE").unwrap_or_else(|_| "eqr_cache".into());
     let tag = format!(
-        "rof_nr{}_r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
+        "rof3_nr{}_r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
         n_raises, (spec.rake_rate * 1000.0) as i32, spec.rake_cap, spec.stack, spec.ante,
         (policy.bet_frac * 100.0) as i32, policy.use_draws as u8, policy.continue_min_made, policy.mc_samples
     );
@@ -323,4 +324,49 @@ fn print_ranges(solver: &PreflopVectorCfr, tree: &FlatTree, it: u32, secs: f64) 
         line.push_str(&format!("{name} {r:.0}/{f:.0}   "));
     }
     eprintln!("    {line}");
+
+    // FACING-A-RAISE / 3-BET gate: the next player after UTG's open-raise. Follow a
+    // mid-size raise child of node 0 to the player who now faces it; report
+    // 3bet%(label4) / call%(label2) / fold%(label0). Watch (per review): if strong
+    // hands FLAT (high call%) instead of 3betting, the multiway-call attractor needs
+    // the same raise-or-fold fix one node deeper.
+    let raise_kids: Vec<usize> = tree
+        .node_children(0)
+        .iter()
+        .filter(|&&k| tree.nodes[k as usize].action_label == 4)
+        .map(|&k| k as usize)
+        .collect();
+    if let Some(&fr) = raise_kids.get(raise_kids.len() / 2) {
+        if tree.nodes[fr].is_player() {
+            let flocal = solver.local_offset[fr];
+            let fna = tree.nodes[fr].num_children as usize;
+            let foff = flocal * MAX_NA_PREFLOP * nc;
+            let flabels: Vec<u8> =
+                tree.node_children(fr).iter().map(|&c| tree.nodes[c as usize].action_label).collect();
+            let frac = |cl: usize, want: u8| -> f32 {
+                let s: f32 = (0..fna).map(|a| avg[foff + a * nc + cl].max(0.0)).sum();
+                if s <= 0.0 {
+                    return 0.0;
+                }
+                let r: f32 =
+                    (0..fna).filter(|&a| flabels[a] == want).map(|a| avg[foff + a * nc + cl].max(0.0)).sum();
+                r / s
+            };
+            eprintln!(
+                "          facing-a-raise (seat {}) — 3bet%/call%/fold%:",
+                tree.nodes[fr].player_id
+            );
+            let mut fl = String::new();
+            for (name, a, b) in hands {
+                let cl = ix(a, b);
+                fl.push_str(&format!(
+                    "{name} {:.0}/{:.0}/{:.0}   ",
+                    frac(cl, 4) * 100.0,
+                    frac(cl, 2) * 100.0,
+                    frac(cl, 0) * 100.0
+                ));
+            }
+            eprintln!("          {fl}");
+        }
+    }
 }

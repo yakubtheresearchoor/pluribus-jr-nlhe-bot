@@ -850,10 +850,17 @@ impl<'a> TreeBuilder<'a> {
                 // limping is strictly dominated in 6-max GTO and is otherwise an
                 // attractor the static EQR terminal can't price. Calling a RAISE
                 // (num_bets>=1) is still allowed.
-                let is_open_limp = self.config.no_open_limp && info.num_bets == 0;
-                if !is_open_limp {
+                // Suppress CALL at the open (no_open_limp, num_bets==0) OR at the
+                // 3-bet decision (threebet_or_fold, num_bets==1) — 3bet-or-fold.
+                let suppress_call = (self.config.no_open_limp && info.num_bets == 0)
+                    || (self.config.threebet_or_fold && info.num_bets == 1);
+                if !suppress_call {
                     actions.push(Action::Call);
                 }
+                // Suppress the JAM at the 3-bet decision: a sized 3-bet must play the
+                // EQR postflop, not collapse to a clean all-in showdown (which the
+                // static terminal over-values for strong hands). Deeper jams unaffected.
+                let suppress_jam = self.config.threebet_or_fold && info.num_bets == 1;
 
                 if !info.allin_flag && may_aggress {
                     for &bet_size in &bet_options.raise {
@@ -871,14 +878,17 @@ impl<'a> TreeBuilder<'a> {
                     }
 
                     let allin_threshold = pot as f64 * self.config.add_allin_threshold;
-                    if max_amount <= prev_amount + allin_threshold.round() as i32 {
+                    if !suppress_jam && max_amount <= prev_amount + allin_threshold.round() as i32 {
                         actions.push(Action::AllIn(max_amount));
                     }
                 }
             }
         }
 
-        self.clamp_and_force_allin(&mut actions, pot, prev_amount, max_amount, min_amount);
+        // At a 3-bet-or-fold decision, keep size-clamping but DON'T force the big
+        // sized 3-bets into all-in jams (suppress_jam there).
+        let allow_force_allin = !(self.config.threebet_or_fold && info.num_bets == 1);
+        self.clamp_and_force_allin(&mut actions, pot, prev_amount, max_amount, min_amount, allow_force_allin);
 
         actions.sort();
         actions.dedup();
@@ -1031,6 +1041,7 @@ impl<'a> TreeBuilder<'a> {
         prev_amount: i32,
         max_amount: i32,
         min_amount: i32,
+        allow_force_allin: bool,
     ) {
         for action in actions.iter_mut() {
             match *action {
@@ -1040,7 +1051,7 @@ impl<'a> TreeBuilder<'a> {
                     let new_pot = pot + 2 * new_amount_diff;
                     let threshold =
                         (new_pot as f64 * self.config.force_allin_threshold).round() as i32;
-                    if max_amount <= clamped + threshold {
+                    if allow_force_allin && max_amount <= clamped + threshold {
                         *action = Action::AllIn(max_amount);
                     } else if clamped != amount {
                         *action = Action::Bet(clamped);
@@ -1052,7 +1063,7 @@ impl<'a> TreeBuilder<'a> {
                     let new_pot = pot + 2 * new_amount_diff;
                     let threshold =
                         (new_pot as f64 * self.config.force_allin_threshold).round() as i32;
-                    if max_amount <= clamped + threshold {
+                    if allow_force_allin && max_amount <= clamped + threshold {
                         *action = Action::AllIn(max_amount);
                     } else if clamped != amount {
                         *action = Action::Raise(clamped);

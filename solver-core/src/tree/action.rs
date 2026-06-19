@@ -170,6 +170,7 @@ impl GameSpec {
             button_player: Some(self.num_players - 1),
             max_bets_per_street: None,
             no_open_limp: false,
+            threebet_or_fold: false,
         }
     }
 
@@ -206,6 +207,7 @@ impl GameSpec {
             button_player: None,
             max_bets_per_street: None,
             no_open_limp: false,
+            threebet_or_fold: false,
         }
     }
 }
@@ -293,6 +295,12 @@ pub struct TreeConfig {
     /// in 6-max GTO; suppressing it removes a branch a static (non-adaptive) terminal
     /// can't price. Calling a raise is unaffected. Default false (legacy behavior).
     pub no_open_limp: bool,
+    /// 3BET-OR-FOLD: when true, the FIRST facing-a-raise decision (num_bets==1, the
+    /// 3-bet spot) offers only FOLD and sized RAISES — no flat-CALL (the multiway
+    /// cold-call attractor) and no ALL-IN/jam (the clean-showdown attractor the
+    /// static terminal over-values vs. a sized 3-bet that plays the EQR postflop).
+    /// Deeper raise-war decisions (4-bet/5-bet, num_bets>=2) are unaffected. Default false.
+    pub threebet_or_fold: bool,
 }
 
 /// See `TreeConfig::max_bets_per_street`.

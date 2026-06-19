@@ -79,6 +79,7 @@ fn build_oracle_tree() -> FlatTree {
         button_player: None,
             max_bets_per_street: None,
             no_open_limp: false,
+            threebet_or_fold: false,
     };
     build_tree(&cfg).expect("oracle tree builds")
 }

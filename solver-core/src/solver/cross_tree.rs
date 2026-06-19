@@ -1050,6 +1050,7 @@ mod tests {
             button_player: None,
             max_bets_per_street: None,
             no_open_limp: false,
+            threebet_or_fold: false,
         }
     }
 
