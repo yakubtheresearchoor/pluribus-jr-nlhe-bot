@@ -287,6 +287,27 @@ fn main() {
         }
     }
     eprintln!("\ndone in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // ── PF_SAVE: dump the solved average strategy for the play harness. The
+    // loader rebuilds the IDENTICAL tree (production_game_v1 + these overrides
+    // + cap3_preflop_tree) so the flat `local_offset`-indexed avg array maps
+    // 1:1, then samples preflop actions per (169-class, node) during play. ──
+    if let Ok(path) = std::env::var("PF_SAVE") {
+        let avg = solver.average_strategy(&tree);
+        let bytes: Vec<u8> = avg.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(format!("{path}.f32"), &bytes).expect("write pf strategy");
+        let meta = format!(
+            "{{\"format\":1,\"n_raises\":{},\"rake_rate\":{},\"rake_cap\":{},\
+             \"stack\":{},\"ante\":{},\"sb\":{},\"bb\":{},\"button_player\":{},\
+             \"num_nodes\":{},\"avg_len\":{},\"nc\":{},\"max_na\":{},\
+             \"no_open_limp\":true,\"threebet_or_fold\":true,\"max_bets\":3}}",
+            n_raises, spec.rake_rate, spec.rake_cap, spec.stack, spec.ante,
+            spec.sb, spec.bb, 5,
+            tree.num_nodes(), avg.len(), NUM_PREFLOP_CLASSES, MAX_NA_PREFLOP,
+        );
+        std::fs::write(format!("{path}.json"), meta).expect("write pf meta");
+        eprintln!("SAVED preflop strategy → {path}.f32 ({} f32) + {path}.json", avg.len());
+    }
 }
 
 /// UTG (node 0) raise/fold% for signature classes from the average strategy.
@@ -400,6 +421,65 @@ fn print_ranges(solver: &PreflopVectorCfr, tree: &FlatTree, it: u32, secs: f64) 
                 ));
             }
             eprintln!("          {fl}");
+        }
+    }
+
+    // BB DEFENSE vs a BTN open — the real diagnostic for the steal fix. Walk the
+    // fold-chain to BTN (UTG/HJ/CO fold), take BTN's mid open-raise, fold SB, and
+    // the BB now closes the action. Report flat%(2)/3bet%(4)/fold%(0). Realistic
+    // shape ≈ flat 30-45%, 3bet 8-12%, rest fold. If BB flats 80%+ the EQR terminal
+    // over-values the blind's flat (dead-money attractor from the blind's seat).
+    let fold_child = |n: usize| -> Option<usize> {
+        tree.node_children(n)
+            .iter()
+            .find(|&&k| tree.nodes[k as usize].action_label == 0 && tree.nodes[k as usize].is_player())
+            .map(|&k| k as usize)
+    };
+    let mid_raise_child = |n: usize| -> Option<usize> {
+        let rk: Vec<usize> = tree
+            .node_children(n)
+            .iter()
+            .filter(|&&k| tree.nodes[k as usize].action_label == 4)
+            .map(|&k| k as usize)
+            .collect();
+        rk.get(rk.len() / 2).copied()
+    };
+    let bb_node = fold_child(0) // UTG fold -> HJ
+        .and_then(fold_child) // HJ fold -> CO
+        .and_then(fold_child) // CO fold -> BTN
+        .and_then(mid_raise_child) // BTN opens -> SB faces
+        .and_then(fold_child); // SB folds -> BB closes
+    if let Some(bb) = bb_node {
+        if tree.nodes[bb].is_player() {
+            let blocal = solver.local_offset[bb];
+            let bna = tree.nodes[bb].num_children as usize;
+            let boff = blocal * MAX_NA_PREFLOP * nc;
+            let blabels: Vec<u8> =
+                tree.node_children(bb).iter().map(|&c| tree.nodes[c as usize].action_label).collect();
+            let bfrac = |cl: usize, want: u8| -> f32 {
+                let s: f32 = (0..bna).map(|a| avg[boff + a * nc + cl].max(0.0)).sum();
+                if s <= 0.0 {
+                    return 0.0;
+                }
+                let r: f32 =
+                    (0..bna).filter(|&a| blabels[a] == want).map(|a| avg[boff + a * nc + cl].max(0.0)).sum();
+                r / s
+            };
+            eprintln!(
+                "          BB-defends-vs-BTN-open (seat {}) — 3bet%/flat%/fold%:",
+                tree.nodes[bb].player_id
+            );
+            let mut bl = String::new();
+            for (name, a, b) in hands {
+                let cl = ix(a, b);
+                bl.push_str(&format!(
+                    "{name} {:.0}/{:.0}/{:.0}   ",
+                    bfrac(cl, 4) * 100.0,
+                    bfrac(cl, 2) * 100.0,
+                    bfrac(cl, 0) * 100.0
+                ));
+            }
+            eprintln!("          {bl}");
         }
     }
 }

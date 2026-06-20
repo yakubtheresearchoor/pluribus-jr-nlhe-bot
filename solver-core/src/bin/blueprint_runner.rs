@@ -283,6 +283,18 @@ fn solve_and_bank(
     if let Some(ctx) = ctx {
         let mut n = BucketedNativeGpu::new(ctx, tree, game.table(), &bk, &solver, (32 / nb) as u32)
             .map_err(|e| std::io::Error::other(format!("native gpu: {e}")))?;
+        // MC terminal sampling (BP_SAMPLE_M). MANDATORY for B>16: an exhaustive
+        // B^K terminal at B≈32 (32^5 ≈ 33M tuples/lane) crashes the device
+        // watchdog. Refuse the unsafe combo rather than hang the machine.
+        let sample_m: u32 =
+            std::env::var("BP_SAMPLE_M").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(
+            !(nb > 16 && sample_m == 0),
+            "B={nb} > 16 requires BP_SAMPLE_M>0 — an exhaustive terminal at B>16 crashes the GPU"
+        );
+        if sample_m > 0 {
+            n.set_sampling(sample_m, (fi as u32) ^ 0x5eed_u32);
+        }
         n.run(iters - 1);
         let before = normalized_flop_sigma(n.cum_strategy_flop(), &solver, tree, &bk);
         n.run(1);
@@ -358,6 +370,21 @@ fn solve_and_bank(
         solver.cum_strategy_flop_mut().copy_from_slice(&cum_flop);
         solver.cum_strategy_turn_mut().copy_from_slice(&cum_turn);
         solver.cum_strategy_river_mut().copy_from_slice(&cum_river);
+        // MC-sample the CPU collapsed terminal during CFV extraction too —
+        // exhaustive B^K here is what hangs the fill at B>16 after the GPU
+        // solve. The root CFV is integrated over the tree, so it tolerates a
+        // lower sample count than the per-iter solve: BP_CFV_SAMPLE_M
+        // (default 512), falling back to BP_SAMPLE_M, then 0. The B>16 guard
+        // on the solve ensures sampling is active whenever nb>16.
+        let solve_sample_m: u32 =
+            std::env::var("BP_SAMPLE_M").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let cfv_sample_m: u32 = std::env::var("BP_CFV_SAMPLE_M")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| if solve_sample_m > 0 { solve_sample_m.min(512) } else { 0 });
+        if cfv_sample_m > 0 {
+            solver.set_sampling(cfv_sample_m, (fi as u64) ^ 0xC0FF_EE00_u64);
+        }
         let root_all = solver.root_cfv_from_avg(tree, &game, &bk);
         let perm =
             table_hand_to_layout_perm(&game.table().hand_cards, game.table().num_valid, flop);

@@ -43,7 +43,13 @@ struct BucketedTermParams {
     starting_pot: i32,
     rake_rate: f32,
     rake_cap: f32,
-    _pad: u32,
+    /// 0 = exhaustive B^K enumeration (byte-identical to the historical
+    /// path); >0 = Monte-Carlo terminal sampling at this many opponent
+    /// tuples per traverser bucket (the higher-B fidelity unlock).
+    sample_m: u32,
+    /// Host seed; the per-(node,bt) RNG stream is a pure function of
+    /// (rng_seed, node, bt) — run-to-run deterministic.
+    rng_seed: u32,
 }
 
 /// Field-for-field mirror of Metal `BucketedWalkDesc`.
@@ -79,6 +85,10 @@ struct BatchedParamsGpu {
     rake_cap: f32,
     /// 0 = packed (hybrid), 1 = resident (G5 native).
     mode: u32,
+    /// 0 = exhaustive; >0 = MC terminal sampling (per-bucket tuples).
+    sample_m: u32,
+    /// Per-(node,bt) deterministic RNG seed.
+    rng_seed: u32,
 }
 
 /// Walk identity for the batched cache.
@@ -122,6 +132,9 @@ pub struct BucketedTerminalGpu {
     rake_rate: f32,
     rake_cap: f32,
     stripes: u32,
+    /// Terminal sampling controls (single-kernel path). 0 = exhaustive.
+    sample_m: u32,
+    rng_seed: u32,
     gpu_busy_s: f64,
     // ── Batched path (G4 step 3) ──
     batched_pipeline: ComputePipelineState,
@@ -371,6 +384,8 @@ impl BucketedTerminalGpu {
             rake_rate: tree.rake_rate as f32,
             rake_cap: tree.rake_cap as f32,
             stripes,
+            sample_m: 0,
+            rng_seed: 0,
             gpu_busy_s: 0.0,
             batched_pipeline,
             batched_pipeline_spec,
@@ -383,6 +398,16 @@ impl BucketedTerminalGpu {
             zone_nodeid_off,
             cache: HashMap::new(),
         })
+    }
+
+    /// Enable/disable Monte-Carlo terminal sampling on the single-kernel
+    /// path (`fill_terminals`). `m == 0` restores exhaustive enumeration
+    /// (byte-identical to the historical path). `m > 0` draws `m` opponent
+    /// tuples per traverser bucket from the reach marginal, importance-
+    /// weighted (unbiased). `seed` keys the deterministic RNG stream.
+    pub fn set_sampling(&mut self, m: u32, seed: u32) {
+        self.sample_m = m;
+        self.rng_seed = seed;
     }
 
     /// Fill every terminal cfv slice for one zone walk. Returns true
@@ -459,7 +484,8 @@ impl BucketedTerminalGpu {
             starting_pot: self.starting_pot,
             rake_rate: self.rake_rate,
             rake_cap: self.rake_cap,
-            _pad: 0,
+            sample_m: self.sample_m,
+            rng_seed: self.rng_seed,
         };
 
         // Stage reach (unified memory; v1 copies, the no-copy variant
@@ -636,6 +662,8 @@ impl BucketedTerminalGpu {
             rake_rate: self.rake_rate,
             rake_cap: self.rake_cap,
             mode: 0,
+            sample_m: self.sample_m,
+            rng_seed: self.rng_seed,
         };
 
         // Per-call buffers (job/desc small; reach the big one).
@@ -823,6 +851,8 @@ impl BucketedTerminalGpu {
             rake_rate: self.rake_rate,
             rake_cap: self.rake_cap,
             mode: 1,
+            sample_m: self.sample_m,
+            rng_seed: self.rng_seed,
         };
         let jobs_flat: Vec<u32> = jobs.iter().flatten().copied().collect();
         let jobs_buf = {

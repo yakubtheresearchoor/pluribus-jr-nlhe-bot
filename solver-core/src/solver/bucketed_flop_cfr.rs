@@ -38,7 +38,8 @@ use crate::abstraction::postflop_buckets::compute_wtl_for_runout;
 use crate::card::Card;
 use crate::solver::bucketed_showdown::{
     bucketed_showdown_cfv, bucketed_showdown_cfv_design1_collapsed,
-    bucketed_showdown_cfv_factored, BucketedRunoutTables,
+    bucketed_showdown_cfv_design1_collapsed_sampled, bucketed_showdown_cfv_factored,
+    BucketedRunoutTables,
 };
 use crate::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use crate::solver::game::GameSpec;
@@ -557,6 +558,12 @@ pub struct BucketedFlopCfr {
     /// terminal path runs unchanged — every existing gate is untouched
     /// by construction.
     terminal_hook: Option<TerminalOffloadHook>,
+    /// MC terminal sampling for the CPU collapsed path (used by
+    /// `root_cfv_from_avg`). 0 = exhaustive B^K; >0 = sample this many
+    /// opponent tuples per bucket. REQUIRED at B>16 — the exhaustive CPU
+    /// terminal at B≈32 (32^K tuples/terminal) hangs the CFV bank.
+    sample_m: u32,
+    rng_seed: u64,
 }
 
 /// See `BucketedFlopCfr::set_terminal_offload_hook`.
@@ -697,12 +704,21 @@ impl BucketedFlopCfr {
             regret_floor: -1e30,
             terminal_design: TerminalDesign::Design1Brute,
             terminal_hook: None,
+            sample_m: 0,
+            rng_seed: 0,
         }
     }
 
     /// Select the bucketed terminal. Default is `Design1Brute` (the
     /// bit-exact anchor); production at real nh uses `Design2Factored`
     /// (cost gate: Design 1 is 563× over budget there).
+    /// Enable MC terminal sampling on the CPU collapsed path (CFV bank).
+    /// `m == 0` restores exhaustive enumeration. MANDATORY for B>16.
+    pub fn set_sampling(&mut self, m: u32, seed: u64) {
+        self.sample_m = m;
+        self.rng_seed = seed;
+    }
+
     pub fn set_terminal_design(&mut self, d: TerminalDesign) {
         self.terminal_design = d;
     }
@@ -1840,25 +1856,49 @@ impl BucketedFlopCfr {
                         .map(|p| tree.get_contribution(idx, p as u8))
                         .collect();
 
-                    let terminal_fn = match self.terminal_design {
-                        TerminalDesign::Design1Brute => bucketed_showdown_cfv,
-                        TerminalDesign::Design1Collapsed => {
-                            bucketed_showdown_cfv_design1_collapsed
-                        }
-                        TerminalDesign::Design2Factored => bucketed_showdown_cfv_factored,
+                    // MC-sample the collapsed terminal when enabled (B>16
+                    // CFV bank — exhaustive B^K hangs otherwise). Per-node
+                    // seed ⇒ independent deterministic stream per terminal.
+                    let cfv_out = if self.sample_m > 0
+                        && matches!(self.terminal_design, TerminalDesign::Design1Collapsed)
+                    {
+                        let term_seed =
+                            self.rng_seed ^ (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        bucketed_showdown_cfv_design1_collapsed_sampled(
+                            &bucket_views,
+                            tables,
+                            &contributions,
+                            fold_mask,
+                            traverser as usize,
+                            self.num_players,
+                            tree.starting_pot,
+                            tree.rake_rate as f32,
+                            tree.rake_cap as f32,
+                            true,
+                            self.sample_m,
+                            term_seed,
+                        )
+                    } else {
+                        let terminal_fn = match self.terminal_design {
+                            TerminalDesign::Design1Brute => bucketed_showdown_cfv,
+                            TerminalDesign::Design1Collapsed => {
+                                bucketed_showdown_cfv_design1_collapsed
+                            }
+                            TerminalDesign::Design2Factored => bucketed_showdown_cfv_factored,
+                        };
+                        terminal_fn(
+                            &bucket_views,
+                            tables,
+                            &contributions,
+                            fold_mask,
+                            traverser as usize,
+                            self.num_players,
+                            tree.starting_pot,
+                            tree.rake_rate as f32,
+                            tree.rake_cap as f32,
+                            true,
+                        )
                     };
-                    let cfv_out = terminal_fn(
-                        &bucket_views,
-                        tables,
-                        &contributions,
-                        fold_mask,
-                        traverser as usize,
-                        self.num_players,
-                        tree.starting_pot,
-                        tree.rake_rate as f32,
-                        tree.rake_cap as f32,
-                        true,
-                    );
 
                     // Expand per-bucket CFV back to hands, with the same
                     // /nc normalization as the exact walk.

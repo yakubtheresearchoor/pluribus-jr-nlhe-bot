@@ -24,3 +24,6 @@
 blueprint_out*/
 preflop_out*/
 eqr_cache/
+
+# Saved preflop strategy artifact (2GB, regenerable via PF_SAVE)
+preflop_eqr_bbfix.*

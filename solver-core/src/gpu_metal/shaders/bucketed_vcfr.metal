@@ -75,8 +75,31 @@ struct BucketedTermParams {
     int starting_pot;
     float rake_rate;
     float rake_cap;
-    uint _pad;
+    uint sample_m;      // 0 = exhaustive B^K enumeration; >0 = MC: draw this
+                        // many opponent tuples per traverser bucket from the
+                        // reach marginal, importance-weighted (unbiased).
+    uint rng_seed;      // host-provided seed; the per-(node,bt) stream is a
+                        // pure function of (rng_seed, node, bt) → run-to-run
+                        // deterministic, same standard as the striped path.
 };
+
+// ── Terminal-sampling RNG (counter-based, deterministic). A pure
+// function of (seed, node, bt) seeds the stream; rng_uniform advances
+// it. No global state, so run-to-run reproducible — the determinism
+// standard the striped production path already lives under. ──
+inline uint wang_hash(uint s) {
+    s = (s ^ 61u) ^ (s >> 16);
+    s *= 9u;
+    s ^= s >> 4;
+    s *= 0x27d4eb2du;
+    s ^= s >> 15;
+    return s;
+}
+inline float rng_uniform(thread uint& state) {
+    state = state * 1664525u + 1013904223u;       // LCG step
+    uint x = wang_hash(state);                     // decorrelate
+    return float(x) * (1.0f / 4294967296.0f);      // [0,1)
+}
 
 // ── Arm-1 leaf: payoff constants, verbatim from recurse_eq_buckets ──
 inline float arm1_leaf(thread const float* state, uint num_opp, float k,
@@ -337,16 +360,144 @@ kernel void bucketed_terminal_collapsed(
         opp_contrib[oi] = contribs[p];
     }
 
-    // ── Phase C: per-lane enumeration ──
-    uint lanes_used = nb * S;
+    // ── Phase C: per-lane enumeration (exhaustive) OR per-bucket MC
+    //    sampling (sample_m > 0). Sampling uses one lane per traverser
+    //    bucket (no stripes); the exhaustive lane layout is untouched. ──
+    bool do_sample = (params.sample_m > 0u);
+    uint lanes_used = do_sample ? nb : nb * S;
     float accum = 0.0f;
     bool lane_active = tid < lanes_used;
-    uint bt = lane_active ? tid / S : 0;
-    uint stripe = lane_active ? tid % S : 0;
+    uint bt = lane_active ? (do_sample ? tid : tid / S) : 0;
+    uint stripe = (lane_active && !do_sample) ? tid % S : 0;
     uint lo0 = stripe * nb / S;
     uint hi0 = (stripe + 1) * nb / S;
 
-    if (lane_active && arm1) {
+    if (do_sample && lane_active) {
+        // ── MC terminal estimator. accum ≈ (Π_d Z_d / M)·Σ_s G(tuple_s),
+        //    the tuple drawn ∝ per-opponent reach marginal; G is the
+        //    exhaustive leaf value with the leading reach factor removed
+        //    (it lives in zprod instead). Unbiased: E[G] = accum / Π Z_d.
+        //    Arm-1 carries the same half_pot post-multiply as below. ──
+        float Z[MAX_OPP_BUCKETED];
+        float zprod = 1.0f;
+        for (uint d = 0; d < num_opp; d++) {
+            float z = 0.0f;
+            for (uint b = 0; b < nb; b++) z += bucket_reach_tg[d * nb + b];
+            Z[d] = z;
+            zprod *= z;
+        }
+        if (zprod > 0.0f) {
+            uint state = wang_hash(params.rng_seed
+                ^ (node * 2654435761u) ^ (bt * 40503u) ^ 0x9e3779b9u);
+            float sumG = 0.0f;
+            if (arm1) {
+                float k = float(num_opp);
+                float half_pot = float(params.starting_pot) / float(np) + float(c_t);
+                int total_pot = params.starting_pot;
+                for (uint p = 0; p < np; p++) total_pot += contribs[p];
+                float rake = max(min(float(total_pot) * eff_rake_rate, eff_rake_cap), 0.0f);
+                float rpus = half_pot > 0.0f ? rake / half_pot : 0.0f;
+                int bo[MAX_OPP_BUCKETED];
+                float s_stack[(MAX_OPP_BUCKETED + 1) * STATE_LEN];
+                for (uint s = 0; s < params.sample_m; s++) {
+                    for (uint d = 0; d < num_opp; d++) {
+                        float u = rng_uniform(state) * Z[d];
+                        float cum = 0.0f;
+                        int ch = -1;
+                        for (uint b = 0; b < nb; b++) {
+                            float r = bucket_reach_tg[d * nb + b];
+                            if (r <= 0.0f) continue;
+                            cum += r;
+                            ch = int(b);   // last nonzero ⇒ rounding-safe fallback
+                            if (cum > u) break;
+                        }
+                        bo[d] = ch;
+                    }
+                    for (int i = 0; i < STATE_LEN; i++) s_stack[i] = 0.0f;
+                    s_stack[1] = 1.0f;
+                    bool dead = false;
+                    for (uint d = 0; d < num_opp; d++) {
+                        uint b = uint(bo[d]);
+                        float m = 1.0f;    // reach removed (carried in zprod)
+                        for (uint j = 0; j < d; j++) {
+                            float f = fn_tg[uint(bo[j]) * nb + b];
+                            if (f == 0.0f) { dead = true; break; }
+                            m *= f;
+                        }
+                        if (dead) break;
+                        uint idx = bt * nb + b;
+                        float fn_ = fn_tg[idx];
+                        float fw = fw_tg[idx];
+                        float ft = ft_tg[idx];
+                        float fl = fl_tg[idx];
+                        thread float* s_in = s_stack + d * STATE_LEN;
+                        thread float* s_out = s_stack + (d + 1) * STATE_LEN;
+                        for (int i = 0; i < STATE_LEN; i++) s_out[i] = 0.0f;
+                        if (s_in[0] != 0.0f) s_out[0] += s_in[0] * (m * fn_);
+                        for (int j = 0; j <= int(d); j++) {
+                            float sv = s_in[1 + j];
+                            if (sv == 0.0f) continue;
+                            if (fl != 0.0f) s_out[0] += sv * (m * fl);
+                            if (ft != 0.0f) s_out[1 + j + 1] += sv * (m * ft);
+                            if (fw != 0.0f) s_out[1 + j] += sv * (m * fw);
+                        }
+                    }
+                    if (!dead) {
+                        thread float* s_out = s_stack + num_opp * STATE_LEN;
+                        sumG += arm1_leaf(s_out, num_opp, k, rpus);
+                    }
+                }
+                accum = half_pot * (zprod / float(params.sample_m)) * sumG;
+            } else {
+                bool traverser_folded = (fold_mask & (1u << trav)) != 0;
+                LevelBlock lb = build_level_block(
+                    contribs, np, trav, num_opp, opp_folded, opp_contrib,
+                    params.starting_pot, eff_rake_rate, eff_rake_cap, traverser_folded);
+                int bo[MAX_OPP_BUCKETED];
+                float sc[MAX_OPP_BUCKETED][4];
+                for (uint s = 0; s < params.sample_m; s++) {
+                    for (uint d = 0; d < num_opp; d++) {
+                        float u = rng_uniform(state) * Z[d];
+                        float cum = 0.0f;
+                        int ch = -1;
+                        for (uint b = 0; b < nb; b++) {
+                            float r = bucket_reach_tg[d * nb + b];
+                            if (r <= 0.0f) continue;
+                            cum += r;
+                            ch = int(b);
+                            if (cum > u) break;
+                        }
+                        bo[d] = ch;
+                    }
+                    float wpair = 1.0f;   // Π opp-opp fn (reach removed)
+                    bool dead = false;
+                    for (uint d = 0; d < num_opp; d++) {
+                        uint b = uint(bo[d]);
+                        for (uint j = 0; j < d; j++) {
+                            float f = fn_tg[uint(bo[j]) * nb + b];
+                            if (f == 0.0f) { dead = true; break; }
+                            wpair *= f;
+                        }
+                        if (dead) break;
+                        uint idx = bt * nb + b;
+                        if (opp_folded[d]) {
+                            float n = fn_tg[idx];
+                            if (n == 0.0f) { dead = true; break; }
+                            sc[d][0] = 0.0f; sc[d][1] = 0.0f; sc[d][2] = 0.0f; sc[d][3] = n;
+                        } else {
+                            float fw = fw_tg[idx];
+                            float ft = ft_tg[idx];
+                            float fl = fl_tg[idx];
+                            if (fw == 0.0f && ft == 0.0f && fl == 0.0f) { dead = true; break; }
+                            sc[d][0] = fw; sc[d][1] = ft; sc[d][2] = fl; sc[d][3] = 0.0f;
+                        }
+                    }
+                    if (!dead) sumG += wpair * net_expected(lb, sc, num_opp, opp_folded);
+                }
+                accum = (zprod / float(params.sample_m)) * sumG;
+            }
+        }
+    } else if (!do_sample && lane_active && arm1) {
         float k = float(num_opp);
         float half_pot = float(params.starting_pot) / float(np) + float(c_t);
         int total_pot = params.starting_pot;
@@ -415,7 +566,7 @@ kernel void bucketed_terminal_collapsed(
         }
         // CPU: cfv[bt] = half_pot * accum — same final multiply, per lane.
         accum = half_pot * accum;
-    } else if (lane_active) {
+    } else if (!do_sample && lane_active) {
         // Arm 2 (folds / unequal): level block + odometer with sc.
         bool traverser_folded = (fold_mask & (1u << trav)) != 0;
         LevelBlock lb = build_level_block(
@@ -470,17 +621,23 @@ kernel void bucketed_terminal_collapsed(
         }
     }
 
-    // ── Phase D: fixed-order stripe reduction ──
-    partials[tid] = accum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane_active && stripe == 0) {
-        float total = partials[tid];
-        for (uint s = 1; s < S; s++) {
-            total += partials[tid + s];   // fixed order: s1, s2, …
+    // ── Phase D: reduction → per-bucket cfv. Sampling writes one lane
+    //    per bucket directly; exhaustive does the fixed-order stripe sum. ──
+    if (do_sample) {
+        if (lane_active) cfv_bucket_tg[bt] = accum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        partials[tid] = accum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane_active && stripe == 0) {
+            float total = partials[tid];
+            for (uint s = 1; s < S; s++) {
+                total += partials[tid + s];   // fixed order: s1, s2, …
+            }
+            cfv_bucket_tg[bt] = total;
         }
-        cfv_bucket_tg[bt] = total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ── Phase E: expansion (strided over h) ──
     device float* out = cfv + ulong(node) * nh;
@@ -540,6 +697,8 @@ struct BucketedBatchedParams {
     // node_ids_all[desc.node_off + lt], cfv written to the walk's
     // resident buffer at the node row).
     uint mode;
+    uint sample_m;      // 0 = exhaustive; >0 = MC terminal sampling.
+    uint rng_seed;      // per-(node,bt) deterministic RNG seed.
 };
 
 kernel void bucketed_terminal_collapsed_batched(
@@ -638,15 +797,139 @@ kernel void bucketed_terminal_collapsed_batched(
         opp_contrib[oi] = contribs[p];
     }
 
-    uint lanes_used = nb * S;
+    // Exhaustive lane layout OR per-bucket MC sampling (sample_m > 0).
+    // Mirrors bucketed_terminal_collapsed; see that kernel for the
+    // estimator derivation. Exhaustive path is byte-identical.
+    bool do_sample = (params.sample_m > 0u);
+    uint lanes_used = do_sample ? nb : nb * S;
     float accum = 0.0f;
     bool lane_active = tid < lanes_used;
-    uint bt = lane_active ? tid / S : 0;
-    uint stripe = lane_active ? tid % S : 0;
+    uint bt = lane_active ? (do_sample ? tid : tid / S) : 0;
+    uint stripe = (lane_active && !do_sample) ? tid % S : 0;
     uint lo0 = stripe * nb / S;
     uint hi0 = (stripe + 1) * nb / S;
 
-    if (lane_active && arm1) {
+    if (do_sample && lane_active) {
+        float Z[MAX_OPP_BUCKETED];
+        float zprod = 1.0f;
+        for (uint d = 0; d < num_opp; d++) {
+            float z = 0.0f;
+            for (uint b = 0; b < nb; b++) z += bucket_reach_tg[d * nb + b];
+            Z[d] = z;
+            zprod *= z;
+        }
+        if (zprod > 0.0f) {
+            uint state = wang_hash(params.rng_seed
+                ^ (node * 2654435761u) ^ (bt * 40503u) ^ 0x9e3779b9u);
+            float sumG = 0.0f;
+            if (arm1) {
+                float k = float(num_opp);
+                float half_pot = float(params.starting_pot) / float(np) + float(c_t);
+                int total_pot = params.starting_pot;
+                for (uint p = 0; p < np; p++) total_pot += contribs[p];
+                float rake = max(min(float(total_pot) * eff_rake_rate, eff_rake_cap), 0.0f);
+                float rpus = half_pot > 0.0f ? rake / half_pot : 0.0f;
+                int bo[MAX_OPP_BUCKETED];
+                float s_stack[(MAX_OPP_BUCKETED + 1) * STATE_LEN];
+                for (uint s = 0; s < params.sample_m; s++) {
+                    for (uint d = 0; d < num_opp; d++) {
+                        float u = rng_uniform(state) * Z[d];
+                        float cum = 0.0f;
+                        int ch = -1;
+                        for (uint b = 0; b < nb; b++) {
+                            float r = bucket_reach_tg[d * nb + b];
+                            if (r <= 0.0f) continue;
+                            cum += r;
+                            ch = int(b);
+                            if (cum > u) break;
+                        }
+                        bo[d] = ch;
+                    }
+                    for (int i = 0; i < STATE_LEN; i++) s_stack[i] = 0.0f;
+                    s_stack[1] = 1.0f;
+                    bool dead = false;
+                    for (uint d = 0; d < num_opp; d++) {
+                        uint b = uint(bo[d]);
+                        float m = 1.0f;
+                        for (uint j = 0; j < d; j++) {
+                            float f = fn_tg[uint(bo[j]) * nb + b];
+                            if (f == 0.0f) { dead = true; break; }
+                            m *= f;
+                        }
+                        if (dead) break;
+                        uint idx = bt * nb + b;
+                        float fn_ = fn_tg[idx];
+                        float fw = fw_tg[idx];
+                        float ft = ft_tg[idx];
+                        float fl = fl_tg[idx];
+                        thread float* s_in = s_stack + d * STATE_LEN;
+                        thread float* s_out = s_stack + (d + 1) * STATE_LEN;
+                        for (int i = 0; i < STATE_LEN; i++) s_out[i] = 0.0f;
+                        if (s_in[0] != 0.0f) s_out[0] += s_in[0] * (m * fn_);
+                        for (int j = 0; j <= int(d); j++) {
+                            float sv = s_in[1 + j];
+                            if (sv == 0.0f) continue;
+                            if (fl != 0.0f) s_out[0] += sv * (m * fl);
+                            if (ft != 0.0f) s_out[1 + j + 1] += sv * (m * ft);
+                            if (fw != 0.0f) s_out[1 + j] += sv * (m * fw);
+                        }
+                    }
+                    if (!dead) {
+                        thread float* s_out = s_stack + num_opp * STATE_LEN;
+                        sumG += arm1_leaf(s_out, num_opp, k, rpus);
+                    }
+                }
+                accum = half_pot * (zprod / float(params.sample_m)) * sumG;
+            } else {
+                bool traverser_folded = (fold_mask & (1u << trav)) != 0;
+                LevelBlock lb = build_level_block(
+                    contribs, np, trav, num_opp, opp_folded, opp_contrib,
+                    params.starting_pot, eff_rake_rate, eff_rake_cap, traverser_folded);
+                int bo[MAX_OPP_BUCKETED];
+                float sc[MAX_OPP_BUCKETED][4];
+                for (uint s = 0; s < params.sample_m; s++) {
+                    for (uint d = 0; d < num_opp; d++) {
+                        float u = rng_uniform(state) * Z[d];
+                        float cum = 0.0f;
+                        int ch = -1;
+                        for (uint b = 0; b < nb; b++) {
+                            float r = bucket_reach_tg[d * nb + b];
+                            if (r <= 0.0f) continue;
+                            cum += r;
+                            ch = int(b);
+                            if (cum > u) break;
+                        }
+                        bo[d] = ch;
+                    }
+                    float wpair = 1.0f;
+                    bool dead = false;
+                    for (uint d = 0; d < num_opp; d++) {
+                        uint b = uint(bo[d]);
+                        for (uint j = 0; j < d; j++) {
+                            float f = fn_tg[uint(bo[j]) * nb + b];
+                            if (f == 0.0f) { dead = true; break; }
+                            wpair *= f;
+                        }
+                        if (dead) break;
+                        uint idx = bt * nb + b;
+                        if (opp_folded[d]) {
+                            float n = fn_tg[idx];
+                            if (n == 0.0f) { dead = true; break; }
+                            sc[d][0] = 0.0f; sc[d][1] = 0.0f; sc[d][2] = 0.0f; sc[d][3] = n;
+                        } else {
+                            float fw = fw_tg[idx];
+                            float ft = ft_tg[idx];
+                            float fl = fl_tg[idx];
+                            if (fw == 0.0f && ft == 0.0f && fl == 0.0f) { dead = true; break; }
+                            sc[d][0] = fw; sc[d][1] = ft; sc[d][2] = fl; sc[d][3] = 0.0f;
+                        }
+                    }
+                    if (!dead) sumG += wpair * net_expected(lb, sc, num_opp, opp_folded);
+                }
+                accum = (zprod / float(params.sample_m)) * sumG;
+            }
+        }
+    } else if (!do_sample && lane_active && arm1) {
         float k = float(num_opp);
         float half_pot = float(params.starting_pot) / float(np) + float(c_t);
         int total_pot = params.starting_pot;
@@ -704,7 +987,7 @@ kernel void bucketed_terminal_collapsed_batched(
             }
         }
         accum = half_pot * accum;
-    } else if (lane_active) {
+    } else if (!do_sample && lane_active) {
         bool traverser_folded = (fold_mask & (1u << trav)) != 0;
         LevelBlock lb = build_level_block(
             contribs, np, trav, num_opp, opp_folded, opp_contrib,
@@ -757,16 +1040,21 @@ kernel void bucketed_terminal_collapsed_batched(
         }
     }
 
-    partials[tid] = accum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane_active && stripe == 0) {
-        float total = partials[tid];
-        for (uint s = 1; s < S; s++) {
-            total += partials[tid + s];
+    if (do_sample) {
+        if (lane_active) cfv_bucket_tg[bt] = accum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        partials[tid] = accum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane_active && stripe == 0) {
+            float total = partials[tid];
+            for (uint s = 1; s < S; s++) {
+                total += partials[tid + s];
+            }
+            cfv_bucket_tg[bt] = total;
         }
-        cfv_bucket_tg[bt] = total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device float* out = (params.mode == 1)
         ? cfv_packed + desc.cfv_off + ulong(node) * nh

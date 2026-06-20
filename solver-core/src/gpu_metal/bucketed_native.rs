@@ -1140,6 +1140,14 @@ impl BucketedNativeGpu {
         self.term.set_use_specialized(on);
     }
 
+    /// MC terminal-sampling passthrough. `m == 0` keeps exhaustive B^K
+    /// enumeration; `m > 0` samples `m` opponent tuples per bucket. REQUIRED
+    /// for B > 16 — an exhaustive (m=0) terminal at B≈32 explodes
+    /// (32^5 ≈ 33M tuples/lane) and crashes the device watchdog.
+    pub fn set_sampling(&mut self, m: u32, seed: u32) {
+        self.term.set_sampling(m, seed);
+    }
+
     /// Stage-timing probe controls (attribution: per-stage command
     /// buffers on one queue — same hazard semantics, slight wall
     /// distortion, busy attribution valid).

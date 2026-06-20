@@ -35,7 +35,8 @@
 use solver_core::abstraction::postflop_buckets::compute_wtl_for_runout;
 use solver_core::card::Card;
 use solver_core::solver::bucketed_showdown::{
-    bucketed_showdown_cfv, bucketed_showdown_cfv_design1_collapsed, BucketedRunoutTables,
+    bucketed_showdown_cfv, bucketed_showdown_cfv_design1_collapsed,
+    bucketed_showdown_cfv_design1_collapsed_sampled, BucketedRunoutTables,
 };
 
 const NP: u8 = 6;
@@ -93,6 +94,62 @@ fn arm2_scenarios() -> Vec<(&'static str, [i32; 6], u16)> {
         ("lone survivor", [8, 8, 30, 8, 8, 16], 0b011111),
         ("folded traverser seat0", [20, 35, 35, 5, 20, 35], (1 << 0) | (1 << 3)),
     ]
+}
+
+/// MC-sampled collapsed terminal (the CFV-bank's B>16 unlock) must be an
+/// UNBIASED estimator of the exact collapsed cfv: at B=8 (where exhaustive
+/// is the ground truth) the reach-weighted error shrinks as 1/√M and is
+/// small at M=8000. Covers arm 1 (no-fold showdown) AND arm 2 (folds/
+/// sidepots) — both arms have a sampling path.
+#[test]
+fn collapse_sampled_unbiased_vs_exhaustive() {
+    let (tables, reaches) = general_fixture(8);
+    let nb = tables.nb;
+    let views: Vec<&[f32]> = reaches.iter().map(|v| v.as_slice()).collect();
+
+    // arm 1 (equal contribs, no folds) + the arm-2 scenarios.
+    let mut cases: Vec<(&str, [i32; 6], u16)> = vec![("arm1 showdown", [20; 6], 0)];
+    cases.extend(arm2_scenarios());
+
+    let werr = |exact: &[f32], samp: &[f32]| -> f64 {
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for (&e, &s) in exact.iter().zip(samp) {
+            num += (s as f64 - e as f64).abs();
+            den += (e as f64).abs();
+        }
+        num / den.max(1e-30)
+    };
+
+    let mut worst_hi = 0.0f64;
+    for (name, contribs, fold_mask) in cases {
+        for traverser in 0..NP as usize {
+            let exact = bucketed_showdown_cfv_design1_collapsed(
+                &views, &tables, &contribs, fold_mask, traverser, NP, 30, 0.05, 3.0, true,
+            );
+            let seed = 0xABCD_0000 ^ (traverser as u64) ^ ((fold_mask as u64) << 8);
+            let lo = bucketed_showdown_cfv_design1_collapsed_sampled(
+                &views, &tables, &contribs, fold_mask, traverser, NP, 30, 0.05, 3.0, true, 2000, seed,
+            );
+            let hi = bucketed_showdown_cfv_design1_collapsed_sampled(
+                &views, &tables, &contribs, fold_mask, traverser, NP, 30, 0.05, 3.0, true, 8000, seed,
+            );
+            // determinism
+            let hi2 = bucketed_showdown_cfv_design1_collapsed_sampled(
+                &views, &tables, &contribs, fold_mask, traverser, NP, 30, 0.05, 3.0, true, 8000, seed,
+            );
+            for b in 0..nb {
+                assert_eq!(hi[b].to_bits(), hi2[b].to_bits(), "{name}: nondeterministic at bucket {b}");
+            }
+            let (e_lo, e_hi) = (werr(&exact, &lo), werr(&exact, &hi));
+            worst_hi = worst_hi.max(e_hi);
+            assert!(
+                e_hi <= e_lo + 0.01,
+                "{name} trav={traverser}: error grew with samples (M2000 {e_lo:.4} → M8000 {e_hi:.4}) — bias, not variance"
+            );
+            assert!(e_hi < 0.05, "{name} trav={traverser}: M8000 rel error {e_hi:.4} too high — sampler likely biased");
+        }
+    }
+    eprintln!("collapse sampled-vs-exhaustive PASSED (B=8): worst M8000 weighted-mean rel {worst_hi:.4}");
 }
 
 #[test]

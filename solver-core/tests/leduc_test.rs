@@ -159,6 +159,21 @@ fn build_round2(tree: &mut FlatTree, c0: i32, c1: i32) -> usize {
     tree.set_folded_mask(fold_b, 0b10);
     tree.set_folded_mask(fold_br, 0b01);
 
+    // Action labels (fold=0, check=1, call=2, bet=3, raise=4) on each child by
+    // the action that reaches it — needed by the Pluribus bias variants
+    // (otherwise every action defaults to label 0 and bias is a no-op).
+    // Unused by CFR/exploitability, so existing gates are unaffected.
+    for (idx, lab) in [
+        (p1_after_check, 1u8), (p1_after_bet, 3),       // p0: check / bet
+        (showdown_cc, 1), (p0_after_cb, 3),             // p1_after_check: check / bet
+        (fold_cb, 0), (call_cb, 2), (p1_after_cr, 4),   // p0_after_cb: fold / call / raise
+        (fold_cr, 0), (call_cr, 2),                     // p1_after_cr: fold / call
+        (fold_b, 0), (call_b, 2), (p0_after_br, 4),     // p1_after_bet: fold / call / raise
+        (fold_br, 0), (call_br, 2),                     // p0_after_br: fold / call
+    ] {
+        tree.nodes[idx].action_label = lab;
+    }
+
     p0
 }
 
@@ -632,4 +647,145 @@ fn s1_multi_continuation_anchor() {
         "single-cont anchor not clean at convergence: {anchor_converged:.5} vs fine {fine_expl:.5}");
     eprintln!("S1 ANCHOR CLEAN (single-cont, converged): {anchor_converged:.5} vs fine {fine_expl:.5}. \
         The 6.78 was non-convergence; depth-limited search is sound. NEXT: corrects gate + multiway anchor.");
+}
+
+// ════════════════════════════════════════════════════════════════════
+// PLURIBUS multi-continuation depth-limited search (Modicum 2018 /
+// Pluribus 2019). Instead of freezing a SINGLE blueprint continuation,
+// the boundary (round-2) player selects among k continuation variants
+// (blueprint + fold/call/raise-biased) during the search, so the
+// searched round-1 is robust to the opponent deviating from the exact
+// blueprint at the leaf. k=1 MUST reduce bit-exactly to single-cont.
+// ════════════════════════════════════════════════════════════════════
+
+/// Like `search_with_frozen_river` but with k continuation variants
+/// (k=1 ⇒ single-continuation, identical to the plain search).
+fn search_frozen_river_k(
+    tree: &FlatTree, game: &LeducGame, blueprint: &CpuMccfr, k: usize, bias: f32, iters: u32,
+) -> f32 {
+    let mut s = CpuMccfr::new(tree, vec![NUM_HANDS, NUM_HANDS]);
+    for &nid in &river_nodes(tree) {
+        let na = tree.nodes[nid].num_children as usize;
+        let strat = blueprint.get_average_strategy(nid, na, NUM_HANDS);
+        let flat: Vec<f32> = (0..na).flat_map(|a| (0..NUM_HANDS).map(move |h| (a, h)))
+            .map(|(a, h)| strat[a][h]).collect();
+        s.freeze_node(nid, &flat);
+    }
+    s.setup_pluribus_continuations(tree, k, bias);
+    s.run(tree, game, iters);
+    full_expl(&s, tree, game)
+}
+
+#[test]
+fn pluribus_multicontinuation_k1_regression_and_effect() {
+    let tree = build_leduc_tree();
+    let game = LeducGame::new();
+    let iters = 4000;
+
+    // A rough blueprint (under-trained) — the case where robustifying the
+    // continuation matters most.
+    let mut rough = CpuMccfr::new(&tree, vec![NUM_HANDS, NUM_HANDS]);
+    rough.run(&tree, &game, 15);
+
+    // Reference: the original single-continuation search.
+    let ref_expl = search_with_frozen_river(&tree, &game, &rough, iters);
+    // k=1 through the multi-continuation machinery — MUST match the reference
+    // (setup_pluribus_continuations(k=1) is a no-op; boundary[] stays empty).
+    let k1_expl = search_frozen_river_k(&tree, &game, &rough, 1, 5.0, iters);
+    // k=4 Pluribus continuations (blueprint + fold/call/raise-biased, 5×).
+    let k4_expl = search_frozen_river_k(&tree, &game, &rough, 4, 5.0, iters);
+
+    eprintln!("\n═══ Pluribus multi-continuation (Leduc, rough blueprint) ═══");
+    eprintln!("single-cont (reference) expl {ref_expl:.6}");
+    eprintln!("k=1 via machinery       expl {k1_expl:.6}");
+    eprintln!("k=4 multi-continuation  expl {k4_expl:.6}");
+
+    // (1) k=1 REGRESSION: the multi-continuation path at k=1 reduces exactly
+    // to single-continuation.
+    assert!(
+        (k1_expl - ref_expl).abs() < 1e-5,
+        "k=1 must reduce to single-continuation: {k1_expl:.6} vs {ref_expl:.6}"
+    );
+    // (2) k=4 has a real EFFECT: the boundary selection engaged and changed
+    // the searched strategy. NOTE we do NOT assert k=4 lowers exact-BR
+    // exploitability of the COMBINED strategy — single-continuation over-fits
+    // round-1 to the fixed rough round-2 (internally consistent ⇒ low exact-BR
+    // expl), while multi-continuation deliberately does NOT over-fit, so an
+    // exact BR to the (robust-round-1 + blueprint-round-2) mismatch punishes
+    // it. The robustness payoff is against DEVIATING opponents, measured in
+    // the S2 study — not exact-BR-of-combined here. This gate proves the
+    // mechanism is correct (k=1 exact, k=4 engages), not that search wins.
+    assert!(
+        (k4_expl - k1_expl).abs() > 1e-4,
+        "k=4 multi-continuation should change the search ({k4_expl:.6} vs {k1_expl:.6})"
+    );
+    eprintln!(
+        "k=1 regression EXACT ({k1_expl:.6}=={ref_expl:.6}); k=4 engages (Δexpl {:.4}). \
+         Direction of exact-BR expl is NOT the robustness metric (see note).",
+        k4_expl - k1_expl
+    );
+}
+
+/// Search round-1 with `blueprint`'s round-2 frozen (k variants); RETURN the
+/// solver so its searched round-1 can be re-combined with a different round-2.
+fn search_solver_k(
+    tree: &FlatTree, game: &LeducGame, blueprint: &CpuMccfr, k: usize, bias: f32, iters: u32,
+) -> CpuMccfr {
+    let mut s = CpuMccfr::new(tree, vec![NUM_HANDS, NUM_HANDS]);
+    for &nid in &river_nodes(tree) {
+        let na = tree.nodes[nid].num_children as usize;
+        let strat = blueprint.get_average_strategy(nid, na, NUM_HANDS);
+        let flat: Vec<f32> = (0..na).flat_map(|a| (0..NUM_HANDS).map(move |h| (a, h)))
+            .map(|(a, h)| strat[a][h]).collect();
+        s.freeze_node(nid, &flat);
+    }
+    s.setup_pluribus_continuations(tree, k, bias);
+    s.run(tree, game, iters);
+    s
+}
+
+/// Exploitability of a combined profile: FLOP (round-1) nodes from `flop_src`,
+/// RIVER (round-2) nodes from `river_src`. Models "I committed round-1 from my
+/// search, but round-2 is actually re-searched (= river_src), not the blueprint
+/// my round-1 search assumed".
+fn combined_expl(tree: &FlatTree, game: &LeducGame, flop_src: &CpuMccfr, river_src: &CpuMccfr) -> f32 {
+    let rn: std::collections::HashSet<usize> = river_nodes(tree).into_iter().collect();
+    let mut s = CpuMccfr::new(tree, vec![NUM_HANDS, NUM_HANDS]);
+    for nid in 0..tree.nodes.len() {
+        if !tree.nodes[nid].is_player() { continue; }
+        let na = tree.nodes[nid].num_children as usize;
+        let src = if rn.contains(&nid) { river_src } else { flop_src };
+        let st = src.get_average_strategy(nid, na, NUM_HANDS);
+        let flat: Vec<f32> = (0..na).flat_map(|a| (0..NUM_HANDS).map(move |h| (a, h)))
+            .map(|(a, h)| st[a][h]).collect();
+        s.freeze_node(nid, &flat);
+    }
+    full_expl(&s, tree, game)
+}
+
+#[test]
+fn s2_robustness_recursive_research() {
+    let tree = build_leduc_tree();
+    let game = LeducGame::new();
+    let mut fine = CpuMccfr::new(&tree, vec![NUM_HANDS, NUM_HANDS]);
+    fine.run(&tree, &game, 20000);
+    let mut rough = CpuMccfr::new(&tree, vec![NUM_HANDS, NUM_HANDS]);
+    rough.run(&tree, &game, 15);
+
+    // Search round-1 against the ROUGH round-2 continuation (single vs multi).
+    let single = search_solver_k(&tree, &game, &rough, 1, 5.0, 4000);
+    let multi = search_solver_k(&tree, &game, &rough, 4, 5.0, 4000);
+
+    // PLAY: the round-2 actually reached is the FINE (re-searched) strategy,
+    // NOT the rough blueprint the round-1 search froze. Robustness = handling
+    // that mismatch. Baseline = no search (rough round-1 + fine round-2).
+    let e_rough = combined_expl(&tree, &game, &rough, &fine);
+    let e_single = combined_expl(&tree, &game, &single, &fine);
+    let e_multi = combined_expl(&tree, &game, &multi, &fine);
+    eprintln!("\n═══ S2 recursive re-search (round-1 searched vs ROUGH, played vs FINE round-2) ═══");
+    eprintln!("no-search round-1 (rough)   expl {e_rough:.6}");
+    eprintln!("single-continuation round-1 expl {e_single:.6}");
+    eprintln!("multi-continuation round-1  expl {e_multi:.6}");
+    eprintln!("→ multi vs single: {:+.6} ({})", e_multi - e_single,
+        if e_multi < e_single { "MULTI MORE ROBUST" } else { "single better / no gain" });
 }

@@ -29,10 +29,26 @@ pub struct CpuMccfr {
     // searcher optimizes only the un-frozen (subgame) nodes against the
     // frozen continuation. Freezing the post-boundary street = the
     // depth-limited leaf-continuation valuation (leaf value = continue
-    // with the blueprint). The frozen strategy is SWAPPABLE (fine or
-    // rough blueprint) — that swappability IS the S2 measurement.
+    // with the blueprint).
     frozen: Vec<bool>,
-    frozen_strategy: Vec<f32>,
+    // PLURIBUS MULTI-CONTINUATION (Modicum 2018 / Pluribus 2019): instead of
+    // a SINGLE frozen continuation, hold `num_variants` continuation
+    // strategies — variant 0 = blueprint, 1..k = action-biased (toward
+    // fold/call/raise). At a depth-limit BOUNDARY node the acting player
+    // SELECTS among the k variants (a regret-matched decision inside the
+    // solved subgame), so the searcher must be robust to the opponent
+    // deviating from the exact blueprint at the leaf. `num_variants == 1`
+    // ⇒ pure single-continuation, bit-identical to the pre-Pluribus path.
+    // `frozen_variants[c]` is one full [a*nh+h] strategy array over all
+    // frozen nodes; `boundary[n]` = a frozen node reached from the searched
+    // region (its player selects the variant); `sel_*` hold the per-boundary
+    // k-action selection regret/cum, indexed by `sel_offset`.
+    num_variants: usize,
+    frozen_variants: Vec<Vec<f32>>,
+    boundary: Vec<bool>,
+    sel_offset: Vec<usize>,
+    sel_regret: Vec<f32>,
+    sel_cum: Vec<f32>,
 }
 
 impl CpuMccfr {
@@ -62,7 +78,12 @@ impl CpuMccfr {
             lambda: None,
             last_cfv: vec![0.0; total],
             frozen: vec![false; tree.num_nodes()],
-            frozen_strategy: vec![0.0; total],
+            num_variants: 1,
+            frozen_variants: vec![vec![0.0; total]],
+            boundary: vec![false; tree.num_nodes()],
+            sel_offset: vec![UNUSED; tree.num_nodes()],
+            sel_regret: Vec::new(),
+            sel_cum: Vec::new(),
         }
     }
 
@@ -74,11 +95,105 @@ impl CpuMccfr {
     pub fn freeze_node(&mut self, node_idx: usize, strat: &[f32]) {
         let off = self.node_data_offset[node_idx];
         assert_ne!(off, UNUSED, "freeze_node on a non-player node {node_idx}");
-        assert!(off + strat.len() <= self.frozen_strategy.len(), "frozen strat overruns node block");
+        assert!(off + strat.len() <= self.frozen_variants[0].len(), "frozen strat overruns node block");
         self.frozen[node_idx] = true;
-        self.frozen_strategy[off..off + strat.len()].copy_from_slice(strat);
+        self.frozen_variants[0][off..off + strat.len()].copy_from_slice(strat);
         // Seed cum_strategy so StrategyProfile reads the blueprint here.
         self.cum_strategy[off..off + strat.len()].copy_from_slice(strat);
+    }
+
+    /// PLURIBUS multi-continuation setup. After all blueprint continuations
+    /// are frozen (variant 0), generate `k-1` action-biased variants and the
+    /// boundary/selection bookkeeping. `bias` multiplies the targeted action
+    /// class's probability then renormalizes (per hand, per frozen node):
+    ///   variant 1 = fold-biased, 2 = call/check-biased, 3 = raise/bet/allin-biased.
+    /// k=1 is a no-op (single-continuation). The acting player at each
+    /// boundary then regret-matches over the k variants during `run`.
+    pub fn setup_pluribus_continuations(&mut self, tree: &FlatTree, k: usize, bias: f32) {
+        assert!(k >= 1, "k>=1");
+        self.num_variants = k;
+        if k == 1 {
+            return;
+        }
+        let total = self.frozen_variants[0].len();
+        // Action-class targets per variant (by builder action_label): fold=0;
+        // check=1,call=2; bet=3,raise=4,allin=5. Variant 0 = blueprint (no bias).
+        let targets: Vec<&[u8]> = vec![&[], &[0], &[1, 2], &[3, 4, 5]];
+        self.frozen_variants.resize(k, vec![0.0; total]);
+        for c in 1..k {
+            self.frozen_variants[c] = self.frozen_variants[0].clone();
+        }
+        for node_idx in 0..tree.num_nodes() {
+            if !self.frozen[node_idx] {
+                continue;
+            }
+            let off = self.node_data_offset[node_idx];
+            if off == UNUSED {
+                continue;
+            }
+            let na = tree.nodes[node_idx].num_children as usize;
+            let nh = self.num_hands[tree.nodes[node_idx].player_id as usize];
+            let labels: Vec<u8> = tree
+                .node_children(node_idx)
+                .iter()
+                .map(|&c| tree.nodes[c as usize].action_label)
+                .collect();
+            for c in 1..k {
+                let tgt = if c < targets.len() { targets[c] } else { &[] };
+                for h in 0..nh {
+                    let mut sum = 0.0f32;
+                    for a in 0..na {
+                        let mut p = self.frozen_variants[c][off + a * nh + h];
+                        if tgt.contains(&labels[a]) {
+                            p *= bias;
+                        }
+                        self.frozen_variants[c][off + a * nh + h] = p;
+                        sum += p;
+                    }
+                    if sum > 0.0 {
+                        for a in 0..na {
+                            self.frozen_variants[c][off + a * nh + h] /= sum;
+                        }
+                    }
+                }
+            }
+        }
+        // Selection nodes = each player's FIRST frozen node on each path (the
+        // owner selects its OWN continuation variant there; deeper frozen nodes
+        // of that player just play the selected variant). DFS from the root
+        // carrying a bitmask of frozen-region players already encountered.
+        let mut sel_total = 0usize;
+        let mut stack: Vec<(usize, u32)> = vec![(0usize, 0u32)];
+        while let Some((n, seen)) = stack.pop() {
+            let mut new_seen = seen;
+            if self.frozen[n]
+                && tree.nodes[n].node_type == NODE_TYPE_PLAYER
+                && self.node_data_offset[n] != UNUSED
+            {
+                let p = tree.nodes[n].player_id as u32;
+                if seen & (1 << p) == 0 {
+                    self.boundary[n] = true;
+                    self.sel_offset[n] = sel_total;
+                    sel_total += k * self.num_hands[p as usize];
+                    new_seen = seen | (1 << p);
+                }
+            }
+            for &ch in tree.node_children(n) {
+                stack.push((ch as usize, new_seen));
+            }
+        }
+        self.sel_regret = vec![0.0; sel_total];
+        self.sel_cum = vec![0.0; sel_total];
+        if std::env::var("PLURIBUS_DEBUG").is_ok() {
+            let nb = self.boundary.iter().filter(|&&b| b).count();
+            let nfr = self.frozen.iter().filter(|&&f| f).count();
+            let vdiff: f32 = self.frozen_variants[1]
+                .iter()
+                .zip(&self.frozen_variants[0])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            eprintln!("[pluribus] frozen={nfr} boundaries={nb} k={k} max|var1-var0|={vdiff:.4}");
+        }
     }
 
     /// Enable QUANTAL-response (QRE) mode with per-seat inverse-
@@ -111,7 +226,8 @@ impl CpuMccfr {
 
             for traverser in 0..np {
                 let mut traverser_reach = game.initial_weight(traverser as u8);
-                let cfv = self.walk_cfr(tree, game, traverser as u8, 0, &mut cfreach, &mut traverser_reach, weight);
+                let mut var = vec![None; np];
+                let cfv = self.walk_cfr(tree, game, traverser as u8, 0, &mut cfreach, &mut traverser_reach, weight, &mut var);
 
                 if traverser == 0 {
                     for h in 0..nh0 {
@@ -138,6 +254,13 @@ impl CpuMccfr {
         cfreach: &mut [Vec<f32>],
         traverser_reach: &mut [f32],
         weight: f32,
+        // PER-PLAYER continuation variant (Pluribus multi-continuation, v2).
+        // var[p] = None until p crosses into the frozen region; then Some(c)
+        // = p plays continuation variant c at ITS frozen nodes. Each player
+        // selects its OWN continuation independently, so the traverser faces
+        // opponents picking their continuations adversarially (the searcher's
+        // own continuation is whatever it best-responds to — no joint bias).
+        var: &mut Vec<Option<usize>>,
     ) -> Vec<f32> {
         let node = &tree.nodes[node_idx];
 
@@ -160,7 +283,7 @@ impl CpuMccfr {
                     if outcome > 0 { game.clear_chance_outcome(); }
                     let probs: Vec<f32> = (0..nh_t).map(|h| game.chance_probability(outcome, h)).collect();
                     game.set_chance_outcome(outcome);
-                    let child_cfv = self.walk_cfr(tree, game, traverser, child, cfreach, traverser_reach, weight);
+                    let child_cfv = self.walk_cfr(tree, game, traverser, child, cfreach, traverser_reach, weight, var);
                     for h in 0..nh_t {
                         cfv[h] += probs[h] * child_cfv[h];
                     }
@@ -171,7 +294,7 @@ impl CpuMccfr {
                     if outcome > 0 { game.clear_chance_outcome(); }
                     let probs: Vec<f32> = (0..nh_t).map(|h| game.chance_probability(outcome, h)).collect();
                     game.set_chance_outcome(outcome);
-                    let child_cfv = self.walk_cfr(tree, game, traverser, child as usize, cfreach, traverser_reach, weight);
+                    let child_cfv = self.walk_cfr(tree, game, traverser, child as usize, cfreach, traverser_reach, weight, var);
                     for h in 0..nh_t {
                         cfv[h] += probs[h] * child_cfv[h];
                     }
@@ -186,7 +309,25 @@ impl CpuMccfr {
         let nh = self.num_hands[player as usize];
         let children = tree.node_children(node_idx);
 
-        let strategy = self.compute_strategy(node_idx, num_actions, nh, player);
+        // PLURIBUS SELECTION (v2): the OWNER's first frozen node — it selects
+        // its own continuation variant. `boundary[]` marks each player's first
+        // frozen node (set only when num_variants>1); `var[player].is_none()`
+        // confirms the owner hasn't selected yet on this path. k=1 leaves
+        // boundary[] empty ⇒ never taken ⇒ bit-identical to single-continuation.
+        let frozen_here = self.frozen[node_idx];
+        if frozen_here && self.boundary[node_idx] && var[player as usize].is_none() {
+            return self.boundary_select(tree, game, traverser, node_idx, cfreach, traverser_reach, weight, var);
+        }
+
+        // Frozen node: play the OWNER's selected variant (var[owner]); 0 if
+        // unset (e.g. k=1). Searched node: regret-match / QRE.
+        let strategy: Vec<f32> = if frozen_here {
+            let off = self.node_data_offset[node_idx];
+            let c = var[player as usize].unwrap_or(0);
+            self.frozen_variants[c][off..off + num_actions * nh].to_vec()
+        } else {
+            self.compute_strategy(node_idx, num_actions, nh, player)
+        };
 
         let mut cfv_all: Vec<Vec<f32>> = Vec::with_capacity(num_actions);
 
@@ -205,7 +346,7 @@ impl CpuMccfr {
                 Some(saved)
             };
 
-            cfv_all.push(self.walk_cfr(tree, game, traverser, child as usize, cfreach, traverser_reach, weight));
+            cfv_all.push(self.walk_cfr(tree, game, traverser, child as usize, cfreach, traverser_reach, weight, var));
 
             if player == traverser {
                 traverser_reach.copy_from_slice(saved_reach.as_ref().unwrap());
@@ -269,13 +410,129 @@ impl CpuMccfr {
         cfv_avg
     }
 
+    /// PLURIBUS boundary: the acting player selects among the k continuation
+    /// variants (a regret-matched decision inside the solved subgame). For
+    /// each variant c we play this node onward as a frozen continuation
+    /// (in_frozen = Some(c)); the player regret-matches over the resulting
+    /// values, robustifying the searched strategy against the opponent
+    /// deviating from the exact blueprint at the depth limit.
+    fn boundary_select(
+        &mut self,
+        tree: &FlatTree,
+        game: &dyn GameSpec,
+        traverser: u8,
+        node_idx: usize,
+        cfreach: &mut [Vec<f32>],
+        traverser_reach: &mut [f32],
+        weight: f32,
+        var: &mut Vec<Option<usize>>,
+    ) -> Vec<f32> {
+        let player = tree.nodes[node_idx].player_id;
+        let k = self.num_variants;
+        let nh = self.num_hands[player as usize];
+        let sel = self.compute_sel_strategy(node_idx, k, nh);
+
+        let mut cfv_c: Vec<Vec<f32>> = Vec::with_capacity(k);
+        for c in 0..k {
+            let saved = if player == traverser {
+                let s = traverser_reach.to_vec();
+                for h in 0..nh {
+                    traverser_reach[h] *= sel[c * nh + h];
+                }
+                s
+            } else {
+                let s = cfreach[player as usize].clone();
+                for h in 0..nh {
+                    cfreach[player as usize][h] *= sel[c * nh + h];
+                }
+                s
+            };
+            // Set ONLY this player's continuation variant; other players keep
+            // their own (selected at their own first frozen node). Re-entering
+            // this node now finds var[player]=Some(c) ⇒ plays variant c, not
+            // re-select.
+            var[player as usize] = Some(c);
+            cfv_c.push(self.walk_cfr(
+                tree, game, traverser, node_idx, cfreach, traverser_reach, weight, var,
+            ));
+            var[player as usize] = None;
+            if player == traverser {
+                traverser_reach.copy_from_slice(&saved);
+            } else {
+                cfreach[player as usize] = saved;
+            }
+        }
+
+        let nh_t = self.num_hands[traverser as usize];
+        let mut cfv_avg = vec![0.0f32; nh_t];
+        if player == traverser {
+            for h in 0..nh_t {
+                for c in 0..k {
+                    cfv_avg[h] += sel[c * nh + h] * cfv_c[c][h];
+                }
+            }
+            let off = self.sel_offset[node_idx];
+            for h in 0..nh {
+                for c in 0..k {
+                    let idx = off + c * nh + h;
+                    self.sel_regret[idx] += weight * (cfv_c[c][h] - cfv_avg[h]);
+                    if self.sel_regret[idx] < self.regret_floor {
+                        self.sel_regret[idx] = self.regret_floor;
+                    }
+                }
+            }
+            for h in 0..nh {
+                for c in 0..k {
+                    self.sel_cum[off + c * nh + h] += weight * traverser_reach[h] * sel[c * nh + h];
+                }
+            }
+        } else {
+            for h in 0..nh_t {
+                for c in 0..k {
+                    cfv_avg[h] += cfv_c[c][h];
+                }
+            }
+        }
+        cfv_avg
+    }
+
+    /// Regret-match the per-boundary continuation selection (k variants).
+    /// The opponent picks the worst-for-searcher continuation in the limit —
+    /// the Modicum robustification.
+    fn compute_sel_strategy(&self, node_idx: usize, k: usize, nh: usize) -> Vec<f32> {
+        let off = self.sel_offset[node_idx];
+        let mut s = vec![0.0f32; k * nh];
+        for h in 0..nh {
+            let mut pos = 0.0f32;
+            for c in 0..k {
+                let r = self.sel_regret[off + c * nh + h];
+                if r > 0.0 {
+                    pos += r;
+                }
+            }
+            if pos > 0.0 {
+                for c in 0..k {
+                    let r = self.sel_regret[off + c * nh + h];
+                    s[c * nh + h] = if r > 0.0 { r / pos } else { 0.0 };
+                }
+            } else {
+                let u = 1.0 / k as f32;
+                for c in 0..k {
+                    s[c * nh + h] = u;
+                }
+            }
+        }
+        s
+    }
+
     fn compute_strategy(&self, node_idx: usize, num_actions: usize, nh: usize, player: u8) -> Vec<f32> {
         let offset = self.node_data_offset[node_idx];
 
         // Depth-limited search: a frozen node plays its fixed blueprint
-        // strategy (never regret-matched, never updated).
+        // strategy (variant 0). The walk plays the ACTIVE variant directly;
+        // this branch only serves the informational accessor.
         if self.frozen[node_idx] {
-            return self.frozen_strategy[offset..offset + num_actions * nh].to_vec();
+            return self.frozen_variants[0][offset..offset + num_actions * nh].to_vec();
         }
 
         let mut strategy = vec![0.0f32; num_actions * nh];

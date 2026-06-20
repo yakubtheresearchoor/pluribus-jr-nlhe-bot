@@ -141,10 +141,21 @@ pub const MAX_OPP: usize = 9;
 /// gate run HUNG THE GPU and crashed the machine. The occupancy cliff
 /// (~1 threadgroup/core) starts near B=28-32, and at that edge the
 /// terminal kernel is not just slow — it destabilised the device. So
-/// the ceiling stays 16 (GPU-stable, validated) until a B>16 raise is
+/// the ceiling stayed 16 (GPU-stable, validated) until a B>16 raise is
 /// re-attempted CAUTIOUSLY: tiny fixture, low iters, stepping B up one
 /// safe level at a time (B20 = 7.2 KB / ~4 tg/core is the first safe
-/// step), never jumping to the cliff. B>16 still falls back to CPU.
+/// step), never jumping to the cliff.
+///
+/// 2026-06-19 — MC terminal sampling (sample_m > 0) UNLOCKS B>16: it caps
+/// per-terminal work at O(M·K) — FLAT in B — so the EXHAUSTIVE B^K explosion
+/// that tripped the GPU watchdog no longer applies. Validated B=32 sampled
+/// solve+bank end-to-end (terminal_bpush_crossover_and_unlock). BUT the
+/// PRODUCTION ceiling STAYS 16: the 32 enlarges the terminal kernel's
+/// threadgroup arrays for ALL dispatches (4.9KB→17.8KB), costing occupancy on
+/// the B8/B15 production fills, and an EXHAUSTIVE dispatch at B≈32 (32^5 ≈ 33M
+/// tuples/lane) STILL crashes the device. To run the B-push experiment, bump
+/// this to 32 (sampled-only; un-ignore terminal_bpush_crossover_and_unlock);
+/// the secondary B² threadgroup wall caps it near B40 regardless.
 pub const MAX_BUCKETS_GPU: usize = 16;
 
 /// Design-1 bucketed mirror of `side_pot_showdown_cfv_with_rake` for
@@ -700,6 +711,314 @@ pub fn bucketed_showdown_cfv_design1_collapsed(
             bucket_reach, tables, &ctx, &mut accum,
         );
         cfv[bt] = accum;
+    }
+    cfv
+}
+
+/// Deterministic counter RNG (splitmix64) for terminal sampling. A pure
+/// function of the seed ⇒ run-to-run reproducible, the same standard the
+/// GPU sampler and the striped production path live under.
+struct TermRng(u64);
+impl TermRng {
+    fn new(seed: u64) -> Self {
+        TermRng(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn unif(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32 // [0,1)
+    }
+}
+
+/// Per-tuple arm-1 value with the reach factor REMOVED (it lives in zprod).
+/// Mirrors `recurse_eq_buckets`'s state DP for one fixed opponent tuple.
+#[inline]
+fn arm1_tuple_value(
+    bo: &[u16],
+    num_opp: usize,
+    nb: usize,
+    bt: usize,
+    tables: &BucketedRunoutTables,
+    k: f32,
+    rpus: f32,
+) -> f32 {
+    let mut state = [0.0f32; MAX_OPP + 2];
+    state[1] = 1.0;
+    for oi in 0..num_opp {
+        let b = bo[oi] as usize;
+        let mut m = 1.0f32; // opp-opp blocking only; reach is in zprod
+        for &pb in bo[..oi].iter() {
+            let f = tables.f_n[pb as usize * nb + b];
+            if f == 0.0 {
+                return 0.0; // blocked tuple ⇒ contributes nothing (= exhaustive skip)
+            }
+            m *= f;
+        }
+        let i = bt * nb + b;
+        let fn_ = tables.f_n[i];
+        if fn_ == 0.0 {
+            return 0.0; // fully blocked vs traverser bucket (⇒ fw=ft=fl=0)
+        }
+        let fw = tables.f_w[i];
+        let ft = tables.f_t[i];
+        let fl = tables.f_l[i];
+        let mut new_state = [0.0f32; MAX_OPP + 2];
+        if state[0] != 0.0 {
+            new_state[0] += state[0] * (m * fn_);
+        }
+        for j in 0..=oi {
+            let s = state[1 + j];
+            if s == 0.0 {
+                continue;
+            }
+            if fl != 0.0 {
+                new_state[0] += s * (m * fl);
+            }
+            if ft != 0.0 {
+                new_state[1 + j + 1] += s * (m * ft);
+            }
+            if fw != 0.0 {
+                new_state[1 + j] += s * (m * fw);
+            }
+        }
+        state = new_state;
+    }
+    let mut accum = 0.0f32;
+    if state[0] != 0.0 {
+        accum += state[0] * -1.0;
+    }
+    for j in 0..=num_opp {
+        let s = state[1 + j];
+        if s == 0.0 {
+            continue;
+        }
+        let net_unit: f32 = if j == 0 {
+            k - rpus
+        } else {
+            let t_f = (j + 1) as f32;
+            (k + 1.0 - t_f) / t_f - rpus / t_f
+        };
+        accum += s * net_unit;
+    }
+    accum
+}
+
+/// Per-tuple arm-2 value with reach removed: Π_{i<j} f_n × net_expected.
+#[inline]
+fn arm2_tuple_value(
+    bo: &[u16],
+    num_opp: usize,
+    nb: usize,
+    bt: usize,
+    sc: &mut [[f32; 4]],
+    tables: &BucketedRunoutTables,
+    ctx: &Arm2Ctx,
+) -> f32 {
+    let mut wpair = 1.0f32; // opp-opp blocking; reach is in zprod
+    for oi in 0..num_opp {
+        let b = bo[oi] as usize;
+        for &pb in bo[..oi].iter() {
+            let f = tables.f_n[pb as usize * nb + b];
+            if f == 0.0 {
+                return 0.0;
+            }
+            wpair *= f;
+        }
+        let i = bt * nb + b;
+        if ctx.opp_folded[oi] {
+            let n = tables.f_n[i];
+            if n == 0.0 {
+                return 0.0;
+            }
+            sc[oi] = [0.0, 0.0, 0.0, n];
+        } else {
+            let w = tables.f_w[i];
+            let t = tables.f_t[i];
+            let l = tables.f_l[i];
+            if w == 0.0 && t == 0.0 && l == 0.0 {
+                return 0.0;
+            }
+            sc[oi] = [w, t, l, 0.0];
+        }
+    }
+    wpair * ctx.net_expected(sc)
+}
+
+/// MC-sampled mirror of `bucketed_showdown_cfv_design1_collapsed`. For each
+/// traverser bucket, draws `sample_m` opponent tuples from the per-opponent
+/// reach marginal and importance-weights by (Π_d Z_d)·Π_pairs f_n — an
+/// UNBIASED estimator of the exact collapsed cfv (the reach factor is the
+/// only thing replaced; the leaf math is the verbatim arm-1/arm-2 value).
+///
+/// This is the CPU twin of the GPU terminal sampler. It lifts the CFV-bank's
+/// B^K wall: `root_cfv_from_avg` calls the exhaustive collapsed terminal,
+/// which at B≈32 enumerates B^K tuples/terminal and hangs the fill AFTER the
+/// GPU solve. `term_seed` keys the deterministic RNG (caller folds the node
+/// id in for an independent stream per terminal).
+#[allow(clippy::too_many_arguments)]
+pub fn bucketed_showdown_cfv_design1_collapsed_sampled(
+    bucket_reach: &[&[f32]],
+    tables: &BucketedRunoutTables,
+    contributions: &[i32],
+    fold_mask: u16,
+    traverser: usize,
+    num_players: u8,
+    starting_pot: i32,
+    rake_rate: f32,
+    rake_cap: f32,
+    flop_seen: bool,
+    sample_m: u32,
+    term_seed: u64,
+) -> Vec<f32> {
+    let nb = tables.nb;
+    let num_opp = bucket_reach.len();
+    let np = num_players as usize;
+    let c_t = contributions[traverser];
+    let mut cfv = vec![0.0f32; nb];
+    assert!(num_opp == np - 1);
+    assert!(num_opp <= MAX_OPP);
+    if sample_m == 0 {
+        // Defensive: caller should route to the exhaustive fn at m=0.
+        return bucketed_showdown_cfv_design1_collapsed(
+            bucket_reach, tables, contributions, fold_mask, traverser, num_players,
+            starting_pot, rake_rate, rake_cap, flop_seen,
+        );
+    }
+
+    let (eff_rake_rate, eff_rake_cap) =
+        if flop_seen { (rake_rate, rake_cap) } else { (0.0, 0.0) };
+
+    // Per-opponent prefix-sum CDF (built once) + total mass Z_d. Any
+    // zero-reach opponent ⇒ the exact cfv is 0 (no odometer leaf reached).
+    // The CDF lets each draw be an O(log nb) binary search instead of the
+    // O(nb) linear scan — the bottleneck at nb=32 over M samples.
+    let mut cdf: Vec<Vec<f32>> = Vec::with_capacity(num_opp);
+    let mut zsum = vec![0.0f32; num_opp];
+    let mut zprod = 1.0f32;
+    for d in 0..num_opp {
+        let mut pref = Vec::with_capacity(nb);
+        let mut c = 0.0f32;
+        for b in 0..nb {
+            c += bucket_reach[d][b];
+            pref.push(c);
+        }
+        zsum[d] = c;
+        zprod *= c;
+        cdf.push(pref);
+    }
+    if zprod <= 0.0 {
+        return cfv;
+    }
+    let inv_m = 1.0 / sample_m as f32;
+
+    // Arm dispatch — identical classification to the exhaustive entry.
+    let mut all_active_equal = true;
+    let mut ref_contrib: Option<i32> = None;
+    for p in 0..np {
+        if fold_mask & (1u16 << p) != 0 {
+            continue;
+        }
+        let cp = contributions[p];
+        if let Some(r) = ref_contrib {
+            if cp != r {
+                all_active_equal = false;
+                break;
+            }
+        } else {
+            ref_contrib = Some(cp);
+        }
+    }
+
+    // Draw bo[d] ∝ reach[d]/Z[d] via binary search on the CDF (first bucket
+    // whose cumulative mass exceeds u). Flat (zero-reach) CDF segments are
+    // never selected except at measure-zero boundaries.
+    let draw = |rng: &mut TermRng, bo: &mut [u16]| {
+        for d in 0..num_opp {
+            let u = rng.unif() * zsum[d];
+            let pref = &cdf[d];
+            let mut lo = 0usize;
+            let mut hi = nb;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if pref[mid] > u {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            bo[d] = lo.min(nb - 1) as u16;
+        }
+    };
+
+    if all_active_equal && fold_mask == 0 {
+        let k = num_opp as f32;
+        let half_pot = starting_pot as f32 / np as f32 + c_t as f32;
+        let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+        let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
+        let rpus = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
+        let mut bo = vec![0u16; num_opp];
+        for (bt, slot) in cfv.iter_mut().enumerate() {
+            let mut rng =
+                TermRng::new(term_seed ^ (bt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut sum_g = 0.0f32;
+            for _ in 0..sample_m {
+                draw(&mut rng, &mut bo);
+                sum_g += arm1_tuple_value(&bo, num_opp, nb, bt, tables, k, rpus);
+            }
+            *slot = half_pot * (zprod * inv_m) * sum_g;
+        }
+        return cfv;
+    }
+
+    // Arm 2 — same Arm2Ctx precompute as the exhaustive/enumerated arms.
+    let mut levels: Vec<i32> = (0..np).map(|p| contributions[p]).collect();
+    levels.sort();
+    levels.dedup();
+    let main_pot_amount: i32 = if levels.is_empty() {
+        starting_pot
+    } else {
+        let num_main_contributors =
+            (0..np).filter(|&p| contributions[p] >= levels[0]).count();
+        levels[0] * num_main_contributors as i32 + starting_pot
+    };
+    let main_pot_rake: f32 =
+        (main_pot_amount as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
+    let traverser_stake = starting_pot as f32 / np as f32 + c_t as f32;
+    let traverser_folded = fold_mask & (1u16 << traverser) != 0;
+    let opp_player: Vec<usize> =
+        (0..num_opp).map(|oi| if oi < traverser { oi } else { oi + 1 }).collect();
+    let opp_contrib: Vec<i32> = opp_player.iter().map(|&p| contributions[p]).collect();
+    let opp_folded: Vec<bool> =
+        opp_player.iter().map(|&p| fold_mask & (1u16 << p) != 0).collect();
+    let ctx = Arm2Ctx {
+        levels,
+        np,
+        contributions: contributions.to_vec(),
+        starting_pot,
+        main_pot_rake,
+        traverser_stake,
+        traverser_folded,
+        c_t,
+        opp_contrib,
+        opp_folded,
+        traverser,
+    };
+
+    let mut bo = vec![0u16; num_opp];
+    let mut sc = vec![[0.0f32; 4]; num_opp];
+    for (bt, slot) in cfv.iter_mut().enumerate() {
+        let mut rng = TermRng::new(term_seed ^ (bt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut sum_g = 0.0f32;
+        for _ in 0..sample_m {
+            draw(&mut rng, &mut bo);
+            sum_g += arm2_tuple_value(&bo, num_opp, nb, bt, &mut sc, tables, &ctx);
+        }
+        *slot = (zprod * inv_m) * sum_g;
     }
     cfv
 }

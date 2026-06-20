@@ -852,8 +852,25 @@ impl<'a> TreeBuilder<'a> {
                 // (num_bets>=1) is still allowed.
                 // Suppress CALL at the open (no_open_limp, num_bets==0) OR at the
                 // 3-bet decision (threebet_or_fold, num_bets==1) — 3bet-or-fold.
+                //
+                // EXCEPTION — the BB's defensive flat vs a single open: 3bet-or-
+                // fold from the blind makes the BB over-fold to steals (it folds
+                // everything it can't profitably 3-bet), which hands the late
+                // positions a free steal — BTN/SB opens explode to ~100% of trash
+                // (the inverse-to-opponents-behind looseness gradient is the tell).
+                // The BB closing the action with a price MUST be allowed to flat-
+                // call wide; that's what disciplines the steal. Early-position
+                // 3bet-or-fold cleanup (HJ/CO/BTN facing an open) is preserved.
+                // First cut: BB only (SB doesn't close — BB can squeeze behind —
+                // so SB stays 3bet-or-fold; revisit from the output if SB over-folds).
+                let bb_seat = self.config.button_player
+                    .map(|b| (b as usize + 2) % num_players);
+                let is_bb_defending_open = self.config.threebet_or_fold
+                    && info.num_bets == 1
+                    && info.board_state == BoardState::Preflop
+                    && bb_seat == Some(player);
                 let suppress_call = (self.config.no_open_limp && info.num_bets == 0)
-                    || (self.config.threebet_or_fold && info.num_bets == 1);
+                    || (self.config.threebet_or_fold && info.num_bets == 1 && !is_bb_defending_open);
                 if !suppress_call {
                     actions.push(Action::Call);
                 }
