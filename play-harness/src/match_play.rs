@@ -133,25 +133,37 @@ impl<'a> MatchEnv<'a> {
         let cat = best5(&cards).category(); // 0=high 1=pair 2=two-pair 3=trips ...
         let street = self.tree.nodes[node].board_state; // 0 flop / 1 turn / 2 river
         if has(1) {
-            // can check: value-bet by strength, rarely bluff
-            let bet_p = if cat >= 2 { 0.72 } else if cat == 1 { 0.40 } else { 0.10 };
+            // open / checked-to: value-bet by strength + a little BLUFFING (so
+            // the pool isn't face-up — the bot can't fold every time it checks).
+            let bet_p = if cat >= 2 { 0.70 } else if cat == 1 { 0.35 } else { 0.14 };
             if r < bet_p { pick(&[3, 4, 5]) } else { pick(&[1]) }
         } else if cat >= 3 {
-            // trips+: raise some, else call
-            if r < 0.28 { pick(&[4, 5, 3, 2]) } else { pick(&[2, 0]) }
+            // trips+: sticky, raises some
+            if r < 0.25 { pick(&[4, 5, 3, 2]) } else { pick(&[2, 0]) }
         } else if cat >= 2 {
-            // two-pair+: sticky (calls down)
-            let fold_p = match street { 2 => 0.08, _ => 0.02 };
-            if r < fold_p { pick(&[0]) } else { pick(&[2, 0]) }
+            // two-pair: calls flop/turn, sheds to the river barrel
+            let f = match street { 2 => 0.45, 1 => 0.20, _ => 0.05 };
+            if r < f { pick(&[0]) } else { pick(&[2, 0]) }
         } else if cat >= 1 {
-            // one pair: peels flop, but SHEDS to sustained pressure (turn/river)
-            // — calibrated so the pool reaches showdown ~WTSD 32%, not 95%.
-            let fold_p = match street { 2 => 0.55, 1 => 0.38, _ => 0.14 };
-            if r < fold_p { pick(&[0]) } else { pick(&[2, 0]) }
+            // ONE PAIR — the load-bearing case. Peels the flop, but FOLDS to
+            // sustained pressure (the 2nd/3rd barrel reads as strength) instead
+            // of stacking off to the nuts. The fraction that DOES call the river
+            // is the bluff-catch (keeps the bot honest). Steep gradient.
+            let f = match street { 2 => 0.82, 1 => 0.55, _ => 0.20 };
+            if r < f { pick(&[0]) } else { pick(&[2, 0]) }
         } else {
-            // air: float flop occasionally, give up by turn/river
-            let fold_p = match street { 2 => 0.94, 1 => 0.88, _ => 0.62 };
-            if r < fold_p { pick(&[0]) } else { pick(&[2, 0]) }
+            // air: floats the flop a little, gives up by turn/river; rare
+            // bluff-raise (the chk-raise leak), no calling down with nothing.
+            let f = match street { 2 => 0.94, 1 => 0.90, _ => 0.62 };
+            if r < f {
+                pick(&[0])
+            } else if r < f + 0.03 {
+                pick(&[4, 5, 3, 2])
+            } else if street == 0 {
+                pick(&[2, 0]) // float the flop
+            } else {
+                pick(&[0]) // turn/river air: just fold
+            }
         }
     }
 

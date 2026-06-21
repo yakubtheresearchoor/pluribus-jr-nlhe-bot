@@ -124,9 +124,18 @@ fn production_baseline_bb100() {
                 let live_seats: Vec<usize> = (0..6).filter(|&p| !fe.folded[p]).collect();
                 let bot_seam = live_seats.iter().position(|&p| p == bot_pos).unwrap();
                 let sh: Vec<[u8; 2]> = live_seats.iter().map(|&p| holes[p]).collect();
+                // SELF=1 → all-Blueprint self-play (must net ~0; rules out a
+                // play_seam/seat/accounting bug independent of the pool model).
+                let selfplay = std::env::var("SELF").is_ok();
                 let sp: Vec<Policy> = live_seats
                     .iter()
-                    .map(|&p| if p == bot_pos { Policy::Blueprint(bp) } else { Policy::Population })
+                    .map(|&p| {
+                        if selfplay || p == bot_pos {
+                            Policy::Blueprint(bp)
+                        } else {
+                            Policy::Population
+                        }
+                    })
                     .collect();
                 let dead = (pot - live as i32 * commit).max(0) as u32;
                 match env.play_seam(&sp, &sh, commit as u32, dead, rake_spec, &mut rng, None) {
