@@ -28,13 +28,30 @@ use crate::solver::flop_start_game::FlopStartGame;
 use crate::solver::game::GameSpec;
 use crate::tree::flat::FlatTree;
 
-pub struct BucketedContinuationGame {
-    /// Exact flop game — supplies num_hands (lossless), initial weights, the
-    /// flop fold terminals, and any flop-level chance.
-    inner: FlopStartGame,
-    /// Flop bucketing: `flop_map[h]` = bucket of hand h (or `NO_BUCKET`), and
-    /// `flop_tables` = the per-bucket runout (turn+river) showdown fractions.
-    bucketing: FlopBucketing,
+/// Which street the search is rooted on — selects the bucket map + runout
+/// tables the depth-limit continuation integrates over:
+///   - `Flop`        → `flop_map` / `flop_tables` (turn+river runout)
+///   - `Turn(ti)`    → `turn_map[ti]` / `turn_tables[ti]` (river runout)
+///   - `River(ti,ri)`→ `river_map[ti][ri]` / `river_tables[ti][ri]` (showdown)
+/// The reach→bucket→sampled-showdown→expand pipeline is identical across
+/// streets; only the (map, tables, nb) triple changes. This is what makes the
+/// per-street Pluribus search reuse one continuation implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContStreet {
+    Flop,
+    Turn(usize),
+    River(usize, usize),
+}
+
+pub struct BucketedContinuationGame<'a> {
+    /// Exact flop game (BORROWED — e.g. a loaded blueprint's `bp.game`) —
+    /// supplies num_hands (lossless), initial weights, the flop fold terminals.
+    inner: &'a FlopStartGame,
+    /// Bucketing (BORROWED — e.g. `bp.bk`): per-street `*_map[h]` = bucket of
+    /// hand h (or `NO_BUCKET`), `*_tables` = per-bucket runout showdown fractions.
+    bucketing: &'a FlopBucketing,
+    /// Rooted street — selects which map/tables the continuation integrates.
+    street: ContStreet,
     np: u8,
     /// MC samples for the collapsed terminal. 0 ⇒ exact enumeration (only sane
     /// at small nb / low np; multiway must sample).
@@ -42,20 +59,57 @@ pub struct BucketedContinuationGame {
     rng_seed: u64,
 }
 
-impl BucketedContinuationGame {
-    pub fn new(inner: FlopStartGame, bucketing: FlopBucketing, sample_m: u32, rng_seed: u64) -> Self {
+impl<'a> BucketedContinuationGame<'a> {
+    /// Flop-rooted search (the original entry point — unchanged behavior).
+    pub fn new(
+        inner: &'a FlopStartGame,
+        bucketing: &'a FlopBucketing,
+        sample_m: u32,
+        rng_seed: u64,
+    ) -> Self {
+        Self::new_street(inner, bucketing, ContStreet::Flop, sample_m, rng_seed)
+    }
+
+    /// Per-street search: root on `street` (Flop/Turn/River); the depth-limit
+    /// continuation integrates that street's runout tables.
+    pub fn new_street(
+        inner: &'a FlopStartGame,
+        bucketing: &'a FlopBucketing,
+        street: ContStreet,
+        sample_m: u32,
+        rng_seed: u64,
+    ) -> Self {
         let np = inner.table().num_players;
-        BucketedContinuationGame { inner, bucketing, np, sample_m, rng_seed }
+        BucketedContinuationGame { inner, bucketing, street, np, sample_m, rng_seed }
     }
 }
 
-impl GameSpec for BucketedContinuationGame {
+impl<'a> GameSpec for BucketedContinuationGame<'a> {
     fn num_hands(&self, player: u8) -> usize {
         self.inner.num_hands(player)
     }
 
     fn initial_weight(&self, player: u8) -> Vec<f32> {
-        self.inner.initial_weight(player)
+        let mut w = self.inner.initial_weight(player);
+        // Turn/River: zero hands that collide with the dealt board card(s) —
+        // the flop game's reach still carries them. `*_map[h] == NO_BUCKET`
+        // flags a board conflict. NOTE (v1): this filters by board only; it
+        // does NOT Bayes-update the range for the prior street's betting (the
+        // Pluribus reach-prior refinement — a documented follow-up). The search
+        // roots on the prior-street entering range minus board conflicts.
+        let mask: Option<&Vec<u16>> = match self.street {
+            ContStreet::Flop => None,
+            ContStreet::Turn(ti) => Some(&self.bucketing.turn_map[ti]),
+            ContStreet::River(ti, ri) => Some(&self.bucketing.river_map[ti][ri]),
+        };
+        if let Some(map) = mask {
+            for (h, wh) in w.iter_mut().enumerate() {
+                if map[h] == NO_BUCKET {
+                    *wh = 0.0;
+                }
+            }
+        }
+        w
     }
 
     fn evaluate_terminal(
@@ -79,8 +133,24 @@ impl GameSpec for BucketedContinuationGame {
         let nh = self.inner.table().num_valid;
         let np = self.np as usize;
         let num_opp = np - 1;
-        let nb = self.bucketing.nb_flop;
-        let map = &self.bucketing.flop_map;
+        // Select the rooted street's bucket map + runout tables.
+        let (nb, map, tables) = match self.street {
+            ContStreet::Flop => (
+                self.bucketing.nb_flop,
+                &self.bucketing.flop_map,
+                &self.bucketing.flop_tables,
+            ),
+            ContStreet::Turn(ti) => (
+                self.bucketing.nb_turn,
+                &self.bucketing.turn_map[ti],
+                &self.bucketing.turn_tables[ti],
+            ),
+            ContStreet::River(ti, ri) => (
+                self.bucketing.nb_river,
+                &self.bucketing.river_map[ti][ri],
+                &self.bucketing.river_tables[ti][ri],
+            ),
+        };
         let fold_mask = tree.get_folded_mask(node_idx);
 
         // (1) per-opponent reach over hands → over flop buckets.
@@ -110,7 +180,7 @@ impl GameSpec for BucketedContinuationGame {
             self.rng_seed ^ (node_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let cfv_bucket = bucketed_showdown_cfv_design1_collapsed_sampled(
             &views,
-            &self.bucketing.flop_tables,
+            tables,
             &contributions,
             fold_mask,
             traverser as usize,

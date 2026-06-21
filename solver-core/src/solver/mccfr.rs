@@ -56,6 +56,13 @@ pub struct CpuMccfr {
     // players — the O(nh^np) showdown never enters the searched tree, it lives
     // in the sampled continuation. Empty ⇒ no depth limit (recurse as before).
     depth_limit: Vec<bool>,
+    // PARALLELIZATION (snapshot CFR): the per-iteration strategy, computed ONCE
+    // from the regrets/last_cfv at iter start. The walk READS this (not the live
+    // regrets), so parallel per-traverser walks never read a value another
+    // thread is writing — the race-free basis for multi-threading (preflop's
+    // proven pattern). Empty ⇒ legacy on-the-fly path (sequential).
+    snapshot: Vec<f32>,
+    use_snapshot: bool,
 }
 
 impl CpuMccfr {
@@ -92,6 +99,38 @@ impl CpuMccfr {
             sel_regret: Vec::new(),
             sel_cum: Vec::new(),
             depth_limit: vec![false; tree.num_nodes()],
+            snapshot: Vec::new(),
+            use_snapshot: false,
+        }
+    }
+
+    /// Enable SNAPSHOT-CFR mode (prerequisite for the multi-threaded walk): the
+    /// per-iter strategy is frozen at iter start and the walk reads it, so
+    /// parallel traversers never read a regret another thread is writing. This
+    /// is a valid CFR variant (all traversers use the iteration's strategy) but
+    /// NOT bit-identical to the legacy sequential-update path, hence opt-in (the
+    /// bit-exact leduc gates keep the default off).
+    pub fn enable_parallel(&mut self) {
+        self.use_snapshot = true;
+        self.snapshot = vec![0.0; self.regrets.len()];
+    }
+
+    /// Freeze the per-iteration strategy for every un-frozen player node into
+    /// `self.snapshot` (read by the walk in snapshot mode). Computes each node's
+    /// strategy from the current regrets/last_cfv (immutable), then writes — so
+    /// the walk's reads are race-free even when traversers run in parallel.
+    fn compute_snapshot(&mut self, tree: &FlatTree) {
+        let updates: Vec<(usize, Vec<f32>)> = (0..tree.num_nodes())
+            .filter(|&n| tree.nodes[n].is_player() && !self.frozen[n])
+            .map(|n| {
+                let na = tree.nodes[n].num_children as usize;
+                let player = tree.nodes[n].player_id;
+                let nh = self.num_hands[player as usize];
+                (self.node_data_offset[n], self.compute_strategy(n, na, nh, player))
+            })
+            .collect();
+        for (off, strat) in updates {
+            self.snapshot[off..off + strat.len()].copy_from_slice(&strat);
         }
     }
 
@@ -243,6 +282,12 @@ impl CpuMccfr {
             self.iteration += 1;
             let weight = self.iteration as f32;
 
+            // Snapshot mode: freeze this iter's strategy so the walk's reads are
+            // race-free (prerequisite for the parallel traverser loop).
+            if self.use_snapshot {
+                self.compute_snapshot(tree);
+            }
+
             let mut cfreach: Vec<Vec<f32>> = (0..np)
                 .map(|p| game.initial_weight(p as u8))
                 .collect();
@@ -355,6 +400,9 @@ impl CpuMccfr {
             let off = self.node_data_offset[node_idx];
             let c = var[player as usize].unwrap_or(0);
             self.frozen_variants[c][off..off + num_actions * nh].to_vec()
+        } else if self.use_snapshot {
+            let off = self.node_data_offset[node_idx];
+            self.snapshot[off..off + num_actions * nh].to_vec()
         } else {
             self.compute_strategy(node_idx, num_actions, nh, player)
         };

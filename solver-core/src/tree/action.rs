@@ -189,12 +189,34 @@ impl GameSpec {
         pot: i32,
         bet_sizes: BetSizeOptions,
     ) -> TreeConfig {
+        self.street_seam_config(BoardState::Flop, live, commit, pot, bet_sizes)
+    }
+
+    /// Derive a STREET-START TreeConfig for a per-street real-time search
+    /// subgame rooted at `state` (Flop/Turn/River). `live` players each have
+    /// `commit` units sunk entering the street, `pot` total in the middle
+    /// (pot ≥ live×commit; excess is dead money). Betting restarts fresh on
+    /// the street (contributions 0, stacks = stack − commit). This is the
+    /// generalization of `flop_seam_config` to the turn and river — the
+    /// Pluribus per-decision resolve roots one of these at the bot's spot.
+    pub fn street_seam_config(
+        &self,
+        state: BoardState,
+        live: u8,
+        commit: i32,
+        pot: i32,
+        bet_sizes: BetSizeOptions,
+    ) -> TreeConfig {
+        assert!(
+            matches!(state, BoardState::Flop | BoardState::Turn | BoardState::River),
+            "street_seam_config is postflop only"
+        );
         assert!(live >= 2 && live <= self.num_players);
         assert!(pot >= live as i32 * commit, "pot must cover live commits");
         assert!(commit <= self.stack);
         TreeConfig {
             num_players: live,
-            initial_state: BoardState::Flop,
+            initial_state: state,
             starting_pot: pot,
             starting_stacks: vec![self.stack - commit; live as usize],
             initial_contributions: vec![0; live as usize],

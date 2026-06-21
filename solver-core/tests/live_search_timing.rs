@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use solver_core::card::{card_from_str, index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
 use solver_core::solver::bucketed_flop_cfr::FlopBucketing;
-use solver_core::solver::bucketed_search::BucketedContinuationGame;
+use solver_core::solver::bucketed_search::{BucketedContinuationGame, ContStreet};
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::game::GameSpec;
 use solver_core::solver::mccfr::CpuMccfr;
@@ -124,8 +124,8 @@ fn live_search_multiway_timing() {
 fn build_bucketed_search(
     live: u8,
     nb: usize,
-    sample_m: u32,
-) -> (FlatTree, BucketedContinuationGame, Vec<usize>) {
+    _sample_m: u32,
+) -> (FlatTree, FlopStartGame, FlopBucketing, Vec<usize>) {
     let board: Vec<Card> = {
         let pt = PreflopChanceTable::new(
             6,
@@ -147,9 +147,17 @@ fn build_bucketed_search(
     }
     let spec = production_game_v1();
     let mrc = MAX_NA_POSTFLOP.saturating_sub(2);
+    // RICHER bet sizing on the searched round (the real-time search affords it
+    // — blueprint's 1×pot is a fill constraint, not a search one). 1/3, 2/3,
+    // pot bets + a 2/3 & pot raise menu. Tests whether this stays under 14s.
+    let _ = mrc;
     let bets = BetSizeOptions {
-        bet: vec![BetSize::PotRelative(1.0)],
-        raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
+        bet: vec![
+            BetSize::PotRelative(0.33),
+            BetSize::PotRelative(0.66),
+            BetSize::PotRelative(1.0),
+        ],
+        raise: vec![BetSize::PotRelative(0.66), BetSize::PotRelative(1.0)],
     };
     let mut cfg = spec.flop_seam_config(live, 6, 20, bets);
     cfg.max_bets_per_street = BetCap::all(3);
@@ -158,7 +166,7 @@ fn build_bucketed_search(
     let canonical: [u8; 3] = [board[0] as u8, board[1] as u8, board[2] as u8];
     let table = FlopChanceTable::build_full_nh_sampled(canonical, live, &turns, &river_decks);
     let bk = FlopBucketing::quantile(&table, nb);
-    let game = BucketedContinuationGame::new(FlopStartGame::new(table), bk, sample_m, 0xC0FFEE);
+    let fsg = FlopStartGame::new(table);
 
     // Depth-limit boundary: each Flop player node's children that are chance or
     // already off-flop. Cutting AT the turn-deal chance node is REQUIRED — the
@@ -178,7 +186,7 @@ fn build_bucketed_search(
     }
     depth.sort_unstable();
     depth.dedup();
-    (tree, game, depth)
+    (tree, fsg, bk, depth)
 }
 
 #[test]
@@ -186,12 +194,112 @@ fn build_bucketed_search(
 fn live_search_multiway_bucketed_timing() {
     eprintln!("Pluribus-faithful: lossless current round + bucketed(nb=16)+sampled continuation");
     for live in [2u8, 3, 4, 5, 6] {
-        let (tree, game, depth) = build_bucketed_search(live, 16, 200);
+        let (tree, fsg, bk, depth) = build_bucketed_search(live, 16, 200);
+        let game = BucketedContinuationGame::new(&fsg, &bk, 200, 0xC0FFEE);
         let np = tree.num_players as usize;
         let nh = game.num_hands(0);
         let mut s = CpuMccfr::new(&tree, vec![nh; np]);
         s.set_depth_limit(&depth);
         s.set_lambda(vec![300.0; np]); // sharp (≈ best-response) for our seat
+        if std::env::var("SNAP").is_ok() {
+            s.enable_parallel(); // snapshot-CFR mode (validate it converges)
+        }
+        let iters = 250u32;
+        let t = Instant::now();
+        s.run(&tree, &game, iters);
+        let secs = t.elapsed().as_secs_f64();
+        let na = tree.nodes[0].num_children as usize;
+        let strat = s.get_average_strategy(0, na, nh);
+        let sum: f32 = (0..na).map(|a| strat[a][0]).sum();
+        eprintln!(
+            "live-{live} (nh={nh}, {} nodes, {} depth-leaves): {iters} it = {secs:7.3}s \
+             ({:.1} ms/it) Σ{sum:.3}  {}",
+            tree.num_nodes(),
+            depth.len(),
+            secs * 1000.0 / iters as f64,
+            if secs <= 14.0 { "≤14s ✓" } else { ">14s ✗" }
+        );
+    }
+}
+
+/// Build a TURN-rooted search subgame: rich turn betting, depth-limit at the
+/// river-deal chance (so the continuation integrates the river runout via
+/// `turn_tables[ti]`). Reuses the synthetic flop bucketing's turn tables.
+/// Validates that the per-street search generalization converges + fits budget.
+fn build_turn_search(
+    live: u8,
+    nb: usize,
+    ti: usize,
+) -> (FlatTree, FlopStartGame, FlopBucketing, Vec<usize>) {
+    let board: Vec<Card> = {
+        let pt = PreflopChanceTable::new(
+            6,
+            vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6],
+        );
+        pt.canonical_flops[0].to_vec()
+    };
+    let board_mask: u64 = board.iter().fold(0u64, |m, &c| m | (1u64 << (c as u8)));
+    let deck: Vec<u8> = (0..52u8).filter(|c| board_mask & (1u64 << c) == 0).collect();
+    let turn_pos = [0usize, 12, 24, 36];
+    let turns: Vec<Card> = turn_pos.iter().map(|&p| deck[p]).collect();
+    let mut river_decks: Vec<Vec<u8>> = vec![vec![]; 52];
+    for &tc in &turns {
+        let rd: Vec<u8> = deck.iter().copied().filter(|&c| c != tc).collect();
+        river_decks[tc as usize] = vec![rd[10]];
+    }
+    let spec = production_game_v1();
+    let bets = BetSizeOptions {
+        bet: vec![
+            BetSize::PotRelative(0.33),
+            BetSize::PotRelative(0.66),
+            BetSize::PotRelative(1.0),
+        ],
+        raise: vec![BetSize::PotRelative(0.66), BetSize::PotRelative(1.0)],
+    };
+    // Representative post-flop spot: 20u sunk each, pot = live·20.
+    let mut cfg = spec.street_seam_config(BoardState::Turn, live, 20, live as i32 * 20, bets);
+    cfg.max_bets_per_street = BetCap::all(3);
+    let tree = build_tree(&cfg).unwrap();
+
+    let canonical: [u8; 3] = [board[0] as u8, board[1] as u8, board[2] as u8];
+    let table = FlopChanceTable::build_full_nh_sampled(canonical, live, &turns, &river_decks);
+    let bk = FlopBucketing::quantile(&table, nb);
+    let fsg = FlopStartGame::new(table);
+
+    // Depth-limit: each Turn player node's children that are chance / off-turn
+    // (the river-deal boundary). turn_tables[ti] integrates the river runout.
+    let turn = BoardState::Turn as u8;
+    let mut depth: Vec<usize> = Vec::new();
+    for n in 0..tree.num_nodes() {
+        if tree.nodes[n].is_player() && tree.nodes[n].board_state == turn {
+            for &c in tree.node_children(n) {
+                let cn = &tree.nodes[c as usize];
+                if cn.is_chance() || cn.board_state != turn {
+                    depth.push(c as usize);
+                }
+            }
+        }
+    }
+    depth.sort_unstable();
+    depth.dedup();
+    let _ = ti;
+    (tree, fsg, bk, depth)
+}
+
+#[test]
+#[ignore = "per-street (turn) search timing; run with --ignored --nocapture --release"]
+fn live_search_turn_bucketed_timing() {
+    eprintln!("Per-street search: TURN-rooted, rich betting, river-runout continuation (turn_tables)");
+    let ti = 0usize;
+    for live in [2u8, 3, 4] {
+        let (tree, fsg, bk, depth) = build_turn_search(live, 16, ti);
+        let game =
+            BucketedContinuationGame::new_street(&fsg, &bk, ContStreet::Turn(ti), 200, 0xC0FFEE);
+        let np = tree.num_players as usize;
+        let nh = game.num_hands(0);
+        let mut s = CpuMccfr::new(&tree, vec![nh; np]);
+        s.set_depth_limit(&depth);
+        s.set_lambda(vec![300.0; np]);
         let iters = 250u32;
         let t = Instant::now();
         s.run(&tree, &game, iters);
