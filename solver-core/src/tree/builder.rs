@@ -4,7 +4,20 @@ use crate::tree::flat::{FlatNode, FlatTree, NODE_TYPE_PLAYER, NODE_TYPE_TERMINAL
 const MAX_DEPTH: usize = 64;
 
 pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
-    build_tree_inner(config, false)
+    build_tree_inner(config, None)
+}
+
+/// DEPTH-LIMITED build for per-street real-time search: truncate the tree one
+/// street past `config.initial_state` (its next-street chance nodes become
+/// childless leaves). A flop-rooted config stops at the turn-deal chance; the
+/// depth-limited solver values those leaves via the bucketed continuation and
+/// never descends. This avoids building (and `setup_pluribus_continuations`
+/// over) the full multi-street betting subtree, which is never visited below
+/// the depth limit and is the dominant cost for multiway rich-betting trees.
+/// River-rooted configs are unchanged (no next chance — showdown terminals are
+/// depth-limited by the caller instead).
+pub fn build_tree_depth_limited(config: &TreeConfig) -> Result<FlatTree, String> {
+    build_tree_inner(config, config.initial_state.next())
 }
 
 /// PREFLOP-ONLY build (2026-06-12, v1 game derivation): truncate the
@@ -21,10 +34,13 @@ pub fn build_tree_preflop_only(config: &TreeConfig) -> Result<FlatTree, String> 
     if config.initial_state != BoardState::Preflop {
         return Err("preflop-only build requires initial_state = Preflop".into());
     }
-    build_tree_inner(config, true)
+    build_tree_inner(config, Some(BoardState::Flop))
 }
 
-fn build_tree_inner(config: &TreeConfig, truncate_at_flop: bool) -> Result<FlatTree, String> {
+fn build_tree_inner(
+    config: &TreeConfig,
+    truncate_at: Option<BoardState>,
+) -> Result<FlatTree, String> {
     let num_players = config.num_players as usize;
     if num_players < 2 || num_players > 10 {
         return Err(format!("num_players must be 2-10, got {}", num_players));
@@ -63,7 +79,7 @@ fn build_tree_inner(config: &TreeConfig, truncate_at_flop: bool) -> Result<FlatT
 
     let mut builder = TreeBuilder {
         config,
-        truncate_at_flop,
+        truncate_at,
         tree: FlatTree::new(
             config.num_players,
             config.starting_pot,
@@ -197,10 +213,11 @@ fn build_tree_inner(config: &TreeConfig, truncate_at_flop: bool) -> Result<FlatT
 
 struct TreeBuilder<'a> {
     config: &'a TreeConfig,
-    /// Preflop-only build: flop-entry chance nodes become leaves (the
-    /// production preflop layer replaces their subtrees with the
-    /// frozen postflop oracle). See `build_tree_preflop_only`.
-    truncate_at_flop: bool,
+    /// If set, chance nodes transitioning INTO this board state become childless
+    /// leaves (the caller's depth-limited solver values them). `Some(Flop)` =
+    /// preflop-only (oracle continuation); `Some(Turn)`/`Some(River)` = per-street
+    /// search depth limit. `None` = full tree. See `build_tree_depth_limited`.
+    truncate_at: Option<BoardState>,
     tree: FlatTree,
 }
 
@@ -691,11 +708,10 @@ impl<'a> TreeBuilder<'a> {
         // from the grandparent; CALL/CHECK don't trigger FOLD propagation, so
         // that's correct.
 
-        // PREFLOP-ONLY BUILD: the flop-entry chance node is a leaf of
-        // this tree; the frozen postflop oracle supplies its value.
-        if self.truncate_at_flop
-            && info.board_state == crate::tree::action::BoardState::Flop
-        {
+        // DEPTH-LIMITED BUILD: the chance node entering `truncate_at` is a leaf
+        // of this tree; the caller's depth-limited solver supplies its value
+        // (preflop oracle, or the per-street bucketed continuation).
+        if self.truncate_at == Some(info.board_state) {
             return;
         }
 

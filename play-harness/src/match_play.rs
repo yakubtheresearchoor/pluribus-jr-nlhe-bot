@@ -117,54 +117,7 @@ impl<'a> MatchEnv<'a> {
     /// get paid off absurdly (the +220bb/100 inflation). Anchored on the flop
     /// fold-to-cbet ~29-33%, escalating by street as real fish do.
     fn pop_postflop(&self, node: usize, hole: [u8; 2], board: &[u8], rng: &mut u64) -> usize {
-        let children = self.tree.node_children(node);
-        let pick = |prefs: &[u8]| -> usize {
-            prefs
-                .iter()
-                .find_map(|&want| {
-                    children.iter().position(|&c| self.tree.nodes[c as usize].action_label == want)
-                })
-                .expect("policy found no matching action label")
-        };
-        let has = |want: u8| children.iter().any(|&c| self.tree.nodes[c as usize].action_label == want);
-        let r = (splitmix64(rng) % 1_000_000) as f64 / 1_000_000.0;
-        let mut cards = vec![hole[0], hole[1]];
-        cards.extend_from_slice(board);
-        let cat = best5(&cards).category(); // 0=high 1=pair 2=two-pair 3=trips ...
-        let street = self.tree.nodes[node].board_state; // 0 flop / 1 turn / 2 river
-        if has(1) {
-            // open / checked-to: value-bet by strength + a little BLUFFING (so
-            // the pool isn't face-up — the bot can't fold every time it checks).
-            let bet_p = if cat >= 2 { 0.70 } else if cat == 1 { 0.35 } else { 0.14 };
-            if r < bet_p { pick(&[3, 4, 5]) } else { pick(&[1]) }
-        } else if cat >= 3 {
-            // trips+: sticky, raises some
-            if r < 0.25 { pick(&[4, 5, 3, 2]) } else { pick(&[2, 0]) }
-        } else if cat >= 2 {
-            // two-pair: calls flop/turn, sheds to the river barrel
-            let f = match street { 2 => 0.45, 1 => 0.20, _ => 0.05 };
-            if r < f { pick(&[0]) } else { pick(&[2, 0]) }
-        } else if cat >= 1 {
-            // ONE PAIR — the load-bearing case. Peels the flop, but FOLDS to
-            // sustained pressure (the 2nd/3rd barrel reads as strength) instead
-            // of stacking off to the nuts. The fraction that DOES call the river
-            // is the bluff-catch (keeps the bot honest). Steep gradient.
-            let f = match street { 2 => 0.82, 1 => 0.55, _ => 0.20 };
-            if r < f { pick(&[0]) } else { pick(&[2, 0]) }
-        } else {
-            // air: floats the flop a little, gives up by turn/river; rare
-            // bluff-raise (the chk-raise leak), no calling down with nothing.
-            let f = match street { 2 => 0.94, 1 => 0.90, _ => 0.62 };
-            if r < f {
-                pick(&[0])
-            } else if r < f + 0.03 {
-                pick(&[4, 5, 3, 2])
-            } else if street == 0 {
-                pick(&[2, 0]) // float the flop
-            } else {
-                pick(&[0]) // turn/river air: just fold
-            }
-        }
+        pop_postflop_action(self.tree, node, hole, board, rng)
     }
 
     /// Play ONE hand in AUDIT mode with the given per-seat policies
@@ -311,6 +264,11 @@ impl<'a> MatchEnv<'a> {
     /// each live player's matched preflop commit; `dead` = pot − live·commit.
     /// `rake_spec` = (rate_milli, cap). Returns (per-seam-seat net, live).
     /// Σ net = dead − rake (folders' −commit is accounted by the caller).
+    /// `bot_search`: optional per-FLOP-node searched strategy (node → [na][nh]).
+    /// When present, a Blueprint seat plays the SEARCHED strategy on the flop
+    /// (lossless real-time search) and the blueprint on turn/river (the frozen
+    /// one-round continuation). None ⇒ pure blueprint (the baseline).
+    #[allow(clippy::too_many_arguments)]
     pub fn play_seam(
         &self,
         policies: &[Policy],
@@ -320,6 +278,7 @@ impl<'a> MatchEnv<'a> {
         rake_spec: (u32, u32),
         rng: &mut u64,
         runout: Option<(usize, usize)>,
+        bot_search: Option<&HashMap<usize, Vec<Vec<f32>>>>,
     ) -> Option<(Vec<i64>, u8)> {
         let np = self.bp.np;
         let blocked = |c: u8| holes.iter().take(np).any(|h| h[0] == c || h[1] == c);
@@ -382,12 +341,27 @@ impl<'a> MatchEnv<'a> {
                 Policy::Blueprint(_) => {
                     let hkey = { let h = holes[p]; (h[0].min(h[1]), h[0].max(h[1])) };
                     let h = *self.hand_of.get(&hkey).expect("hand in universe");
-                    self.strategy(node, ti, ri, h, &mut buf);
+                    // FLOP (ti=None) with a searched strategy → play the search;
+                    // else (turn/river, or no search) → blueprint.
+                    let searched = if ti.is_none() {
+                        bot_search.and_then(|sc| sc.get(&node))
+                    } else {
+                        None
+                    };
                     let mut x = (splitmix64(rng) % 1_000_000) as f32 / 1_000_000.0;
                     let mut sel = na - 1;
-                    for (i, &v) in buf[..na].iter().enumerate() {
-                        if x < v { sel = i; break; }
-                        x -= v;
+                    if let Some(strat) = searched {
+                        for a in 0..na {
+                            let v = strat[a][h];
+                            if x < v { sel = a; break; }
+                            x -= v;
+                        }
+                    } else {
+                        self.strategy(node, ti, ri, h, &mut buf);
+                        for (i, &v) in buf[..na].iter().enumerate() {
+                            if x < v { sel = i; break; }
+                            x -= v;
+                        }
                     }
                     sel
                 }
@@ -446,5 +420,62 @@ impl<'a> MatchEnv<'a> {
             holes[p] = [pool[2 * p], pool[2 * p + 1]];
         }
         holes
+    }
+}
+
+/// NL10 pool postflop action on an ARBITRARY tree (the per-street search
+/// subgame trees, not just the blueprint seam tree) → child index. Same
+/// calibrated loose-passive, street-aware logic as `MatchEnv::pop_postflop`;
+/// factored out so the Pluribus per-street searched play loop can drive the
+/// pool on its own subgame trees.
+pub fn pop_postflop_action(
+    tree: &FlatTree,
+    node: usize,
+    hole: [u8; 2],
+    board: &[u8],
+    rng: &mut u64,
+) -> usize {
+    let children = tree.node_children(node);
+    // Robust pick: try the preference list; if NONE match this node's action set
+    // (the rich per-street search trees have action-sets the lean-tree pool logic
+    // didn't anticipate — e.g. raise-capped spots), fall back to the most passive
+    // available action (check > call > fold), then to child 0. Never panics.
+    let pick = |prefs: &[u8]| -> usize {
+        prefs
+            .iter()
+            .chain([1u8, 2, 0].iter())
+            .find_map(|&want| {
+                children.iter().position(|&c| tree.nodes[c as usize].action_label == want)
+            })
+            .unwrap_or(0)
+    };
+    let has = |want: u8| children.iter().any(|&c| tree.nodes[c as usize].action_label == want);
+    let r = (splitmix64(rng) % 1_000_000) as f64 / 1_000_000.0;
+    let mut cards = vec![hole[0], hole[1]];
+    cards.extend_from_slice(board);
+    let cat = best5(&cards).category(); // 0=high 1=pair 2=two-pair 3=trips ...
+    let street = tree.nodes[node].board_state; // 0 flop / 1 turn / 2 river
+    if has(1) {
+        let bet_p = if cat >= 2 { 0.70 } else if cat == 1 { 0.35 } else { 0.14 };
+        if r < bet_p { pick(&[3, 4, 5]) } else { pick(&[1]) }
+    } else if cat >= 3 {
+        if r < 0.25 { pick(&[4, 5, 3, 2]) } else { pick(&[2, 0]) }
+    } else if cat >= 2 {
+        let f = match street { 2 => 0.45, 1 => 0.20, _ => 0.05 };
+        if r < f { pick(&[0]) } else { pick(&[2, 0]) }
+    } else if cat >= 1 {
+        let f = match street { 2 => 0.82, 1 => 0.55, _ => 0.20 };
+        if r < f { pick(&[0]) } else { pick(&[2, 0]) }
+    } else {
+        let f = match street { 2 => 0.94, 1 => 0.90, _ => 0.62 };
+        if r < f {
+            pick(&[0])
+        } else if r < f + 0.03 {
+            pick(&[4, 5, 3, 2])
+        } else if street == 0 {
+            pick(&[2, 0])
+        } else {
+            pick(&[0])
+        }
     }
 }

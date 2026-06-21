@@ -82,6 +82,15 @@ impl<'a> BucketedContinuationGame<'a> {
         let np = inner.table().num_players;
         BucketedContinuationGame { inner, bucketing, street, np, sample_m, rng_seed }
     }
+
+    /// Override the player count (default = the inner game's np). The pairwise
+    /// bucket-vs-bucket showdown tables are np-independent, so the same blueprint
+    /// continuation values a subgame with FEWER live players (e.g. after a
+    /// mid-hand fold dropped a multiway pot from np to L). The search subgame
+    /// tree must be built with this same L.
+    pub fn set_player_count(&mut self, np: u8) {
+        self.np = np;
+    }
 }
 
 impl<'a> GameSpec for BucketedContinuationGame<'a> {
