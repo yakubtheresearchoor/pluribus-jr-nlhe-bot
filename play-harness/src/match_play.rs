@@ -30,6 +30,11 @@ pub enum Policy<'a> {
     CheckFold,
     /// Most aggressive action available (bet, else call).
     AlwaysAggressive,
+    /// NL10 loose-passive pool (postflop), calibrated to reference_6max_pool_priors
+    /// (NL10 row): when given the option, continuation-bets 52.4% (else checks);
+    /// facing a bet, folds 29.1% (fold-to-cbet), raises ~7.3% (chk-raise proxy),
+    /// else calls. Street-uniform first model. The realistic fish the bot is judged against.
+    Population,
 }
 
 pub struct MatchEnv<'a> {
@@ -198,6 +203,26 @@ impl<'a> MatchEnv<'a> {
             let a = match &policies[p] {
                 Policy::AlwaysAggressive => pick(&[3, 4, 5, 2]), // bet/raise/allin, else call
                 Policy::CheckFold => pick(&[1, 0]),              // check, else fold
+                Policy::Population => {
+                    // NL10 loose-passive pool (postflop frequencies).
+                    let has = |want: u8| {
+                        children.iter().any(|&c| self.tree.nodes[c as usize].action_label == want)
+                    };
+                    let r = (splitmix64(rng) % 1_000_000) as f64 / 1_000_000.0;
+                    if has(1) {
+                        // open / checked-to: c-bet 52.4%, else check
+                        if r < 0.524 { pick(&[3, 4, 5]) } else { pick(&[1]) }
+                    } else {
+                        // facing a bet: fold 29.1%, raise ~7.3%, else call
+                        if r < 0.291 {
+                            pick(&[0])
+                        } else if r < 0.291 + 0.073 {
+                            pick(&[4, 5, 3, 2])
+                        } else {
+                            pick(&[2, 0])
+                        }
+                    }
+                }
                 Policy::Blueprint(_) => {
                     let hkey = {
                         let h = holes[p];
