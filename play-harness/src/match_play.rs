@@ -110,6 +110,47 @@ impl<'a> MatchEnv<'a> {
         }
     }
 
+    /// NL10 pool postflop action at `node` → child index. Loose-passive but
+    /// STREET-AWARE: vs a (pot-sized) bet the pool folds more on later streets
+    /// (flop 33% / turn 45% / river 52%) instead of a flat 64%-call every
+    /// street — the flat version made the bot's pot-sized turn/river value bets
+    /// get paid off absurdly (the +220bb/100 inflation). Anchored on the flop
+    /// fold-to-cbet ~29-33%, escalating by street as real fish do.
+    fn pop_postflop(&self, node: usize, rng: &mut u64) -> usize {
+        let children = self.tree.node_children(node);
+        let pick = |prefs: &[u8]| -> usize {
+            prefs
+                .iter()
+                .find_map(|&want| {
+                    children.iter().position(|&c| self.tree.nodes[c as usize].action_label == want)
+                })
+                .expect("policy found no matching action label")
+        };
+        let has = |want: u8| children.iter().any(|&c| self.tree.nodes[c as usize].action_label == want);
+        let r = (splitmix64(rng) % 1_000_000) as f64 / 1_000_000.0;
+        if has(1) {
+            // can check (open / checked-to): c-bet 52%, else check
+            if r < 0.524 { pick(&[3, 4, 5]) } else { pick(&[1]) }
+        } else {
+            // facing a (pot-sized) bet: fold escalates by street (0=flop
+            // 1=turn 2=river). Real fish fold ~45/58/68% to pot-sized bets;
+            // calling much less keeps the bot from getting its value bets paid
+            // off unrealistically (the residual +bb inflation).
+            let (fold_p, raise_p) = match self.tree.nodes[node].board_state {
+                2 => (0.68, 0.04),
+                1 => (0.58, 0.05),
+                _ => (0.45, 0.06),
+            };
+            if r < fold_p {
+                pick(&[0])
+            } else if r < fold_p + raise_p {
+                pick(&[4, 5, 3, 2])
+            } else {
+                pick(&[2, 0])
+            }
+        }
+    }
+
     /// Play ONE hand in AUDIT mode with the given per-seat policies
     /// and dealt hole cards; returns net chips per seat (ante 2 each
     /// included). `rng` drives action sampling and runout draws.
@@ -203,26 +244,7 @@ impl<'a> MatchEnv<'a> {
             let a = match &policies[p] {
                 Policy::AlwaysAggressive => pick(&[3, 4, 5, 2]), // bet/raise/allin, else call
                 Policy::CheckFold => pick(&[1, 0]),              // check, else fold
-                Policy::Population => {
-                    // NL10 loose-passive pool (postflop frequencies).
-                    let has = |want: u8| {
-                        children.iter().any(|&c| self.tree.nodes[c as usize].action_label == want)
-                    };
-                    let r = (splitmix64(rng) % 1_000_000) as f64 / 1_000_000.0;
-                    if has(1) {
-                        // open / checked-to: c-bet 52.4%, else check
-                        if r < 0.524 { pick(&[3, 4, 5]) } else { pick(&[1]) }
-                    } else {
-                        // facing a bet: fold 29.1%, raise ~7.3%, else call
-                        if r < 0.291 {
-                            pick(&[0])
-                        } else if r < 0.291 + 0.073 {
-                            pick(&[4, 5, 3, 2])
-                        } else {
-                            pick(&[2, 0])
-                        }
-                    }
-                }
+                Policy::Population => self.pop_postflop(node, rng),
                 Policy::Blueprint(_) => {
                     let hkey = {
                         let h = holes[p];
@@ -340,19 +362,7 @@ impl<'a> MatchEnv<'a> {
             let a = match &policies[p] {
                 Policy::AlwaysAggressive => pick(&[3, 4, 5, 2]),
                 Policy::CheckFold => pick(&[1, 0]),
-                Policy::Population => {
-                    let has = |want: u8| children.iter().any(|&c| self.tree.nodes[c as usize].action_label == want);
-                    let r = (splitmix64(rng) % 1_000_000) as f64 / 1_000_000.0;
-                    if has(1) {
-                        if r < 0.524 { pick(&[3, 4, 5]) } else { pick(&[1]) }
-                    } else if r < 0.291 {
-                        pick(&[0])
-                    } else if r < 0.291 + 0.073 {
-                        pick(&[4, 5, 3, 2])
-                    } else {
-                        pick(&[2, 0])
-                    }
-                }
+                Policy::Population => self.pop_postflop(node, rng),
                 Policy::Blueprint(_) => {
                     let hkey = { let h = holes[p]; (h[0].min(h[1]), h[0].max(h[1])) };
                     let h = *self.hand_of.get(&hkey).expect("hand in universe");
