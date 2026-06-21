@@ -18,3 +18,4 @@ pub mod cross_tree;
 pub mod zone_dims;
 pub mod bucketed_showdown;
 pub mod bucketed_flop_cfr;
+pub mod bucketed_search;

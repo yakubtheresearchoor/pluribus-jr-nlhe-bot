@@ -49,6 +49,13 @@ pub struct CpuMccfr {
     sel_offset: Vec<usize>,
     sel_regret: Vec<f32>,
     sel_cum: Vec<f32>,
+    // DEPTH-LIMIT BOUNDARY (Pluribus-faithful multiway): at these nodes the
+    // searcher stops and values the leaf via `game.evaluate_continuation`
+    // (the bucketed + MC-sampled blueprint continuation) INSTEAD of recursing
+    // into the (frozen) next street. This is what keeps multiway flat in
+    // players — the O(nh^np) showdown never enters the searched tree, it lives
+    // in the sampled continuation. Empty ⇒ no depth limit (recurse as before).
+    depth_limit: Vec<bool>,
 }
 
 impl CpuMccfr {
@@ -84,6 +91,22 @@ impl CpuMccfr {
             sel_offset: vec![UNUSED; tree.num_nodes()],
             sel_regret: Vec::new(),
             sel_cum: Vec::new(),
+            depth_limit: vec![false; tree.num_nodes()],
+        }
+    }
+
+    /// DEPTH-LIMITED SEARCH boundary: mark nodes where the searcher values the
+    /// leaf via `game.evaluate_continuation` instead of recursing. For a flop
+    /// search these are the turn-entry nodes (the first node of the next
+    /// street). The subtree past a depth-limit node is never walked, so it need
+    /// not be frozen (though freezing is harmless). This is the lever that
+    /// makes multiway tractable: the continuation is sampled, not enumerated.
+    pub fn set_depth_limit(&mut self, nodes: &[usize]) {
+        for b in self.depth_limit.iter_mut() {
+            *b = false;
+        }
+        for &n in nodes {
+            self.depth_limit[n] = true;
         }
     }
 
@@ -263,6 +286,13 @@ impl CpuMccfr {
         var: &mut Vec<Option<usize>>,
     ) -> Vec<f32> {
         let node = &tree.nodes[node_idx];
+
+        // DEPTH LIMIT: value the leaf via the (sampled) blueprint continuation
+        // and stop — do NOT recurse into the next street. Checked first so it
+        // overrides chance/player handling at the boundary node.
+        if self.depth_limit[node_idx] {
+            return game.evaluate_continuation(traverser, node_idx, tree, cfreach);
+        }
 
         if node.is_terminal() {
             return game.evaluate_terminal(traverser, node_idx, tree, cfreach);
