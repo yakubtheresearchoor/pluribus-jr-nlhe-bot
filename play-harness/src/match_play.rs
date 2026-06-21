@@ -116,7 +116,7 @@ impl<'a> MatchEnv<'a> {
     /// street — the flat version made the bot's pot-sized turn/river value bets
     /// get paid off absurdly (the +220bb/100 inflation). Anchored on the flop
     /// fold-to-cbet ~29-33%, escalating by street as real fish do.
-    fn pop_postflop(&self, node: usize, rng: &mut u64) -> usize {
+    fn pop_postflop(&self, node: usize, hole: [u8; 2], board: &[u8], rng: &mut u64) -> usize {
         let children = self.tree.node_children(node);
         let pick = |prefs: &[u8]| -> usize {
             prefs
@@ -128,26 +128,30 @@ impl<'a> MatchEnv<'a> {
         };
         let has = |want: u8| children.iter().any(|&c| self.tree.nodes[c as usize].action_label == want);
         let r = (splitmix64(rng) % 1_000_000) as f64 / 1_000_000.0;
+        let mut cards = vec![hole[0], hole[1]];
+        cards.extend_from_slice(board);
+        let cat = best5(&cards).category(); // 0=high 1=pair 2=two-pair 3=trips ...
+        let street = self.tree.nodes[node].board_state; // 0 flop / 1 turn / 2 river
         if has(1) {
-            // can check (open / checked-to): c-bet 52%, else check
-            if r < 0.524 { pick(&[3, 4, 5]) } else { pick(&[1]) }
+            // can check: value-bet by strength, rarely bluff
+            let bet_p = if cat >= 2 { 0.72 } else if cat == 1 { 0.40 } else { 0.10 };
+            if r < bet_p { pick(&[3, 4, 5]) } else { pick(&[1]) }
+        } else if cat >= 3 {
+            // trips+: raise some, else call
+            if r < 0.28 { pick(&[4, 5, 3, 2]) } else { pick(&[2, 0]) }
+        } else if cat >= 2 {
+            // two-pair+: sticky (calls down)
+            let fold_p = match street { 2 => 0.08, _ => 0.02 };
+            if r < fold_p { pick(&[0]) } else { pick(&[2, 0]) }
+        } else if cat >= 1 {
+            // one pair: peels flop, but SHEDS to sustained pressure (turn/river)
+            // — calibrated so the pool reaches showdown ~WTSD 32%, not 95%.
+            let fold_p = match street { 2 => 0.55, 1 => 0.38, _ => 0.14 };
+            if r < fold_p { pick(&[0]) } else { pick(&[2, 0]) }
         } else {
-            // facing a (pot-sized) bet: fold escalates by street (0=flop
-            // 1=turn 2=river). Real fish fold ~45/58/68% to pot-sized bets;
-            // calling much less keeps the bot from getting its value bets paid
-            // off unrealistically (the residual +bb inflation).
-            let (fold_p, raise_p) = match self.tree.nodes[node].board_state {
-                2 => (0.68, 0.04),
-                1 => (0.58, 0.05),
-                _ => (0.45, 0.06),
-            };
-            if r < fold_p {
-                pick(&[0])
-            } else if r < fold_p + raise_p {
-                pick(&[4, 5, 3, 2])
-            } else {
-                pick(&[2, 0])
-            }
+            // air: float flop occasionally, give up by turn/river
+            let fold_p = match street { 2 => 0.94, 1 => 0.88, _ => 0.62 };
+            if r < fold_p { pick(&[0]) } else { pick(&[2, 0]) }
         }
     }
 
@@ -244,7 +248,7 @@ impl<'a> MatchEnv<'a> {
             let a = match &policies[p] {
                 Policy::AlwaysAggressive => pick(&[3, 4, 5, 2]), // bet/raise/allin, else call
                 Policy::CheckFold => pick(&[1, 0]),              // check, else fold
-                Policy::Population => self.pop_postflop(node, rng),
+                Policy::Population => self.pop_postflop(node, holes[p], &board, rng),
                 Policy::Blueprint(_) => {
                     let hkey = {
                         let h = holes[p];
@@ -362,7 +366,7 @@ impl<'a> MatchEnv<'a> {
             let a = match &policies[p] {
                 Policy::AlwaysAggressive => pick(&[3, 4, 5, 2]),
                 Policy::CheckFold => pick(&[1, 0]),
-                Policy::Population => self.pop_postflop(node, rng),
+                Policy::Population => self.pop_postflop(node, holes[p], &board, rng),
                 Policy::Blueprint(_) => {
                     let hkey = { let h = holes[p]; (h[0].min(h[1]), h[0].max(h[1])) };
                     let h = *self.hand_of.get(&hkey).expect("hand in universe");
