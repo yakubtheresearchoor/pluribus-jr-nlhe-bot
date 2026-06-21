@@ -66,17 +66,18 @@ impl FlopRouter {
         Ok(FlopRouter { map, live_bins, stack })
     }
 
-    /// Route a flop entry → (cell dir, exact/fallback/uncovered).
-    pub fn route(&self, cell: &SeamCell) -> (Option<String>, RouteKind) {
+    /// Route a flop entry → (cell (commit, pot, dir), exact/fallback/uncovered).
+    /// The returned commit/pot are the CELL's (the blueprint's economics), used
+    /// for the seam tree + settlement (the cell is the bucket representative).
+    pub fn route(&self, cell: &SeamCell) -> (Option<(i32, i32, String)>, RouteKind) {
         let key = cell.bucket_key(self.stack);
         if let Some(v) = self.map.get(&key) {
-            return (Some(v.2.clone()), RouteKind::Exact);
+            return (Some(v.clone()), RouteKind::Exact);
         }
-        // nearest SPR bin for this live-count
         if let Some(bins) = self.live_bins.get(&cell.live) {
             if let Some(&nb) = bins.iter().min_by_key(|&&b| (b - key.1).abs()) {
                 if let Some(v) = self.map.get(&(cell.live, nb)) {
-                    return (Some(v.2.clone()), RouteKind::Fallback);
+                    return (Some(v.clone()), RouteKind::Fallback);
                 }
             }
         }

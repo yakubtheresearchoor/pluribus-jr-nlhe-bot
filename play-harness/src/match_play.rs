@@ -266,6 +266,146 @@ impl<'a> MatchEnv<'a> {
         Some((settle_pots(&commits, &folded, &ranks, 0, (0, 0)), live as u8))
     }
 
+    /// np=live SEAM play (production baseline): Blueprint (bot) + Population
+    /// (pool) walk the cell's flop→river tree; settle the live commits + the
+    /// preflop DEAD money (folders), minus rake on the main pot, to the
+    /// winners. `holes`/`policies` length = np = `self.bp.np`; `base_commit` =
+    /// each live player's matched preflop commit; `dead` = pot − live·commit.
+    /// `rake_spec` = (rate_milli, cap). Returns (per-seam-seat net, live).
+    /// Σ net = dead − rake (folders' −commit is accounted by the caller).
+    pub fn play_seam(
+        &self,
+        policies: &[Policy],
+        holes: &[[u8; 2]],
+        base_commit: u32,
+        dead: u32,
+        rake_spec: (u32, u32),
+        rng: &mut u64,
+        runout: Option<(usize, usize)>,
+    ) -> Option<(Vec<i64>, u8)> {
+        let np = self.bp.np;
+        let blocked = |c: u8| holes.iter().take(np).any(|h| h[0] == c || h[1] == c);
+        let mut node = 0usize;
+        let (mut ti, mut ri): (Option<usize>, Option<usize>) = (None, None);
+        let mut board: Vec<u8> = self.bp.flop.to_vec();
+        let mut buf = [0f32; MAX_NA_POSTFLOP];
+        loop {
+            let n = &self.tree.nodes[node];
+            if n.is_terminal() {
+                break;
+            }
+            if n.is_chance() {
+                if ti.is_none() {
+                    let t = if let Some((ft, _)) = runout {
+                        if blocked(self.bp.turns[ft]) { return None; }
+                        ft
+                    } else {
+                        let opts: Vec<usize> = (0..self.bp.turns.len())
+                            .filter(|&t| !blocked(self.bp.turns[t]))
+                            .collect();
+                        if opts.is_empty() { return None; }
+                        opts[(splitmix64(rng) % opts.len() as u64) as usize]
+                    };
+                    ti = Some(t);
+                    board.push(self.bp.turns[t]);
+                } else {
+                    let t = ti.unwrap();
+                    let r = if let Some((_, fr)) = runout {
+                        if fr >= self.bp.rivers[t].len() || blocked(self.bp.rivers[t][fr]) { return None; }
+                        fr
+                    } else {
+                        let opts: Vec<usize> = (0..self.bp.rivers[t].len())
+                            .filter(|&r| !blocked(self.bp.rivers[t][r]))
+                            .collect();
+                        if opts.is_empty() { return None; }
+                        opts[(splitmix64(rng) % opts.len() as u64) as usize]
+                    };
+                    ri = Some(r);
+                    board.push(self.bp.rivers[t][r]);
+                }
+                node = self.tree.node_children(node)[0] as usize;
+                continue;
+            }
+            let p = n.player_id as usize;
+            let na = n.num_children as usize;
+            let children = self.tree.node_children(node);
+            let pick = |prefs: &[u8]| -> usize {
+                prefs
+                    .iter()
+                    .find_map(|&want| {
+                        children.iter().position(|&c| self.tree.nodes[c as usize].action_label == want)
+                    })
+                    .expect("policy found no matching action label")
+            };
+            let a = match &policies[p] {
+                Policy::AlwaysAggressive => pick(&[3, 4, 5, 2]),
+                Policy::CheckFold => pick(&[1, 0]),
+                Policy::Population => {
+                    let has = |want: u8| children.iter().any(|&c| self.tree.nodes[c as usize].action_label == want);
+                    let r = (splitmix64(rng) % 1_000_000) as f64 / 1_000_000.0;
+                    if has(1) {
+                        if r < 0.524 { pick(&[3, 4, 5]) } else { pick(&[1]) }
+                    } else if r < 0.291 {
+                        pick(&[0])
+                    } else if r < 0.291 + 0.073 {
+                        pick(&[4, 5, 3, 2])
+                    } else {
+                        pick(&[2, 0])
+                    }
+                }
+                Policy::Blueprint(_) => {
+                    let hkey = { let h = holes[p]; (h[0].min(h[1]), h[0].max(h[1])) };
+                    let h = *self.hand_of.get(&hkey).expect("hand in universe");
+                    self.strategy(node, ti, ri, h, &mut buf);
+                    let mut x = (splitmix64(rng) % 1_000_000) as f32 / 1_000_000.0;
+                    let mut sel = na - 1;
+                    for (i, &v) in buf[..na].iter().enumerate() {
+                        if x < v { sel = i; break; }
+                        x -= v;
+                    }
+                    sel
+                }
+            };
+            node = self.tree.node_children(node)[a] as usize;
+        }
+        // ---- seam settle ----
+        let fold_mask = self.tree.get_folded_mask(node);
+        let folded: Vec<bool> = (0..np).map(|p| fold_mask & (1 << p) != 0).collect();
+        let live_commits: Vec<u32> =
+            (0..np).map(|p| base_commit + self.tree.get_contribution(node, p as u8) as u32).collect();
+        let n_live = folded.iter().filter(|&&f| !f).count();
+        if n_live == 0 {
+            return None;
+        }
+        let ranks: Vec<Option<u32>> = (0..np)
+            .map(|p| {
+                if folded[p] {
+                    None
+                } else if n_live == 1 {
+                    Some(0)
+                } else {
+                    let mut c = holes[p].to_vec();
+                    c.extend_from_slice(&board);
+                    Some(best5(&c).0)
+                }
+            })
+            .collect();
+        let mut net = settle_pots(&live_commits, &folded, &ranks, 0, (0, 0));
+        let total_pot: u32 = live_commits.iter().sum::<u32>() + dead;
+        let rake = ((total_pot as u64 * rake_spec.0 as u64) / 1000).min(rake_spec.1 as u64) as i64;
+        let gain = dead as i64 - rake;
+        let best = (0..np).filter(|&p| !folded[p]).map(|p| ranks[p].unwrap()).max().unwrap();
+        let winners: Vec<usize> = (0..np).filter(|&p| !folded[p] && ranks[p].unwrap() == best).collect();
+        let share = gain.div_euclid(winners.len() as i64);
+        let mut odd = gain - share * winners.len() as i64;
+        for &w in &winners {
+            let extra = if odd > 0 { 1 } else { 0 };
+            odd -= extra;
+            net[w] += share + extra;
+        }
+        Some((net, n_live as u8))
+    }
+
     /// Deal hole cards from the deck minus the flop (seeded).
     pub fn deal_holes(&self, rng: &mut u64) -> [[u8; 2]; 6] {
         let fm: u64 =
