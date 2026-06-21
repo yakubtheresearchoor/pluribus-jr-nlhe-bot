@@ -13,6 +13,76 @@ use crate::pool_preflop::{PoolPreflop, PreAction};
 use crate::preflop_player::{splitmix64, PreflopPlayer};
 use solver_core::solver::postflop_oracle::SeamCell;
 use solver_core::tree::flat::MAX_NA_PREFLOP;
+use std::collections::HashMap;
+
+/// Routes a flop SeamCell → the v1 postflop cell dir for live-3/4/5 (the solved
+/// families), via `SeamCell::bucket_key`, with nearest-SPR-bin fallback for
+/// situations the census didn't cover (the pool's limps shift the distribution
+/// off the raise-or-fold census). live-2 (.bp2) and live-6 (rollout) are
+/// separate paths handled by the caller.
+pub struct FlopRouter {
+    map: HashMap<(u8, i64), (i32, i32, String)>, // (live, spr_bin) -> (commit, pot, dir)
+    live_bins: HashMap<u8, Vec<i64>>,            // per-live sorted spr_bins
+    stack: i32,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RouteKind {
+    Exact,
+    Fallback,
+    Uncovered, // live-count not in the solved cell set (2 / 6)
+}
+
+impl FlopRouter {
+    /// Parse a `cells.txt` (lines "CELL live=L commit=C pot=P b=B") under
+    /// `blueprint_root` into the bucket map.
+    pub fn load(blueprint_root: &str, cells_txt: &str, stack: i32) -> std::io::Result<Self> {
+        let text = std::fs::read_to_string(cells_txt)?;
+        let mut map = HashMap::new();
+        let mut live_bins: HashMap<u8, Vec<i64>> = HashMap::new();
+        for line in text.lines() {
+            if !line.starts_with("CELL live=") {
+                continue;
+            }
+            let f = |k: &str| -> i64 {
+                line.split_whitespace()
+                    .find_map(|t| t.strip_prefix(k))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0)
+            };
+            let live = f("live=") as u8;
+            let commit = f("commit=") as i32;
+            let pot = f("pot=") as i32;
+            let b = f("b=");
+            let key = SeamCell { live, commit, pot }.bucket_key(stack);
+            let dir = format!("{blueprint_root}/live{live}_c{commit}_p{pot}_b{b}");
+            map.insert(key, (commit, pot, dir));
+            live_bins.entry(live).or_default().push(key.1);
+        }
+        for v in live_bins.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        Ok(FlopRouter { map, live_bins, stack })
+    }
+
+    /// Route a flop entry → (cell dir, exact/fallback/uncovered).
+    pub fn route(&self, cell: &SeamCell) -> (Option<String>, RouteKind) {
+        let key = cell.bucket_key(self.stack);
+        if let Some(v) = self.map.get(&key) {
+            return (Some(v.2.clone()), RouteKind::Exact);
+        }
+        // nearest SPR bin for this live-count
+        if let Some(bins) = self.live_bins.get(&cell.live) {
+            if let Some(&nb) = bins.iter().min_by_key(|&&b| (b - key.1).abs()) {
+                if let Some(v) = self.map.get(&(cell.live, nb)) {
+                    return (Some(v.2.clone()), RouteKind::Fallback);
+                }
+            }
+        }
+        (None, RouteKind::Uncovered)
+    }
+}
 
 // Position (action order) → constants. Seat index 0..5 = UTG..BB.
 pub const UTG: usize = 0;
@@ -34,18 +104,45 @@ pub struct FlopEntry {
     pub cell: SeamCell,
 }
 
+/// Adjustable game economics. Production v1 = {rake_rate 0.05, rake_cap 20
+/// (=10bb at bb=2), ante 0}. All flex so we can test other rake/ante structures.
+#[derive(Clone, Copy)]
+pub struct GameEcon {
+    pub rake_rate: f64,
+    pub rake_cap: i32, // chips
+    pub ante: i32,     // chips, posted by every seat preflop
+}
+
+impl Default for GameEcon {
+    fn default() -> Self {
+        GameEcon { rake_rate: 0.05, rake_cap: 20, ante: 0 }
+    }
+}
+
 pub struct FullHandSim {
     pf: PreflopPlayer,
     pool: PoolPreflop,
     pub stack: i32,
     sb: i32,
     bb: i32,
+    pub econ: GameEcon,
     /// EQR open-decision node per opening position UTG..SB (BB never opens).
     open_node: [usize; 5],
 }
 
 impl FullHandSim {
     pub fn new(pf: PreflopPlayer, pool: PoolPreflop, stack: i32, sb: i32, bb: i32) -> Self {
+        Self::with_econ(pf, pool, stack, sb, bb, GameEcon::default())
+    }
+
+    pub fn with_econ(
+        pf: PreflopPlayer,
+        pool: PoolPreflop,
+        stack: i32,
+        sb: i32,
+        bb: i32,
+        econ: GameEcon,
+    ) -> Self {
         // Open node per position = follow the FOLD edge from the root that many
         // times (UTG=root; each fold advances to the next position's open).
         let mut open_node = [0usize; 5];
@@ -61,7 +158,7 @@ impl FullHandSim {
                 n = fold as usize;
             }
         }
-        FullHandSim { pf, pool, stack, sb, bb, open_node }
+        FullHandSim { pf, pool, stack, sb, bb, econ, open_node }
     }
 
     /// Bot's EQR decision node by skeleton-replay of `skel` (the fold/raise edge
@@ -102,11 +199,14 @@ impl FullHandSim {
         holes: &[[u8; 2]; 6],
         rng: &mut u64,
     ) -> FlopEntry {
-        let mut commit = [0i32; 6];
+        // Every seat antes (dead baseline); blinds post on top. to-call excludes
+        // the ante (it's a baseline all share), so current_bet = ante + bb.
+        let ante = self.econ.ante;
+        let mut commit = [ante; 6];
         let mut folded = [false; 6];
-        commit[SB] = self.sb;
-        commit[BB] = self.bb;
-        let mut current_bet = self.bb;
+        commit[SB] = ante + self.sb;
+        commit[BB] = ante + self.bb;
+        let mut current_bet = ante + self.bb;
         let mut num_raises = 0u32; // raises beyond the blind
         // need[p] = player p still owes an action this round. Set false when they
         // act (fold/call/check); a raise re-sets need=true for all other live

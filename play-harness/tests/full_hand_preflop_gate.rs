@@ -6,7 +6,7 @@
 //! Run: PF_STRAT=$PWD/preflop_eqr_bbfix cargo test --release -p play-harness \
 //!      --test full_hand_preflop_gate -- --ignored --nocapture
 
-use play_harness::full_hand::{FullHandSim, Seat};
+use play_harness::full_hand::{FlopRouter, FullHandSim, RouteKind, Seat};
 use play_harness::pool_preflop::PoolPreflop;
 use play_harness::preflop_player::PreflopPlayer;
 use solver_core::card::NUM_POSSIBLE_HANDS;
@@ -46,6 +46,64 @@ fn trace_few_hands() {
         let fe = sim.play_preflop(&seats, &holes, &mut rng);
         eprintln!("  => live={} pot={} commit_max={} folded={:?}", fe.live, fe.pot, fe.cell.commit, fe.folded);
     }
+}
+
+#[test]
+#[ignore = "needs preflop artifact + blueprint_out_v1/cells.txt; --ignored --nocapture --release"]
+fn flop_routing_coverage() {
+    let base = std::env::var("PF_STRAT").unwrap_or_else(|_| "preflop_eqr_bbfix".into());
+    let bp_root = std::env::var("BP_ROOT").unwrap_or_else(|_| "blueprint_out_v1".into());
+    let cells = format!("{bp_root}/cells.txt");
+    if !std::path::Path::new(&format!("{base}.f32")).exists() || !std::path::Path::new(&cells).exists() {
+        eprintln!("SKIP: missing {base}.f32 or {cells}");
+        return;
+    }
+    let pf = PreflopPlayer::load(&base).unwrap();
+    let sim = FullHandSim::new(pf, PoolPreflop::new(), 200, 1, 2);
+    let router = FlopRouter::load(&bp_root, &cells, 200).unwrap();
+    let seats = [Seat::Bot, Seat::Pool, Seat::Pool, Seat::Pool, Seat::Pool, Seat::Pool];
+
+    let n = 30_000;
+    let mut rng = 0x55_u64;
+    // per live-count: [exact, fallback, uncovered]
+    let mut cov: std::collections::HashMap<u8, [u64; 3]> = std::collections::HashMap::new();
+    for _ in 0..n {
+        let holes = deal(&mut rng);
+        let fe = sim.play_preflop(&seats, &holes, &mut rng);
+        if fe.live < 2 {
+            continue;
+        }
+        let (_, kind) = router.route(&fe.cell);
+        let e = cov.entry(fe.live).or_default();
+        match kind {
+            RouteKind::Exact => e[0] += 1,
+            RouteKind::Fallback => e[1] += 1,
+            RouteKind::Uncovered => e[2] += 1,
+        }
+    }
+
+    eprintln!("\n=== flop routing coverage (live-3/4/5 = solved cells) ===");
+    let mut lives: Vec<u8> = cov.keys().copied().collect();
+    lives.sort();
+    for l in lives {
+        let [ex, fb, un] = cov[&l];
+        let tot = ex + fb + un;
+        eprintln!(
+            "  live-{l}: {tot:>6} pots | exact {:5.1}% | fallback {:5.1}% | uncovered {:5.1}%",
+            100.0 * ex as f64 / tot as f64,
+            100.0 * fb as f64 / tot as f64,
+            100.0 * un as f64 / tot as f64
+        );
+    }
+    eprintln!("(live-2 .bp2 + live-6 rollout are separate paths, shown as 'uncovered' here)");
+    // live-3/4/5 should mostly route (exact+fallback), not be uncovered.
+    for l in [3u8, 4, 5] {
+        if let Some(&[ex, fb, un]) = cov.get(&l) {
+            let routed = ex + fb;
+            assert!(routed > un, "live-{l}: more uncovered than routed ({un} vs {routed})");
+        }
+    }
+    eprintln!("✓ live-3/4/5 pots route to v1 cells (exact or nearest-bin fallback)");
 }
 
 #[test]
