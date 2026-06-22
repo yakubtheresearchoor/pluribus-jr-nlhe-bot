@@ -128,8 +128,19 @@ impl<'a> GameSpec for BucketedContinuationGame<'a> {
         tree: &FlatTree,
         cfreach: &[Vec<f32>],
     ) -> Vec<f32> {
-        // Flop folds (no showdown reached) — exact, cheap.
-        self.inner.evaluate_terminal(traverser, node_idx, tree, cfreach)
+        // HU (num_opp=1): the exact fold terminal is O(nh²) — cheap and precise.
+        // MULTIWAY (num_opp≥2): the exact side-pot showdown is O(nh^num_opp) with
+        // card removal — the per-street-search perf wall (minutes/decision). Route
+        // it through the SAME bucketed collapsed showdown as the depth-limit
+        // continuation (flat in np; handles the node's fold_mask). An approximate
+        // leaf value for the search — the ACTUAL hand result at play-settle uses
+        // exact cards, so this trades search precision for tractability, not
+        // chip-accounting correctness.
+        if self.np <= 2 {
+            self.inner.evaluate_terminal(traverser, node_idx, tree, cfreach)
+        } else {
+            self.evaluate_continuation(traverser, node_idx, tree, cfreach)
+        }
     }
 
     fn evaluate_continuation(
