@@ -102,21 +102,9 @@ async fn decide_handler(
         };
     }
 
-    // Live counts without per-cell blueprints: live-2 is the HU `.bp2` stage-bank
-    // format (no flop_NNNN.bp cells), live-6+ is the equity-rollout model (no
-    // blueprint at all). Both need their own decision path — return a clear,
-    // structured error so the runtime can fall back rather than hit a load error.
-    if req.live <= 2 || req.live >= 6 {
-        let why = if req.live <= 2 {
-            "live-2 (heads-up) uses the .bp2 stage-bank format — no per-cell search wired"
-        } else {
-            "live-6+ uses the equity-rollout model — no per-cell search wired"
-        };
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, why.to_string()));
-    }
-
     // Board→canonical-flop routing: derive flop_id + remap cards from the raw
-    // board so the runtime can omit flop_id and send real cards.
+    // board so the runtime can omit flop_id and send real cards. Run BEFORE the
+    // live-count dispatch so both the search and live-2 paths get canonical cards.
     if req.route {
         play_harness::api::route_to_canonical(&mut req).ok_or((
             StatusCode::BAD_REQUEST,
@@ -124,7 +112,33 @@ async fn decide_handler(
         ))?;
     }
 
-    // POSTFLOP: get-or-load the blueprint for this cell+flop.
+    // LIVE-2 (heads-up): banked exact HU strategy (.bp2 under {bp_root}/live2),
+    // a lookup not a search. Only the flop is runout-independent (1×1 bank).
+    if req.live == 2 {
+        let live2_root = format!("{}/live2", st.bp_root);
+        let out = tokio::task::spawn_blocking(move || {
+            play_harness::api::decide_live2(&live2_root, &req)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live2 join: {e}")))?;
+        return match out {
+            Some(r) => Ok(Json(r)),
+            None => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "live-2: not a flop decision / SPR bin not banked / all-in (rollout)".into(),
+            )),
+        };
+    }
+
+    // live-6+ is the equity-rollout model (no blueprint) — not wired yet.
+    if req.live >= 6 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "live-6+ uses the equity-rollout model — no per-cell search wired".to_string(),
+        ));
+    }
+
+    // POSTFLOP (live 3/4/5): get-or-load the blueprint for this cell+flop.
     let key = (req.cell_dir.clone(), req.flop_id);
     let bp: Arc<SyncBp> = {
         let mut cache = st.cache.lock().unwrap();

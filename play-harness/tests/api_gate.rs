@@ -5,9 +5,64 @@
 //! Run: BP_ROOT=$PWD/blueprint_out_v1 PAR=1 \
 //!   cargo test --release -p play-harness --test api_gate -- --ignored --nocapture
 
-use play_harness::api::{decide_postflop, route_to_canonical, ActionInput, DecideRequest};
+use play_harness::api::{decide_live2, decide_postflop, route_to_canonical, ActionInput, DecideRequest};
 use play_harness::blueprint::Blueprint;
 use play_harness::pluribus_play::SearchCfg;
+
+/// LIVE-2 flop decision from the banked HU strategy: a lookup (no search). Asserts
+/// a valid distribution and suit-iso routing invariance (a permuted raw board +
+/// hole cards yields the same distribution). commit=10/pot=20 ⇒ SPR bin S12.
+#[test]
+#[ignore = "needs blueprint_out_v1/live2 bank; --ignored --nocapture --release"]
+fn api_live2_flop() {
+    let bp_root = std::env::var("BP_ROOT").unwrap_or_else(|_| "blueprint_out_v1".into());
+    let live2_root = format!("{bp_root}/live2");
+    if !std::path::Path::new(&format!("{live2_root}/manifest.txt")).exists() {
+        eprintln!("SKIP: no live2 bank under {live2_root}");
+        return;
+    }
+    // canonical flop 0 = three rainbow deuces [0,1,2]; hero off-board.
+    let canon_req = DecideRequest {
+        board: vec![0, 1, 2],
+        hero_cards: [20, 33],
+        partner_cards: None,
+        live: 2,
+        hero_idx: 0,
+        partner_idx: None,
+        commit_entry: 10,
+        pot_entry: 20,
+        street_actions: vec![],
+        cell_dir: String::new(),
+        flop_id: 0,
+        seed: Some(0x1234),
+        route: false,
+    };
+    let base = decide_live2(&live2_root, &canon_req).expect("live2 flop decision");
+    let z: f32 = base.actions.iter().map(|a| a.prob).sum();
+    eprintln!("LIVE2 flop bin-S12: {} actions, Σp={z:.3}, {}ms", base.actions.len(), base.search_ms);
+    for a in &base.actions {
+        eprintln!("  {:<5} amt={:<4} p={:.3}", a.action, a.amount, a.prob);
+    }
+    assert!((z - 1.0).abs() < 1e-3, "live2 probs must sum to 1, got {z}");
+    assert_eq!(base.live, 2);
+
+    // routing invariance: permute board + hole by a suit map, route, expect same.
+    let perm = [1u8, 0, 3, 2];
+    let remap = |c: u8| ((c >> 2) << 2) | perm[(c & 3) as usize];
+    let mut routed = DecideRequest {
+        board: canon_req.board.iter().map(|&c| remap(c)).collect(),
+        hero_cards: [remap(canon_req.hero_cards[0]), remap(canon_req.hero_cards[1])],
+        route: true,
+        ..canon_req
+    };
+    route_to_canonical(&mut routed).expect("route");
+    let routed_resp = decide_live2(&live2_root, &routed).expect("routed live2 decision");
+    for (b, r) in base.actions.iter().zip(routed_resp.actions.iter()) {
+        assert_eq!(b.label, r.label);
+        assert!((b.prob - r.prob).abs() < 1e-3, "live2 routing must be suit-iso invariant");
+    }
+    eprintln!("OK: live-2 flop decision valid + suit-iso routing invariant.");
+}
 
 /// Routing invariance: a strategy that respects suit isomorphism must produce the
 /// SAME decision on any orbit member of the canonical flop. Permute a canonical
@@ -85,6 +140,114 @@ fn api_route_invariance() {
         assert!((b.prob - r.prob).abs() < 1e-3, "routed prob must match canonical");
     }
     eprintln!("OK: routing is suit-iso invariant (flop_id derived, decision preserved).");
+}
+
+/// Routed TURN + RIVER decisions: the per-street search requires the (remapped)
+/// runout card to be in the bank (bp.turns/bp.rivers). Pick a RAINBOW, distinct-
+/// rank canonical flop (trivial suit automorphism ⇒ a permuted-then-routed turn
+/// maps back exactly to the banked turn), take a banked runout, permute the whole
+/// board + hole by a suit map, route it back, and assert the decision matches the
+/// un-permuted (canonical) turn/river decision.
+#[test]
+#[ignore = "needs blueprint_out_v1; --ignored --nocapture --release"]
+fn api_route_turn_river() {
+    use solver_core::abstraction::flop_isomorphism::enumerate_canonical_flops;
+    let bp_root = std::env::var("BP_ROOT").unwrap_or_else(|_| "blueprint_out_v1".into());
+    let cell_dir = std::fs::read_dir(&bp_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("live3_"));
+    let cell_dir = match cell_dir {
+        Some(c) => c,
+        None => {
+            eprintln!("SKIP: no live3 cell under {bp_root}");
+            return;
+        }
+    };
+    let parse = |p: char| cell_dir.split('_').find_map(|t| t.strip_prefix(p)?.parse::<u32>().ok());
+    let (commit, pot) = (parse('c').unwrap(), parse('p').unwrap());
+
+    // Find a rainbow, distinct-rank canonical flop (trivial automorphism).
+    let canon = enumerate_canonical_flops();
+    let fi = canon
+        .iter()
+        .position(|f| {
+            let ranks: Vec<u8> = f.iter().map(|&c| c >> 2).collect();
+            let suits: Vec<u8> = f.iter().map(|&c| c & 3).collect();
+            ranks[0] != ranks[1] && ranks[1] != ranks[2] && ranks[0] != ranks[2]
+                && suits[0] != suits[1] && suits[1] != suits[2] && suits[0] != suits[2]
+        })
+        .expect("a rainbow distinct-rank canonical flop exists");
+    let bp_path = format!("{bp_root}/{cell_dir}/flop_{fi:04}.bp");
+    if !std::path::Path::new(&bp_path).exists() {
+        eprintln!("SKIP: {bp_path} not present");
+        return;
+    }
+    let bp = Blueprint::load(&bp_path).unwrap();
+    let flop: Vec<u8> = bp.flop.to_vec();
+    let t0 = bp.turns[0];
+    let r0 = bp.rivers[0][0];
+    eprintln!("cell {cell_dir} fi={fi} flop={flop:?} banked turn={t0} river={r0}");
+
+    let bmask = |cards: &[u8]| cards.iter().fold(0u64, |m, &c| m | (1u64 << c));
+    let perm = [2u8, 3, 0, 1];
+    let remap = |c: u8| ((c >> 2) << 2) | perm[(c & 3) as usize];
+    let cfg = SearchCfg { iters: 120, ..Default::default() };
+
+    for (street_name, board) in [
+        ("turn", vec![flop[0], flop[1], flop[2], t0]),
+        ("river", vec![flop[0], flop[1], flop[2], t0, r0]),
+    ] {
+        // hero off the board.
+        let used = bmask(&board);
+        let deck: Vec<u8> = (0..52u8).filter(|&c| used & (1u64 << c) == 0).collect();
+        let hero = [deck[0], deck[1]];
+        let base_req = DecideRequest {
+            board: board.clone(),
+            hero_cards: hero,
+            partner_cards: None,
+            live: bp.np as u8,
+            hero_idx: 0,
+            partner_idx: None,
+            commit_entry: commit,
+            pot_entry: pot,
+            street_actions: vec![],
+            cell_dir: cell_dir.clone(),
+            flop_id: fi as u32,
+            seed: Some(0x1234),
+            route: false,
+        };
+        let base = match decide_postflop(&bp, &base_req, &cfg) {
+            Some(r) => r,
+            None => {
+                eprintln!("SKIP {street_name}: canonical decision unmappable (node not hero's)");
+                continue;
+            }
+        };
+        // permute board + hole, route back.
+        let mut routed = DecideRequest {
+            board: board.iter().map(|&c| remap(c)).collect(),
+            hero_cards: [remap(hero[0]), remap(hero[1])],
+            flop_id: 999,
+            route: true,
+            ..base_req
+        };
+        route_to_canonical(&mut routed).expect("route turn/river");
+        assert_eq!(routed.flop_id, fi as u32, "{street_name}: routed flop_id");
+        assert_eq!(&routed.board[..3], &flop[..], "{street_name}: routed flop matches canonical");
+        assert_eq!(routed.board[3], t0, "{street_name}: routed turn maps to banked turn");
+        let routed_resp = decide_postflop(&bp, &routed, &cfg).expect("routed turn/river decision");
+        eprintln!("{street_name}: {} actions", base.actions.len());
+        for (b, r) in base.actions.iter().zip(routed_resp.actions.iter()) {
+            eprintln!("  {:<5} base={:.4} routed={:.4}", b.action, b.prob, r.prob);
+            assert_eq!(b.label, r.label, "{street_name}: labels align");
+            assert!((b.prob - r.prob).abs() < 1e-3, "{street_name}: routed prob matches canonical");
+        }
+    }
+    eprintln!("OK: routed turn + river decisions are suit-iso invariant.");
 }
 
 #[test]

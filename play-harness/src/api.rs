@@ -13,10 +13,14 @@
 //! re-implementing the full betting engine the runtime already runs.
 
 use crate::blueprint::Blueprint;
+use crate::live2_bank::load_live2;
 use crate::pluribus_play::{hand_index, search_decision, SearchCfg};
 use crate::preflop_player::{splitmix64, PreflopPlayer};
 use serde::{Deserialize, Serialize};
 use solver_core::abstraction::flop_isomorphism::{canonicalize_flop, enumerate_canonical_flops};
+use solver_core::solver::preflop_start_game::flop_combo_layout;
+use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions};
+use solver_core::tree::builder::build_tree;
 use solver_core::tree::flat::{FlatTree, MAX_NA_PREFLOP};
 use std::sync::OnceLock;
 
@@ -309,6 +313,118 @@ pub fn decide_postflop(
         actions,
         search_ms: t0.elapsed().as_millis() as u64,
         paired,
+    })
+}
+
+/// The live-2 SPR-bin rep (commit, pot) used to build that bin's HU seam tree.
+/// Parsed once per `live2_root` from `manifest.txt` (lines `S{bin} commit=C
+/// pot=P dir=...`). The bank solves ONE rep cell per SPR bin, so a decision must
+/// rebuild the tree with the REP commit/pot (not the live game's) or the blob's
+/// buffers won't fit.
+fn live2_bin_rep(live2_root: &str, bin: i64) -> Option<(i32, i32)> {
+    let text = std::fs::read_to_string(format!("{live2_root}/manifest.txt")).ok()?;
+    for line in text.lines() {
+        if !line.starts_with('S') {
+            continue;
+        }
+        let b: i64 = match line.split_whitespace().next()?.trim_start_matches('S').parse() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if b != bin {
+            continue;
+        }
+        let get = |k: &str| line.split_whitespace().find_map(|t| t.strip_prefix(k)?.parse::<i32>().ok());
+        return Some((get("commit=")?, get("pot=")?));
+    }
+    None
+}
+
+/// Run a LIVE-2 (heads-up) postflop decision from the banked exact HU strategy
+/// (`.bp2`), which can't go through the bucketed search path (HU showdown is
+/// exact, np≥3 only there) and is unviable to resolve live (~156–780 s/decision).
+/// The bank is keyed by SPR bin × canonical flop and is 1×1 (one seeded runout),
+/// so the FLOP decision is fully covered but turn/river only exist for the seeded
+/// turn/river — for any other runout this returns None (a bank-fidelity limit).
+pub fn decide_live2(live2_root: &str, req: &DecideRequest) -> Option<DecideResponse> {
+    let t0 = std::time::Instant::now();
+    if req.board.len() != 3 {
+        return None; // 1×1 bank: only the flop decision is runout-independent
+    }
+    let spec = production_game_v1();
+    let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
+    let behind = spec.stack - commit;
+    if behind <= 0 || pot <= 0 {
+        return None; // all-in / degenerate → equity rollout, not banked
+    }
+    // SPR bin (replicates SeamCell::bucket_key) → rep cell for the tree shape.
+    let bin = ((behind as f64 / pot as f64).log2() / 0.25).floor() as i64;
+    let (rep_commit, rep_pot) = live2_bin_rep(live2_root, bin)?;
+
+    // Canonicalize the flop locally (works whether or not the caller pre-routed):
+    // derive flop_id + the perm to bring the hero's hole cards into the bank frame.
+    let raw_flop = [req.board[0], req.board[1], req.board[2]];
+    let canon = canonicalize_flop(raw_flop);
+    let fi = canon_flop_id(canon)? as usize;
+    let perm = suit_perm_to_canonical(raw_flop, canon)?;
+    let hero = [remap_card(req.hero_cards[0], &perm), remap_card(req.hero_cards[1], &perm)];
+
+    // Rebuild the HU seam tree on the REP cell, load the banked strategy blob.
+    let bets = BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    let tree = build_tree(&spec.flop_seam_config(2, rep_commit, rep_pot, bets)).ok()?;
+    let path = format!("{live2_root}/S{bin}/flop_{fi:04}.bp2");
+    let canon_cards: [u8; 3] = canon;
+    let solver = load_live2(&path, canon_cards, fi, &tree).ok()?;
+
+    // Hero's hand index in the full-nh layout (skip-flop, c1<c2 — identical to the
+    // table's hand order, so it indexes the solver's strategy directly).
+    let (a, b) = (hero[0].min(hero[1]), hero[0].max(hero[1]));
+    let layout = flop_combo_layout(canon);
+    let h = layout.iter().position(|&(x, y)| x == a && y == b)?;
+
+    // Walk this street's betting to the hero's node, read the average strategy.
+    let node = walk_to_node(&tree, &req.street_actions)?;
+    if tree.nodes[node].player_id as usize != req.hero_idx as usize {
+        return None;
+    }
+    let na = tree.nodes[node].num_children as usize;
+    let dist = solver.avg_action_dist(node, na, None, None, h);
+    let children = tree.node_children(node);
+    // Bets are pot-relative; the rep pot ≈ the live pot within the SPR bin but not
+    // exactly, so rescale the contribution into the live game's chip frame.
+    let scale = pot as f32 / rep_pot.max(1) as f32;
+    let mut actions: Vec<ActionProb> = (0..na)
+        .map(|a| {
+            let child = children[a] as usize;
+            let label = tree.nodes[child].action_label;
+            let rep_contrib = tree.get_contribution(child, req.hero_idx);
+            let amount = commit + (rep_contrib as f32 * scale).round() as i32;
+            ActionProb { label, action: action_name(label).to_string(), amount, prob: dist[a] }
+        })
+        .collect();
+    let mut rng = req.seed.unwrap_or(0xA17C0DE);
+    let mut x = (splitmix64(&mut rng) % 1_000_000) as f32 / 1_000_000.0;
+    let mut sel = na.saturating_sub(1);
+    for (a, ap) in actions.iter().enumerate() {
+        if x < ap.prob {
+            sel = a;
+            break;
+        }
+        x -= ap.prob;
+    }
+    let z: f32 = actions.iter().map(|a| a.prob).sum();
+    if z > 0.0 {
+        for a in actions.iter_mut() {
+            a.prob /= z;
+        }
+    }
+    Some(DecideResponse {
+        street: "flop".to_string(),
+        live: 2,
+        chosen: actions[sel.min(na.saturating_sub(1))].clone(),
+        actions,
+        search_ms: t0.elapsed().as_millis() as u64,
+        paired: false,
     })
 }
 
