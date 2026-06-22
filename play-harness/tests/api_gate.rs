@@ -5,9 +5,87 @@
 //! Run: BP_ROOT=$PWD/blueprint_out_v1 PAR=1 \
 //!   cargo test --release -p play-harness --test api_gate -- --ignored --nocapture
 
-use play_harness::api::{decide_postflop, ActionInput, DecideRequest};
+use play_harness::api::{decide_postflop, route_to_canonical, ActionInput, DecideRequest};
 use play_harness::blueprint::Blueprint;
 use play_harness::pluribus_play::SearchCfg;
+
+/// Routing invariance: a strategy that respects suit isomorphism must produce the
+/// SAME decision on any orbit member of the canonical flop. Permute a canonical
+/// board + hole cards by an arbitrary suit map, route it back, and the action
+/// distribution must match the un-permuted decision (cards may differ by an
+/// automorphism — only the distribution is invariant).
+#[test]
+#[ignore = "needs blueprint_out_v1; --ignored --nocapture --release"]
+fn api_route_invariance() {
+    let bp_root = std::env::var("BP_ROOT").unwrap_or_else(|_| "blueprint_out_v1".into());
+    let cell_dir = std::fs::read_dir(&bp_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("live3_"))
+        .find(|n| std::path::Path::new(&format!("{bp_root}/{n}/flop_0000.bp")).exists());
+    let cell_dir = match cell_dir {
+        Some(c) => c,
+        None => {
+            eprintln!("SKIP: no live3 cell under {bp_root}");
+            return;
+        }
+    };
+    let bp = Blueprint::load(&format!("{bp_root}/{cell_dir}/flop_0000.bp")).unwrap();
+    let parse = |p: char| cell_dir.split('_').find_map(|t| t.strip_prefix(p)?.parse::<u32>().ok());
+    let (commit, pot) = (parse('c').unwrap(), parse('p').unwrap());
+    let cfg = SearchCfg { iters: 120, ..Default::default() };
+
+    // canonical board (= bp.flop, flop_id 0) + two hole cards off it.
+    let canon_board: Vec<u8> = bp.flop.to_vec();
+    let bmask: u64 = canon_board.iter().fold(0u64, |m, &c| m | (1u64 << c));
+    let deck: Vec<u8> = (0..52u8).filter(|&c| bmask & (1u64 << c) == 0).collect();
+    let hero = [deck[0], deck[1]];
+
+    let base_req = DecideRequest {
+        board: canon_board.clone(),
+        hero_cards: hero,
+        partner_cards: None,
+        live: bp.np as u8,
+        hero_idx: 0,
+        partner_idx: None,
+        commit_entry: commit,
+        pot_entry: pot,
+        street_actions: vec![],
+        cell_dir: cell_dir.clone(),
+        flop_id: 0,
+        seed: Some(0x1234),
+        route: false,
+    };
+    let base = decide_postflop(&bp, &base_req, &cfg).expect("canonical decision");
+
+    // permute every card by a fixed suit map, then route back.
+    let perm = [1u8, 0, 3, 2]; // 0↔1, 2↔3
+    let remap = |c: u8| ((c >> 2) << 2) | perm[(c & 3) as usize];
+    let raw_board: Vec<u8> = canon_board.iter().map(|&c| remap(c)).collect();
+    let raw_hero = [remap(hero[0]), remap(hero[1])];
+    let mut routed = DecideRequest {
+        board: raw_board,
+        hero_cards: raw_hero,
+        flop_id: 999, // wrong on purpose — routing must overwrite it
+        route: true,
+        ..base_req
+    };
+    route_to_canonical(&mut routed).expect("route");
+    assert_eq!(routed.flop_id, 0, "routed flop_id must resolve back to 0");
+    assert_eq!(routed.board, canon_board, "routed board must equal canonical flop");
+    let routed_resp = decide_postflop(&bp, &routed, &cfg).expect("routed decision");
+
+    eprintln!("base vs routed action distributions:");
+    for (b, r) in base.actions.iter().zip(routed_resp.actions.iter()) {
+        eprintln!("  {:<5} base={:.4} routed={:.4}", b.action, b.prob, r.prob);
+        assert_eq!(b.label, r.label, "action labels must align");
+        assert!((b.prob - r.prob).abs() < 1e-3, "routed prob must match canonical");
+    }
+    eprintln!("OK: routing is suit-iso invariant (flop_id derived, decision preserved).");
+}
 
 #[test]
 #[ignore = "needs blueprint_out_v1; --ignored --nocapture --release"]
@@ -61,6 +139,7 @@ fn api_decide_smoke() {
         cell_dir: cell_dir.clone(),
         flop_id: 0,
         seed: Some(0x1234),
+        route: false,
     };
     let resp = decide_postflop(&bp, &req, &cfg).expect("solo decision");
     let z: f32 = resp.actions.iter().map(|a| a.prob).sum();
@@ -86,6 +165,7 @@ fn api_decide_smoke() {
         cell_dir: cell_dir.clone(),
         flop_id: 0,
         seed: Some(0x1234),
+        route: false,
     };
     // (with one prior action by seat 1, the node should be hero=seat? — depends on
     // action order; if the mapped node isn't hero's, decide returns None. Use the

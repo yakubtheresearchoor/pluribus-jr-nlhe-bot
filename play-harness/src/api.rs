@@ -16,7 +16,9 @@ use crate::blueprint::Blueprint;
 use crate::pluribus_play::{hand_index, search_decision, SearchCfg};
 use crate::preflop_player::{splitmix64, PreflopPlayer};
 use serde::{Deserialize, Serialize};
+use solver_core::abstraction::flop_isomorphism::{canonicalize_flop, enumerate_canonical_flops};
 use solver_core::tree::flat::{FlatTree, MAX_NA_PREFLOP};
+use std::sync::OnceLock;
 
 /// Action labels (pinned tree facts): FOLD=0 CHECK=1 CALL=2 BET=3 RAISE=4 ALLIN=5.
 pub fn action_name(label: u8) -> &'static str {
@@ -29,6 +31,107 @@ pub fn action_name(label: u8) -> &'static str {
         5 => "allin",
         _ => "?",
     }
+}
+
+/// Map a canonical flop (blueprint frame) to its `flop_id` — the index into the
+/// 1,755-entry canonical-flop list (which is exactly how the blueprint cells are
+/// named, `flop_{id:04}.bp`). The lookup map is built once.
+fn canon_flop_id(canon: [u8; 3]) -> Option<u32> {
+    static MAP: OnceLock<std::collections::HashMap<[u8; 3], u32>> = OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        enumerate_canonical_flops()
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let mut s = f;
+                s.sort_unstable();
+                (s, i as u32)
+            })
+            .collect()
+    });
+    let mut key = canon;
+    key.sort_unstable();
+    map.get(&key).copied()
+}
+
+/// All 24 suit permutations (source-suit index → target suit).
+fn all_suit_perms() -> Vec<[u8; 4]> {
+    let mut out = Vec::with_capacity(24);
+    for a in 0..4u8 {
+        for b in 0..4u8 {
+            if b == a {
+                continue;
+            }
+            for c in 0..4u8 {
+                if c == a || c == b {
+                    continue;
+                }
+                out.push([a, b, c, 6 - a - b - c]); // 0+1+2+3 = 6 ⇒ the 4th suit
+            }
+        }
+    }
+    out
+}
+
+fn remap_card(c: u8, perm: &[u8; 4]) -> u8 {
+    let rank = c >> 2;
+    let suit = (c & 3) as usize;
+    (rank << 2) | perm[suit]
+}
+
+/// Find the full suit permutation that maps `raw_flop` onto its canonical
+/// representative `canon` (set-wise). Canonicalization is `relabel ∘ perm`, itself
+/// a permutation, so one of the 24 always works. The SAME map is then applied to
+/// the hole / turn / river cards to bring the whole hand into the canonical frame.
+fn suit_perm_to_canonical(raw_flop: [u8; 3], canon: [u8; 3]) -> Option<[u8; 4]> {
+    let mut canon_sorted = canon;
+    canon_sorted.sort_unstable();
+    for p in all_suit_perms() {
+        let mut mapped = [
+            remap_card(raw_flop[0], &p),
+            remap_card(raw_flop[1], &p),
+            remap_card(raw_flop[2], &p),
+        ];
+        mapped.sort_unstable();
+        if mapped == canon_sorted {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Rewrite a raw-board request into the blueprint's canonical frame IN PLACE:
+/// derive `flop_id` from the board's flop and remap the board + hero/partner hole
+/// cards by the canonicalizing suit permutation. Returns None if the board is
+/// shorter than a flop or the canonical flop isn't in the bank's list. Idempotent
+/// effect for an already-canonical board (perm = identity, flop_id unchanged).
+pub fn route_to_canonical(req: &mut DecideRequest) -> Option<()> {
+    if req.board.len() < 3 {
+        return None;
+    }
+    let raw_flop = [req.board[0], req.board[1], req.board[2]];
+    let canon = canonicalize_flop(raw_flop);
+    let flop_id = canon_flop_id(canon)?;
+    let perm = suit_perm_to_canonical(raw_flop, canon)?;
+    // The flop portion becomes the canonical flop in its EXACT order (= bp.flop),
+    // so board[0..3] matches the blueprint frame precisely. Turn/river (board[3..])
+    // and the hole cards are remapped by the same canonicalizing permutation.
+    for c in req.board[3..].iter_mut() {
+        *c = remap_card(*c, &perm);
+    }
+    req.board[0] = canon[0];
+    req.board[1] = canon[1];
+    req.board[2] = canon[2];
+    for c in req.hero_cards.iter_mut() {
+        *c = remap_card(*c, &perm);
+    }
+    if let Some(pc) = req.partner_cards.as_mut() {
+        for c in pc.iter_mut() {
+            *c = remap_card(*c, &perm);
+        }
+    }
+    req.flop_id = flop_id;
+    Some(())
 }
 
 /// One action taken on the current street (for replaying to the hero's node).
@@ -78,6 +181,13 @@ pub struct DecideRequest {
     /// Optional RNG seed for the (deterministic) action sample.
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Board→canonical-flop routing. When true, the server DERIVES `flop_id` from
+    /// the raw `board` (suit-isomorphism canonicalization) and remaps the board +
+    /// hero/partner hole cards into the blueprint's canonical suit frame before
+    /// searching — so the runtime can send real cards and omit `flop_id`. When
+    /// false (default), the caller supplies `flop_id` and pre-canonicalized cards.
+    #[serde(default)]
+    pub route: bool,
 }
 
 #[derive(Serialize, Clone)]

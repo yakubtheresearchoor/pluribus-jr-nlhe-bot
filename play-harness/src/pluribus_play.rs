@@ -43,11 +43,42 @@ pub struct SearchCfg {
     pub opp_lambda: f32,
     pub sample_m: u32,
     pub seed: u64,
+    /// Run the parallel snapshot walk (rayon over traversers). `None` ⇒ defer to
+    /// the `PAR` env var (back-compat); `Some(b)` ⇒ explicit.
+    pub par: Option<bool>,
+    /// Run Discounted-CFR (α=1.5,β=0,γ=2 — faster convergence, fewer iters).
+    /// `None` ⇒ defer to the `DCFR` env var; `Some(b)` ⇒ explicit.
+    pub dcfr: Option<bool>,
 }
 
 impl Default for SearchCfg {
     fn default() -> Self {
-        SearchCfg { iters: 160, lambda: 300.0, opp_lambda: 300.0, sample_m: 200, seed: 0x5EA12C }
+        SearchCfg {
+            iters: 160,
+            lambda: 300.0,
+            opp_lambda: 300.0,
+            sample_m: 200,
+            seed: 0x5EA12C,
+            par: None,
+            dcfr: None,
+        }
+    }
+}
+
+impl SearchCfg {
+    /// Latency schedule per live-player count, sized to the ~14s real-time
+    /// budget (measured: PAR live-5 ≈4.9s, live-4 ≈3.4s, live-3 ≈0.3s; DCFR
+    /// converges in fewer iters). Parallel + discounted for the heavy multiway
+    /// counts; cheaper counts get more iters for a tighter strategy. `base`
+    /// carries λ / sample_m / seed (the non-latency knobs) unchanged.
+    pub fn for_live(live: usize, base: &SearchCfg) -> SearchCfg {
+        let (iters, par, dcfr) = match live {
+            0..=2 => (base.iters.max(240), false, false), // cheap exact showdown
+            3 => (base.iters.max(200), true, false),
+            4 => (base.iters, true, true),
+            _ => (base.iters.min(140), true, true), // live-5+: trim iters to fit budget
+        };
+        SearchCfg { iters, par: Some(par), dcfr: Some(dcfr), ..*base }
     }
 }
 
@@ -450,7 +481,15 @@ pub fn search_street_strat(
     let mut s = CpuMccfr::new(tree, vec![nh; l]);
     s.set_depth_limit(depth);
     s.set_lambda(vec![cfg.lambda; l]);
-    if std::env::var("PAR").is_ok() {
+    // DCFR (explicit cfg, else DCFR env): discounted regret-matching, faster
+    // convergence. Must be set before enable_parallel (the snapshot walk folds
+    // the discount into its update).
+    let dcfr = cfg.dcfr.unwrap_or_else(|| std::env::var("DCFR").is_ok());
+    if dcfr {
+        s.set_dcfr(1.5, 0.0, 2.0);
+    }
+    let par = cfg.par.unwrap_or_else(|| std::env::var("PAR").is_ok());
+    if par {
         s.enable_parallel();
     }
     s.run(tree, &game, cfg.iters);

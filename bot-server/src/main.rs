@@ -88,7 +88,7 @@ async fn main() {
 
 async fn decide_handler(
     State(st): State<AppState>,
-    Json(req): Json<DecideRequest>,
+    Json(mut req): Json<DecideRequest>,
 ) -> Result<Json<DecideResponse>, (StatusCode, String)> {
     // PREFLOP (empty board): EQR player — fast tree lookup, run inline.
     if req.board.is_empty() {
@@ -100,6 +100,28 @@ async fn decide_handler(
             Some(r) => Ok(Json(r)),
             None => Err((StatusCode::BAD_REQUEST, "unmappable preflop node".into())),
         };
+    }
+
+    // Live counts without per-cell blueprints: live-2 is the HU `.bp2` stage-bank
+    // format (no flop_NNNN.bp cells), live-6+ is the equity-rollout model (no
+    // blueprint at all). Both need their own decision path — return a clear,
+    // structured error so the runtime can fall back rather than hit a load error.
+    if req.live <= 2 || req.live >= 6 {
+        let why = if req.live <= 2 {
+            "live-2 (heads-up) uses the .bp2 stage-bank format — no per-cell search wired"
+        } else {
+            "live-6+ uses the equity-rollout model — no per-cell search wired"
+        };
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, why.to_string()));
+    }
+
+    // Board→canonical-flop routing: derive flop_id + remap cards from the raw
+    // board so the runtime can omit flop_id and send real cards.
+    if req.route {
+        play_harness::api::route_to_canonical(&mut req).ok_or((
+            StatusCode::BAD_REQUEST,
+            "route: board < 3 cards or canonical flop not in bank".to_string(),
+        ))?;
     }
 
     // POSTFLOP: get-or-load the blueprint for this cell+flop.
@@ -117,7 +139,9 @@ async fn decide_handler(
             bp
         }
     };
-    let cfg = st.cfg;
+    // Per-live latency schedule (parallel + discounted for heavy multiway counts)
+    // so each live count fits the ~14s real-time budget without manual env tuning.
+    let cfg = play_harness::pluribus_play::SearchCfg::for_live(req.live as usize, &st.cfg);
     // CPU-bound search → blocking pool so the async runtime isn't stalled.
     let out = tokio::task::spawn_blocking(move || decide_postflop(&bp, &req, &cfg))
         .await
