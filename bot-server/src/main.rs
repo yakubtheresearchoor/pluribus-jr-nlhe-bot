@@ -17,9 +17,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use play_harness::api::{decide_postflop, DecideRequest, DecideResponse};
+use play_harness::api::{decide_postflop, decide_preflop, DecideRequest, DecideResponse};
 use play_harness::blueprint::Blueprint;
 use play_harness::pluribus_play::SearchCfg;
+use play_harness::preflop_player::PreflopPlayer;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -37,12 +38,20 @@ impl std::ops::Deref for SyncBp {
     }
 }
 
+/// The EQR preflop player is read-only at decision time (`action_dist(&self)`);
+/// share it across request threads.
+struct SyncPf(PreflopPlayer);
+unsafe impl Send for SyncPf {}
+unsafe impl Sync for SyncPf {}
+
 #[derive(Clone)]
 struct AppState {
     bp_root: String,
     cfg: SearchCfg,
     // (cell_dir, flop_id) -> loaded blueprint (loaded once, reused).
     cache: Arc<Mutex<HashMap<(String, u32), Arc<SyncBp>>>>,
+    // EQR preflop strategy (for board-empty requests); None if PF_STRAT unset.
+    pf: Option<Arc<SyncPf>>,
 }
 
 #[tokio::main]
@@ -54,7 +63,19 @@ async fn main() {
     let par = std::env::var("PAR").is_ok();
     let dcfr = std::env::var("DCFR").is_ok();
 
-    let state = AppState { bp_root: bp_root.clone(), cfg, cache: Arc::new(Mutex::new(HashMap::new())) };
+    // EQR preflop strategy (optional — preflop /decide needs it).
+    let pf = std::env::var("PF_STRAT").ok().map(|base| {
+        let p = PreflopPlayer::load(&base).expect("load PF_STRAT preflop strategy");
+        eprintln!("loaded preflop strategy from {base} ({} nodes)", p.tree.num_nodes());
+        Arc::new(SyncPf(p))
+    });
+
+    let state = AppState {
+        bp_root: bp_root.clone(),
+        cfg,
+        cache: Arc::new(Mutex::new(HashMap::new())),
+        pf,
+    };
     let app = Router::new()
         .route("/", get(|| async { "poker-bot decision server — POST /decide (see play_harness::api::DecideRequest)" }))
         .route("/decide", post(decide_handler))
@@ -69,7 +90,19 @@ async fn decide_handler(
     State(st): State<AppState>,
     Json(req): Json<DecideRequest>,
 ) -> Result<Json<DecideResponse>, (StatusCode, String)> {
-    // get-or-load the blueprint for this cell+flop.
+    // PREFLOP (empty board): EQR player — fast tree lookup, run inline.
+    if req.board.is_empty() {
+        let pf = st.pf.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no preflop strategy loaded (set PF_STRAT)".to_string(),
+        ))?;
+        return match decide_preflop(&pf.0, &req) {
+            Some(r) => Ok(Json(r)),
+            None => Err((StatusCode::BAD_REQUEST, "unmappable preflop node".into())),
+        };
+    }
+
+    // POSTFLOP: get-or-load the blueprint for this cell+flop.
     let key = (req.cell_dir.clone(), req.flop_id);
     let bp: Arc<SyncBp> = {
         let mut cache = st.cache.lock().unwrap();

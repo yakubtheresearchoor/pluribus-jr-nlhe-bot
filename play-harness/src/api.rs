@@ -14,9 +14,9 @@
 
 use crate::blueprint::Blueprint;
 use crate::pluribus_play::{hand_index, search_decision, SearchCfg};
-use crate::preflop_player::splitmix64;
+use crate::preflop_player::{splitmix64, PreflopPlayer};
 use serde::{Deserialize, Serialize};
-use solver_core::tree::flat::FlatTree;
+use solver_core::tree::flat::{FlatTree, MAX_NA_PREFLOP};
 
 /// Action labels (pinned tree facts): FOLD=0 CHECK=1 CALL=2 BET=3 RAISE=4 ALLIN=5.
 pub fn action_name(label: u8) -> &'static str {
@@ -54,19 +54,26 @@ pub struct DecideRequest {
     pub hero_cards: [u8; 2],
     #[serde(default)]
     pub partner_cards: Option<[u8; 2]>,
+    #[serde(default)]
     pub live: u8,
+    #[serde(default)]
     pub hero_idx: u8,
     #[serde(default)]
     pub partner_idx: Option<u8>,
+    // Postflop-only (preflop requests — empty board — may omit these).
+    #[serde(default)]
     pub commit_entry: u32,
+    #[serde(default)]
     pub pot_entry: u32,
     #[serde(default)]
     pub street_actions: Vec<ActionInput>,
-    /// Blueprint routing: the flop-entry cell dir (e.g. `live3_c6_p20_b15`) and the
-    /// canonical flop id. The runtime — which tracks the hand — supplies these; the
-    /// server loads `{bp_root}/{cell_dir}/flop_{flop_id:04}.bp` (cached). (Board→
-    /// canonical-flop routing is a later refinement.)
+    /// Blueprint routing (postflop): the flop-entry cell dir (e.g.
+    /// `live3_c6_p20_b15`) and the canonical flop id. The runtime — which tracks the
+    /// hand — supplies these; the server loads `{bp_root}/{cell_dir}/flop_{id:04}.bp`
+    /// (cached). (Board→canonical-flop routing is a later refinement.)
+    #[serde(default)]
     pub cell_dir: String,
+    #[serde(default)]
     pub flop_id: u32,
     /// Optional RNG seed for the (deterministic) action sample.
     #[serde(default)]
@@ -192,5 +199,56 @@ pub fn decide_postflop(
         actions,
         search_ms: t0.elapsed().as_millis() as u64,
         paired,
+    })
+}
+
+/// Run a PREFLOP decision (board empty): replay the preflop betting on the EQR
+/// player's cap-3 tree to the hero's node and return the action distribution for
+/// the hero's 169-class hand. None if the node can't be mapped.
+pub fn decide_preflop(pf: &PreflopPlayer, req: &DecideRequest) -> Option<DecideResponse> {
+    let t0 = std::time::Instant::now();
+    let tree = &pf.tree;
+    let node = walk_to_node(tree, &req.street_actions)?;
+    if tree.nodes[node].is_terminal() || tree.nodes[node].is_chance() {
+        return None;
+    }
+    let hand_class = PreflopPlayer::hand_class(req.hero_cards[0], req.hero_cards[1]);
+    let mut out = [0f32; MAX_NA_PREFLOP];
+    let na = pf.action_dist(node, hand_class, &mut out);
+    let children = tree.node_children(node);
+    let acting = tree.nodes[node].player_id; // the player to act at this node = hero
+    let mut actions: Vec<ActionProb> = (0..na)
+        .map(|a| {
+            let child = children[a] as usize;
+            let label = tree.nodes[child].action_label;
+            // Hero's TOTAL chips in after the action (preflop contributions include
+            // posted blinds), so the runtime knows the raise-to / call amount.
+            let amount = tree.get_contribution(child, acting);
+            ActionProb { label, action: action_name(label).to_string(), amount, prob: out[a] }
+        })
+        .collect();
+    let mut rng = req.seed.unwrap_or(0xA17C0DE);
+    let mut x = (splitmix64(&mut rng) % 1_000_000) as f32 / 1_000_000.0;
+    let mut sel = na.saturating_sub(1);
+    for (a, ap) in actions.iter().enumerate() {
+        if x < ap.prob {
+            sel = a;
+            break;
+        }
+        x -= ap.prob;
+    }
+    let z: f32 = actions.iter().map(|a| a.prob).sum();
+    if z > 0.0 {
+        for a in actions.iter_mut() {
+            a.prob /= z;
+        }
+    }
+    Some(DecideResponse {
+        street: "preflop".to_string(),
+        live: req.live,
+        chosen: actions[sel.min(na.saturating_sub(1))].clone(),
+        actions,
+        search_ms: t0.elapsed().as_millis() as u64,
+        paired: false,
     })
 }
