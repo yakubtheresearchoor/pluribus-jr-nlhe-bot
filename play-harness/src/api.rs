@@ -62,25 +62,15 @@ pub struct DecideRequest {
     pub pot_entry: u32,
     #[serde(default)]
     pub street_actions: Vec<ActionInput>,
-    pub cell: CellKey,
+    /// Blueprint routing: the flop-entry cell dir (e.g. `live3_c6_p20_b15`) and the
+    /// canonical flop id. The runtime — which tracks the hand — supplies these; the
+    /// server loads `{bp_root}/{cell_dir}/flop_{flop_id:04}.bp` (cached). (Board→
+    /// canonical-flop routing is a later refinement.)
+    pub cell_dir: String,
+    pub flop_id: u32,
     /// Optional RNG seed for the (deterministic) action sample.
     #[serde(default)]
     pub seed: Option<u64>,
-}
-
-/// Flop-entry cell key — routes which banked blueprint supplies the continuation.
-#[derive(Deserialize, Clone, Copy)]
-pub struct CellKey {
-    pub live: u8,
-    pub commit: u32,
-    pub pot: u32,
-}
-
-impl CellKey {
-    /// Blueprint cell directory name, e.g. `live3_c6_p20_b15`.
-    pub fn dir(&self, b: u32) -> String {
-        format!("live{}_c{}_p{}_b{}", self.live, self.commit, self.pot, b)
-    }
 }
 
 #[derive(Serialize, Clone)]

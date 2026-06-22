@@ -1,0 +1,99 @@
+//! Runtime decision HTTP server for the poker bot.
+//!
+//! POST /decide  — body = DecideRequest (see play_harness::api). Loads (caches)
+//! the blueprint for the request's cell+flop, runs the per-street search on a
+//! blocking thread (CPU-bound, ~0.3-17s depending on live count), and returns the
+//! action distribution + a sampled choice. Pair mode = include partner_cards.
+//!
+//! Env: BP_ROOT (blueprint dir), BIND (addr, default 127.0.0.1:8080), ITERS
+//! (search iterations), and PAR=1 / DCFR=1 to toggle the parallel / discounted
+//! solver (set these when launching for live-3+ to fit the budget).
+//!
+//! Run: BP_ROOT=$PWD/blueprint_out_v1 PAR=1 cargo run --release -p bot-server
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use play_harness::api::{decide_postflop, DecideRequest, DecideResponse};
+use play_harness::blueprint::Blueprint;
+use play_harness::pluribus_play::SearchCfg;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// The blueprint holds `Cell` chance state (FlopStartGame), making it `!Sync`.
+/// That state is NEVER written during a DEPTH-LIMITED search (no chance recursion;
+/// evaluate_* only read it), so sharing a blueprint across request threads — and
+/// concurrent reads of the Cell — are sound. Assert it for the server.
+struct SyncBp(Blueprint);
+unsafe impl Send for SyncBp {}
+unsafe impl Sync for SyncBp {}
+impl std::ops::Deref for SyncBp {
+    type Target = Blueprint;
+    fn deref(&self) -> &Blueprint {
+        &self.0
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    bp_root: String,
+    cfg: SearchCfg,
+    // (cell_dir, flop_id) -> loaded blueprint (loaded once, reused).
+    cache: Arc<Mutex<HashMap<(String, u32), Arc<SyncBp>>>>,
+}
+
+#[tokio::main]
+async fn main() {
+    let bp_root = std::env::var("BP_ROOT").unwrap_or_else(|_| "blueprint_out_v1".into());
+    let iters = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(160u32);
+    let cfg = SearchCfg { iters, ..Default::default() };
+    let bind = std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let par = std::env::var("PAR").is_ok();
+    let dcfr = std::env::var("DCFR").is_ok();
+
+    let state = AppState { bp_root: bp_root.clone(), cfg, cache: Arc::new(Mutex::new(HashMap::new())) };
+    let app = Router::new()
+        .route("/", get(|| async { "poker-bot decision server — POST /decide (see play_harness::api::DecideRequest)" }))
+        .route("/decide", post(decide_handler))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
+    eprintln!("decision server on http://{bind}  (bp_root={bp_root}, iters={iters}, PAR={par}, DCFR={dcfr})");
+    axum::serve(listener, app).await.expect("serve");
+}
+
+async fn decide_handler(
+    State(st): State<AppState>,
+    Json(req): Json<DecideRequest>,
+) -> Result<Json<DecideResponse>, (StatusCode, String)> {
+    // get-or-load the blueprint for this cell+flop.
+    let key = (req.cell_dir.clone(), req.flop_id);
+    let bp: Arc<SyncBp> = {
+        let mut cache = st.cache.lock().unwrap();
+        if let Some(bp) = cache.get(&key) {
+            bp.clone()
+        } else {
+            let path = format!("{}/{}/flop_{:04}.bp", st.bp_root, req.cell_dir, req.flop_id);
+            let bp = Blueprint::load(&path)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("load {path}: {e}")))?;
+            let bp = Arc::new(SyncBp(bp));
+            cache.insert(key, bp.clone());
+            bp
+        }
+    };
+    let cfg = st.cfg;
+    // CPU-bound search → blocking pool so the async runtime isn't stalled.
+    let out = tokio::task::spawn_blocking(move || decide_postflop(&bp, &req, &cfg))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("search join: {e}")))?;
+    match out {
+        Some(r) => Ok(Json(r)),
+        None => Err((
+            StatusCode::BAD_REQUEST,
+            "unmappable decision (bad state / node not hero's / blocked board)".into(),
+        )),
+    }
+}

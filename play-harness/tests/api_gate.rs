@@ -5,7 +5,7 @@
 //! Run: BP_ROOT=$PWD/blueprint_out_v1 PAR=1 \
 //!   cargo test --release -p play-harness --test api_gate -- --ignored --nocapture
 
-use play_harness::api::{decide_postflop, ActionInput, CellKey, DecideRequest};
+use play_harness::api::{decide_postflop, ActionInput, DecideRequest};
 use play_harness::blueprint::Blueprint;
 use play_harness::pluribus_play::SearchCfg;
 
@@ -46,7 +46,6 @@ fn api_decide_smoke() {
     let partner = [deck[2], deck[3]];
 
     let cfg = SearchCfg { iters: 120, ..Default::default() };
-    let cell = CellKey { live: bp.np as u8, commit, pot };
 
     // --- SOLO: hero first to act on the flop (no prior street action) ---
     let req = DecideRequest {
@@ -59,7 +58,8 @@ fn api_decide_smoke() {
         commit_entry: commit,
         pot_entry: pot,
         street_actions: vec![],
-        cell,
+        cell_dir: cell_dir.clone(),
+        flop_id: 0,
         seed: Some(0x1234),
     };
     let resp = decide_postflop(&bp, &req, &cfg).expect("solo decision");
@@ -83,7 +83,8 @@ fn api_decide_smoke() {
         commit_entry: commit,
         pot_entry: pot,
         street_actions: vec![ActionInput { label: 1, to_total: commit }], // seat 1 checks
-        cell,
+        cell_dir: cell_dir.clone(),
+        flop_id: 0,
         seed: Some(0x1234),
     };
     // (with one prior action by seat 1, the node should be hero=seat? — depends on
