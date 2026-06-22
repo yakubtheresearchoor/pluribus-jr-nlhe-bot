@@ -3,6 +3,24 @@ use super::game::GameSpec;
 
 const UNUSED: usize = usize::MAX;
 
+/// Unsafe-Sync wrapper to share a `&dyn GameSpec` across the parallel traverser
+/// walk. SOUND only for DEPTH-LIMITED searches: the game's interior mutability
+/// (e.g. FlopStartGame's `Cell` chance state) is never touched there — only the
+/// read-only `evaluate_continuation`/`evaluate_terminal`/`initial_weight` run,
+/// and concurrent reads of `Cell` are fine when no thread writes it.
+struct SyncGame<'a>(&'a dyn GameSpec);
+unsafe impl<'a> Sync for SyncGame<'a> {}
+unsafe impl<'a> Send for SyncGame<'a> {}
+impl<'a> SyncGame<'a> {
+    // Method access (not field `.0`) so a closure captures the whole SyncGame
+    // (Sync) rather than the inner `&dyn GameSpec` (disjoint-capture would
+    // otherwise grab the !Sync field directly).
+    #[inline]
+    fn get(&self) -> &dyn GameSpec {
+        self.0
+    }
+}
+
 pub struct CpuMccfr {
     num_players: u8,
     num_hands: Vec<usize>,
@@ -282,10 +300,49 @@ impl CpuMccfr {
             self.iteration += 1;
             let weight = self.iteration as f32;
 
-            // Snapshot mode: freeze this iter's strategy so the walk's reads are
-            // race-free (prerequisite for the parallel traverser loop).
             if self.use_snapshot {
+                // PARALLEL snapshot-CFR: freeze this iter's strategy, then walk each
+                // traverser concurrently. Disjoint per-traverser regret/cum/last_cfv
+                // raw-ptr writes (player == traverser); all reads are the frozen
+                // snapshot + shared read-only state — race-free.
                 self.compute_snapshot(tree);
+                use rayon::prelude::*;
+                let regrets_addr = self.regrets.as_mut_ptr() as usize;
+                let cum_addr = self.cum_strategy.as_mut_ptr() as usize;
+                let lastcfv_addr = self.last_cfv.as_mut_ptr() as usize;
+                // The continuation game is !Sync (FlopStartGame has Cell chance
+                // state) but that state is NEVER touched in a depth-limited walk
+                // (no chance recursion) — only read-only evaluate_* run. Assert
+                // shareability for the parallel map.
+                let sg = SyncGame(game);
+                // Each traverser runs ONCE; collect() preserves index order so
+                // results[0] is traverser 0's root CFV.
+                let results: Vec<Vec<f32>> = (0..np)
+                    .into_par_iter()
+                    .map(|traverser| {
+                        let g = sg.get();
+                        let mut cfreach: Vec<Vec<f32>> =
+                            (0..np).map(|p| g.initial_weight(p as u8)).collect();
+                        let mut traverser_reach = g.initial_weight(traverser as u8);
+                        self.walk_cfr_par(
+                            tree,
+                            g,
+                            traverser as u8,
+                            0,
+                            &mut cfreach,
+                            &mut traverser_reach,
+                            weight,
+                            regrets_addr as *mut f32,
+                            cum_addr as *mut f32,
+                            lastcfv_addr as *mut f32,
+                        )
+                    })
+                    .collect();
+                for h in 0..nh0 {
+                    root_cfv_sum[h] += results[0][h];
+                }
+                p0_count += 1;
+                continue;
             }
 
             let mut cfreach: Vec<Vec<f32>> = (0..np)
@@ -480,6 +537,133 @@ impl CpuMccfr {
                 for h in 0..nh {
                     for a in 0..num_actions {
                         self.last_cfv[offset + a * nh + h] += cfv_all[a][h];
+                    }
+                }
+            }
+        }
+
+        cfv_avg
+    }
+
+    /// PARALLEL traverser walk (`&self`, raw-ptr writes) — the per-traverser body
+    /// of the snapshot-CFR parallel loop. Reads the frozen `snapshot` strategy
+    /// (never the live regrets) and writes regrets/cum/last_cfv through raw
+    /// pointers. SAFE because each traverser writes ONLY its own nodes
+    /// (`player == traverser`), which are DISJOINT across traversers, and reads
+    /// are all `&self`-shared read-only state.
+    ///
+    /// Assumes a DEPTH-LIMITED search (no chance recursion — the next-street
+    /// chance is a depth leaf) and no frozen/boundary nodes (the per-street
+    /// search uses `set_depth_limit`, not `freeze_node`). Both hold for every
+    /// production use; violations hit the `unreachable!`/snapshot-index paths.
+    ///
+    /// # Safety
+    /// `regrets`/`cum`/`last_cfv` must point at arrays of `self.regrets.len()`
+    /// f32s, and all concurrent callers must use DISJOINT traversers so their
+    /// written index ranges never overlap.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_cfr_par(
+        &self,
+        tree: &FlatTree,
+        game: &dyn GameSpec,
+        traverser: u8,
+        node_idx: usize,
+        cfreach: &mut [Vec<f32>],
+        traverser_reach: &mut [f32],
+        weight: f32,
+        regrets: *mut f32,
+        cum: *mut f32,
+        last_cfv: *mut f32,
+    ) -> Vec<f32> {
+        let node = &tree.nodes[node_idx];
+
+        if self.depth_limit[node_idx] {
+            return game.evaluate_continuation(traverser, node_idx, tree, cfreach);
+        }
+        if node.is_terminal() {
+            return game.evaluate_terminal(traverser, node_idx, tree, cfreach);
+        }
+        if node.is_chance() {
+            unreachable!("walk_cfr_par requires a depth-limited search (no chance recursion)");
+        }
+
+        let player = node.player_id;
+        let num_actions = node.num_children as usize;
+        let nh = self.num_hands[player as usize];
+        let children = tree.node_children(node_idx);
+
+        // Parallel path is always snapshot mode (frozen nodes absent here).
+        let off = self.node_data_offset[node_idx];
+        let strategy = &self.snapshot[off..off + num_actions * nh];
+
+        let mut cfv_all: Vec<Vec<f32>> = Vec::with_capacity(num_actions);
+        for (a, &child) in children.iter().enumerate() {
+            let saved = if player == traverser {
+                let s = traverser_reach.to_vec();
+                for h in 0..nh {
+                    traverser_reach[h] *= strategy[a * nh + h];
+                }
+                s
+            } else {
+                let s = cfreach[player as usize].clone();
+                for h in 0..nh {
+                    cfreach[player as usize][h] *= strategy[a * nh + h];
+                }
+                s
+            };
+            cfv_all.push(self.walk_cfr_par(
+                tree, game, traverser, child as usize, cfreach, traverser_reach, weight, regrets,
+                cum, last_cfv,
+            ));
+            if player == traverser {
+                traverser_reach.copy_from_slice(&saved);
+            } else {
+                cfreach[player as usize] = saved;
+            }
+        }
+
+        let nh_t = self.num_hands[traverser as usize];
+        let mut cfv_avg = vec![0.0f32; nh_t];
+        if player == traverser {
+            for h in 0..nh_t {
+                for a in 0..num_actions {
+                    cfv_avg[h] += strategy[a * nh + h] * cfv_all[a][h];
+                }
+            }
+        } else {
+            for h in 0..nh_t {
+                for a in 0..num_actions {
+                    cfv_avg[h] += cfv_all[a][h];
+                }
+            }
+        }
+
+        if player == traverser && !self.frozen[node_idx] {
+            let offset = self.node_data_offset[node_idx];
+            // SAFETY: disjoint per-traverser index ranges (player == traverser).
+            unsafe {
+                for h in 0..nh {
+                    for a in 0..num_actions {
+                        let idx = offset + a * nh + h;
+                        let regret = cfv_all[a][h] - cfv_avg[h];
+                        let r = regrets.add(idx);
+                        *r += weight * regret;
+                        if *r < self.regret_floor {
+                            *r = self.regret_floor;
+                        }
+                    }
+                }
+                for h in 0..nh {
+                    for a in 0..num_actions {
+                        let idx = offset + a * nh + h;
+                        *cum.add(idx) += weight * traverser_reach[h] * strategy[a * nh + h];
+                    }
+                }
+                if self.lambda.is_some() {
+                    for h in 0..nh {
+                        for a in 0..num_actions {
+                            *last_cfv.add(offset + a * nh + h) += cfv_all[a][h];
+                        }
                     }
                 }
             }

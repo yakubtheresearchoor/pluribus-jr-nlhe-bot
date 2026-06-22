@@ -196,6 +196,9 @@ pub fn play_seam_pluribus(
                 .map(|j| if selfplay || Some(j) == bot_j { cfg.lambda } else { cfg.opp_lambda })
                 .collect();
             s.set_lambda(lam);
+            if std::env::var("PAR").is_ok() {
+                s.enable_parallel();
+            }
             s.run(&tree, &game, cfg.iters);
             let mut m = HashMap::new();
             for n in 0..tree.num_nodes() {
@@ -399,6 +402,9 @@ pub fn flop_search_exploitability(bp: &Blueprint, commit: i32, pot: i32, cfg: &S
     let mut s = CpuMccfr::new(&tree, vec![nh; np]);
     s.set_depth_limit(&depth);
     s.set_lambda(vec![cfg.lambda; np]);
+    if std::env::var("PAR").is_ok() {
+        s.enable_parallel();
+    }
     s.run(&tree, &game, cfg.iters);
     let profile = StrategyProfile::from_usize_offsets(s.cum_strategy_slice(), s.node_offsets(), nh);
     // Exploitability with SUM-1 reach (the search used raw reach; normalization is
@@ -433,6 +439,9 @@ fn search_street_strat(
     let mut s = CpuMccfr::new(tree, vec![nh; l]);
     s.set_depth_limit(depth);
     s.set_lambda(vec![cfg.lambda; l]);
+    if std::env::var("PAR").is_ok() {
+        s.enable_parallel();
+    }
     s.run(tree, &game, cfg.iters);
     let mut m = HashMap::new();
     for n in 0..tree.num_nodes() {
