@@ -81,6 +81,13 @@ pub struct CpuMccfr {
     // proven pattern). Empty ⇒ legacy on-the-fly path (sequential).
     snapshot: Vec<f32>,
     use_snapshot: bool,
+    // DCFR (Discounted CFR, Brown & Sandholm 2019): per-iteration discounting of
+    // accumulated regrets/strategy — converges much faster than linear CFR.
+    // `Some((α,β,γ))`: positive regret ×= t^α/(t^α+1), negative ×= t^β/(t^β+1),
+    // cum_strategy ×= ((t-1)/t)^γ, and new contributions use weight 1 (the
+    // discounting replaces the linear-iteration weight). NASH (regret-matching)
+    // path only — no effect in QRE mode. `None` = linear CFR (unchanged).
+    dcfr: Option<(f32, f32, f32)>,
 }
 
 impl CpuMccfr {
@@ -119,6 +126,44 @@ impl CpuMccfr {
             depth_limit: vec![false; tree.num_nodes()],
             snapshot: Vec::new(),
             use_snapshot: false,
+            dcfr: None,
+        }
+    }
+
+    /// Enable DCFR (Discounted CFR) with discount exponents (α, β, γ). Standard
+    /// Brown-Sandholm defaults are (1.5, 0.0, 2.0). NASH (regret-matching) path
+    /// only — do NOT combine with set_lambda (QRE). Use with enable_parallel so
+    /// the per-iter snapshot reads the regret-matched strategy from BEFORE this
+    /// iter's discount (the discount forms R_t from R_{t-1} after the snapshot).
+    pub fn set_dcfr(&mut self, alpha: f32, beta: f32, gamma: f32) {
+        self.dcfr = Some((alpha, beta, gamma));
+    }
+
+    /// Per-iteration (weight, discount) for the walk update. DCFR (only with the
+    /// snapshot/parallel path) ⇒ weight 1 and sign-dependent factors
+    /// (pos_d, neg_d, strat_d) folded into the accumulator; otherwise linear CFR
+    /// (weight = iteration, no discount). Pure — the discount is applied per-node
+    /// in the walk, so there is no separate full-array pass.
+    fn dcfr_step(&self) -> (f32, (f32, f32, f32)) {
+        match self.dcfr {
+            Some((alpha, beta, gamma)) if self.use_snapshot => {
+                let t = self.iteration as f32;
+                if t <= 1.0 {
+                    return (1.0, (1.0, 1.0, 1.0)); // R_0 empty ⇒ no discount
+                }
+                let tm = t - 1.0;
+                let pos_d = {
+                    let x = tm.powf(alpha);
+                    x / (x + 1.0)
+                };
+                let neg_d = {
+                    let x = tm.powf(beta);
+                    x / (x + 1.0)
+                };
+                let strat_d = (tm / t).powf(gamma);
+                (1.0, (pos_d, neg_d, strat_d))
+            }
+            _ => (self.iteration as f32, (1.0, 1.0, 1.0)),
         }
     }
 
@@ -298,13 +343,17 @@ impl CpuMccfr {
 
         for _ in 0..num_iterations {
             self.iteration += 1;
-            let weight = self.iteration as f32;
+            // DCFR: weight 1 + per-iter sign-dependent discount factors (folded
+            // into the walk update). Non-DCFR: linear weight, disc=(1,1,1).
+            let (weight, disc) = self.dcfr_step();
 
             if self.use_snapshot {
                 // PARALLEL snapshot-CFR: freeze this iter's strategy, then walk each
                 // traverser concurrently. Disjoint per-traverser regret/cum/last_cfv
                 // raw-ptr writes (player == traverser); all reads are the frozen
-                // snapshot + shared read-only state — race-free.
+                // snapshot + shared read-only state — race-free. The snapshot reads
+                // the undiscounted R_{t-1}; the discount is applied per-node in the
+                // walk (R_t = R_{t-1}·d + r), so no separate full-array pass.
                 self.compute_snapshot(tree);
                 use rayon::prelude::*;
                 let regrets_addr = self.regrets.as_mut_ptr() as usize;
@@ -332,6 +381,7 @@ impl CpuMccfr {
                             &mut cfreach,
                             &mut traverser_reach,
                             weight,
+                            disc,
                             regrets_addr as *mut f32,
                             cum_addr as *mut f32,
                             lastcfv_addr as *mut f32,
@@ -345,6 +395,8 @@ impl CpuMccfr {
                 continue;
             }
 
+            // (Sequential path: DCFR falls back to linear CFR — dcfr_step only
+            // returns discount factors under use_snapshot. DCFR requires parallel.)
             let mut cfreach: Vec<Vec<f32>> = (0..np)
                 .map(|p| game.initial_weight(p as u8))
                 .collect();
@@ -571,6 +623,7 @@ impl CpuMccfr {
         cfreach: &mut [Vec<f32>],
         traverser_reach: &mut [f32],
         weight: f32,
+        disc: (f32, f32, f32),
         regrets: *mut f32,
         cum: *mut f32,
         last_cfv: *mut f32,
@@ -612,8 +665,8 @@ impl CpuMccfr {
                 s
             };
             cfv_all.push(self.walk_cfr_par(
-                tree, game, traverser, child as usize, cfreach, traverser_reach, weight, regrets,
-                cum, last_cfv,
+                tree, game, traverser, child as usize, cfreach, traverser_reach, weight, disc,
+                regrets, cum, last_cfv,
             ));
             if player == traverser {
                 traverser_reach.copy_from_slice(&saved);
@@ -640,14 +693,18 @@ impl CpuMccfr {
 
         if player == traverser && !self.frozen[node_idx] {
             let offset = self.node_data_offset[node_idx];
+            let (pos_d, neg_d, strat_d) = disc;
             // SAFETY: disjoint per-traverser index ranges (player == traverser).
+            // DCFR is FOLDED into the update (no separate full-array pass): the
+            // accumulator is discounted in place (R_t = R_{t-1}·d + w·r). For the
+            // non-DCFR default disc=(1,1,1) ⇒ bit-identical to `*r += w·r`.
             unsafe {
                 for h in 0..nh {
                     for a in 0..num_actions {
                         let idx = offset + a * nh + h;
                         let regret = cfv_all[a][h] - cfv_avg[h];
                         let r = regrets.add(idx);
-                        *r += weight * regret;
+                        *r = *r * (if *r > 0.0 { pos_d } else { neg_d }) + weight * regret;
                         if *r < self.regret_floor {
                             *r = self.regret_floor;
                         }
@@ -656,7 +713,8 @@ impl CpuMccfr {
                 for h in 0..nh {
                     for a in 0..num_actions {
                         let idx = offset + a * nh + h;
-                        *cum.add(idx) += weight * traverser_reach[h] * strategy[a * nh + h];
+                        let c = cum.add(idx);
+                        *c = *c * strat_d + weight * traverser_reach[h] * strategy[a * nh + h];
                     }
                 }
                 if self.lambda.is_some() {

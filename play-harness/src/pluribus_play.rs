@@ -195,9 +195,14 @@ pub fn play_seam_pluribus(
             let lam: Vec<f32> = (0..l)
                 .map(|j| if selfplay || Some(j) == bot_j { cfg.lambda } else { cfg.opp_lambda })
                 .collect();
-            s.set_lambda(lam);
-            if std::env::var("PAR").is_ok() {
+            if std::env::var("DCFR").is_ok() {
+                s.set_dcfr(1.5, 0.0, 2.0);
                 s.enable_parallel();
+            } else {
+                s.set_lambda(lam);
+                if std::env::var("PAR").is_ok() {
+                    s.enable_parallel();
+                }
             }
             s.run(&tree, &game, cfg.iters);
             let mut m = HashMap::new();
@@ -401,9 +406,15 @@ pub fn flop_search_exploitability(bp: &Blueprint, commit: i32, pot: i32, cfg: &S
     let game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
     let mut s = CpuMccfr::new(&tree, vec![nh; np]);
     s.set_depth_limit(&depth);
-    s.set_lambda(vec![cfg.lambda; np]);
-    if std::env::var("PAR").is_ok() {
+    if std::env::var("DCFR").is_ok() {
+        // Nash regret-matching + DCFR (needs snapshot) + parallel.
+        s.set_dcfr(1.5, 0.0, 2.0);
         s.enable_parallel();
+    } else {
+        s.set_lambda(vec![cfg.lambda; np]);
+        if std::env::var("PAR").is_ok() {
+            s.enable_parallel();
+        }
     }
     s.run(&tree, &game, cfg.iters);
     let profile = StrategyProfile::from_usize_offsets(s.cum_strategy_slice(), s.node_offsets(), nh);
