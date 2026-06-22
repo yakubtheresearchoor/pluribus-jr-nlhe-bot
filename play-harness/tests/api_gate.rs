@@ -141,6 +141,56 @@ fn api_live2_flop() {
     eprintln!("OK: live-2 flop decision valid + suit-iso routing invariant.");
 }
 
+/// LIVE-2 turn/river real-time decision: exact HU search of the actual board (no
+/// bank). Asserts a valid distribution + the rich menu appears, and reports timing.
+#[test]
+fn api_live2_turn_river() {
+    use play_harness::live2_bank::{solve_live2_street, LIVE2_RT_RIVER_ITERS, LIVE2_RT_TURN_ITERS};
+    for (name, board) in [
+        ("turn", vec![44u8, 33, 8, 2]),
+        ("river", vec![44u8, 33, 8, 2, 19]),
+    ] {
+        let used: u64 = board.iter().fold(0u64, |m, &c| m | (1u64 << c));
+        let deck: Vec<u8> = (0..52u8).filter(|&c| used & (1u64 << c) == 0).collect();
+        let hero = [deck[0], deck[1]];
+        // root acting player (so hero_idx matches the first decision node).
+        // Deep SPR (commit10/pot20) — the worst case for the turn (unbounded ≈45s);
+        // adaptive iters must keep it under budget.
+        let iters = if board.len() == 5 { LIVE2_RT_RIVER_ITERS } else { LIVE2_RT_TURN_ITERS };
+        let probe = solve_live2_street(&board, 10, 20, iters).expect("solve");
+        let root_player = probe.tree.nodes[0].player_id as u8;
+
+        let req = DecideRequest {
+            board: board.clone(),
+            hero_cards: hero,
+            partner_cards: None,
+            live: 2,
+            hero_idx: root_player,
+            partner_idx: None,
+            commit_entry: 10,
+            pot_entry: 20,
+            street_actions: vec![],
+            cell_dir: String::new(),
+            flop_id: 0,
+            seed: Some(7),
+            route: false,
+            to_call: None,
+        };
+        let r = decide_live2("", &req).expect("turn/river decision");
+        let z: f32 = r.actions.iter().map(|a| a.prob).sum();
+        eprintln!(
+            "LIVE2 {name}: {} actions, Σp={z:.3}, {}ms  {:?}",
+            r.actions.len(), r.search_ms,
+            r.actions.iter().map(|a| (a.action.as_str(), a.amount, (a.prob * 100.0).round() / 100.0)).collect::<Vec<_>>()
+        );
+        assert_eq!(r.street, name);
+        assert!((z - 1.0).abs() < 1e-3, "{name} probs must sum to 1, got {z}");
+        assert!(r.actions.len() >= 2, "{name} should offer ≥2 actions");
+        assert!(r.search_ms < 13_000, "{name} must fit the budget, took {}ms", r.search_ms);
+    }
+    eprintln!("OK: live-2 turn + river real-time decisions valid + within budget.");
+}
+
 /// Routing invariance: a strategy that respects suit isomorphism must produce the
 /// SAME decision on any orbit member of the canonical flop. Permute a canonical
 /// board + hole cards by an arbitrary suit map, route it back, and the action

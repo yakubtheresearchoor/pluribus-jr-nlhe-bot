@@ -16,9 +16,13 @@
 use std::io::{Read, Write};
 
 use solver_core::card::Card;
+use solver_core::solver::chance_table::ChanceTable;
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
-use solver_core::tree::action::{BetSize, BetSizeOptions};
+use solver_core::solver::turn_start_game::TurnStartGame;
+use solver_core::solver::vector_cfr::VectorCfr;
+use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions, BoardState};
+use solver_core::tree::builder::build_tree;
 use solver_core::tree::flat::FlatTree;
 
 use crate::preflop_oracle::seeded_1x1;
@@ -41,6 +45,68 @@ pub fn live2_bet_menu() -> BetSizeOptions {
         ],
         raise: vec![BetSize::PotRelative(0.66), BetSize::PotRelative(1.0)],
     }
+}
+
+/// Real-time HU solve iter CEILINGS (measured: turn ≈5s @48 at mid-SPR, river
+/// ≈100ms @96). The turn cost is strongly SPR-dependent (deep stacks ⇒ a much
+/// bigger turn+river betting tree: ~45s @48 at SPR≈9), so the solve uses an ADAPTIVE
+/// iter count — `solve_live2_street` measures one iteration and runs as many as fit
+/// a wall-clock budget, capped at these ceilings.
+pub const LIVE2_RT_TURN_ITERS: u32 = 48;
+pub const LIVE2_RT_RIVER_ITERS: u32 = 96;
+/// Wall-clock budget (ms) for a real-time street solve — kept under the ~14s live
+/// budget with margin. At deep SPR the turn may run fewer than the ceiling iters.
+pub const LIVE2_RT_BUDGET_MS: u128 = 9_000;
+/// Floor on adaptive iters (don't degrade below this even if over budget).
+pub const LIVE2_RT_MIN_ITERS: u32 = 6;
+
+/// Result of a real-time exact HU street solve (turn or river root): the seam tree,
+/// the solved CFR (query the average strategy at the hero's node), nh, and the hand
+/// layout (`hand_cards[i*2..i*2+2]` = the i-th hand's two cards, c1<c2).
+pub struct Live2StreetSolve {
+    pub tree: FlatTree,
+    pub cfr: VectorCfr,
+    pub nh: usize,
+    pub hand_cards: Vec<u8>,
+}
+
+/// Solve a live-2 (HU) TURN (4-card board) or RIVER (5-card board) subgame EXACTLY
+/// in real time with the rich M2 menu, from uniform entering ranges. Unlike the flop
+/// (1×1 bank, runout-specific), the actual board IS known here, so the remaining game
+/// is small and exact — no abstraction, no continuation, HU plays to an exact
+/// showdown: river = betting→showdown (~100ms); turn = river chance(47) + river
+/// betting → showdown (~5s). `commit`/`pot` are the live game's chips entering the
+/// street (the tree is built in that exact frame, so amounts need no rescale).
+///
+/// NOTE (approximation): the entering ranges are UNIFORM (full range), i.e. an
+/// unconstrained subgame re-solve — it does not narrow the opponent's range by the
+/// prior betting. Same simplification the flop bank makes at the flop.
+pub fn solve_live2_street(board: &[u8], commit: i32, pot: i32, iters: u32) -> Option<Live2StreetSolve> {
+    let spec = production_game_v1();
+    let board_c: Vec<Card> = board.to_vec();
+    let ranges = vec![vec![1.0f32; 1326]; 2];
+    let (state, table) = match board.len() {
+        4 => (BoardState::Turn, ChanceTable::compute_turn_start(&board_c, &ranges, 2)),
+        5 => (BoardState::River, ChanceTable::compute_river_start(&board_c, &ranges, 2)),
+        _ => return None,
+    };
+    let nh = table.num_valid;
+    let hand_cards = table.hand_cards.clone();
+    let game = TurnStartGame::new(table);
+    let tree = build_tree(&spec.street_seam_config(state, 2, commit, pot, live2_bet_menu())).ok()?;
+    let mut cfr = VectorCfr::new(&tree, vec![nh; 2]);
+    // Adaptive iters: time one iteration, then run as many more as fit the wall-clock
+    // budget (capped at `iters`, floored at MIN). The river is cheap (runs the full
+    // ceiling); a deep-SPR turn auto-trims to stay under budget.
+    let t = std::time::Instant::now();
+    cfr.run(&tree, &game, 1);
+    let per_iter = t.elapsed().as_millis().max(1);
+    let fit = (LIVE2_RT_BUDGET_MS / per_iter) as u32;
+    let total = fit.clamp(LIVE2_RT_MIN_ITERS, iters);
+    if total > 1 {
+        cfr.run(&tree, &game, total - 1);
+    }
+    Some(Live2StreetSolve { tree, cfr, nh, hand_cards })
 }
 
 /// Header dims, written as JSON and re-checked on load (a mismatch means the

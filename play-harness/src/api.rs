@@ -346,16 +346,89 @@ fn live2_bin_rep(live2_root: &str, bin: i64) -> Option<(i32, i32)> {
     None
 }
 
-/// Run a LIVE-2 (heads-up) postflop decision from the banked exact HU strategy
-/// (`.bp2`), which can't go through the bucketed search path (HU showdown is
-/// exact, np≥3 only there) and is unviable to resolve live (~156–780 s/decision).
-/// The bank is keyed by SPR bin × canonical flop and is 1×1 (one seeded runout),
-/// so the FLOP decision is fully covered but turn/river only exist for the seeded
-/// turn/river — for any other runout this returns None (a bank-fidelity limit).
+/// Sample a choice + normalize + wrap into a live-2 DecideResponse (shared by the
+/// flop-bank and turn/river-search paths).
+fn finalize_live2(
+    mut actions: Vec<ActionProb>,
+    street: &str,
+    seed: Option<u64>,
+    t0: std::time::Instant,
+) -> DecideResponse {
+    let na = actions.len();
+    let mut rng = seed.unwrap_or(0xA17C0DE);
+    let mut x = (splitmix64(&mut rng) % 1_000_000) as f32 / 1_000_000.0;
+    let mut sel = na.saturating_sub(1);
+    for (a, ap) in actions.iter().enumerate() {
+        if x < ap.prob {
+            sel = a;
+            break;
+        }
+        x -= ap.prob;
+    }
+    let z: f32 = actions.iter().map(|a| a.prob).sum();
+    if z > 0.0 {
+        for a in actions.iter_mut() {
+            a.prob /= z;
+        }
+    }
+    DecideResponse {
+        street: street.to_string(),
+        live: 2,
+        chosen: actions[sel.min(na.saturating_sub(1))].clone(),
+        actions,
+        search_ms: t0.elapsed().as_millis() as u64,
+        paired: false,
+    }
+}
+
+/// Run a LIVE-2 (heads-up) postflop decision. FLOP: banked exact HU strategy
+/// (`.bp2`, SPR bin × canonical flop) — a lookup, runout-independent. TURN/RIVER:
+/// the bank is 1×1 (one seeded runout) so it can't serve an arbitrary board; instead
+/// we SEARCH the actual board in real time — an exact HU subgame solve (no
+/// abstraction, plays to exact showdown): river ≈100ms, turn ≈5s (see
+/// `solve_live2_street`). So heads-up now has a rich-sizing decision on every street.
 pub fn decide_live2(live2_root: &str, req: &DecideRequest) -> Option<DecideResponse> {
     let t0 = std::time::Instant::now();
+
+    // TURN (4) / RIVER (5): real-time exact HU search of the actual board. No bank,
+    // no SPR routing, no canonicalization — the solve is exact on the real cards.
+    if req.board.len() == 4 || req.board.len() == 5 {
+        let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
+        let iters = if req.board.len() == 5 {
+            crate::live2_bank::LIVE2_RT_RIVER_ITERS
+        } else {
+            crate::live2_bank::LIVE2_RT_TURN_ITERS
+        };
+        let solve = crate::live2_bank::solve_live2_street(&req.board, commit, pot, iters)?;
+        let node = walk_to_node(&solve.tree, &req.street_actions)?;
+        if solve.tree.nodes[node].player_id as usize != req.hero_idx as usize {
+            return None;
+        }
+        // Hero's hand index in the table layout (c1<c2, not on board).
+        let (a, b) = (
+            req.hero_cards[0].min(req.hero_cards[1]),
+            req.hero_cards[0].max(req.hero_cards[1]),
+        );
+        let h = (0..solve.nh)
+            .find(|&i| solve.hand_cards[i * 2] == a && solve.hand_cards[i * 2 + 1] == b)?;
+        let na = solve.tree.nodes[node].num_children as usize;
+        let strat = solve.cfr.get_average_strategy(node, na, solve.nh); // [na][nh]
+        let children = solve.tree.node_children(node);
+        let actions: Vec<ActionProb> = (0..na)
+            .map(|a| {
+                let child = children[a] as usize;
+                let label = solve.tree.nodes[child].action_label;
+                // The tree is built in the live commit/pot frame → exact amounts.
+                let amount = commit + solve.tree.get_contribution(child, req.hero_idx);
+                ActionProb { label, action: action_name(label).to_string(), amount, prob: strat[a][h] }
+            })
+            .collect();
+        let street = if req.board.len() == 5 { "river" } else { "turn" };
+        return Some(finalize_live2(actions, street, req.seed, t0));
+    }
+
     if req.board.len() != 3 {
-        return None; // 1×1 bank: only the flop decision is runout-independent
+        return None;
     }
     let spec = production_game_v1();
     let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
@@ -399,7 +472,7 @@ pub fn decide_live2(live2_root: &str, req: &DecideRequest) -> Option<DecideRespo
     // Bets are pot-relative; the rep pot ≈ the live pot within the SPR bin but not
     // exactly, so rescale the contribution into the live game's chip frame.
     let scale = pot as f32 / rep_pot.max(1) as f32;
-    let mut actions: Vec<ActionProb> = (0..na)
+    let actions: Vec<ActionProb> = (0..na)
         .map(|a| {
             let child = children[a] as usize;
             let label = tree.nodes[child].action_label;
@@ -408,30 +481,7 @@ pub fn decide_live2(live2_root: &str, req: &DecideRequest) -> Option<DecideRespo
             ActionProb { label, action: action_name(label).to_string(), amount, prob: dist[a] }
         })
         .collect();
-    let mut rng = req.seed.unwrap_or(0xA17C0DE);
-    let mut x = (splitmix64(&mut rng) % 1_000_000) as f32 / 1_000_000.0;
-    let mut sel = na.saturating_sub(1);
-    for (a, ap) in actions.iter().enumerate() {
-        if x < ap.prob {
-            sel = a;
-            break;
-        }
-        x -= ap.prob;
-    }
-    let z: f32 = actions.iter().map(|a| a.prob).sum();
-    if z > 0.0 {
-        for a in actions.iter_mut() {
-            a.prob /= z;
-        }
-    }
-    Some(DecideResponse {
-        street: "flop".to_string(),
-        live: 2,
-        chosen: actions[sel.min(na.saturating_sub(1))].clone(),
-        actions,
-        search_ms: t0.elapsed().as_millis() as u64,
-        paired: false,
-    })
+    Some(finalize_live2(actions, "flop", req.seed, t0))
 }
 
 /// Number of MC showdown samples for the live-6 equity estimate.
