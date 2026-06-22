@@ -70,7 +70,7 @@ fn pluribus_play_gate() {
     let fmask: u64 = bp.flop.iter().fold(0u64, |m, &c| m | (1u64 << c));
     let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
     let sample_m: u32 = std::env::var("SM").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
-    let cfg = SearchCfg { iters, lambda: 300.0, sample_m, seed: 0xC0FFEE };
+    let cfg = SearchCfg { iters, lambda: 300.0, opp_lambda: 300.0, sample_m, seed: 0xC0FFEE };
 
     // ---- (1) exact conservation, rake = 0 ----
     let mut rng = 0xBEEF_u64;
@@ -93,36 +93,46 @@ fn pluribus_play_gate() {
     assert_eq!(bad, 0, "chip conservation violated in {bad}/{n_cons} hands");
     eprintln!("conservation OK: Σnet==dead for all {n_cons} hands (rake=0)");
 
-    // ---- (2) postflop bb/100 with production rake ----
+    // ---- (2) postflop bb/100 vs the pool, sweeping the OPPONENT λ ----
+    // Bot λ stays sharp (cfg.lambda); the bot MODELS opponents at opp_λ. Lower
+    // opp_λ ⇒ the bot best-responds to softer/looser opponents ⇒ more
+    // exploitative (the exploit lever vs the loose-passive pool). opp_λ == bot λ
+    // is the GTO-ish baseline. CRN: every λ replays the SAME dealt hands (rng
+    // reseeded per λ) so the comparison is paired, not confounded by variance.
     let rake_spec = (50u32, 20u32); // 5% capped at 10bb (20 units)
-    let mut rng = 0x1234_u64;
-    let mut sum = 0i64;
-    let mut cnt = 0u64;
-    let mut botwin = 0u64;
+    let bb = 2.0;
     let n = std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(8u64);
-    // SELF=1 → all seats play the searched strategy (self-play). Bot-seat net
-    // should be ≈0 (minus rake) if the strategy is internally sound; a strongly
-    // negative bot seat would signal an asymmetry/bug rather than pop-exploitation.
     let selfplay = std::env::var("SELF").is_ok();
-    for _ in 0..n {
-        let holes = deal(live, fmask, &mut rng);
-        if let Some((net, _)) =
-            play_seam_pluribus(&bp, &holes, 0, commit as u32, dead, rake_spec, &cfg, &mut rng, selfplay)
-        {
-            sum += net[0];
-            cnt += 1;
-            if net[0] > 0 {
-                botwin += 1;
+    // SWEEP list (opponent λ); default a spread from GTO-sharp down to near-uniform.
+    let sweep: Vec<f32> = match std::env::var("LAMSWEEP") {
+        Ok(s) => s.split(',').filter_map(|t| t.trim().parse().ok()).collect(),
+        Err(_) => vec![300.0, 100.0, 30.0, 10.0, 3.0, 1.0],
+    };
+    eprintln!("=== opp-λ sweep (bot λ={:.0}, N={n}/λ, CRN) ===", cfg.lambda);
+    for &olam in &sweep {
+        let mut scfg = cfg;
+        scfg.opp_lambda = olam;
+        let mut rng = 0x1234_u64; // CRN: same hands across λ values
+        let (mut sum, mut cnt, mut botwin) = (0i64, 0u64, 0u64);
+        for _ in 0..n {
+            let holes = deal(live, fmask, &mut rng);
+            if let Some((net, _)) = play_seam_pluribus(
+                &bp, &holes, 0, commit as u32, dead, rake_spec, &scfg, &mut rng, selfplay,
+            ) {
+                sum += net[0];
+                cnt += 1;
+                if net[0] > 0 {
+                    botwin += 1;
+                }
             }
         }
+        let avg = sum as f64 / cnt.max(1) as f64;
+        eprintln!(
+            "  opp-λ={olam:>6.1}: hands={cnt} bot-avg={avg:+.2} ({:+.1} bb/100) win={:.1}%",
+            avg / bb * 100.0,
+            100.0 * botwin as f64 / cnt.max(1) as f64
+        );
     }
-    let bb = 2.0;
-    let avg = sum as f64 / cnt.max(1) as f64;
-    eprintln!(
-        "postflop: hands={cnt} bot-avg={avg:+.2} chips ({:+.1} bb/100) bot-win={:.1}%",
-        avg / bb * 100.0,
-        100.0 * botwin as f64 / cnt.max(1) as f64
-    );
 }
 
 /// Deal `live` holes (2 cards each) from the deck minus the flop.

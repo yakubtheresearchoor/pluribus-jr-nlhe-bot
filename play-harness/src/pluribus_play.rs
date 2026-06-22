@@ -32,14 +32,20 @@ use std::collections::HashMap;
 #[derive(Clone, Copy)]
 pub struct SearchCfg {
     pub iters: u32,
+    /// QRE λ for the BOT seat (sharp ≈ best-response).
     pub lambda: f32,
+    /// QRE λ for the OPPONENT seats in the search. Lower ⇒ the bot models
+    /// opponents as softer/looser and best-responds more EXPLOITATIVELY (value-
+    /// bet thinner, call down more) — the exploit lever vs a loose pool. Equal to
+    /// `lambda` ⇒ symmetric (GTO-ish, robust vs tough opponents).
+    pub opp_lambda: f32,
     pub sample_m: u32,
     pub seed: u64,
 }
 
 impl Default for SearchCfg {
     fn default() -> Self {
-        SearchCfg { iters: 160, lambda: 300.0, sample_m: 200, seed: 0x5EA12C }
+        SearchCfg { iters: 160, lambda: 300.0, opp_lambda: 300.0, sample_m: 200, seed: 0x5EA12C }
     }
 }
 
@@ -181,7 +187,13 @@ pub fn play_seam_pluribus(
             if plk > 1 {
                 s.setup_pluribus_continuations(&tree, plk, 5.0);
             }
-            s.set_lambda(vec![cfg.lambda; l]);
+            // Asymmetric λ: the bot seat sharp (cfg.lambda); opponent seats at
+            // cfg.opp_lambda (lower ⇒ bot best-responds to softer/looser opponents
+            // ⇒ exploits the loose pool). In self-play every seat is "the bot".
+            let lam: Vec<f32> = (0..l)
+                .map(|j| if selfplay || Some(j) == bot_j { cfg.lambda } else { cfg.opp_lambda })
+                .collect();
+            s.set_lambda(lam);
             s.run(&tree, &game, cfg.iters);
             let mut m = HashMap::new();
             for n in 0..tree.num_nodes() {
