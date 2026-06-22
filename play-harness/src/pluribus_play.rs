@@ -104,6 +104,7 @@ pub fn play_seam_pluribus(
     rake_spec: (u32, u32),
     cfg: &SearchCfg,
     rng: &mut u64,
+    selfplay: bool,
 ) -> Option<(Vec<i64>, u8)> {
     let np = holes.len();
     let nh = bp.nh;
@@ -163,7 +164,10 @@ pub fn play_seam_pluribus(
         // multi-continuation robustification — diagnostic for its cost).
         let plk: usize = std::env::var("PLK").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
         let t0 = std::time::Instant::now();
-        let bot_strat: Option<HashMap<usize, Vec<Vec<f32>>>> = if bot_j.is_some() {
+        // Self-play needs the strategy for ALL seats (any acting player reads it);
+        // normal play only when the bot is live.
+        let need_strat = selfplay || bot_j.is_some();
+        let bot_strat: Option<HashMap<usize, Vec<Vec<f32>>>> = if need_strat {
             let mut game = BucketedContinuationGame::new_street(
                 &bp.game,
                 &bp.bk,
@@ -209,7 +213,7 @@ pub fn play_seam_pluribus(
             let j = n.player_id as usize;
             let seat = live_seats[j];
             let na = n.num_children as usize;
-            let a = if seat == bot_seam {
+            let a = if (seat == bot_seam || selfplay) && bot_strat.is_some() {
                 let strat = bot_strat.as_ref().unwrap().get(&node).expect("bot flop node");
                 let h = *hand_of.get(&hkey(holes[seat])).expect("hand in universe");
                 let mut x = (splitmix64(rng) % 1_000_000) as f32 / 1_000_000.0;
@@ -221,6 +225,20 @@ pub fn play_seam_pluribus(
                         break;
                     }
                     x -= v;
+                }
+                if dbg {
+                    let labels: Vec<u8> = tree
+                        .node_children(node)
+                        .iter()
+                        .map(|&c| tree.nodes[c as usize].action_label)
+                        .collect();
+                    let dist: Vec<String> =
+                        (0..na).map(|a| format!("{:.2}", strat[a][h])).collect();
+                    eprintln!(
+                        "    BOT s={street_u8} node={node} labels={labels:?} dist=[{}] -> a{sel}(L{})",
+                        dist.join(","),
+                        labels[sel]
+                    );
                 }
                 sel
             } else {

@@ -136,7 +136,14 @@ impl<'a> GameSpec for BucketedContinuationGame<'a> {
         // leaf value for the search — the ACTUAL hand result at play-settle uses
         // exact cards, so this trades search precision for tractability, not
         // chip-accounting correctness.
-        if self.np <= 2 {
+        // The exact inner path assumes the inner game's player count (its reach /
+        // contribution arrays). Use it only for genuine HU where np MATCHES the
+        // inner game; a multiway cell whose live count dropped to 2 after a fold
+        // (set_player_count(2) on the np=3 inner game) must still use the bucketed
+        // path — else inner.evaluate_terminal indexes a 3-player game with 2-player
+        // reach and panics.
+        let np_matches_inner = self.np as usize == self.inner.table().num_players as usize;
+        if self.np <= 2 && np_matches_inner {
             self.inner.evaluate_terminal(traverser, node_idx, tree, cfreach)
         } else {
             self.evaluate_continuation(traverser, node_idx, tree, cfreach)

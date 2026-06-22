@@ -30,15 +30,25 @@ fn parse_cell(name: &str) -> Option<(usize, i32, i32)> {
 #[ignore = "needs blueprint_out_v1; run --ignored --nocapture --release"]
 fn pluribus_play_gate() {
     let bp_root = std::env::var("BP_ROOT").unwrap_or_else(|_| "blueprint_out_v1".into());
-    // pick the first live-3 cell with a flop_0000.bp.
-    let cell_dir = std::fs::read_dir(&bp_root)
-        .ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("live3_"))
-        .find(|n| std::path::Path::new(&format!("{bp_root}/{n}/flop_0000.bp")).exists());
+    // CELL env overrides; else pick the LOWEST-commit live-3 cell with a
+    // flop_0000.bp (highest SPR ⇒ real bet sizing survives in the tree, vs a
+    // low-SPR 3bet pot where pot bets merge to all-in).
+    let cell_dir = if let Ok(c) = std::env::var("CELL") {
+        Some(c)
+    } else {
+        let mut cands: Vec<String> = std::fs::read_dir(&bp_root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("live3_"))
+            .filter(|n| std::path::Path::new(&format!("{bp_root}/{n}/flop_0000.bp")).exists())
+            .collect();
+        // sort by commit (the cN token) ascending.
+        cands.sort_by_key(|n| parse_cell(n).map(|(_, c, _)| c).unwrap_or(i32::MAX));
+        cands.into_iter().next()
+    };
     let cell_dir = match cell_dir {
         Some(c) => c,
         None => {
@@ -69,7 +79,7 @@ fn pluribus_play_gate() {
     for _ in 0..n_cons {
         let holes = deal(live, fmask, &mut rng);
         if let Some((net, _live)) =
-            play_seam_pluribus(&bp, &holes, 0, commit as u32, dead, (0, 0), &cfg, &mut rng)
+            play_seam_pluribus(&bp, &holes, 0, commit as u32, dead, (0, 0), &cfg, &mut rng, false)
         {
             let s: i64 = net.iter().sum();
             if s != dead as i64 {
@@ -90,10 +100,14 @@ fn pluribus_play_gate() {
     let mut cnt = 0u64;
     let mut botwin = 0u64;
     let n = std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(8u64);
+    // SELF=1 → all seats play the searched strategy (self-play). Bot-seat net
+    // should be ≈0 (minus rake) if the strategy is internally sound; a strongly
+    // negative bot seat would signal an asymmetry/bug rather than pop-exploitation.
+    let selfplay = std::env::var("SELF").is_ok();
     for _ in 0..n {
         let holes = deal(live, fmask, &mut rng);
         if let Some((net, _)) =
-            play_seam_pluribus(&bp, &holes, 0, commit as u32, dead, rake_spec, &cfg, &mut rng)
+            play_seam_pluribus(&bp, &holes, 0, commit as u32, dead, rake_spec, &cfg, &mut rng, selfplay)
         {
             sum += net[0];
             cnt += 1;
