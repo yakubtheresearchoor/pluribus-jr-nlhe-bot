@@ -600,6 +600,7 @@ version = "0.1.0"
 dependencies = [
  "clean-rules",
  "rayon",
+ "serde",
  "solver-core",
 ]
 

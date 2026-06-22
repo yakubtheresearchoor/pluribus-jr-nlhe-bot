@@ -11,3 +11,4 @@ edition = "2021"
 clean-rules = { path = "../clean-rules" }
 solver-core = { path = "../solver-core" }
 rayon = "1.8"
+serde = { version = "1", features = ["derive"] }

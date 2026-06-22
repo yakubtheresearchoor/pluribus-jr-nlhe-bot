@@ -429,7 +429,7 @@ pub fn flop_search_exploitability(bp: &Blueprint, commit: i32, pot: i32, cfg: &S
 /// Run ONE per-street search and extract the strategy for `street_u8` nodes.
 /// `overrides` = per-subgame-seat reach overrides (paired-bot shared info).
 #[allow(clippy::too_many_arguments)]
-fn search_street_strat(
+pub fn search_street_strat(
     bp: &Blueprint,
     tree: &FlatTree,
     depth: &[usize],
@@ -710,4 +710,91 @@ pub fn play_seam_pair(
         net[w] += share_amt + extra;
     }
     Some((net, n_live as u8))
+}
+
+/// SINGLE-DECISION postflop search for the runtime API. Builds the current
+/// street's subgame, searches it (optionally with pair-mode range blocking), and
+/// returns (subgame tree, per-node strategy map). The caller maps the street's
+/// betting history onto the tree to find the hero's decision node and reads its
+/// action distribution for the hero's actual hand.
+///
+/// `board` = full board (3/4/5 cards). `live` = players still in (the subgame is
+/// built for this count). `hero_idx`/`partner_idx` = indices WITHIN the live set
+/// (0..live). `blocker_cards` = cards to remove from the POOL (non-hero,
+/// non-partner) ranges — pair mode passes the partner's 2 hole cards (the solver
+/// already filters the hero's own + board via the showdown). `commit_entry` =
+/// each live seat's matched commit ENTERING this street; `pot_entry` = total pot
+/// entering this street (≥ live·commit; excess is dead money). Search params come
+/// from `cfg` + the PAR/DCFR env toggles (set them when launching the server).
+#[allow(clippy::too_many_arguments)]
+pub fn search_decision(
+    bp: &Blueprint,
+    board: &[u8],
+    live: usize,
+    hero_idx: usize,
+    partner_idx: Option<usize>,
+    blocker_cards: &[u8],
+    commit_entry: i32,
+    pot_entry: i32,
+    cfg: &SearchCfg,
+) -> Option<(FlatTree, std::collections::HashMap<usize, Vec<Vec<f32>>>)> {
+    let nh = bp.nh;
+    let hc = &bp.game.table().hand_cards;
+    let (street, cont) = match board.len() {
+        3 => (BoardState::Flop, ContStreet::Flop),
+        4 => {
+            let ti = bp.turns.iter().position(|&c| c == board[3])?;
+            (BoardState::Turn, ContStreet::Turn(ti))
+        }
+        5 => {
+            let ti = bp.turns.iter().position(|&c| c == board[3])?;
+            let ri = bp.rivers[ti].iter().position(|&c| c == board[4])?;
+            (BoardState::River, ContStreet::River(ti, ri))
+        }
+        _ => return None,
+    };
+    let is_river = street == BoardState::River;
+    let street_u8 = street as u8;
+    let spec = production_game_v1();
+    let mut tcfg = spec.street_seam_config(street, live as u8, commit_entry, pot_entry, rich_bets());
+    tcfg.max_bets_per_street = BetCap::all(3);
+    let tree = build_tree_depth_limited(&tcfg).ok()?;
+    let depth = depth_leaves(&tree, street_u8, is_river, live);
+
+    // Pair-mode range blocking: pool seats (not hero, not partner) lose every
+    // hand containing a blocker card.
+    let mut overrides: Vec<(usize, Vec<f32>)> = Vec::new();
+    if !blocker_cards.is_empty() {
+        let scratch =
+            BucketedContinuationGame::new_street(&bp.game, &bp.bk, cont, cfg.sample_m, cfg.seed);
+        let base = scratch.initial_weight(0);
+        let blocked: Vec<f32> = (0..nh)
+            .map(|h| {
+                let (c1, c2) = (hc[h * 2], hc[h * 2 + 1]);
+                if blocker_cards.iter().any(|&b| b == c1 || b == c2) {
+                    0.0
+                } else {
+                    base[h]
+                }
+            })
+            .collect();
+        for j in 0..live {
+            if j == hero_idx || Some(j) == partner_idx {
+                continue;
+            }
+            overrides.push((j, blocked.clone()));
+        }
+    }
+
+    let seed_salt = board.iter().fold(0u64, |a, &c| a.wrapping_mul(53).wrapping_add(c as u64));
+    let strat = search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides);
+    Some((tree, strat))
+}
+
+/// Hand index of `cards` in the blueprint universe (for reading the searched
+/// strategy at the hero's actual hand). None if not a valid (non-board) hand.
+pub fn hand_index(bp: &Blueprint, cards: [u8; 2]) -> Option<usize> {
+    let hc = &bp.game.table().hand_cards;
+    let key = (cards[0].min(cards[1]), cards[0].max(cards[1]));
+    (0..bp.nh).find(|&h| (hc[h * 2].min(hc[h * 2 + 1]), hc[h * 2].max(hc[h * 2 + 1])) == key)
 }
