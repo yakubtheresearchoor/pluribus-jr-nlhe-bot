@@ -5,9 +5,78 @@
 //! Run: BP_ROOT=$PWD/blueprint_out_v1 PAR=1 \
 //!   cargo test --release -p play-harness --test api_gate -- --ignored --nocapture
 
-use play_harness::api::{decide_live2, decide_postflop, route_to_canonical, ActionInput, DecideRequest};
+use play_harness::api::{
+    decide_live2, decide_live6, decide_postflop, route_to_canonical, ActionInput, DecideRequest,
+};
 use play_harness::blueprint::Blueprint;
 use play_harness::pluribus_play::SearchCfg;
+
+/// LIVE-6 equity-rollout decision (no blueprint needed). Unbet ⇒ check; facing a
+/// bet ⇒ pot-odds call/fold vs MC all-in equity. A flopped set clears the odds and
+/// calls; total air doesn't and folds.
+#[test]
+fn api_live6_rollout() {
+    // AKQ rainbow flop.
+    let flop = vec![48u8, 45, 42]; // A♠ K♦ Q♣ (rank*4+suit)
+    let base = DecideRequest {
+        board: flop.clone(),
+        hero_cards: [49, 50], // A♦ A♥ → flopped set of aces
+        partner_cards: None,
+        live: 6,
+        hero_idx: 0,
+        partner_idx: None,
+        commit_entry: 20,
+        pot_entry: 100,
+        street_actions: vec![],
+        cell_dir: String::new(),
+        flop_id: 0,
+        seed: Some(0x77),
+        route: false,
+        to_call: Some(0),
+    };
+    // Unbet → check.
+    let r_check = decide_live6(&base).expect("live6 unbet");
+    assert_eq!(r_check.actions.len(), 1);
+    assert_eq!(r_check.chosen.action, "check");
+    eprintln!("LIVE6 unbet → {} ({}ms)", r_check.chosen.action, r_check.search_ms);
+
+    // Facing a pot-odds-33% bet with a set → call.
+    let strong = DecideRequest { to_call: Some(50), ..clone_req(&base) };
+    let r_strong = decide_live6(&strong).expect("live6 set");
+    eprintln!("LIVE6 set facing 50 into 100: chose {}", r_strong.chosen.action);
+    assert_eq!(r_strong.chosen.action, "call", "a flopped set should call 33% pot odds");
+
+    // Same bet with total air (7♠2♦ on AKQ) → fold.
+    let weak = DecideRequest {
+        hero_cards: [28, 9], // 7♠ 2♦
+        to_call: Some(50),
+        ..clone_req(&base)
+    };
+    let r_weak = decide_live6(&weak).expect("live6 air");
+    eprintln!("LIVE6 air facing 50 into 100: chose {}", r_weak.chosen.action);
+    assert_eq!(r_weak.chosen.action, "fold", "total air should fold 33% pot odds");
+    eprintln!("OK: live-6 equity-rollout check/call/fold behaves by pot-odds.");
+}
+
+/// Shallow-clone a DecideRequest (the struct isn't Clone; rebuild the owned fields).
+fn clone_req(r: &DecideRequest) -> DecideRequest {
+    DecideRequest {
+        board: r.board.clone(),
+        hero_cards: r.hero_cards,
+        partner_cards: r.partner_cards,
+        live: r.live,
+        hero_idx: r.hero_idx,
+        partner_idx: r.partner_idx,
+        commit_entry: r.commit_entry,
+        pot_entry: r.pot_entry,
+        street_actions: r.street_actions.clone(),
+        cell_dir: r.cell_dir.clone(),
+        flop_id: r.flop_id,
+        seed: r.seed,
+        route: r.route,
+        to_call: r.to_call,
+    }
+}
 
 /// LIVE-2 flop decision from the banked HU strategy: a lookup (no search). Asserts
 /// a valid distribution and suit-iso routing invariance (a permuted raw board +
@@ -36,6 +105,7 @@ fn api_live2_flop() {
         flop_id: 0,
         seed: Some(0x1234),
         route: false,
+        to_call: None,
     };
     let base = decide_live2(&live2_root, &canon_req).expect("live2 flop decision");
     let z: f32 = base.actions.iter().map(|a| a.prob).sum();
@@ -113,6 +183,7 @@ fn api_route_invariance() {
         flop_id: 0,
         seed: Some(0x1234),
         route: false,
+        to_call: None,
     };
     let base = decide_postflop(&bp, &base_req, &cfg).expect("canonical decision");
 
@@ -219,6 +290,7 @@ fn api_route_turn_river() {
             flop_id: fi as u32,
             seed: Some(0x1234),
             route: false,
+            to_call: None,
         };
         let base = match decide_postflop(&bp, &base_req, &cfg) {
             Some(r) => r,
@@ -303,6 +375,7 @@ fn api_decide_smoke() {
         flop_id: 0,
         seed: Some(0x1234),
         route: false,
+        to_call: None,
     };
     let resp = decide_postflop(&bp, &req, &cfg).expect("solo decision");
     let z: f32 = resp.actions.iter().map(|a| a.prob).sum();
@@ -329,6 +402,7 @@ fn api_decide_smoke() {
         flop_id: 0,
         seed: Some(0x1234),
         route: false,
+        to_call: None,
     };
     // (with one prior action by seat 1, the node should be hero=seat? — depends on
     // action order; if the mapped node isn't hero's, decide returns None. Use the

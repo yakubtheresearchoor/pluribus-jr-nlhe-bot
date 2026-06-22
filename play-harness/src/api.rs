@@ -185,6 +185,12 @@ pub struct DecideRequest {
     /// Optional RNG seed for the (deterministic) action sample.
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Amount the hero must put in to call THIS decision (chips), for the live-6
+    /// equity-rollout path which has no betting tree to derive it from. 0 / unset
+    /// ⇒ unbet (the bot checks). When unset, the live-6 path derives it from
+    /// `street_actions` (max opponent to_total this street − hero's).
+    #[serde(default)]
+    pub to_call: Option<u32>,
     /// Board→canonical-flop routing. When true, the server DERIVES `flop_id` from
     /// the raw `board` (suit-isomorphism canonicalization) and remaps the board +
     /// hero/partner hole cards into the blueprint's canonical suit frame before
@@ -423,6 +429,86 @@ pub fn decide_live2(live2_root: &str, req: &DecideRequest) -> Option<DecideRespo
         live: 2,
         chosen: actions[sel.min(na.saturating_sub(1))].clone(),
         actions,
+        search_ms: t0.elapsed().as_millis() as u64,
+        paired: false,
+    })
+}
+
+/// Number of MC showdown samples for the live-6 equity estimate.
+const LIVE6_EQUITY_SAMPLES: usize = 20_000;
+
+/// Run a LIVE-6 (full-ring) postflop decision via the EQUITY-ROLLOUT model: the
+/// six-way game has no per-cell blueprint (the postflop tree is valued by check-
+/// down showdown equity, not solved). Faithful to that model: the bot never bets
+/// (no betting strategy exists), so when UNBET it CHECKS; when FACING A BET it
+/// calls or folds by pot-odds vs its Monte-Carlo all-in equity against the field.
+/// Works on flop/turn/river (rolls out the remaining board). No blueprint needed.
+pub fn decide_live6(req: &DecideRequest) -> Option<DecideResponse> {
+    let t0 = std::time::Instant::now();
+    if req.board.len() < 3 || req.board.len() > 5 {
+        return None;
+    }
+    let live = req.live as usize;
+    if live < 2 {
+        return None;
+    }
+    // Amount to call: explicit (the contract for live-6), else best-effort from
+    // this street's actions = the largest opponent to_total seen.
+    let to_call = req
+        .to_call
+        .unwrap_or_else(|| req.street_actions.iter().map(|a| a.to_total).max().unwrap_or(0));
+
+    let seed = req.seed.unwrap_or(0xA17C0DE);
+    let equity = crate::eqr::allin_equity_on_board(
+        req.hero_cards,
+        &req.board,
+        live,
+        LIVE6_EQUITY_SAMPLES,
+        seed,
+    );
+
+    let street = match req.board.len() {
+        3 => "flop",
+        4 => "turn",
+        _ => "river",
+    };
+    let commit = req.commit_entry as i32;
+    let pot = req.pot_entry as i32;
+
+    let actions: Vec<ActionProb> = if to_call == 0 {
+        // Unbet: the rollout model checks down.
+        vec![ActionProb {
+            label: 1,
+            action: "check".into(),
+            amount: commit,
+            prob: 1.0,
+        }]
+    } else {
+        // Facing a bet: pot-odds break-even = to_call / (pot + to_call). Call iff the
+        // hero's equity clears it (pure decision — the rollout model has no bluffs).
+        let req_eq = to_call as f32 / (pot + to_call as i32).max(1) as f32;
+        let call = equity >= req_eq;
+        vec![
+            ActionProb {
+                label: 0,
+                action: "fold".into(),
+                amount: commit,
+                prob: if call { 0.0 } else { 1.0 },
+            },
+            ActionProb {
+                label: 2,
+                action: "call".into(),
+                amount: commit + to_call as i32,
+                prob: if call { 1.0 } else { 0.0 },
+            },
+        ]
+    };
+    let chosen = actions.iter().max_by(|a, b| a.prob.total_cmp(&b.prob))?.clone();
+    Some(DecideResponse {
+        street: street.to_string(),
+        live: req.live,
+        actions,
+        chosen,
         search_ms: t0.elapsed().as_millis() as u64,
         paired: false,
     })

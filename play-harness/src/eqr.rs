@@ -320,6 +320,58 @@ pub fn realized_ev_table_on_flop(
     (0..n).map(|i| if cnt[i] > 0 { (sum[i] / cnt[i] as f64) as f32 } else { -half_pot }).collect()
 }
 
+/// All-in / showdown equity from ANY known board (3/4/5 cards) — MC showdown vs
+/// `live-1` uniform-random opponents, rolling out the remaining board cards. This
+/// is the equity-rollout model used for live-6 (and any all-in spot) on the turn
+/// and river as well as the flop. Returns the hero's pot share (split-aware).
+pub fn allin_equity_on_board(
+    my_hole: [u8; 2],
+    board_known: &[u8],
+    live: usize,
+    samples: usize,
+    seed: u64,
+) -> f32 {
+    let mut s = seed | 1;
+    let mut base_used: u64 = (1u64 << my_hole[0]) | (1u64 << my_hole[1]);
+    for &c in board_known {
+        base_used |= 1u64 << c;
+    }
+    let to_draw = 5 - board_known.len(); // remaining board cards
+    let mut acc = 0.0f64;
+    for _ in 0..samples {
+        let mut used = base_used;
+        let mut opp = Vec::with_capacity(live - 1);
+        for _ in 0..live - 1 {
+            let a = draw_card(&mut s, &mut used);
+            let b = draw_card(&mut s, &mut used);
+            opp.push([a, b]);
+        }
+        let mut board = [0u8; 5];
+        board[..board_known.len()].copy_from_slice(board_known);
+        for i in 0..to_draw {
+            board[board_known.len() + i] = draw_card(&mut s, &mut used);
+        }
+        let my_rank = rank7(my_hole, board);
+        let mut maxr = my_rank;
+        for o in &opp {
+            let r = rank7(*o, board);
+            if r > maxr {
+                maxr = r;
+            }
+        }
+        let mut winners = if my_rank == maxr { 1u32 } else { 0 };
+        for o in &opp {
+            if rank7(*o, board) == maxr {
+                winners += 1;
+            }
+        }
+        if my_rank == maxr {
+            acc += 1.0 / winners as f64;
+        }
+    }
+    (acc / samples as f64) as f32
+}
+
 /// All-in / showdown equity (share of pot won, no folding) — the DUMB baseline
 /// the realization model must beat, for the EQR comparison.
 pub fn allin_equity_on_flop(

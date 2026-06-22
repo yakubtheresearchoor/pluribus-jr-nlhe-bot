@@ -130,12 +130,20 @@ async fn decide_handler(
         };
     }
 
-    // live-6+ is the equity-rollout model (no blueprint) — not wired yet.
+    // LIVE-6+ (full ring): equity-rollout model — no blueprint, MC showdown equity
+    // → check when unbet, pot-odds call/fold when facing a bet. CPU-bound MC →
+    // blocking pool.
     if req.live >= 6 {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "live-6+ uses the equity-rollout model — no per-cell search wired".to_string(),
-        ));
+        let out = tokio::task::spawn_blocking(move || play_harness::api::decide_live6(&req))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live6 join: {e}")))?;
+        return match out {
+            Some(r) => Ok(Json(r)),
+            None => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "live-6: board must be 3-5 cards".into(),
+            )),
+        };
     }
 
     // POSTFLOP (live 3/4/5): get-or-load the blueprint for this cell+flop.
