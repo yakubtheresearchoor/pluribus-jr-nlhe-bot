@@ -19,7 +19,7 @@ use crate::preflop_player::{splitmix64, PreflopPlayer};
 use serde::{Deserialize, Serialize};
 use solver_core::abstraction::flop_isomorphism::{canonicalize_flop, enumerate_canonical_flops};
 use solver_core::solver::preflop_start_game::flop_combo_layout;
-use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions};
+use solver_core::tree::action::production_game_v1;
 use solver_core::tree::builder::build_tree;
 use solver_core::tree::flat::{FlatTree, MAX_NA_PREFLOP};
 use std::sync::OnceLock;
@@ -375,9 +375,9 @@ pub fn decide_live2(live2_root: &str, req: &DecideRequest) -> Option<DecideRespo
     let perm = suit_perm_to_canonical(raw_flop, canon)?;
     let hero = [remap_card(req.hero_cards[0], &perm), remap_card(req.hero_cards[1], &perm)];
 
-    // Rebuild the HU seam tree on the REP cell, load the banked strategy blob.
-    let bets = BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
-    let tree = build_tree(&spec.flop_seam_config(2, rep_commit, rep_pot, bets)).ok()?;
+    // Rebuild the HU seam tree on the REP cell (with the SAME bet menu the bank was
+    // filled with), load the banked strategy blob.
+    let tree = build_tree(&spec.flop_seam_config(2, rep_commit, rep_pot, crate::live2_bank::live2_bet_menu())).ok()?;
     let path = format!("{live2_root}/S{bin}/flop_{fi:04}.bp2");
     let canon_cards: [u8; 3] = canon;
     let solver = load_live2(&path, canon_cards, fi, &tree).ok()?;

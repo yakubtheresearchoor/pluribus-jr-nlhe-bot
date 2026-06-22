@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use play_harness::live2_bank::{save_live2, solve_live2};
+use play_harness::live2_bank::{live2_bet_menu, save_live2_v2, solve_live2};
 use play_harness::preflop_oracle::{cfv_live2, write_prebanked};
 use solver_core::abstraction::preflop_class::NUM_PREFLOP_CLASSES;
 use solver_core::solver::postflop_oracle::SeamCell;
@@ -43,11 +43,17 @@ fn cap3_preflop_tree() -> FlatTree {
 fn main() {
     let spec = production_game_v1();
     let root = std::env::var("PF_BLUEPRINT").unwrap_or_else(|_| "blueprint_out_v1".into());
-    let out = format!("{root}/live2");
+    // L2_SUBDIR lets a re-bank write to a fresh dir (e.g. live2_m2) without clobbering
+    // the live bank; swap it in once validated. Default "live2".
+    let subdir = std::env::var("L2_SUBDIR").unwrap_or_else(|_| "live2".into());
+    let out = format!("{root}/{subdir}");
     let cfv_root = format!("{root}/cfv");
     let threads: usize = std::env::var("L2_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(14);
-    let bank_cfv: bool = std::env::var("L2_CFV").ok().as_deref() != Some("0");
-    let bets = BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
+    // CFV is keyed to the SOLVE, independent of the strategy bank's bet menu, and is
+    // already banked from the original pot-only fill — default OFF on a re-bank to
+    // avoid redundant work (set L2_CFV=1 to also refresh it).
+    let bank_cfv: bool = std::env::var("L2_CFV").as_deref() == Ok("1");
+    let bets = live2_bet_menu();
 
     // Discover the live-2 SPR buckets (rep = first cell per bin), skip all-in.
     let pft = cap3_preflop_tree();
@@ -61,10 +67,15 @@ fn main() {
     }
     let mut blist: Vec<((u8, i64), SeamCell)> = buckets.into_iter().collect();
     blist.sort_by_key(|(k, _)| k.1);
+    // Optional caps for a smoke fill (validate the pipeline before the full run).
+    if let Some(mb) = std::env::var("L2_MAXBINS").ok().and_then(|s| s.parse::<usize>().ok()) {
+        blist.truncate(mb);
+    }
+    let max_flops = std::env::var("L2_MAXFLOPS").ok().and_then(|s| s.parse::<usize>().ok());
 
     let canon = PreflopChanceTable::new(6, vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6])
         .canonical_flops.clone();
-    let nflop = canon.len();
+    let nflop = max_flops.map(|m| m.min(canon.len())).unwrap_or(canon.len());
     std::fs::create_dir_all(&out).expect("mkdir live2 out");
     // Manifest: bin → (commit, pot) rep, for the deployment loader.
     let mut manifest = String::from("# live-2 strategy bank: bin commit pot dir\n");
@@ -91,9 +102,9 @@ fn main() {
                     .expect("live-2 seam tree");
                 let dir = format!("{out}/S{}", key.1);
                 std::fs::create_dir_all(&dir).expect("mkdir bin");
-                for (fi, &canonical) in canon.iter().enumerate() {
+                for (fi, &canonical) in canon.iter().enumerate().take(nflop) {
                     let solver = solve_live2(canonical, fi, &tree);
-                    save_live2(&format!("{dir}/flop_{fi:04}.bp2"), &solver, cell.commit, cell.pot, fi)
+                    save_live2_v2(&format!("{dir}/flop_{fi:04}.bp2"), &solver, cell.commit, cell.pot, fi)
                         .expect("save live-2 blob");
                     if bank_cfv {
                         let per_live = cfv_live2(canonical, fi, &tree);

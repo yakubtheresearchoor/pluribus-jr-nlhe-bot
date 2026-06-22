@@ -115,7 +115,8 @@ async fn decide_handler(
     // LIVE-2 (heads-up): banked exact HU strategy (.bp2 under {bp_root}/live2),
     // a lookup not a search. Only the flop is runout-independent (1×1 bank).
     if req.live == 2 {
-        let live2_root = format!("{}/live2", st.bp_root);
+        let subdir = std::env::var("L2_SUBDIR").unwrap_or_else(|_| "live2".into());
+        let live2_root = format!("{}/{}", st.bp_root, subdir);
         let out = tokio::task::spawn_blocking(move || {
             play_harness::api::decide_live2(&live2_root, &req)
         })

@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use solver_core::card::Card;
 use solver_core::solver::flop_start_game::{FlopChanceTable, FlopStartGame};
 use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
+use solver_core::tree::action::{BetSize, BetSizeOptions};
 use solver_core::tree::flat::FlatTree;
 
 use crate::preflop_oracle::seeded_1x1;
@@ -25,6 +26,22 @@ use crate::preflop_oracle::seeded_1x1;
 /// DCFR iters for the live-2 strategy solve — matches the postflop fill / the
 /// banked CFV convention so the banked strategy is consistent with its CFV.
 pub const LIVE2_BANK_ITERS: u32 = 34;
+
+/// The live-2 (HU) postflop bet menu — the RICH "M2" abstraction (3 bet sizes +
+/// 2 raise sizes), enabled by the flop-only zstd bank (SSL3) which makes the
+/// otherwise-prohibitive rich-menu storage fit (~2.4 GB vs ~440 GB raw). BOTH the
+/// fill (`live2_fill`) and the decision (`api::decide_live2`) MUST build the HU
+/// seam tree with THIS exact menu, or the banked buffers won't fit the tree.
+pub fn live2_bet_menu() -> BetSizeOptions {
+    BetSizeOptions {
+        bet: vec![
+            BetSize::PotRelative(0.33),
+            BetSize::PotRelative(0.66),
+            BetSize::PotRelative(1.0),
+        ],
+        raise: vec![BetSize::PotRelative(0.66), BetSize::PotRelative(1.0)],
+    }
+}
 
 /// Header dims, written as JSON and re-checked on load (a mismatch means the
 /// tree/table shape changed under the blob — a hard error, not a silent skip).
@@ -103,10 +120,44 @@ pub fn save_live2(
     std::fs::rename(&tmp, path)
 }
 
+/// Write the COMPRESSED flop-only live-2 blob (format SSL3): magic + JSON header +
+/// zstd(cum_strategy_flop f32-LE). `decide_live2` only ever queries the FLOP (turn/
+/// river are 1×1 / runout-specific and return None), so banking the flop buffer
+/// alone drops ~95% of the bytes, and zstd on the near-pure strategy adds ~12× more
+/// — together ~180× smaller than the naive 3-street f32 dump, and LOSSLESS: the flop
+/// cum round-trips bit-exact, so the query path normalizes it identically to SSL2.
+/// This makes the rich M2 bet menu bankable (~2.4 GB vs ~440 GB raw).
+pub fn save_live2_v2(
+    path: &str,
+    s: &FlopStartVectorCfr,
+    commit: i32,
+    pot: i32,
+    fi: usize,
+) -> std::io::Result<()> {
+    let hdr = Live2Header::from_solver(s, commit, pot, fi, LIVE2_BANK_ITERS);
+    let flop = s.cum_strategy_flop();
+    let mut raw = Vec::with_capacity(flop.len() * 4);
+    for &v in flop {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    let comp = zstd::encode_all(&raw[..], 9)?;
+    let tmp = format!("{path}.tmp");
+    {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        f.write_all(b"SSL3\n")?;
+        writeln!(f, "{}", hdr.to_json())?;
+        f.write_all(&comp)?;
+        f.flush()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 /// Read a live-2 strategy blob INTO a freshly-reconstructed solver. The caller
 /// passes the same tree + canonical flop + flop index; this rebuilds the
-/// identical seeded 1×1 table/solver and copies the banked cum buffers in. The
-/// returned solver's average strategy (normalize(cum)) is the deployed policy.
+/// identical seeded 1×1 table/solver and copies the banked cum buffers in.
+/// Magic-aware: SSL2 = full 3-street f32 (legacy pot-only bank); SSL3 = flop-only
+/// zstd (compressed rich-menu bank). The returned solver's average strategy
+/// (normalize(cum)) is the deployed policy.
 pub fn load_live2(
     path: &str,
     canonical: [Card; 3],
@@ -115,9 +166,9 @@ pub fn load_live2(
 ) -> std::io::Result<FlopStartVectorCfr> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?.read_to_end(&mut bytes)?;
-    // Split magic + header line from the f32 payload.
-    let nl1 = bytes.iter().position(|&b| b == b'\n').expect("SSL2 magic newline");
-    assert_eq!(&bytes[..nl1], b"SSL2", "live-2 blob bad magic in {path}");
+    // Split magic + header line from the payload.
+    let nl1 = bytes.iter().position(|&b| b == b'\n').expect("live-2 magic newline");
+    let magic = bytes[..nl1].to_vec();
     let nl2 = nl1 + 1 + bytes[nl1 + 1..].iter().position(|&b| b == b'\n').expect("header newline");
     let header = std::str::from_utf8(&bytes[nl1 + 1..nl2]).expect("header utf8").to_string();
     let payload = &bytes[nl2 + 1..];
@@ -126,23 +177,49 @@ pub fn load_live2(
     let table = FlopChanceTable::build_full_nh_sampled(canonical, 2, &turns, &river_decks);
     let game = FlopStartGame::new(table);
     let mut s = FlopStartVectorCfr::new(tree, game.table());
-
-    let (fl, tl, rl) = (
-        s.cum_strategy_flop().len(),
-        s.cum_strategy_turn().len(),
-        s.cum_strategy_river().len(),
-    );
-    let want = (fl + tl + rl) * 4;
-    assert_eq!(
-        payload.len(), want,
-        "live-2 blob {path}: payload {} ≠ expected {want} (header {header}) — tree/table shape drift",
-        payload.len()
-    );
     let as_f32 = |b: &[u8]| -> Vec<f32> {
         b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     };
-    s.cum_strategy_flop_mut().copy_from_slice(&as_f32(&payload[..fl * 4]));
-    s.cum_strategy_turn_mut().copy_from_slice(&as_f32(&payload[fl * 4..(fl + tl) * 4]));
-    s.cum_strategy_river_mut().copy_from_slice(&as_f32(&payload[(fl + tl) * 4..]));
+    let fl = s.cum_strategy_flop().len();
+
+    // Shape/format mismatches return Err (not panic) so a caller hitting a bank
+    // built with a DIFFERENT bet menu (tree shape drift during a re-bank) degrades
+    // to None rather than crashing the server.
+    let shape_err = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    match magic.as_slice() {
+        b"SSL3" => {
+            // Flop-only, zstd-compressed cum_strategy_flop. turn/river stay zero
+            // (never queried — decide_live2 returns None off the flop).
+            let raw = zstd::decode_all(payload)
+                .map_err(|e| shape_err(format!("zstd {path}: {e}")))?;
+            if raw.len() != fl * 4 {
+                return Err(shape_err(format!(
+                    "live-2 SSL3 blob {path}: flop payload {} ≠ expected {} (header {header}) — tree shape drift",
+                    raw.len(), fl * 4
+                )));
+            }
+            s.cum_strategy_flop_mut().copy_from_slice(&as_f32(&raw));
+        }
+        b"SSL2" => {
+            // Legacy full 3-street f32 dump.
+            let (tl, rl) = (s.cum_strategy_turn().len(), s.cum_strategy_river().len());
+            let want = (fl + tl + rl) * 4;
+            if payload.len() != want {
+                return Err(shape_err(format!(
+                    "live-2 SSL2 blob {path}: payload {} ≠ expected {want} (header {header}) — tree/table shape drift",
+                    payload.len()
+                )));
+            }
+            s.cum_strategy_flop_mut().copy_from_slice(&as_f32(&payload[..fl * 4]));
+            s.cum_strategy_turn_mut().copy_from_slice(&as_f32(&payload[fl * 4..(fl + tl) * 4]));
+            s.cum_strategy_river_mut().copy_from_slice(&as_f32(&payload[(fl + tl) * 4..]));
+        }
+        other => {
+            return Err(shape_err(format!(
+                "live-2 blob {path}: bad magic {:?}",
+                String::from_utf8_lossy(other)
+            )))
+        }
+    }
     Ok(s)
 }
