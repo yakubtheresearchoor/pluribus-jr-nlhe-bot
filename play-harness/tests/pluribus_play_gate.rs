@@ -50,6 +50,10 @@ fn pluribus_play_gate() {
     let bp_path = format!("{bp_root}/{cell_dir}/flop_0000.bp");
     let bp = Blueprint::load(&bp_path).expect("load bp");
     eprintln!("cell {cell_dir}: live={live} commit={commit} pot={pot} flop={:?}", bp.flop);
+    eprintln!(
+        "  bk nb_flop={} nb_turn={} nb_river={} nh={}",
+        bp.bk.nb_flop, bp.bk.nb_turn, bp.bk.nb_river, bp.nh
+    );
     assert_eq!(bp.np, live, "blueprint np matches cell live");
 
     let dead = (pot - live as i32 * commit).max(0) as u32;

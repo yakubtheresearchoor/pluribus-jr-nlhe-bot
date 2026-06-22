@@ -43,14 +43,14 @@ impl Default for SearchCfg {
     }
 }
 
+/// Search bet menu: 2 bet sizes (half / pot) + 1 raise (pot). Trimmed from
+/// 3 bets + 2 raises — rich betting × multiway × lossless nh blows the tree up
+/// exponentially in the branching factor, so fewer sizes is the lever that keeps
+/// live-3+ search under the 14s budget while staying multi-size (≫ 1×pot).
 fn rich_bets() -> BetSizeOptions {
     BetSizeOptions {
-        bet: vec![
-            BetSize::PotRelative(0.33),
-            BetSize::PotRelative(0.66),
-            BetSize::PotRelative(1.0),
-        ],
-        raise: vec![BetSize::PotRelative(0.66), BetSize::PotRelative(1.0)],
+        bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)],
+        raise: vec![BetSize::PotRelative(1.0)],
     }
 }
 
@@ -152,6 +152,16 @@ pub fn play_seam_pluribus(
         // bot decision strategy for THIS street (if the bot is still live).
         let bot_j = live_seats.iter().position(|&s| s == bot_seam);
         let dbg = std::env::var("PLDBG").is_ok();
+        if dbg && bot_j.is_some() {
+            eprintln!(
+                "  street={street_u8} L={l} tree_nodes={} depth_leaves={} (building strat...)",
+                tree.num_nodes(),
+                depth.len()
+            );
+        }
+        // PLK env: number of Pluribus continuation variants (1 = skip the k=4
+        // multi-continuation robustification — diagnostic for its cost).
+        let plk: usize = std::env::var("PLK").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
         let t0 = std::time::Instant::now();
         let bot_strat: Option<HashMap<usize, Vec<Vec<f32>>>> = if bot_j.is_some() {
             let mut game = BucketedContinuationGame::new_street(
@@ -164,7 +174,9 @@ pub fn play_seam_pluribus(
             game.set_player_count(l as u8);
             let mut s = CpuMccfr::new(&tree, vec![nh; l]);
             s.set_depth_limit(&depth);
-            s.setup_pluribus_continuations(&tree, 4, 5.0);
+            if plk > 1 {
+                s.setup_pluribus_continuations(&tree, plk, 5.0);
+            }
             s.set_lambda(vec![cfg.lambda; l]);
             s.run(&tree, &game, cfg.iters);
             let mut m = HashMap::new();
