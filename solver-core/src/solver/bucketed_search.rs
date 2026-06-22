@@ -57,6 +57,18 @@ pub struct BucketedContinuationGame<'a> {
     /// at small nb / low np; multiway must sample).
     sample_m: u32,
     rng_seed: u64,
+    /// If true, `initial_weight` normalizes each seat's range to sum 1 (a
+    /// probability distribution). The SEARCH uses the raw range (the showdown's
+    /// /num_combinations is calibrated for it); the EXPLOITABILITY computation
+    /// uses normalized reach so best-response/strategy values land in chip units
+    /// instead of blowing up by ~nh per opponent. Normalization is a uniform
+    /// scale ⇒ the optimal strategy is unchanged, so the exploit gap is faithful.
+    normalize_reach: bool,
+    /// Per-seat reach OVERRIDE (indexed by player; empty or None ⇒ default range).
+    /// Used by PAIRED bots sharing hole-card info: the partner seat is set to a
+    /// point mass (its known hand) and the pool seat to a blocker-narrowed range,
+    /// so the bot's continuation value reflects the shared card removal.
+    reach_override: Vec<Option<Vec<f32>>>,
 }
 
 impl<'a> BucketedContinuationGame<'a> {
@@ -80,7 +92,26 @@ impl<'a> BucketedContinuationGame<'a> {
         rng_seed: u64,
     ) -> Self {
         let np = inner.table().num_players;
-        BucketedContinuationGame { inner, bucketing, street, np, sample_m, rng_seed }
+        BucketedContinuationGame {
+            inner,
+            bucketing,
+            street,
+            np,
+            sample_m,
+            rng_seed,
+            normalize_reach: false,
+            reach_override: Vec::new(),
+        }
+    }
+
+    /// Set seat `player`'s reach to an explicit vector (length nh), overriding the
+    /// default range — for paired-bot shared-info modeling (partner point mass /
+    /// blocker-narrowed pool range).
+    pub fn set_reach_override(&mut self, player: usize, reach: Vec<f32>) {
+        if self.reach_override.len() <= player {
+            self.reach_override.resize(player + 1, None);
+        }
+        self.reach_override[player] = Some(reach);
     }
 
     /// Override the player count (default = the inner game's np). The pairwise
@@ -91,6 +122,12 @@ impl<'a> BucketedContinuationGame<'a> {
     pub fn set_player_count(&mut self, np: u8) {
         self.np = np;
     }
+
+    /// Enable sum-1 reach normalization (for the exploitability computation —
+    /// NOT the search). See the `normalize_reach` field.
+    pub fn set_normalize_reach(&mut self, on: bool) {
+        self.normalize_reach = on;
+    }
 }
 
 impl<'a> GameSpec for BucketedContinuationGame<'a> {
@@ -99,6 +136,11 @@ impl<'a> GameSpec for BucketedContinuationGame<'a> {
     }
 
     fn initial_weight(&self, player: u8) -> Vec<f32> {
+        // Paired-bot shared-info override (caller supplies the final, already
+        // board-filtered reach for this seat).
+        if let Some(Some(r)) = self.reach_override.get(player as usize) {
+            return r.clone();
+        }
         let mut w = self.inner.initial_weight(player);
         // Turn/River: zero hands that collide with the dealt board card(s) —
         // the flop game's reach still carries them. `*_map[h] == NO_BUCKET`
@@ -115,6 +157,14 @@ impl<'a> GameSpec for BucketedContinuationGame<'a> {
             for (h, wh) in w.iter_mut().enumerate() {
                 if map[h] == NO_BUCKET {
                     *wh = 0.0;
+                }
+            }
+        }
+        if self.normalize_reach {
+            let s: f32 = w.iter().sum();
+            if s > 0.0 {
+                for wh in w.iter_mut() {
+                    *wh /= s;
                 }
             }
         }
