@@ -11,6 +11,47 @@ use play_harness::api::{
 use play_harness::blueprint::Blueprint;
 use play_harness::pluribus_play::SearchCfg;
 
+/// MULTIWAY turn/river fallback: a live-3 turn on a NON-banked runout (the 1×1
+/// hole) must no longer return None — it falls back to the equity-rollout model and
+/// serves a valid decision.
+#[test]
+#[ignore = "needs blueprint_out_v1; --ignored --nocapture --release"]
+fn api_postflop_turn_fallback() {
+    let bp_root = std::env::var("BP_ROOT").unwrap_or_else(|_| "blueprint_out_v1".into());
+    let cell = std::fs::read_dir(&bp_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("live3_") && std::path::Path::new(&format!("{bp_root}/{n}/flop_0000.bp")).exists());
+    let cell = match cell {
+        Some(c) => c,
+        None => { eprintln!("SKIP: no live3 cell"); return; }
+    };
+    let bp = Blueprint::load(&format!("{bp_root}/{cell}/flop_0000.bp")).unwrap();
+    let parse = |p: char| cell.split('_').find_map(|t| t.strip_prefix(p)?.parse::<u32>().ok());
+    let (commit, pot) = (parse('c').unwrap(), parse('p').unwrap());
+    // turn = a card almost certainly NOT the banked 1×1 turn → search misses → fallback.
+    let used: u64 = bp.flop.iter().fold(0u64, |m, &c| m | (1u64 << c));
+    let turn = (0..52u8).find(|&c| used & (1u64 << c) == 0 && c != bp.turns[0]).unwrap();
+    let board: Vec<u8> = vec![bp.flop[0], bp.flop[1], bp.flop[2], turn];
+    let deck: Vec<u8> = (0..52u8).filter(|&c| board.iter().all(|&b| b != c)).collect();
+    let req = DecideRequest {
+        board, hero_cards: [deck[0], deck[1]], partner_cards: None, live: bp.np as u8,
+        hero_idx: 0, partner_idx: None, commit_entry: commit, pot_entry: pot,
+        street_actions: vec![], cell_dir: cell.clone(), flop_id: 0, seed: Some(1),
+        route: false, to_call: Some(0),
+    };
+    let cfg = SearchCfg { iters: 80, ..Default::default() };
+    let r = decide_postflop(&bp, &req, &cfg).expect("fallback must serve (no 400)");
+    let z: f32 = r.actions.iter().map(|a| a.prob).sum();
+    eprintln!("FALLBACK live-3 turn (non-banked runout): {} actions, Σp={z:.3}, {}ms", r.actions.len(), r.search_ms);
+    assert!((z - 1.0).abs() < 1e-3);
+    assert_eq!(r.street, "turn");
+    eprintln!("OK: multiway turn/river no longer 400s on unbanked runouts.");
+}
+
 /// LIVE-6 equity-rollout decision (no blueprint needed). Unbet ⇒ check; facing a
 /// bet ⇒ pot-odds call/fold vs MC all-in equity. A flopped set clears the odds and
 /// calls; total air doesn't and folds.

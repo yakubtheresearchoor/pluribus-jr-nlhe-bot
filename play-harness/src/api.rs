@@ -248,7 +248,24 @@ fn walk_to_node(tree: &FlatTree, actions: &[ActionInput]) -> Option<usize> {
 /// Run a POSTFLOP decision: search the current street's subgame (pair-blocked if
 /// partner cards given), locate the hero's node, return per-action probabilities
 /// + a sampled choice. None on malformed state / unmappable node / blocked board.
-pub fn decide_postflop(
+/// Run a LIVE-3/4/5 postflop decision. Primary path: the per-street bucketed-
+/// continuation search (`decide_postflop_search`). FALLBACK: if the search can't
+/// serve the spot — chiefly a TURN/RIVER runout not in the 1×1 bank (the multiway
+/// hole) — degrade to the equity-rollout model so the runtime gets a sane check /
+/// pot-odds decision instead of a 400. The flop always resolves via search (no
+/// runout dependency), so a None there is a genuine malformed-state error, not a
+/// runout miss — only turn/river (board ≥ 4) fall back.
+pub fn decide_postflop(bp: &Blueprint, req: &DecideRequest, cfg: &SearchCfg) -> Option<DecideResponse> {
+    if let Some(r) = decide_postflop_search(bp, req, cfg) {
+        return Some(r);
+    }
+    if req.board.len() >= 4 {
+        return decide_live6(req);
+    }
+    None
+}
+
+fn decide_postflop_search(
     bp: &Blueprint,
     req: &DecideRequest,
     cfg: &SearchCfg,
