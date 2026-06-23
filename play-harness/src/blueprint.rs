@@ -88,6 +88,64 @@ fn ints(body: &str) -> Vec<i64> {
         .collect()
 }
 
+/// Re-encode a raw `SSBP1` blueprint blob into compressed `SSBP2` (cum_* sections →
+/// `[lo:f32][scale:f32][zstd(u8-quant)]`, other sections → `zstd`). Pure bytes→bytes,
+/// no table rebuild. Returns None if `raw` isn't SSBP1 (already-SSBP2 returns a copy).
+/// The u8 quant matches `Blueprint::quantize_roundtrip` (money-test-proven play-safe).
+pub fn reencode_to_v2(raw: &[u8], zlevel: i32) -> Option<Vec<u8>> {
+    if raw.len() < 6 {
+        return None;
+    }
+    if &raw[..6] == b"SSBP2\n" {
+        return Some(raw.to_vec());
+    }
+    if &raw[..6] != b"SSBP1\n" {
+        return None;
+    }
+    let hdr_end = 6 + raw[6..].iter().position(|&b| b == b'\n')?;
+    let mut out = Vec::with_capacity(raw.len() / 8);
+    out.extend_from_slice(b"SSBP2\n");
+    out.extend_from_slice(&raw[6..hdr_end]);
+    out.push(b'\n');
+    let mut pos = hdr_end + 1;
+    while pos < raw.len() {
+        let name_end = pos + raw[pos..].iter().position(|&b| b == b'\n')?;
+        let name = std::str::from_utf8(&raw[pos..name_end]).ok()?;
+        let len = u64::from_le_bytes(raw[name_end + 1..name_end + 9].try_into().ok()?) as usize;
+        let data = &raw[name_end + 9..name_end + 9 + len];
+        pos = name_end + 9 + len;
+        let encoded: Vec<u8> = if name.starts_with("cum_") {
+            let vals: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for &v in &vals {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            let scale = (hi - lo).max(1e-12);
+            let q: Vec<u8> = vals
+                .iter()
+                .map(|&v| (((v - lo) / scale) * 255.0).round().clamp(0.0, 255.0) as u8)
+                .collect();
+            let z = zstd::encode_all(&q[..], zlevel).ok()?;
+            let mut e = Vec::with_capacity(8 + z.len());
+            e.extend_from_slice(&lo.to_le_bytes());
+            e.extend_from_slice(&scale.to_le_bytes());
+            e.extend_from_slice(&z);
+            e
+        } else {
+            zstd::encode_all(data, zlevel).ok()?
+        };
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        out.extend_from_slice(&encoded);
+    }
+    Some(out)
+}
+
 impl Blueprint {
     /// In-place u8 quantization round-trip of the cumulative strategy
     /// (per-array linear min..max → 0..255 → back). Models the deployed
@@ -118,7 +176,11 @@ impl Blueprint {
     pub fn load(path: &str) -> std::io::Result<Blueprint> {
         let mut raw = Vec::new();
         std::fs::File::open(path)?.read_to_end(&mut raw)?;
-        assert_eq!(&raw[..6], b"SSBP1\n", "bad magic");
+        // SSBP1 = raw f32/u16 sections; SSBP2 = COMPRESSED (cum_* = [lo:f32][scale:f32]
+        // [zstd(u8-quant)], maps = zstd(u16)) — a retroactive ~16× shrink, u8 quant
+        // proven play-safe (see quantize_roundtrip). Section framing is identical.
+        let v2 = &raw[..6] == b"SSBP2\n";
+        assert!(v2 || &raw[..6] == b"SSBP1\n", "bad magic");
         let hdr_end = 6 + raw[6..].iter().position(|&b| b == b'\n').expect("header line");
         let header = std::str::from_utf8(&raw[6..hdr_end]).expect("utf8 header").to_string();
 
@@ -135,17 +197,24 @@ impl Blueprint {
             sections.insert(name, data);
             pos = name_end + 9 + len;
         }
+        // SSBP2 cum sections decode as [lo:f32][scale:f32][zstd(u8)] → dequant; SSBP1
+        // cum sections are raw f32. (f32s is only ever called for cum_* sections.)
         let f32s = |name: &str| -> Vec<f32> {
-            sections[name]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
+            let d = &sections[name];
+            if v2 {
+                let lo = f32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+                let scale = f32::from_le_bytes([d[4], d[5], d[6], d[7]]);
+                let q = zstd::decode_all(&d[8..]).expect("zstd cum decode");
+                q.iter().map(|&b| lo + (b as f32 / 255.0) * scale).collect()
+            } else {
+                d.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            }
         };
+        // SSBP2 map sections are zstd(u16-LE); SSBP1 are raw u16.
         let u16s = |name: &str| -> Vec<u16> {
-            sections[name]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect()
+            let d = &sections[name];
+            let bytes = if v2 { zstd::decode_all(&d[..]).expect("zstd map decode") } else { d.clone() };
+            bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
         };
 
         let flop_v = ints(json_array_body(&header, "flop"));
