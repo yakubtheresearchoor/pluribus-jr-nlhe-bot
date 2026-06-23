@@ -1,10 +1,23 @@
-use crate::tree::action::{Action, BetSize, BoardState, TreeConfig};
+use crate::tree::action::{Action, BetSize, BetSizeOptions, BoardState, TreeConfig};
 use crate::tree::flat::{FlatNode, FlatTree, NODE_TYPE_PLAYER, NODE_TYPE_TERMINAL};
 
 const MAX_DEPTH: usize = 64;
 
 pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
-    build_tree_inner(config, None)
+    build_tree_inner(config, None, &[])
+}
+
+/// Build a tree where specific board states use a DIFFERENT bet menu than
+/// `config.bet_sizes` (per-street action abstraction). Used for NESTED solving:
+/// a turn-rooted re-solve keeps the rich menu on the TURN but a coarse (or
+/// check-only) menu on the RIVER continuation — the river is re-solved exactly on
+/// arrival, so its in-lookahead abstraction can be cheap. `overrides` maps a
+/// board state to its menu; states not listed use `config.bet_sizes`.
+pub fn build_tree_with_bet_override(
+    config: &TreeConfig,
+    overrides: &[(BoardState, BetSizeOptions)],
+) -> Result<FlatTree, String> {
+    build_tree_inner(config, None, overrides)
 }
 
 /// DEPTH-LIMITED build for per-street real-time search: truncate the tree one
@@ -17,7 +30,7 @@ pub fn build_tree(config: &TreeConfig) -> Result<FlatTree, String> {
 /// River-rooted configs are unchanged (no next chance — showdown terminals are
 /// depth-limited by the caller instead).
 pub fn build_tree_depth_limited(config: &TreeConfig) -> Result<FlatTree, String> {
-    build_tree_inner(config, config.initial_state.next())
+    build_tree_inner(config, config.initial_state.next(), &[])
 }
 
 /// PREFLOP-ONLY build (2026-06-12, v1 game derivation): truncate the
@@ -34,12 +47,13 @@ pub fn build_tree_preflop_only(config: &TreeConfig) -> Result<FlatTree, String> 
     if config.initial_state != BoardState::Preflop {
         return Err("preflop-only build requires initial_state = Preflop".into());
     }
-    build_tree_inner(config, Some(BoardState::Flop))
+    build_tree_inner(config, Some(BoardState::Flop), &[])
 }
 
 fn build_tree_inner(
     config: &TreeConfig,
     truncate_at: Option<BoardState>,
+    bet_override: &[(BoardState, BetSizeOptions)],
 ) -> Result<FlatTree, String> {
     let num_players = config.num_players as usize;
     if num_players < 2 || num_players > 10 {
@@ -80,6 +94,7 @@ fn build_tree_inner(
     let mut builder = TreeBuilder {
         config,
         truncate_at,
+        bet_override,
         tree: FlatTree::new(
             config.num_players,
             config.starting_pot,
@@ -218,6 +233,9 @@ struct TreeBuilder<'a> {
     /// preflop-only (oracle continuation); `Some(Turn)`/`Some(River)` = per-street
     /// search depth limit. `None` = full tree. See `build_tree_depth_limited`.
     truncate_at: Option<BoardState>,
+    /// Per-board-state bet-menu overrides (nested solving). A board state listed
+    /// here uses its menu instead of `config.bet_sizes`; empty = uniform.
+    bet_override: &'a [(BoardState, BetSizeOptions)],
     tree: FlatTree,
 }
 
@@ -798,7 +816,14 @@ impl<'a> TreeBuilder<'a> {
 
         let num_remaining_streets = info.board_state.num_remaining_streets();
 
-        let bet_options = &self.config.bet_sizes;
+        // Per-street override (nested solving): a coarse/check-only menu on a later
+        // street; defaults to the config's uniform menu.
+        let bet_options = self
+            .bet_override
+            .iter()
+            .find(|(bs, _)| *bs == info.board_state)
+            .map(|(_, m)| m)
+            .unwrap_or(&self.config.bet_sizes);
 
         let mut actions = Vec::new();
 

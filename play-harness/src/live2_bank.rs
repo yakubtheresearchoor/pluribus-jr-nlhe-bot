@@ -22,7 +22,7 @@ use solver_core::solver::flop_start_vector_cfr::FlopStartVectorCfr;
 use solver_core::solver::turn_start_game::TurnStartGame;
 use solver_core::solver::vector_cfr::VectorCfr;
 use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions, BoardState};
-use solver_core::tree::builder::build_tree;
+use solver_core::tree::builder::{build_tree, build_tree_with_bet_override};
 use solver_core::tree::flat::FlatTree;
 
 use crate::preflop_oracle::seeded_1x1;
@@ -93,7 +93,21 @@ pub fn solve_live2_street(board: &[u8], commit: i32, pot: i32, iters: u32) -> Op
     let nh = table.num_valid;
     let hand_cards = table.hand_cards.clone();
     let game = TurnStartGame::new(table);
-    let tree = build_tree(&spec.street_seam_config(state, 2, commit, pot, live2_bet_menu())).ok()?;
+    let cfg = spec.street_seam_config(state, 2, commit, pot, live2_bet_menu());
+    // NESTED solve: the TURN decision keeps the rich M2 menu, but the river
+    // continuation INSIDE the turn lookahead is CHECK-ONLY (showdown equity) — this
+    // shrinks the turn tree ~5× (the river-betting blowup at deep SPR: 584→182
+    // nodes, 40s→8s @48it), keeping full 48 iters in budget at every SPR. The river
+    // is re-solved EXACTLY with the full menu on arrival, so only the turn's
+    // valuation of future river betting is approximated (Pluribus depth-limit
+    // philosophy; check-down tracks the full-river turn strategy closely). The
+    // river root (board.len()==5) is unaffected (no continuation past it).
+    let tree = if board.len() == 4 {
+        let check_only = BetSizeOptions { bet: vec![], raise: vec![] };
+        build_tree_with_bet_override(&cfg, &[(BoardState::River, check_only)]).ok()?
+    } else {
+        build_tree(&cfg).ok()?
+    };
     let mut cfr = VectorCfr::new(&tree, vec![nh; 2]);
     // Adaptive iters: time one iteration, then run as many more as fit the wall-clock
     // budget (capped at `iters`, floored at MIN). The river is cheap (runs the full
