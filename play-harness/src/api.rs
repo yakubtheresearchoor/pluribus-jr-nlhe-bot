@@ -155,7 +155,7 @@ pub struct ActionInput {
 /// `pot_entry` = the matched commit / total pot ENTERING the current street.
 /// `cell` routes the blueprint (the flop-entry live/commit/pot). `street_actions`
 /// = the ordered actions THIS street.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct DecideRequest {
     pub board: Vec<u8>,
     pub hero_cards: [u8; 2],
@@ -182,6 +182,12 @@ pub struct DecideRequest {
     pub cell_dir: String,
     #[serde(default)]
     pub flop_id: u32,
+    /// Postflop betting on PRIOR streets (flop[, turn]) in order — for the connected
+    /// blueprint, which replays the whole-postflop cell tree from the flop root to a
+    /// turn/river node. Empty for flop decisions / the street-local search path. The
+    /// runtime (which tracks the hand) supplies it for turn/river.
+    #[serde(default)]
+    pub prior_actions: Vec<ActionInput>,
     /// Optional RNG seed for the (deterministic) action sample.
     #[serde(default)]
     pub seed: Option<u64>,
@@ -256,13 +262,78 @@ fn walk_to_node(tree: &FlatTree, actions: &[ActionInput]) -> Option<usize> {
 /// runout dependency), so a None there is a genuine malformed-state error, not a
 /// runout miss — only turn/river (board ≥ 4) fall back.
 pub fn decide_postflop(bp: &Blueprint, req: &DecideRequest, cfg: &SearchCfg) -> Option<DecideResponse> {
+    // 1. Bucketed blueprint search (the per-cell 1×1-runout strategy). Returns
+    //    None on the multiway turn/river hole (an arbitrary runout the blueprint
+    //    never solved).
     if let Some(r) = decide_postflop_search(bp, req, cfg) {
         return Some(r);
+    }
+    // 2. Multiway (live ≥ 3) turn/river: FACTORED full-nh re-solve of the actual
+    //    board — a real solve where the blueprint has no cell, ahead of the crude
+    //    equity rollout. (HU turn/river is served by decide_live2, not here.)
+    if req.board.len() >= 4 && req.live >= 3 {
+        if let Some(r) = decide_postflop_resolve(req) {
+            return Some(r);
+        }
+        // 3. Last resort: equity-rollout (check / pot-odds call-fold).
+        return decide_live6(req);
     }
     if req.board.len() >= 4 {
         return decide_live6(req);
     }
     None
+}
+
+/// MULTIWAY (live ≥ 3) turn/river FACTORED full-nh re-solve fallback. Solves the
+/// ACTUAL board with the rich M2 menu, valued by the factored O(nh·2^K) showdown
+/// (`solve_multiway_street`), and reads the hero's average strategy at the
+/// decision node. This covers the multiway turn/river hole left by the
+/// 1×1-runout blueprint with a real strategy instead of a check/pot-odds rollout.
+/// Uniform entering ranges (a real-time prior); the factored showdown is an
+/// independent-opponent approximation (<1% of pot per-hand EV vs exact).
+pub fn decide_postflop_resolve(req: &DecideRequest) -> Option<DecideResponse> {
+    let t0 = std::time::Instant::now();
+    if req.live < 3 || (req.board.len() != 4 && req.board.len() != 5) {
+        return None;
+    }
+    let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
+    let iters = if req.board.len() == 5 {
+        crate::live2_bank::LIVE2_RT_RIVER_ITERS
+    } else {
+        crate::live2_bank::LIVE2_RT_TURN_ITERS
+    };
+    let solve = crate::live2_bank::solve_multiway_street(
+        &req.board,
+        req.live,
+        commit,
+        pot,
+        iters,
+        crate::live2_bank::LIVE2_RT_BUDGET_MS,
+    )?;
+    let node = walk_to_node(&solve.tree, &req.street_actions)?;
+    if solve.tree.nodes[node].player_id as usize != req.hero_idx as usize {
+        return None; // hero is not the acting player at this node
+    }
+    // Hero's hand index in the table layout (c1 < c2, not on board).
+    let (a, b) = (
+        req.hero_cards[0].min(req.hero_cards[1]),
+        req.hero_cards[0].max(req.hero_cards[1]),
+    );
+    let h = (0..solve.nh)
+        .find(|&i| solve.hand_cards[i * 2] == a && solve.hand_cards[i * 2 + 1] == b)?;
+    let na = solve.tree.nodes[node].num_children as usize;
+    let strat = solve.cfr.get_average_strategy(node, na, solve.nh); // [na][nh]
+    let children = solve.tree.node_children(node);
+    let actions: Vec<ActionProb> = (0..na)
+        .map(|a| {
+            let child = children[a] as usize;
+            let label = solve.tree.nodes[child].action_label;
+            let amount = commit + solve.tree.get_contribution(child, req.hero_idx);
+            ActionProb { label, action: action_name(label).to_string(), amount, prob: strat[a][h] }
+        })
+        .collect();
+    let street = if req.board.len() == 5 { "river" } else { "turn" };
+    Some(finalize_decision(actions, street, req.live, false, req.seed, t0))
 }
 
 fn decide_postflop_search(
@@ -366,8 +437,22 @@ fn live2_bin_rep(live2_root: &str, bin: i64) -> Option<(i32, i32)> {
 /// Sample a choice + normalize + wrap into a live-2 DecideResponse (shared by the
 /// flop-bank and turn/river-search paths).
 fn finalize_live2(
+    actions: Vec<ActionProb>,
+    street: &str,
+    seed: Option<u64>,
+    t0: std::time::Instant,
+) -> DecideResponse {
+    finalize_decision(actions, street, 2, false, seed, t0)
+}
+
+/// Sample a (deterministic-given-seed) chosen action from `actions`, normalize
+/// the displayed probabilities, and assemble the response. Shared by the live-2
+/// real-time path and the multiway factored re-solve fallback.
+fn finalize_decision(
     mut actions: Vec<ActionProb>,
     street: &str,
+    live: u8,
+    paired: bool,
     seed: Option<u64>,
     t0: std::time::Instant,
 ) -> DecideResponse {
@@ -390,11 +475,11 @@ fn finalize_live2(
     }
     DecideResponse {
         street: street.to_string(),
-        live: 2,
+        live,
         chosen: actions[sel.min(na.saturating_sub(1))].clone(),
         actions,
         search_ms: t0.elapsed().as_millis() as u64,
-        paired: false,
+        paired,
     }
 }
 

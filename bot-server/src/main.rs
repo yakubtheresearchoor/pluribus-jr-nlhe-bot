@@ -130,9 +130,10 @@ async fn decide_handler(
         ))?;
     }
 
-    // FLOP via the connected blueprint (lookup) when loaded. Falls through to the
-    // existing search/live paths if it can't serve (turn/river, unmapped, etc.).
-    if req.board.len() == 3 {
+    // POSTFLOP (flop/turn/river) via the connected blueprint (lookup) when loaded.
+    // Turn/river need `prior_actions` (the runtime supplies the full postflop path).
+    // Falls through to the existing search/live paths if it can't serve.
+    if (3..=5).contains(&req.board.len()) {
         if let Some(conn) = st.conn.as_ref() {
             if let Some(r) = conn.decide(&req) {
                 return Ok(Json(r));

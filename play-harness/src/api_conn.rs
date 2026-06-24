@@ -25,6 +25,16 @@ pub struct ConnDecider {
     canonical_flops: Vec<[Card; 3]>,
 }
 
+/// Parse a cell dir `live{N}_c{C}_p{P}_…` into the flop-entry seam `(live, commit,
+/// pot)`. None if the string isn't in that form.
+fn parse_cell_dir(s: &str) -> Option<(u8, i32, i32)> {
+    let mut it = s.split('_');
+    let live = it.next()?.strip_prefix("live")?.parse().ok()?;
+    let commit = it.next()?.strip_prefix('c')?.parse().ok()?;
+    let pot = it.next()?.strip_prefix('p')?.parse().ok()?;
+    Some((live, commit, pot))
+}
+
 fn splitmix(s: &mut u64) -> u64 {
     *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *s;
@@ -59,6 +69,16 @@ impl ConnDecider {
             .copied()
     }
 
+    /// The flop-entry seam (cell key) for this hand. From `cell_dir`
+    /// (`live{N}_c{C}_p{P}_…`) when supplied — stable across all postflop streets —
+    /// else the current-street `(live, commit_entry, pot_entry)` (flop-correct only).
+    fn seam(&self, req: &DecideRequest) -> Option<(u8, i32, i32)> {
+        if let Some((l, c, p)) = parse_cell_dir(&req.cell_dir) {
+            return self.select_cell(l, c, p);
+        }
+        self.select_cell(req.live, req.commit_entry as i32, req.pot_entry as i32)
+    }
+
     /// Serve a decision. Returns None for spots this path can't serve (turn/river,
     /// unmapped node, missing cache) so the caller can fall back.
     pub fn decide(&self, req: &DecideRequest) -> Option<DecideResponse> {
@@ -68,8 +88,11 @@ impl ConnDecider {
 
         let (street, raw): (&str, Vec<(u8, i32, f32)>) = if req.board.is_empty() {
             ("preflop", self.bp.preflop_action_dist(hero, &hist)?)
-        } else if req.board.len() == 3 {
-            // FLOP: the cell root is the flop, so the flop street_actions map directly.
+        } else if (3..=5).contains(&req.board.len()) {
+            // POSTFLOP (flop/turn/river): replay the WHOLE-postflop cell tree from the
+            // flop root — prior_actions (earlier streets) ++ this street's actions —
+            // to the hero's node, indexing with the node's street bucket. Buckets come
+            // from the FULL 49×48 GS14 cache (full-fidelity for ANY actual board card).
             let flop_id = req.flop_id as usize;
             if flop_id >= self.canonical_flops.len() {
                 return None;
@@ -80,12 +103,20 @@ impl ConnDecider {
                 self.nb, self.bnt, self.bnr,
             )?;
             let fl = FlopLayout::for_canonical(canonical, self.bnt, self.bnr);
-            let bucket = fl.flop_bucket(&maps, hero)? as usize;
+            let b = req.board.len();
+            let buckets = [
+                fl.flop_bucket(&maps, hero)? as usize,
+                if b >= 4 { fl.turn_bucket(&maps, hero, req.board[3] as Card)? as usize } else { 0 },
+                if b == 5 { fl.river_bucket(&maps, hero, req.board[3] as Card, req.board[4] as Card)? as usize } else { 0 },
+            ];
             let post = self.bp.postflop_cum(flop_id).ok()?;
-            let (live, commit, pot) = self.select_cell(req.live, req.commit_entry as i32, req.pot_entry as i32)?;
-            ("flop", self.layout.flop_action_dist(&post, live, commit, pot, bucket, &hist)?)
+            let (live, commit, pot) = self.seam(req)?;
+            // full postflop history: prior streets ++ this street.
+            let mut full: Vec<(u8, i32)> = req.prior_actions.iter().map(|a| (a.label, a.to_total as i32)).collect();
+            full.extend(hist.iter().copied());
+            let street = match b { 3 => "flop", 4 => "turn", _ => "river" };
+            (street, self.layout.postflop_action_dist(&post, live, commit, pot, buckets, &full)?)
         } else {
-            // turn/river: needs full postflop betting path (API extension).
             return None;
         };
 
