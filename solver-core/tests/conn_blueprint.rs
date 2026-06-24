@@ -62,7 +62,7 @@ fn loads_and_indexes_synthetic_blp2() {
 
     // Replay from root (empty history) yields a normalized distribution.
     let d0 = bp.preflop_action_dist((48, 49), &[]).expect("root dist");
-    let s: f32 = d0.iter().map(|(_, p)| p).sum();
+    let s: f32 = d0.iter().map(|(_, _, p)| p).sum();
     assert!((s - 1.0).abs() < 1e-5, "root dist sums to {s}");
     let _ = std::fs::remove_file(&tmp);
 }
@@ -140,10 +140,10 @@ fn sharded_blueprint_serves_decisions() {
     let (mut aa_fold, mut t72_fold) = (1.0f32, 0.0f32);
     for (nm, a, b) in probes {
         let dist = bp.preflop_action_dist((a, b), &[]).expect("preflop dist");
-        let sum: f32 = dist.iter().map(|(_, p)| p).sum();
+        let sum: f32 = dist.iter().map(|(_, _, p)| p).sum();
         assert!((sum - 1.0).abs() < 1e-4, "{nm}: dist sums to {sum}");
-        assert!(dist.iter().all(|(_, p)| p.is_finite() && *p >= 0.0), "{nm}: bad probs");
-        let fold = dist.iter().find(|(l, _)| *l == 0).map(|(_, p)| *p).unwrap_or(0.0);
+        assert!(dist.iter().all(|(_, _, p)| p.is_finite() && *p >= 0.0), "{nm}: bad probs");
+        let fold = dist.iter().find(|(l, _, _)| *l == 0).map(|(_, _, p)| *p).unwrap_or(0.0);
         if nm == "AA" { aa_fold = fold; }
         if nm == "72o" { t72_fold = fold; }
     }
@@ -191,10 +191,58 @@ fn postflop_cell_layout_and_flop_decision() {
     // First flop decision in each cell (empty history = cell root) → sane dist.
     let (live, commit, pot) = layout.keys[0];
     if let Some(dist) = layout.flop_action_dist(&post0, live, commit, pot, bucket, &[]) {
-        let sum: f32 = dist.iter().map(|(_, p)| p).sum();
+        let sum: f32 = dist.iter().map(|(_, _, p)| p).sum();
         assert!((sum - 1.0).abs() < 1e-4, "flop dist sums to {sum}");
-        assert!(dist.iter().all(|(_, p)| p.is_finite() && *p >= 0.0));
+        assert!(dist.iter().all(|(_, _, p)| p.is_finite() && *p >= 0.0));
     }
+}
+
+/// Turn/river decisions: walk a cell tree (auto-advancing through deal nodes) to a
+/// turn-street player node, then confirm postflop_action_dist resolves there with a
+/// sane distribution — exercising chance-node traversal + per-street bucket indexing.
+#[test]
+fn postflop_turn_decision_resolves() {
+    let dir = "blueprint_conn_v1";
+    let Ok(bp) = ShardedConnBlueprint::load(dir, 6, 1, 200, 16, 16, 3) else { return; };
+    let layout = ConnCellLayout::build(6, 1, 200);
+    let post0 = bp.postflop_cum(0).expect("shard 0");
+    if layout.keys.is_empty() { return; }
+
+    // Pick the cell with the largest tree (most likely to span streets).
+    let ki = (0..layout.keys.len()).max_by_key(|&i| layout.cell_trees[i].num_nodes()).unwrap();
+    let (live, commit, pot) = layout.keys[ki];
+    let tree = &layout.cell_trees[ki];
+
+    // BFS to a turn-street (board_state==1) player node, recording the betting path
+    // (auto-advancing chance/deal nodes, which have a single child).
+    let mut found: Option<Vec<(u8, i32)>> = None;
+    let mut stack: Vec<(usize, Vec<(u8, i32)>)> = vec![(0, vec![])];
+    while let Some((mut node, hist)) = stack.pop() {
+        if hist.len() > 10 { continue; }
+        while tree.nodes[node].is_chance() { node = tree.node_children(node)[0] as usize; }
+        if !tree.nodes[node].is_player() { continue; }
+        if tree.nodes[node].board_state == 1 { found = Some(hist); break; }
+        for &k in tree.node_children(node) {
+            let kn = &tree.nodes[k as usize];
+            let mut h2 = hist.clone();
+            h2.push((kn.action_label, kn.amount));
+            stack.push((k as usize, h2));
+        }
+    }
+
+    if let Some(hist) = found {
+        // any in-range bucket suffices to exercise indexing (bucket VALUES are
+        // covered by the FlopLayout tests); use 0/1/2 across streets.
+        let dist = bp_dist(&layout, &post0, live, commit, pot, [5, 7, 9], &hist);
+        let d = dist.expect("turn decision should resolve");
+        let sum: f32 = d.iter().map(|(_, _, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-4, "turn dist sums to {sum}");
+        assert!(d.iter().all(|(_, _, p)| p.is_finite() && *p >= 0.0));
+    }
+}
+
+fn bp_dist(layout: &ConnCellLayout, post: &[f32], live: u8, commit: i32, pot: i32, b: [usize; 3], h: &[(u8, i32)]) -> Option<Vec<(u8, i32, f32)>> {
+    layout.postflop_action_dist(post, live, commit, pot, b, h)
 }
 
 /// Load a real GS14 bucket-map cache file (when present) and verify shape +

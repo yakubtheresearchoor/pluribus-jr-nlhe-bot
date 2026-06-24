@@ -52,6 +52,8 @@ struct AppState {
     cache: Arc<Mutex<HashMap<(String, u32), Arc<SyncBp>>>>,
     // EQR preflop strategy (for board-empty requests); None if PF_STRAT unset.
     pf: Option<Arc<SyncPf>>,
+    // Connected blueprint decider (CONN_BP set): serves preflop + flop by lookup.
+    conn: Option<Arc<play_harness::api_conn::ConnDecider>>,
 }
 
 #[tokio::main]
@@ -70,11 +72,22 @@ async fn main() {
         Arc::new(SyncPf(p))
     });
 
+    // Connected blueprint (CONN_BP=dir): preflop + flop decisions by lookup. Needs
+    // CONN_GS14 (the 49×48 GS14 bucket cache). Config defaults to blueprint_conn_v1.
+    let conn = std::env::var("CONN_BP").ok().map(|dir| {
+        let gs14 = std::env::var("CONN_GS14").unwrap_or_else(|_| "gs14_blueprint_cache".into());
+        let d = play_harness::api_conn::ConnDecider::load(&dir, &gs14, 6, 1, 200, 3)
+            .expect("load CONN_BP connected blueprint");
+        eprintln!("loaded connected blueprint from {dir} (gs14={gs14})");
+        Arc::new(d)
+    });
+
     let state = AppState {
         bp_root: bp_root.clone(),
         cfg,
         cache: Arc::new(Mutex::new(HashMap::new())),
         pf,
+        conn,
     };
     let app = Router::new()
         .route("/", get(|| async { "poker-bot decision server — POST /decide (see play_harness::api::DecideRequest)" }))
@@ -90,8 +103,13 @@ async fn decide_handler(
     State(st): State<AppState>,
     Json(mut req): Json<DecideRequest>,
 ) -> Result<Json<DecideResponse>, (StatusCode, String)> {
-    // PREFLOP (empty board): EQR player — fast tree lookup, run inline.
+    // PREFLOP (empty board): connected blueprint if loaded, else EQR player.
     if req.board.is_empty() {
+        if let Some(conn) = st.conn.as_ref() {
+            if let Some(r) = conn.decide(&req) {
+                return Ok(Json(r));
+            }
+        }
         let pf = st.pf.as_ref().ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
             "no preflop strategy loaded (set PF_STRAT)".to_string(),
@@ -110,6 +128,16 @@ async fn decide_handler(
             StatusCode::BAD_REQUEST,
             "route: board < 3 cards or canonical flop not in bank".to_string(),
         ))?;
+    }
+
+    // FLOP via the connected blueprint (lookup) when loaded. Falls through to the
+    // existing search/live paths if it can't serve (turn/river, unmapped, etc.).
+    if req.board.len() == 3 {
+        if let Some(conn) = st.conn.as_ref() {
+            if let Some(r) = conn.decide(&req) {
+                return Ok(Json(r));
+            }
+        }
     }
 
     // LIVE-2 (heads-up): banked exact HU strategy (.bp2 under {bp_root}/live2),

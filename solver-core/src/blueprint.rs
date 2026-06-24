@@ -393,7 +393,7 @@ impl ConnBlueprint {
         &self,
         hero: (Card, Card),
         history: &[(u8, i32)],
-    ) -> Option<Vec<(u8, f32)>> {
+    ) -> Option<Vec<(u8, i32, f32)>> {
         let mut node = self.root();
         for &(label, to_total) in history {
             if !self.pft.nodes[node].is_player() {
@@ -424,11 +424,12 @@ impl ConnBlueprint {
         }
         let class = PreflopClass::from_combo(hero.0, hero.1).index();
         let dist = self.preflop_dist_at(node, class);
+        let acting = self.pft.nodes[node].player_id;
         let kids = self.pft.node_children(node);
         Some(
             kids.iter()
                 .enumerate()
-                .map(|(a, &k)| (self.pft.nodes[k as usize].action_label, dist[a]))
+                .map(|(a, &k)| (self.pft.nodes[k as usize].action_label, self.pft.get_contribution(k as usize, acting), dist[a]))
                 .collect(),
         )
     }
@@ -528,14 +529,18 @@ impl ShardedConnBlueprint {
     }
 
     /// Preflop action distribution after replaying `history`, for `hero` cards:
-    /// `(action_label, prob)` per child of the acting node.
-    pub fn preflop_action_dist(&self, hero: (Card, Card), history: &[(u8, i32)]) -> Option<Vec<(u8, f32)>> {
+    /// `(action_label, hero-total-contribution, prob)` per child of the acting node.
+    pub fn preflop_action_dist(&self, hero: (Card, Card), history: &[(u8, i32)]) -> Option<Vec<(u8, i32, f32)>> {
         let node = ConnBlueprint::replay_preflop_node(&self.pft, history)?;
         let na = self.pft.nodes[node].num_children as usize;
         let class = PreflopClass::from_combo(hero.0, hero.1).index();
         let dist = normalize_pre_dist(&self.pre_cum, &self.pre_local, self.maxna, node, na, class);
+        let acting = self.pft.nodes[node].player_id;
         let kids = self.pft.node_children(node);
-        Some(kids.iter().enumerate().map(|(a, &k)| (self.pft.nodes[k as usize].action_label, dist[a])).collect())
+        Some(kids.iter().enumerate().map(|(a, &k)| {
+            let kn = &self.pft.nodes[k as usize];
+            (kn.action_label, self.pft.get_contribution(k as usize, acting), dist[a])
+        }).collect())
     }
 
     /// Decode a flop's postflop cum shard (post_stride floats). Reads disk each
@@ -624,20 +629,31 @@ impl ConnCellLayout {
         ConnCellLayout { keys, key_idx, cell_trees, cell_local, cell_reg_base, post_stride: off, maxna, nb }
     }
 
-    /// Postflop action distribution for a FLOP-street decision: replay the flop
-    /// betting `history` in the `(live, commit, pot)` cell's tree, index the shard
-    /// at `(cell, local-infoset, bucket)`. `bucket` = the hero's flop bucket
-    /// (`FlopLayout::flop_bucket`). Returns `(action_label, prob)` per child, or
-    /// None if the cell/node/history doesn't resolve. (Turn/river decisions need
-    /// chance-node traversal — a follow-on.)
-    pub fn flop_action_dist(&self, post_cum: &[f32], live: u8, commit: i32, pot: i32, bucket: usize, history: &[(u8, i32)]) -> Option<Vec<(u8, f32)>> {
+    /// Postflop action distribution at ANY street. Replays postflop betting
+    /// `history` (all actions, flop→turn→river in order) in the `(live, commit, pot)`
+    /// cell's tree — auto-advancing through deal (chance) nodes — to the hero's
+    /// decision node, then indexes the shard at `(cell, local-infoset, bucket)` using
+    /// the bucket for THAT node's street. `buckets = [flop, turn, river]` from
+    /// `FlopLayout` (only the decision street's entry must be valid). Returns
+    /// `(action_label, prob)` per child, or None if it doesn't resolve.
+    pub fn postflop_action_dist(&self, post_cum: &[f32], live: u8, commit: i32, pot: i32, buckets: [usize; 3], history: &[(u8, i32)]) -> Option<Vec<(u8, i32, f32)>> {
         let ki = *self.key_idx.get(&(live, commit, pot))?;
         let tree = &self.cell_trees[ki];
         let mut node = 0usize;
-        for &(label, to_total) in history {
-            if !tree.nodes[node].is_player() {
-                return None;
+        let mut hi = 0usize;
+        loop {
+            if tree.nodes[node].is_chance() {
+                // deal node (turn/river) — single child in the 1×1 cell tree.
+                node = tree.node_children(node)[0] as usize;
+                continue;
             }
+            if !tree.nodes[node].is_player() {
+                return None; // terminal reached before the decision
+            }
+            if hi >= history.len() {
+                break; // hero's decision node
+            }
+            let (label, to_total) = history[hi];
             let mut next = None;
             for &k in tree.node_children(node) {
                 let kn = &tree.nodes[k as usize];
@@ -651,15 +667,15 @@ impl ConnCellLayout {
                 }
             }
             node = next?;
-        }
-        if !tree.nodes[node].is_player() {
-            return None;
+            hi += 1;
         }
         let na = tree.nodes[node].num_children as usize;
         let local = self.cell_local[ki][node];
         if local < 0 {
             return None;
         }
+        let street = (tree.nodes[node].board_state as usize).min(2); // 0=flop,1=turn,2=river
+        let bucket = buckets[street];
         let base = self.cell_reg_base[ki] + (local as usize * self.nb + bucket) * self.maxna;
         if base + na > post_cum.len() {
             return None;
@@ -667,7 +683,16 @@ impl ConnCellLayout {
         let raw: Vec<f32> = (0..na).map(|a| post_cum[base + a].max(0.0)).collect();
         let sum: f32 = raw.iter().sum();
         let dist: Vec<f32> = if sum > 0.0 { raw.iter().map(|x| x / sum).collect() } else { vec![1.0 / na as f32; na] };
+        let acting = tree.nodes[node].player_id;
         let kids = tree.node_children(node);
-        Some(kids.iter().enumerate().map(|(a, &k)| (tree.nodes[k as usize].action_label, dist[a])).collect())
+        Some(kids.iter().enumerate().map(|(a, &k)| {
+            let kn = &tree.nodes[k as usize];
+            (kn.action_label, tree.get_contribution(k as usize, acting), dist[a])
+        }).collect())
+    }
+
+    /// Convenience: a FLOP-street decision (bucket = hero's flop bucket).
+    pub fn flop_action_dist(&self, post_cum: &[f32], live: u8, commit: i32, pot: i32, bucket: usize, history: &[(u8, i32)]) -> Option<Vec<(u8, i32, f32)>> {
+        self.postflop_action_dist(post_cum, live, commit, pot, [bucket, 0, 0], history)
     }
 }

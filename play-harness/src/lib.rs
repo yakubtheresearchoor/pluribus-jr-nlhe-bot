@@ -45,6 +45,7 @@ pub mod live2_bank;
 pub mod match_play;
 pub mod pluribus_play;
 pub mod api;
+pub mod api_conn;
 pub mod convert;
 pub mod experiment;
 pub mod v1_seam;
