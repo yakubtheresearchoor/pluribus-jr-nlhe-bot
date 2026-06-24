@@ -27,3 +27,9 @@ eqr_cache/
 
 # Saved preflop strategy artifact (2GB, regenerable via PF_SAVE)
 preflop_eqr_bbfix.*
+
+# GS14 blueprint bucket cache (~10GB, regenerable in ~3h)
+gs14_blueprint_cache/
+
+# Connected MCCFR blueprint output (~770MB, regenerable ~45min)
+blueprint_conn_v1/

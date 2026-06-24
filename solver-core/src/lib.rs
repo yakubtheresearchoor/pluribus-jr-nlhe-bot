@@ -4,6 +4,7 @@ pub mod range;
 pub mod card;
 pub mod solver;
 pub mod abstraction;
+pub mod blueprint;
 pub mod mem_guard;
 #[cfg(feature = "metal")]
 pub mod gpu_metal;
