@@ -5,10 +5,10 @@
 //! request maps directly). TURN/RIVER need the full postflop betting path, which
 //! the street-local `DecideRequest` doesn't carry — a noted API extension.
 
-use crate::api::{action_name, decide_postflop, ActionProb, DecideRequest, DecideResponse};
+use crate::api::{action_name, decide_postflop_with_reach, ActionProb, DecideRequest, DecideResponse};
 use crate::blueprint::Blueprint;
 use crate::pluribus_play::SearchCfg;
-use solver_core::abstraction::preflop_class::NUM_PREFLOP_CLASSES;
+use solver_core::abstraction::preflop_class::{PreflopClass, NUM_PREFLOP_CLASSES};
 use solver_core::blueprint::{
     gs14_cache_path, load_gs14_cache, runout_grid, ConnCellLayout, FlopLayout, ShardedConnBlueprint,
 };
@@ -132,9 +132,25 @@ impl ConnDecider {
     fn decide_postflop_search(&self, req: &DecideRequest) -> Option<DecideResponse> {
         let flop_id = req.flop_id as usize;
         let adapter = self.adapter(flop_id, req.live as usize)?;
-        // Use the tuned base cfg directly (par+dcfr+iters) rather than the 200-iter
-        // for_live schedule, which was sized for the precomputed-table blueprint.
-        decide_postflop(&adapter.0, req, &self.cfg)
+        // REACH-PRIOR (piece 3): per-seat entering ranges = the connected preflop's
+        // CONTINUING range (per-class non-fold weight at the open node), not uniform.
+        // Same range for all live seats (symmetric v1; position-specific is a
+        // refinement). Hands fold trash out → the search solves realistic ranges.
+        let hc = &adapter.0.game.table().hand_cards;
+        let nh = adapter.0.nh;
+        let mut class_cont: HashMap<usize, f32> = HashMap::new();
+        let reach: Vec<f32> = (0..nh).map(|h| {
+            let (c1, c2) = (hc[h * 2], hc[h * 2 + 1]);
+            let cls = PreflopClass::from_combo(c1 as Card, c2 as Card).index();
+            *class_cont.entry(cls).or_insert_with(|| {
+                self.bp.preflop_action_dist((c1 as Card, c2 as Card), &[])
+                    .map(|d| d.iter().filter(|(l, _, _)| *l != 0).map(|(_, _, p)| p).sum())
+                    .unwrap_or(1.0)
+            })
+        }).collect();
+        let reach_priors: Vec<(usize, Vec<f32>)> = (0..req.live as usize).map(|s| (s, reach.clone())).collect();
+        // Tuned base cfg (par+dcfr+iters); QRE λ from CONN_LAMBDA/CONN_OPP_LAMBDA.
+        decide_postflop_with_reach(&adapter.0, req, &self.cfg, &reach_priors)
     }
 
     /// Select the `(live, commit, pot)` cell: exact match, else nearest among

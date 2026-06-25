@@ -776,6 +776,7 @@ pub fn search_decision(
     commit_entry: i32,
     pot_entry: i32,
     cfg: &SearchCfg,
+    reach_priors: &[(usize, Vec<f32>)],
 ) -> Option<(FlatTree, std::collections::HashMap<usize, Vec<Vec<f32>>>)> {
     let nh = bp.nh;
     let hc = &bp.game.table().hand_cards;
@@ -825,6 +826,15 @@ pub fn search_decision(
         }
     }
 
+    // REACH-PRIOR (piece 3): entering ranges from the connected blueprint's
+    // strategy (Bayes-ish posterior — preflop-continuing range) instead of uniform.
+    // Applied AFTER pair-mode so blocking composes; reach-prior seats not pair-
+    // blocked get the prior, pair-blocked seats keep their (already-narrowed) range.
+    for (seat, reach) in reach_priors {
+        if !overrides.iter().any(|(s, _)| s == seat) {
+            overrides.push((*seat, reach.clone()));
+        }
+    }
     let seed_salt = board.iter().fold(0u64, |a, &c| a.wrapping_mul(53).wrapping_add(c as u64));
     let strat = search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides);
     Some((tree, strat))

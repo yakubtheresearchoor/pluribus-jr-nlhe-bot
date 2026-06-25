@@ -262,10 +262,17 @@ fn walk_to_node(tree: &FlatTree, actions: &[ActionInput]) -> Option<usize> {
 /// runout dependency), so a None there is a genuine malformed-state error, not a
 /// runout miss — only turn/river (board ≥ 4) fall back.
 pub fn decide_postflop(bp: &Blueprint, req: &DecideRequest, cfg: &SearchCfg) -> Option<DecideResponse> {
+    decide_postflop_with_reach(bp, req, cfg, &[])
+}
+
+/// `decide_postflop` + per-seat REACH PRIORS for the search's entering ranges
+/// (empty = uniform `initial_weight`). The connected-blueprint path supplies the
+/// preflop-continuing range here (Pluribus reach-prior).
+pub fn decide_postflop_with_reach(bp: &Blueprint, req: &DecideRequest, cfg: &SearchCfg, reach_priors: &[(usize, Vec<f32>)]) -> Option<DecideResponse> {
     // 1. Bucketed blueprint search (the per-cell 1×1-runout strategy). Returns
     //    None on the multiway turn/river hole (an arbitrary runout the blueprint
     //    never solved).
-    if let Some(r) = decide_postflop_search(bp, req, cfg) {
+    if let Some(r) = decide_postflop_search(bp, req, cfg, reach_priors) {
         return Some(r);
     }
     // 2. Multiway (live ≥ 3) turn/river: FACTORED full-nh re-solve of the actual
@@ -340,6 +347,7 @@ fn decide_postflop_search(
     bp: &Blueprint,
     req: &DecideRequest,
     cfg: &SearchCfg,
+    reach_priors: &[(usize, Vec<f32>)],
 ) -> Option<DecideResponse> {
     let t0 = std::time::Instant::now();
     let blockers: Vec<u8> = req.partner_cards.map(|c| c.to_vec()).unwrap_or_default();
@@ -354,6 +362,7 @@ fn decide_postflop_search(
         req.commit_entry as i32,
         req.pot_entry as i32,
         cfg,
+        reach_priors,
     )?;
     let node = walk_to_node(&tree, &req.street_actions)?;
     // The hero must be the acting player at this node.
