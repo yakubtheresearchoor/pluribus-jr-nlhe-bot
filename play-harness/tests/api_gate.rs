@@ -6,10 +6,66 @@
 //!   cargo test --release -p play-harness --test api_gate -- --ignored --nocapture
 
 use play_harness::api::{
-    decide_live2, decide_live6, decide_postflop, route_to_canonical, ActionInput, DecideRequest,
+    decide_live2, decide_live6, decide_postflop, decide_postflop_resolve, route_to_canonical,
+    ActionInput, DecideRequest,
 };
 use play_harness::blueprint::Blueprint;
 use play_harness::pluribus_play::SearchCfg;
+
+/// END-TO-END multiway FACTORED re-solve (no blueprint needed — solves the real
+/// board fresh). Drives `decide_postflop_resolve` for a live-3 turn AND river on
+/// an arbitrary runout and checks it serves a valid, normalized strategy. This
+/// is the path `decide_postflop` falls into for the multiway turn/river hole.
+#[test]
+fn api_multiway_resolve_e2e() {
+    let card = |r: u8, s: u8| r * 4 + s; // rank*4+suit
+    for (label, board) in [
+        ("turn", vec![card(11, 0), card(7, 1), card(2, 2), card(0, 3)]),
+        ("river", vec![card(11, 0), card(7, 1), card(2, 2), card(0, 3), card(12, 0)]),
+    ] {
+        let deck: Vec<u8> = (0..52u8).filter(|&c| !board.contains(&c)).collect();
+        // The acting player at the subgame root depends on tree construction;
+        // try each seat and require that the hero-is-acting seat serves a
+        // valid decision.
+        let mut served = 0;
+        for hero_idx in 0..3u8 {
+            let req = DecideRequest {
+                board: board.clone(),
+                hero_cards: [deck[0], deck[1]],
+                partner_cards: None,
+                live: 3,
+                hero_idx,
+                partner_idx: None,
+                commit_entry: 20,
+                pot_entry: 60,
+                street_actions: vec![],
+                cell_dir: String::new(),
+                flop_id: 0,
+                prior_actions: vec![],
+                seed: Some(0x5EED),
+                route: false,
+                to_call: Some(0),
+            };
+            if let Some(r) = decide_postflop_resolve(&req) {
+                served += 1;
+                let z: f32 = r.actions.iter().map(|a| a.prob).sum();
+                eprintln!(
+                    "{label} live-3 seat {hero_idx}: {} actions, Σp={z:.3}, {}ms",
+                    r.actions.len(),
+                    r.search_ms
+                );
+                assert_eq!(r.street, label);
+                assert_eq!(r.live, 3);
+                assert!(!r.actions.is_empty(), "must offer actions");
+                assert!((z - 1.0).abs() < 1e-3, "probs must normalize");
+                assert!(r.actions.iter().all(|a| a.amount >= 0), "amounts non-negative");
+                assert!(r.actions.iter().all(|a| a.prob >= 0.0 && a.prob <= 1.0));
+            }
+        }
+        assert!(served >= 1, "{label}: at least one seat must be the acting player at root");
+    }
+    eprintln!("OK: multiway factored re-solve serves valid live-3 turn+river decisions end-to-end.");
+}
 
 /// MULTIWAY turn/river fallback: a live-3 turn on a NON-banked runout (the 1×1
 /// hole) must no longer return None — it falls back to the equity-rollout model and
@@ -41,7 +97,7 @@ fn api_postflop_turn_fallback() {
         board, hero_cards: [deck[0], deck[1]], partner_cards: None, live: bp.np as u8,
         hero_idx: 0, partner_idx: None, commit_entry: commit, pot_entry: pot,
         street_actions: vec![], cell_dir: cell.clone(), flop_id: 0, seed: Some(1),
-        route: false, to_call: Some(0),
+        route: false, to_call: Some(0), prior_actions: vec![],
     };
     let cfg = SearchCfg { iters: 80, ..Default::default() };
     let r = decide_postflop(&bp, &req, &cfg).expect("fallback must serve (no 400)");
@@ -71,6 +127,7 @@ fn api_live6_rollout() {
         street_actions: vec![],
         cell_dir: String::new(),
         flop_id: 0,
+        prior_actions: vec![],
         seed: Some(0x77),
         route: false,
         to_call: Some(0),
@@ -113,6 +170,7 @@ fn clone_req(r: &DecideRequest) -> DecideRequest {
         street_actions: r.street_actions.clone(),
         cell_dir: r.cell_dir.clone(),
         flop_id: r.flop_id,
+        prior_actions: vec![],
         seed: r.seed,
         route: r.route,
         to_call: r.to_call,
@@ -145,6 +203,7 @@ fn api_live2_flop() {
         street_actions: vec![],
         cell_dir: String::new(),
         flop_id: 0,
+        prior_actions: vec![],
         seed: Some(0x1234),
         route: false,
         to_call: None,
@@ -213,6 +272,7 @@ fn api_live2_turn_river() {
             street_actions: vec![],
             cell_dir: String::new(),
             flop_id: 0,
+            prior_actions: vec![],
             seed: Some(7),
             route: false,
             to_call: None,
@@ -279,6 +339,7 @@ fn api_route_invariance() {
         street_actions: vec![],
         cell_dir: cell_dir.clone(),
         flop_id: 0,
+        prior_actions: vec![],
         seed: Some(0x1234),
         route: false,
         to_call: None,
@@ -294,6 +355,7 @@ fn api_route_invariance() {
         board: raw_board,
         hero_cards: raw_hero,
         flop_id: 999, // wrong on purpose — routing must overwrite it
+        prior_actions: vec![],
         route: true,
         ..base_req
     };
@@ -386,6 +448,7 @@ fn api_route_turn_river() {
             street_actions: vec![],
             cell_dir: cell_dir.clone(),
             flop_id: fi as u32,
+            prior_actions: vec![],
             seed: Some(0x1234),
             route: false,
             to_call: None,
@@ -402,6 +465,7 @@ fn api_route_turn_river() {
             board: board.iter().map(|&c| remap(c)).collect(),
             hero_cards: [remap(hero[0]), remap(hero[1])],
             flop_id: 999,
+            prior_actions: vec![],
             route: true,
             ..base_req
         };
@@ -471,6 +535,7 @@ fn api_decide_smoke() {
         street_actions: vec![],
         cell_dir: cell_dir.clone(),
         flop_id: 0,
+        prior_actions: vec![],
         seed: Some(0x1234),
         route: false,
         to_call: None,
@@ -498,6 +563,7 @@ fn api_decide_smoke() {
         street_actions: vec![ActionInput { label: 1, to_total: commit }], // seat 1 checks
         cell_dir: cell_dir.clone(),
         flop_id: 0,
+        prior_actions: vec![],
         seed: Some(0x1234),
         route: false,
         to_call: None,
