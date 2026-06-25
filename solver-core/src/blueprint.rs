@@ -127,6 +127,29 @@ pub fn load_gs14_cache(path: &std::path::Path, nb: usize, nt: usize, nr: usize) 
     Some((fm, tm, rm))
 }
 
+/// Subset full (bnt×bnr) GS14 maps to an (nt×nr) runout subset, preserving the
+/// full-fidelity bucket VALUES (runout_grid(nt,nr) cards ⊂ the (bnt,bnr) grid).
+/// Shared by the solver and the runtime (search adapter at a reduced runout).
+pub fn subset_gs14(full: &Gs14Maps, flop: [Card; 3], bnt: usize, bnr: usize, nt: usize, nr: usize) -> Gs14Maps {
+    let (bturns, _) = runout_grid(flop, bnt, bnr);
+    let (sturns, _) = runout_grid(flop, nt, nr);
+    let pos = |hay: &[u8], needle: u8| hay.iter().position(|&x| x == needle).expect("subset card not in full grid");
+    let bturns_u8: Vec<u8> = bturns.iter().map(|&c| c as u8).collect();
+    let tpos: Vec<usize> = sturns.iter().map(|&t| pos(&bturns_u8, t as u8)).collect();
+    let tm: Vec<Vec<u16>> = tpos.iter().map(|&p| full.1[p].clone()).collect();
+    let (_, b_rivers) = runout_grid(flop, bnt, bnr);
+    let (_, s_rivers) = runout_grid(flop, nt, nr);
+    let rm: Vec<Vec<Vec<u16>>> = sturns.iter().enumerate().map(|(si, &stc)| {
+        let p_t = tpos[si];
+        let brd = &b_rivers[stc as u8 as usize];
+        s_rivers[stc as u8 as usize].iter().map(|&src| {
+            let p_r = pos(brd, src);
+            full.2[p_t][p_r].clone()
+        }).collect()
+    }).collect();
+    (full.0.clone(), tm, rm)
+}
+
 /// Build the connected-solve preflop tree + the player-node → local-infoset map.
 ///
 /// MUST mirror `gpu_conn_solve` exactly: the blueprint's preflop indexing depends

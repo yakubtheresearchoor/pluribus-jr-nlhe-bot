@@ -96,31 +96,7 @@ fn load_gs14(path: &std::path::Path, nb: usize, nt: usize, nr: usize) -> Option<
     Some((fm, tm, rm))
 }
 
-/// Subset full (bnt×bnr) GS14 maps down to an (nt×nr) runout subset, preserving the
-/// full-fidelity bucket VALUES (only fewer runout positions are emitted). Valid
-/// because runout_grid(nt,nr)'s turn/river cards are a strict subset of the
-/// (bnt,bnr) grid's. Used by the memory-bounded all-flops solve: cluster at 49×48
-/// (the banked cache), sample the showdown over a small subset (~7GB for nf=1755).
-fn subset_gs14(full: &Gs14Maps, flop: [solver_core::card::Card; 3], bnt: usize, bnr: usize, nt: usize, nr: usize) -> Gs14Maps {
-    let (bturns, _) = runout_grid(flop, bnt, bnr);
-    let (sturns, _) = runout_grid(flop, nt, nr);
-    // For river positions we need each grid's per-turn river ORDER (the deck minus turn).
-    let pos = |hay: &[u8], needle: u8| hay.iter().position(|&x| x == needle).expect("subset card not in full grid");
-    let bturns_u8: Vec<u8> = bturns.iter().map(|&c| c as u8).collect();
-    let tpos: Vec<usize> = sturns.iter().map(|&t| pos(&bturns_u8, t as u8)).collect();
-    let tm: Vec<Vec<u16>> = tpos.iter().map(|&p| full.1[p].clone()).collect();
-    let (_, b_rivers) = runout_grid(flop, bnt, bnr);
-    let (_, s_rivers) = runout_grid(flop, nt, nr);
-    let rm: Vec<Vec<Vec<u16>>> = sturns.iter().enumerate().map(|(si, &stc)| {
-        let p_t = tpos[si];
-        let brd = &b_rivers[stc as u8 as usize];
-        s_rivers[stc as u8 as usize].iter().map(|&src| {
-            let p_r = pos(brd, src);
-            full.2[p_t][p_r].clone()
-        }).collect()
-    }).collect();
-    (full.0.clone(), tm, rm)
-}
+// subset_gs14 moved to solver_core::blueprint (shared with the runtime search adapter).
 
 /// GS14 potential-aware + EMD hand→bucket maps (Pluribus's information abstraction),
 /// fit to the FlopChanceTable's exact hand/runout ordering so they drop into
@@ -167,7 +143,7 @@ fn gs14_maps(
 
 // runout_grid moved to solver_core::blueprint (single source shared with the
 // runtime FlopLayout, so cached maps and runtime lookups index one ordering).
-use solver_core::blueprint::runout_grid;
+use solver_core::blueprint::{runout_grid, subset_gs14};
 
 /// Build + disk-cache the GS14 maps for one flop (no env; parallel-safe). Returns the
 /// build time in seconds (0.0 if already cached). `canonical` must come from the SAME
