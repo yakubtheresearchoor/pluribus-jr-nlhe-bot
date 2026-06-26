@@ -115,6 +115,16 @@ The server dispatches on `live` and `board.len()`:
 | `live ∈ {3,4,5}` | **multiway** | per-street depth-limited search over the bucketed blueprint continuation, rich bet sizing | a blueprint cell (`cell_dir` + `flop_id`, or `route = true`). |
 | `live ≥ 6` | **full ring** | equity-rollout model: check when unbet, pot-odds call/fold vs Monte-Carlo all-in equity | `to_call` (or derivable from `street_actions`). |
 
+**Connected blueprint (`CONN_BP`, e.g. `blueprint_conn_v4`).** When set, the server
+also loads a single self-contained connected blueprint and tries it first for
+empty-board and 3–5-card-board requests (`ConnDecider::decide`). It serves
+**postflop (flop/turn/river) by lookup** — validated byte-exact and smoke-tested
+sane — and this is the recommended postflop path. **It must NOT serve preflop**
+(its preflop region is an `MC_NF=1` reach prior, broken for non-pairs — see §11);
+preflop must come from `PF_STRAT`. Turn/river via the connected blueprint require
+`prior_actions` (the full postflop betting path) + `cell_dir`/`flop_id` (or
+`route=true`).
+
 A complete hand is driven by repeated `/decide` calls: one preflop, then one per
 postflop street as the board and `street_actions` grow.
 
@@ -126,6 +136,13 @@ postflop street as the board and `street_actions` grow.
 > is the production game class: **6-max, 100 bb deep, NL10-style rake (5% capped at
 > 10 bb), 0.5/1 bb blinds, no-flop-no-drop.** Until the rest are solved, every request
 > snaps to this one blueprint regardless of the table's real stake or depth.
+>
+> **The solved postflop blueprint is `blueprint_conn_v4`** (connected GPU MCCFR):
+> rich preflop menu (5 pot-relative raises + all-in) feeding per-flop solved postflop
+> cells — exact heads-up + fine SPR-binned 3-way/4-way + lean 5-6-way, 1755 flops,
+> validated. Load with `CONN_BP=blueprint_conn_v4 CONN_GS14=gs14_blueprint_cache`
+> (params np=6, nraises=5, nb=200, maxna=7). Serves **postflop**; preflop = `PF_STRAT`
+> (§5, §11).
 
 A real deployment needs a **matrix of blueprints** because the equilibrium strategy
 depends on two things the cell grid does **not** capture:
@@ -264,8 +281,28 @@ curl -s localhost:8080/decide -H 'content-type: application/json' -d '{
 
 ## 11. Model caveats (the honest frontier)
 
-These are deliberate model choices, not missing wiring — every (street × live count)
-decision is served:
+**★ KNOWN BUG (preflop), found 2026-06-26 by HTTP smoke test — NOT a deliberate
+choice:** the connected blueprint (`CONN_BP`, e.g. `blueprint_conn_v4`) must serve
+**postflop only**. Its *preflop* region is trained in the connected solve's Phase A
+over a **single representative flop** (`MC_NF=1`, a dry disconnected rainbow board),
+so it is valid as a *reach prior into the postflop cells* but is **NOT a usable
+preflop strategy**: on that one dry board, pairs dominate (fold ≈ 0) and non-pairs
+over-fold, inversely correlated with strength (measured AKs fold 0.83, KQo 0.91,
+72s 0.53). Pairs look fine, which is why the AA-only unit test missed it.
+- **The fix:** serve preflop from the DEDICATED all-flops preflop solve (`PF_STRAT`
+  = `preflop_out_v1`, solved by `preflop_runner` against the banked oracle over all
+  1755 flops), per §5. The connected blueprint's preflop is reach-only.
+- **Current `bot-server` routing is WRONG here:** `decide_handler` tries `conn.decide`
+  FIRST for empty-board requests, so it serves the broken connected preflop instead of
+  `PF_STRAT`. Until fixed, either (a) don't set `CONN_BP` for preflop, or (b) make the
+  empty-board branch prefer `PF_STRAT` and fall back to `conn` only postflop.
+- **To get a sound preflop WITH all-ins** (the rich-abstraction goal): re-run
+  `preflop_runner` with `BetSize::AllIn` in the preflop menu against the banked
+  oracle. Postflop (the connected v4 cells) is per-flop solved and validated — no
+  preflop bias there.
+
+The remaining items below are deliberate model choices, not bugs — every (street ×
+live count) decision is still served:
 
 - **Blueprint matrix is 1/20 solved** — all requests currently snap to the NL10 /
   100 bb blueprint (§6). Real-stake/depth selection is pending the other solves.

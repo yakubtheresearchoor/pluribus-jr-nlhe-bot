@@ -18,10 +18,59 @@
 
 use crate::abstraction::preflop_class::{PreflopClass, NUM_PREFLOP_CLASSES};
 use crate::card::Card;
-use crate::tree::action::{production_game_v1, BetCap, BetSize, BetSizeOptions};
-use crate::tree::builder::{build_tree, build_tree_preflop_only};
+use crate::solver::postflop_oracle::SeamCell;
+use crate::tree::action::{production_game_v1, BetCap, BetSize, BetSizeOptions, BoardState};
+use crate::tree::builder::{build_tree_preflop_only, build_tree_with_bet_override};
 use crate::tree::flat::FlatTree;
 use std::io;
+
+/// Per-live SPR bin WIDTHS (log2-SPR units). Finer = more cells = more memory.
+/// The real ceiling is GPU memory (2 buffers × reg_buf × 4B ≤ ~27GB default),
+/// tighter than u32. Tuned to fit default memory while beating v3's ~24 bins/live.
+/// MUST be identical at solve + runtime; env is TUNING-ONLY — hardcode final.
+/// Tuned to fit ~24.5GB GPU (under the ~27GB default wired limit) with 119 three-
+/// way + 100 four-way bins (≈5× v3). HARDCODED — must match solve + runtime; never
+/// env-driven (a mismatch would corrupt the layout).
+const SPR_W3: f64 = 0.04;
+const SPR_W4: f64 = 0.05;
+
+/// PER-LIVE seam CELL KEY — SHARED by the connected solve (`gpu_conn_solve`) and
+/// the runtime (`ConnCellLayout`) so the cell layout is byte-exact:
+///   - live = 2 (HU): EXACT (commit, pot) — cheap (0.33B) + the most volume.
+///   - live = 3: fine SPR bin (`spr_w3`) — finer than v3.
+///   - live = 4: fine SPR bin (`spr_w4`) — finer than v3.
+///   - live ≥ 5: ONE shared cell per live (rarely reached under raise-or-fold).
+/// SPR = (stack − commit)/pot. `stack` = production start stack.
+pub fn conn_seam_bin(pft: &FlatTree, node: usize, np: usize, stack: i32) -> (u8, i64) {
+    let sc = SeamCell::at_chance_node(pft, node, np);
+    conn_seam_bin_from(sc.live, sc.commit, pft.starting_pot + sc.pot, stack)
+}
+/// The representative `(live, commit, pot)` for a seam node — the FIRST node seen
+/// for a bin defines that cell's betting tree (deterministic given tree order, so
+/// solve + runtime agree).
+pub fn conn_seam_rep(pft: &FlatTree, node: usize, np: usize) -> (u8, i32, i32) {
+    let sc = SeamCell::at_chance_node(pft, node, np);
+    (sc.live, sc.commit, pft.starting_pot + sc.pot)
+}
+/// PER-LIVE cell key from an explicit `(live, commit, pot)` (`pot` = full pot incl.
+/// dead). See `conn_seam_bin` for the per-live policy.
+pub fn conn_seam_bin_from(live: u8, commit: i32, pot: i32, stack: i32) -> (u8, i64) {
+    let spr_bin = |w: f64| -> i64 {
+        let behind = stack - commit;
+        if behind <= 0 {
+            return i64::MIN;
+        }
+        ((behind as f64 / pot as f64).log2() / w).floor() as i64
+    };
+    match live {
+        // EXACT: unique i64 per (commit, pot). commit,pot ≥ 0 and ≪ 2^31.
+        0..=2 => (live, ((commit as i64) << 32) | (pot as i64 & 0xFFFF_FFFF)),
+        3 => (live, spr_bin(SPR_W3)),
+        4 => (live, spr_bin(SPR_W4)),
+        // live ≥ 5: one shared cell per live.
+        _ => (live, 0),
+    }
+}
 
 pub const BLP2_MAGIC: u32 = 0x42_4C_50_32;
 pub const GS14_MAGIC: u32 = 0x4753_3134;
@@ -159,8 +208,16 @@ pub fn subset_gs14(full: &Gs14Maps, flop: [Card; 3], bnt: usize, bnr: usize, nt:
 pub fn build_conn_preflop_tree(np: usize, nraises: usize) -> (FlatTree, Vec<i32>, usize, usize) {
     let mut spec = production_game_v1();
     spec.num_players = np as u8;
-    let raises: Vec<BetSize> = (0..nraises).map(|i| BetSize::PotRelative(1.0 + i as f64)).collect();
+    // RICH preflop menu: `nraises` pot-relative raise sizes PLUS an explicit ALL-IN
+    // (na = fold + call + nraises + all-in; nraises=5 ⇒ na=8 = CL_MAXNA ceiling). The
+    // preflop all-in is now AFFORDABLE because SPR-binning + the multiway postflop
+    // taper (build_conn_cell_tree) freed the regret budget — earlier it busted u32
+    // only because the exact-(commit,pot) postflop explosion left no room.
+    const RICH: [f64; 13] = [1.0, 0.5, 0.75, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 11.0];
     let pre_bets = if nraises > 0 {
+        let mut raises: Vec<BetSize> =
+            RICH.iter().take(nraises).map(|&f| BetSize::PotRelative(f)).collect();
+        raises.push(BetSize::AllIn);
         BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: raises }
     } else {
         BetSizeOptions { bet: vec![], raise: vec![] }
@@ -168,6 +225,9 @@ pub fn build_conn_preflop_tree(np: usize, nraises: usize) -> (FlatTree, Vec<i32>
     let mut pcfg = spec.preflop_tree_config(pre_bets);
     if nraises > 0 {
         pcfg.max_bets_per_street = BetCap::all(3);
+        // KEEP open-limps + flat-calls (no_open_limp / threebet_or_fold left FALSE):
+        // the production pool is loose-passive, so the bot must model and exploit
+        // limpers and cold-callers — raise-or-fold would throw that away.
     }
     let pft = build_tree_preflop_only(&pcfg).expect("preflop tree");
     let pnn = pft.num_nodes();
@@ -182,6 +242,57 @@ pub fn build_conn_preflop_tree(np: usize, nraises: usize) -> (FlatTree, Vec<i32>
         }
     }
     (pft, pre_local, pre_ninfo, pre_maxna)
+}
+
+/// Tapered postflop bet menu per street (Pluribus). FLOP "more coarse": fold/call
+/// + {0.33, 0.66, 1, 1.5}× pot + all-in (re-raise {0.66, 1}× + all-in). TURN/RIVER
+/// = the PUBLISHED Pluribus sizes: first {0.5, 1}× + all-in, subsequent {1}× +
+/// all-in. cap-3 raises/street. SHARED by `build_shrunk_cell` (solve) and
+/// `ConnCellLayout` (runtime) so the cell trees match byte-for-byte.
+pub fn build_conn_cell_tree(live: u8, commit: i32, pot: i32) -> FlatTree {
+    let pr = BetSize::PotRelative;
+    // PER-LIVE TAPER. Multiway postflop trees explode combinatorially (6-way is
+    // ~600× HU) and dominate the regret budget (live 5-6 = 92% of the floats), yet
+    // rich multiway sizing is both rare AND low-EV (multiway pots play simpler).
+    // So: rich HU/3-way (where the EV + volume is), medium 4-way, minimal 5-6-way.
+    // SHARED by solve + runtime ⇒ byte-exact. The flop, turn/river menus and the
+    // raise CAP all taper together.
+    let (flop, tr, cap) = match live {
+        // HU / 3-way: FULL rich menu (exact cells — the bulk of postflop volume).
+        0..=3 => (
+            BetSizeOptions {
+                bet: vec![pr(0.33), pr(0.66), pr(1.0), pr(1.5), BetSize::AllIn],
+                raise: vec![pr(0.66), pr(1.0), BetSize::AllIn],
+            },
+            BetSizeOptions {
+                bet: vec![pr(0.5), pr(1.0), BetSize::AllIn],
+                raise: vec![pr(1.0), BetSize::AllIn],
+            },
+            3u8,
+        ),
+        // 4-way: medium menu (3 sizes + all-in, cap-2) so the cells stay small
+        // enough to afford MANY fine SPR bins within the leftover u32 budget — a
+        // better fidelity trade for 4-way than a few rich bins.
+        4 => (
+            BetSizeOptions {
+                bet: vec![pr(0.66), pr(1.0), BetSize::AllIn],
+                raise: vec![pr(1.0), BetSize::AllIn],
+            },
+            BetSizeOptions { bet: vec![pr(1.0), BetSize::AllIn], raise: vec![BetSize::AllIn] },
+            2,
+        ),
+        // 5-6-way: one shared cell each (~never reached). Lean menu — a single pot
+        // bet, no raise war, no all-in (all-in-only multiway overflows the builder).
+        _ => (
+            BetSizeOptions { bet: vec![pr(1.0)], raise: vec![] },
+            BetSizeOptions { bet: vec![pr(1.0)], raise: vec![] },
+            1,
+        ),
+    };
+    let mut cfg = production_game_v1().flop_seam_config(live, commit, pot, flop);
+    cfg.max_bets_per_street = BetCap::all(cap);
+    build_tree_with_bet_override(&cfg, &[(BoardState::Turn, tr.clone()), (BoardState::River, tr)])
+        .expect("conn cell tree")
 }
 
 /// Deterministic runout grid for a canonical flop: `nt` evenly-spaced turn cards,
@@ -587,8 +698,10 @@ impl ShardedConnBlueprint {
 /// indexed into a flop's postflop shard. The reconstructed `post_stride` MUST equal
 /// the decoded shard length (a byte-exact correctness gate).
 pub struct ConnCellLayout {
+    /// Representative `(live, commit, pot)` per cell (the first seam seen for a bin).
     pub keys: Vec<(u8, i32, i32)>,
-    pub key_idx: std::collections::HashMap<(u8, i32, i32), usize>,
+    /// `(live, SPR-bin)` → cell index. SPR-binned so it matches `gpu_conn_solve`.
+    pub key_idx: std::collections::HashMap<(u8, i64), usize>,
     pub cell_trees: Vec<FlatTree>,
     pub cell_local: Vec<Vec<i32>>,
     pub cell_reg_base: Vec<usize>,
@@ -603,32 +716,24 @@ impl ConnCellLayout {
     /// (the production solve); `real=true` (cap-3 rich postflop) is not yet wired.
     pub fn build(np: usize, nraises: usize, nb: usize) -> Self {
         let (pft, _pl, _pn, pre_maxna) = build_conn_preflop_tree(np, nraises);
-        let cell_key = |node: usize| -> (u8, i32, i32) {
-            let fm = pft.get_folded_mask(node);
-            let contribs: Vec<i32> = (0..np).map(|p| pft.get_contribution(node, p as u8)).collect();
-            let live: Vec<usize> = (0..np).filter(|&p| (fm >> p) & 1 == 0).collect();
-            (live.len() as u8, contribs[live[0]], pft.starting_pot + contribs.iter().sum::<i32>())
-        };
+        let stack = production_game_v1().stack;
         let mut keys = Vec::new();
         let mut key_idx = std::collections::HashMap::new();
         for i in 0..pft.num_nodes() {
             if pft.nodes[i].is_chance() {
-                let k = cell_key(i);
-                if k.0 >= 2 && !key_idx.contains_key(&k) {
-                    key_idx.insert(k, keys.len());
-                    keys.push(k);
+                let bk = conn_seam_bin(&pft, i, np, stack);
+                if bk.0 >= 2 && !key_idx.contains_key(&bk) {
+                    key_idx.insert(bk, keys.len());
+                    keys.push(conn_seam_rep(&pft, i, np));
                 }
             }
         }
-        let spec = production_game_v1();
-        let bets = BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] };
         let mut cell_trees = Vec::with_capacity(keys.len());
         let mut cell_local = Vec::with_capacity(keys.len());
         let mut cell_ninfo = Vec::with_capacity(keys.len());
         let mut maxna = pre_maxna;
         for &(live, commit, pot) in &keys {
-            let cfg = spec.flop_seam_config(live, commit, pot, bets.clone());
-            let tree = build_tree(&cfg).expect("cell tree");
+            let tree = build_conn_cell_tree(live, commit, pot);
             let nn = tree.num_nodes();
             let mut local = vec![-1i32; nn];
             let mut ni = 0usize;
@@ -660,7 +765,9 @@ impl ConnCellLayout {
     /// `FlopLayout` (only the decision street's entry must be valid). Returns
     /// `(action_label, prob)` per child, or None if it doesn't resolve.
     pub fn postflop_action_dist(&self, post_cum: &[f32], live: u8, commit: i32, pot: i32, buckets: [usize; 3], history: &[(u8, i32)]) -> Option<Vec<(u8, i32, f32)>> {
-        let ki = *self.key_idx.get(&(live, commit, pot))?;
+        // SPR-bin the decision's (live, commit, pot) to find its cell (the rep tree).
+        let stack = production_game_v1().stack;
+        let ki = *self.key_idx.get(&conn_seam_bin_from(live, commit, pot, stack))?;
         let tree = &self.cell_trees[ki];
         let mut node = 0usize;
         let mut hi = 0usize;

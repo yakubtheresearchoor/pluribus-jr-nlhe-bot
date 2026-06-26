@@ -192,7 +192,7 @@ fn build_metal_shaders() {
     // Collect all .metal files
     // Collect all .metal files — compile as a single unit to resolve includes
     let metal_source_files =
-        ["vcfr.metal", "bucketed_vcfr.metal"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        ["vcfr.metal", "bucketed_vcfr.metal", "mccfr_bench.metal"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
     // Compile each .metal file to .air, then link all into one .metallib
     let mut air_files: Vec<PathBuf> = Vec::new();

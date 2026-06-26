@@ -9,6 +9,10 @@ use solver_core::blueprint::{
 };
 use solver_core::solver::preflop_start_game::PreflopChanceTable;
 
+/// Resolve a workspace-root path (tests run with CWD = crate dir).
+fn ws(p: &str) -> String { format!("{}/../{}", env!("CARGO_MANIFEST_DIR"), p) }
+fn bp() -> String { std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_v4")) }
+
 /// Serialize a known `gcum` into BLP2 bytes against the REAL rebuilt tree, load
 /// it back, and verify parse + index math + normalization + replay. No GPU
 /// needed — exercises the exact indexing path the runtime serves from.
@@ -124,15 +128,15 @@ fn phase_b_output_decodes_sane() {
     }
 }
 
-/// Load the REAL solved production blueprint (blueprint_conn_v1/) via the sharded
+/// Load the REAL solved production blueprint (blueprint_conn_v2/) via the sharded
 /// loader and verify it serves: preflop distributions are sane (sum to 1, premiums
 /// non-fold-heavy, trash fold-heavy), and a postflop shard decodes + the FlopLayout
 /// resolves a bucket. Skipped if the blueprint isn't present (CI).
 #[test]
 fn sharded_blueprint_serves_decisions() {
-    let dir = "blueprint_conn_v1";
+    let dir = bp();
     // production config: np=6, 1 preraise, nb=200, 16×16 runout, maxna=3.
-    let Ok(bp) = ShardedConnBlueprint::load(dir, 6, 1, 200, 16, 16, 3) else { return; };
+    let Ok(bp) = ShardedConnBlueprint::load(&dir, 6, 5, 200, 16, 16, 7) else { return; };
 
     // PREFLOP: open-or-fold from the first acting node (empty history). AA/KK
     // should be aggressive (low fold), 72o fold-heavier; all sum to 1.
@@ -164,22 +168,22 @@ fn sharded_blueprint_serves_decisions() {
 /// Skipped if blueprint/cache absent.
 #[test]
 fn postflop_cell_layout_and_flop_decision() {
-    let dir = "blueprint_conn_v1";
-    let Ok(bp) = ShardedConnBlueprint::load(dir, 6, 1, 200, 16, 16, 3) else { return; };
-    let layout = ConnCellLayout::build(6, 1, 200);
+    let dir = bp();
+    let Ok(bp) = ShardedConnBlueprint::load(&dir, 6, 5, 200, 16, 16, 7) else { return; };
+    let layout = ConnCellLayout::build(6, 5, 200);
     let post0 = bp.postflop_cum(0).expect("shard 0");
 
     // ★ GATE: reconstructed post_stride == decoded shard length (proves the whole
     // cell layout — trees, n_info, offsets, maxna — matches the solve byte-for-byte).
     assert_eq!(layout.post_stride, post0.len(),
         "reconstructed post_stride {} != shard length {}", layout.post_stride, post0.len());
-    assert_eq!(layout.maxna, 3);
+    assert!(layout.maxna >= 1 && layout.maxna <= 8, "postflop maxna={}", layout.maxna);
     assert!(!layout.keys.is_empty());
 
     // Flop decision: need the hero's flop bucket. flop_map is hand-indexed
     // (runout-independent), so the 49×48 cache's flop_map serves any subset.
     let nb = 200usize;
-    let mpath = gs14_cache_path("gs14_blueprint_cache", 0, nb, 49, 48);
+    let mpath = gs14_cache_path(&ws("gs14_blueprint_cache"), 0, nb, 49, 48);
     let Some(maps) = load_gs14_cache(&mpath, nb, 49, 48) else { return; };
     let ranges = vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6];
     let flop = PreflopChanceTable::new(6, ranges).canonical_flops[0];
@@ -202,9 +206,9 @@ fn postflop_cell_layout_and_flop_decision() {
 /// sane distribution — exercising chance-node traversal + per-street bucket indexing.
 #[test]
 fn postflop_turn_decision_resolves() {
-    let dir = "blueprint_conn_v1";
-    let Ok(bp) = ShardedConnBlueprint::load(dir, 6, 1, 200, 16, 16, 3) else { return; };
-    let layout = ConnCellLayout::build(6, 1, 200);
+    let dir = bp();
+    let Ok(bp) = ShardedConnBlueprint::load(&dir, 6, 5, 200, 16, 16, 7) else { return; };
+    let layout = ConnCellLayout::build(6, 5, 200);
     let post0 = bp.postflop_cum(0).expect("shard 0");
     if layout.keys.is_empty() { return; }
 
@@ -285,7 +289,7 @@ fn load_gs14_cache_if_present() {
 #[test]
 fn postflop_bucket_lookup_production_cache() {
     let (nb, nt, nr) = (200usize, 49usize, 48usize);
-    let path = gs14_cache_path("gs14_blueprint_cache", 0, nb, nt, nr);
+    let path = gs14_cache_path(&ws("gs14_blueprint_cache"), 0, nb, nt, nr);
     let Some(maps) = load_gs14_cache(&path, nb, nt, nr) else { return; };
 
     // Canonical flop 0 — same source the precompute used (uniform 6-max ranges).
@@ -317,4 +321,46 @@ fn postflop_bucket_lookup_production_cache() {
     let x = *deck.iter().find(|&&c| c != tc && c != deck[2]).unwrap();
     assert!(layout.flop_bucket(&maps, (tc, x)).is_some(), "(tc,x) should be live on the flop");
     assert!(layout.turn_bucket(&maps, (tc, x), tc).is_none(), "hand holding the turn card not dead on that turn");
+}
+
+/// MEASUREMENT (cargo test -p solver-core --test conn_blueprint config_fit -- --nocapture --ignored):
+/// per-live cell count + floats under the REAL per-live keying (conn_seam_bin) +
+/// build_conn_cell_tree — predicts the solve's regret_len before any GPU run.
+#[test]
+#[ignore]
+fn config_fit() {
+    use solver_core::blueprint::{build_conn_cell_tree, conn_seam_bin, conn_seam_rep};
+    use solver_core::tree::action::production_game_v1;
+    use std::collections::{BTreeMap, HashMap};
+    let (np, nraises) = (6usize, 5usize);
+    let (pft, _pl, pre_ninfo, pre_maxna) = build_conn_preflop_tree(np, nraises);
+    let stack = production_game_v1().stack;
+    let nb = 200usize;
+    // distinct cells (key -> rep), grouped by live
+    let mut cells: HashMap<(u8, i64), (u8, i32, i32)> = HashMap::new();
+    for i in 0..pft.num_nodes() {
+        if pft.nodes[i].is_chance() {
+            let bk = conn_seam_bin(&pft, i, np, stack);
+            if bk.0 >= 2 { cells.entry(bk).or_insert_with(|| conn_seam_rep(&pft, i, np)); }
+        }
+    }
+    // maxna = max(pre, postflop)
+    let mut maxna = pre_maxna;
+    let mut by_live: BTreeMap<u8, (usize, usize)> = BTreeMap::new();
+    for (_k, &(live, c, p)) in &cells {
+        let t = build_conn_cell_tree(live, c, p);
+        let ni = (0..t.num_nodes()).filter(|&n| t.nodes[n].is_player()).count();
+        let mx = (0..t.num_nodes()).map(|n| t.nodes[n].num_children as usize).max().unwrap_or(0);
+        maxna = maxna.max(mx);
+        let e = by_live.entry(live).or_insert((0, 0)); e.0 += 1; e.1 += ni;
+    }
+    let pre_floats = pre_ninfo * 169 * maxna;
+    println!("maxna={maxna}");
+    println!("preflop: {pre_ninfo} infosets -> {:.2}B floats", pre_floats as f64 / 1e9);
+    let mut tot = pre_floats;
+    for (live, (nc, ni)) in &by_live {
+        let fl = ni * nb * maxna; tot += fl;
+        println!("live={live}: {nc} cells, {ni} infosets -> {:.3}B floats", fl as f64 / 1e9);
+    }
+    println!("=> TOTAL regret_len = {:.3}B floats vs u32 4.29B -> {}", tot as f64 / 1e9, if tot < 4_294_967_295 { "FITS" } else { "OVER" });
 }

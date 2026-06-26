@@ -294,6 +294,34 @@ impl VectorCfr {
         cfv_avg
     }
 
+    /// WARM-START from a prior strategy (e.g. the blueprint transferred to the real
+    /// board). Seeds the regrets so the CURRENT strategy = the prior (regret-matching
+    /// of `prior·weight` returns the prior), and the cumulative strategy so the
+    /// extracted AVERAGE = the prior, both scaled by `weight` (≈ how many iterations
+    /// of "prior weight" to carry — larger = stickier). After this, `run` refines
+    /// from the prior instead of from uniform, so the in-budget average starts AT the
+    /// fallback and only improves. `prior(node_idx, na) -> [na*nh]` gives the target
+    /// strategy (action-major, hand-minor) at each decision node.
+    pub fn warm_start(&mut self, tree: &FlatTree, weight: f32, prior: impl Fn(usize, usize) -> Vec<f32>) {
+        let nh = self.nh;
+        for &nid in &tree.decision_node_ids {
+            let nidu = nid as usize;
+            let off = self.node_data_offset[nidu];
+            if off == UNUSED {
+                continue;
+            }
+            let na = tree.nodes[nidu].num_children as usize;
+            let p = prior(nidu, na);
+            for a in 0..na {
+                for h in 0..nh {
+                    let v = p[a * nh + h].max(0.0) * weight;
+                    self.regrets[off + a * nh + h] = v;
+                    self.cum_strategy[off + a * nh + h] = v;
+                }
+            }
+        }
+    }
+
     pub fn run(
         &mut self,
         tree: &FlatTree,

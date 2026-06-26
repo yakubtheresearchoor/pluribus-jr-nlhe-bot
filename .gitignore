@@ -33,3 +33,8 @@ gs14_blueprint_cache/
 
 # Connected MCCFR blueprint output (~770MB, regenerable ~45min)
 blueprint_conn_v1/
+
+# na=8 rich re-solve output
+blueprint_conn_v2/
+blueprint_conn_v3/
+blueprint_conn_v4/

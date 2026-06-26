@@ -12,6 +12,8 @@ pub mod flop_start_vector_cfr;
 pub mod preflop_start_game;
 pub mod preflop_cfr;
 pub mod preflop_terminal;
+pub mod preflop_allin_equity;
+pub mod preflop_jam_game;
 pub mod postflop_oracle;
 pub mod best_response;
 pub mod cross_tree;

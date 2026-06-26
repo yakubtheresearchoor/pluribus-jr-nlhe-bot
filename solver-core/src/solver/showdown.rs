@@ -1596,6 +1596,158 @@ fn tvrp_brute(
     sum
 }
 
+/// Factored (independent-opponent) per-hand total reach product
+/// `Π_oi R_oi(h)` — each opponent's card-removal-correct total reach at `h`,
+/// multiplied across opponents ASSUMING INDEPENDENCE (ignores inter-opponent
+/// card removal, the same approximation as `factored_showdown_eq_cfv`). This is
+/// the counterfactual reach normalizer for a CONSTANT-payoff terminal (the
+/// traverser folded, or wins uncontested): `cfv[h] = payoff × reach_prod[h]`.
+/// Replaces the exact O(nh^K) joint-reach brute force with O(nh·K).
+pub fn factored_total_reach_product(
+    opp_reach: &[&[f32]],
+    hand_cards: &[u8],
+    nh: usize,
+) -> Vec<f32> {
+    let num_opp = opp_reach.len();
+    let mut prod = vec![1.0f32; nh];
+    for r in opp_reach.iter().take(num_opp) {
+        let mut sum = 0.0f32;
+        let mut minus = [0.0f32; 52];
+        for ho in 0..nh {
+            let rr = r[ho];
+            if rr != 0.0 {
+                sum += rr;
+                minus[hand_cards[ho * 2] as usize] += rr;
+                minus[hand_cards[ho * 2 + 1] as usize] += rr;
+            }
+        }
+        for h in 0..nh {
+            let c1 = hand_cards[h * 2] as usize;
+            let c2 = hand_cards[h * 2 + 1] as usize;
+            let tot = sum - minus[c1] - minus[c2] + r[h];
+            prod[h] *= tot;
+        }
+    }
+    prod
+}
+
+/// FACTORED (independent-opponent) multiway showdown CFV — the "factored I-E"
+/// the brute-force `side_pot_showdown_cfv_with_rake` path documents as the
+/// production need for K≥2. Equal-contribution showdown only (no side pots):
+/// every active player is assumed to have matched `contributions[traverser]`.
+///
+/// Per active opponent `oi` we get card-removal-correct win/tie/total reach for
+/// each traverser hand `h` from the validated per-opponent sorted sweep, then
+/// combine across opponents ASSUMING INDEPENDENCE — i.e. we ignore inter-
+/// opponent card removal (two opponents can't hold the same card; the exact
+/// brute force excludes those joint draws, we don't). This drops cost from
+/// `O(nh^K)` to `O(nh·(K + 2^K))`, fast enough for a real-time turn/river
+/// re-solve. The independence error is validated against the brute force
+/// before use (see `factored_showdown_probe`).
+///
+/// Units match the brute-force path: reach-product-weighted, in chips
+/// (`half_pot × net_units`); the caller applies the global `/nc` normalization.
+/// `fold_mask` excludes folded players from the active set (their reach is not
+/// passed in `opp_reach`; `num_active_opp = opp_reach.len()`).
+#[allow(clippy::too_many_arguments)]
+pub fn factored_showdown_eq_cfv(
+    opp_reach: &[&[f32]],
+    hand_cards: &[u8],
+    nh: usize,
+    sorted_opp_str: &[u16],
+    sorted_opp_idx: &[u16],
+    sorted_pl_str: &[u16],
+    sorted_pl_idx: &[u16],
+    contributions: &[i32],
+    traverser: usize,
+    num_players: u8,
+    starting_pot: i32,
+    rake_rate: f32,
+    rake_cap: f32,
+    flop_seen: bool,
+) -> Vec<f32> {
+    let num_opp = opp_reach.len();
+    let np = num_players as usize;
+    let c_t = contributions[traverser];
+    let (eff_rake_rate, eff_rake_cap) = if flop_seen { (rake_rate, rake_cap) } else { (0.0, 0.0) };
+
+    // Equal-contribution at-risk half-pot: starting_pot split np ways + the
+    // traverser's own contribution. Matches the brute-force K≥2 path.
+    let half_pot = starting_pot as f32 / np as f32 + c_t as f32;
+    let total_pot: i32 = starting_pot + contributions.iter().sum::<i32>();
+    let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
+    let rpu = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
+    let k = num_opp as f32;
+
+    // Per-opponent card-removal-correct win/tie/total reach for each h.
+    let mut win = vec![vec![0.0f32; nh]; num_opp];
+    let mut tie = vec![vec![0.0f32; nh]; num_opp];
+    let mut tot = vec![vec![0.0f32; nh]; num_opp];
+    for oi in 0..num_opp {
+        let single: [&[f32]; 1] = [opp_reach[oi]];
+        let so_str = &sorted_opp_str[oi * nh..(oi + 1) * nh];
+        let so_idx = &sorted_opp_idx[oi * nh..(oi + 1) * nh];
+        let (_, w, t) = sorted_sweep_with_rake_components(
+            &single, hand_cards, nh, so_str, so_idx, sorted_pl_str, sorted_pl_idx,
+        );
+        win[oi] = w;
+        tie[oi] = t;
+        // total reach minus the traverser's two cards (inclusion-exclusion).
+        let r = opp_reach[oi];
+        let mut sum = 0.0f32;
+        let mut minus = [0.0f32; 52];
+        for ho in 0..nh {
+            let rr = r[ho];
+            if rr != 0.0 {
+                sum += rr;
+                minus[hand_cards[ho * 2] as usize] += rr;
+                minus[hand_cards[ho * 2 + 1] as usize] += rr;
+            }
+        }
+        for h in 0..nh {
+            let c1 = hand_cards[h * 2] as usize;
+            let c2 = hand_cards[h * 2 + 1] as usize;
+            // +r[h]: the (c1,c2) hand was double-subtracted (it uses both).
+            tot[oi][h] = sum - minus[c1] - minus[c2] + r[h];
+        }
+    }
+
+    let mut cfv = vec![0.0f32; nh];
+    let nsub = 1u32 << num_opp;
+    for h in 0..nh {
+        // tot_prod (all opponents present) and wt_prod (all opp ≤ h) under
+        // independence.
+        let mut tot_prod = 1.0f32;
+        let mut wt_prod = 1.0f32;
+        for oi in 0..num_opp {
+            tot_prod *= tot[oi][h];
+            wt_prod *= win[oi][h] + tie[oi][h];
+        }
+        // At-top mass split by tie multiplicity: Σ_{S⊆opp} Π_{oi∈S} tie ×
+        // Π_{oi∉S} win, weighted by net_unit(|S|+1). Σ over subsets of this
+        // product == wt_prod (consistency check), distributed over tie counts.
+        let mut at_top = 0.0f32;
+        for s in 0..nsub {
+            let mut prod = 1.0f32;
+            let mut t = 1u32; // traverser + tied opponents
+            for oi in 0..num_opp {
+                if s & (1 << oi) != 0 {
+                    prod *= tie[oi][h];
+                    t += 1;
+                } else {
+                    prod *= win[oi][h];
+                }
+            }
+            let tf = t as f32;
+            let net = (k + 1.0 - tf) / tf - rpu / tf;
+            at_top += prod * net;
+        }
+        let loss = tot_prod - wt_prod; // some opponent beats h
+        cfv[h] = half_pot * (at_top - loss);
+    }
+    cfv
+}
+
 /// Compute `TotalValidReachProduct(h)` for each `h` — the I-E quantity:
 ///
 /// ```text

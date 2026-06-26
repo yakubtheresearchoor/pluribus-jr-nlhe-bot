@@ -73,10 +73,11 @@ async fn main() {
     });
 
     // Connected blueprint (CONN_BP=dir): preflop + flop decisions by lookup. Needs
-    // CONN_GS14 (the 49×48 GS14 bucket cache). Config defaults to blueprint_conn_v1.
+    // CONN_GS14 (the 49×48 GS14 bucket cache). v4 = exact HU + fine 3/4-way SPR bins + lean 5-6way
+    // + SPR-binned, multiway-tapered postflop ⇒ params (np=6, nraises=5, nb=200, maxna=7).
     let conn = std::env::var("CONN_BP").ok().map(|dir| {
         let gs14 = std::env::var("CONN_GS14").unwrap_or_else(|_| "gs14_blueprint_cache".into());
-        let d = play_harness::api_conn::ConnDecider::load(&dir, &gs14, 6, 1, 200, 3)
+        let d = play_harness::api_conn::ConnDecider::load(&dir, &gs14, 6, 5, 200, 7)
             .expect("load CONN_BP connected blueprint");
         eprintln!("loaded connected blueprint from {dir} (gs14={gs14})");
         Arc::new(d)

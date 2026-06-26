@@ -23,21 +23,17 @@ use solver_core::solver::preflop_cfr::{
     make_bootstrap_terminal_value_fn_multiway_pairwise, PreflopVectorCfr,
 };
 use solver_core::solver::preflop_start_game::PreflopChanceTable;
-use solver_core::tree::action::{production_game_v1, BetCap, BetSize, BetSizeOptions};
-use solver_core::tree::builder::build_tree_preflop_only;
+use solver_core::tree::action::production_game_v1;
 use solver_core::tree::flat::{FlatTree, MAX_NA_PREFLOP};
 
-/// The production cap-3 preflop tree (v1 game class, MAX_NA_PREFLOP-derived
-/// raise ladder — 6 sizes at MAX_NA_PREFLOP=8 — capped at 3 bets/street).
+/// The production preflop tree — the SINGLE SOURCE OF TRUTH shared with the
+/// connected solve (`gpu_conn_solve`) and the runtime loader: 5 pot-relative raise
+/// sizes + an explicit ALL-IN (na=8), cap-3, LIMP-INCLUSIVE (no_open_limp /
+/// threebet_or_fold left FALSE so the loose-passive pool's limps/cold-calls are
+/// modelled). Using `build_conn_preflop_tree` here makes the preflop strategy
+/// interchangeable with the connected blueprint — the prerequisite for co-solving.
 fn cap3_preflop_tree() -> FlatTree {
-    let spec = production_game_v1();
-    let mrc = MAX_NA_PREFLOP.saturating_sub(2);
-    let mut cfg = spec.preflop_tree_config(BetSizeOptions {
-        bet: vec![BetSize::PotRelative(1.0)],
-        raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
-    });
-    cfg.max_bets_per_street = BetCap::all(3);
-    build_tree_preflop_only(&cfg).expect("cap-3 preflop tree")
+    solver_core::blueprint::build_conn_preflop_tree(6, 5).0
 }
 
 fn load_cells(root: &str) -> Vec<(u8, i32, i32, usize)> {

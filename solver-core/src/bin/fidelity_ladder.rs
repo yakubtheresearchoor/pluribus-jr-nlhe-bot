@@ -82,7 +82,14 @@ fn main() {
         for (bi, &nb) in bs.iter().enumerate() {
             let bk = FlopBucketing::quantile(game.table(), nb);
             let mut s = BucketedFlopCfr::new(&tree, game.table(), &bk);
-            s.set_terminal_design(TerminalDesign::Design1Collapsed);
+            // FL_TERM=factored ⇒ the precomputed-equity (Pluribus-style) terminal
+            // (O(M·K), flat in B); default = the production Design1Collapsed (B^K).
+            // Design2Factored is np≥4 only, so it applies to live-4/5.
+            let term = match std::env::var("FL_TERM").as_deref() {
+                Ok("factored") if live >= 4 => TerminalDesign::Design2Factored,
+                _ => TerminalDesign::Design1Collapsed,
+            };
+            s.set_terminal_design(term);
 
             #[cfg(feature = "metal")]
             let ms = {

@@ -166,7 +166,10 @@ impl FlatNode {
 // preflop.blob is na=8, so the analysis tree must match it. (joint_solve
 // runs fine at either na; flip back to 16 before the full joint run.)
 pub const MAX_NA_PREFLOP: usize = 16;
-pub const MAX_NA_POSTFLOP: usize = 4;
+// 4→6 for the tapered postflop (flop: check/call + up to 4 bet/all-in options;
+// turn/river: the published Pluribus 0.5/1×+all-in). In the CONNECTED solve the
+// regret cost is LINEAR in maxna, not the O(maxna^5) the old factored path warns of.
+pub const MAX_NA_POSTFLOP: usize = 6;
 
 pub const VCFR_NO_INFOSET: u32 = u32::MAX;
 

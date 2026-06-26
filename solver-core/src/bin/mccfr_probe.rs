@@ -210,23 +210,12 @@ pub fn build_shrunk_cell(live: u8, commit: i32, pot: i32, nb: usize, nt: usize, 
     // more terminal types) than the simple single-bet tree — Phase-0 re-certifies
     // the anchor on THIS, since the card-removal/per-street bugs were found on the
     // simpler tree and the real tree must be re-checked.
-    let real = std::env::var("MC_REAL").is_ok();
-    let bets = if real {
-        let mrc = MAX_NA_POSTFLOP.saturating_sub(2);
-        BetSizeOptions {
-            bet: vec![BetSize::PotRelative(1.0)],
-            raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
-        }
-    } else {
-        BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] }
-    };
     let cflops = canonical_flops_cached();
     let flop_idx: usize = std::env::var("MC_FLOP").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let canonical = cflops[flop_idx.min(cflops.len() - 1)];
     let (turns, river_decks) = runout_grid(canonical, nt, nr);
-    let mut cfg = spec.flop_seam_config(live, commit, pot, bets);
-    if real { cfg.max_bets_per_street = BetCap::all(3); }
-    let tree = build_tree(&cfg).unwrap();
+    // TAPERED postflop menu (Pluribus) — SHARED with the runtime ConnCellLayout.
+    let tree = solver_core::blueprint::build_conn_cell_tree(live, commit, pot);
     let table = FlopChanceTable::build_full_nh_sampled(canonical, live, &turns, &river_decks);
     // MC_IDENTITY=1: identity bucketing (nb=nh) ⇒ the bucketed game IS the exact
     // game, so converged DCFR is a TRUE Nash (exploitability→0) — the localization
@@ -3433,21 +3422,23 @@ fn gpu_conn_solve() {
     let (pft, pre_local, pre_ninfo, pre_maxna) =
         solver_core::blueprint::build_conn_preflop_tree(np, nraises);
     let pnn = pft.num_nodes();
-    // SEAM CELLS keyed by (live, commit, pot): every distinct preflop betting line gets
-    // its own postflop cell (Pluribus action gradient). fold/call ⇒ one cell per live;
-    // raises ⇒ more cells. All cells share g2's card bucketing (pot-independent).
-    let cell_key = |node: usize| -> (u8, i32, i32) {
-        let fm = pft.get_folded_mask(node);
-        let contribs: Vec<i32> = (0..np).map(|p| pft.get_contribution(node, p as u8)).collect();
-        let live: Vec<usize> = (0..np).filter(|&p| (fm >> p) & 1 == 0).collect();
-        (live.len() as u8, contribs[live[0]], pft.starting_pot + contribs.iter().sum::<i32>())
-    };
+    // SEAM CELLS keyed by (live, SPR-bin) — NOT exact (commit, pot). The rich-preflop
+    // exact key explodes to ~9366 cells ⇒ 48.6B floats/flop, 11× over the u32 offset
+    // ceiling (this corrupted blueprint_conn_v2). SPR-binning collapses it ~230× while
+    // keeping the rich sizing: postflop play is ~SPR-determined, so seams with the same
+    // (live, SPR-bin) share one cell built at the FIRST-seen representative (commit,pot).
+    let stack = production_game_v1().stack;
     let mut keys: Vec<(u8, i32, i32)> = Vec::new();
-    let mut key_idx: std::collections::HashMap<(u8, i32, i32), usize> = std::collections::HashMap::new();
+    let mut key_idx: std::collections::HashMap<(u8, i64), usize> = std::collections::HashMap::new();
     for i in 0..pnn {
         if pft.nodes[i].is_chance() {
-            let k = cell_key(i);
-            if k.0 >= 2 && !key_idx.contains_key(&k) { key_idx.insert(k, keys.len()); keys.push(k); }
+            let bk = solver_core::blueprint::conn_seam_bin(&pft, i, np, stack);
+            if bk.0 >= 2 {
+                key_idx.entry(bk).or_insert_with(|| {
+                    keys.push(solver_core::blueprint::conn_seam_rep(&pft, i, np));
+                    keys.len() - 1
+                });
+            }
         }
     }
     let mut cells: Vec<Mccfr> = Vec::new();
@@ -3527,13 +3518,29 @@ fn gpu_conn_solve() {
     let pre_region = pre_ninfo * NUM_PREFLOP_CLASSES * maxna;
     let mut cell_node_base = vec![0usize; keys.len()];
     let mut cell_reg_base = vec![0u32; keys.len()];
-    let mut node_off = pnn; let mut reg_off = pre_region as u32;
+    // Accumulate offsets in USIZE (not u32) so the guard below can SEE an overflow.
+    // The regret buffer is indexed by u32 offsets in the kernel; if the true region
+    // exceeds the u32 ceiling the offsets silently wrap and cells alias onto each
+    // other (and the preflop) → corrupt solve. This bit the first rich-na=8 attempt
+    // (9366 exact-(commit,pot) cells ⇒ ~48.6B floats/flop, 11× over u32). Fix is
+    // SPR-bin cells; until then, FAIL LOUDLY rather than write garbage.
+    let mut node_off = pnn;
+    let mut reg_off: usize = pre_region;
     for ki in 0..keys.len() {
-        cell_node_base[ki] = node_off; cell_reg_base[ki] = reg_off;
+        cell_node_base[ki] = node_off;
+        cell_reg_base[ki] = reg_off as u32;
         node_off += cell_trees[ki].num_nodes();
-        reg_off += (cells[ki].n_info * mnb * maxna) as u32;
+        reg_off += cells[ki].n_info * mnb * maxna;
     }
-    let reg_total = reg_off as usize;
+    let reg_total = reg_off;
+    assert!(
+        reg_total <= u32::MAX as usize,
+        "postflop regret region {reg_total} floats EXCEEDS the u32 offset ceiling {} \
+         ({} seam cells × nb={mnb} × maxna={maxna}) — exact-(commit,pot) cell explosion; \
+         the u32 kernel offsets would wrap + alias. Need SPR-bin cells (collapse cells) \
+         or u64 offsets before solving this abstraction.",
+        u32::MAX, keys.len(),
+    );
     // preflop nodes
     for i in 0..pnn {
         let n = &pft.nodes[i];
@@ -3542,8 +3549,8 @@ fn gpu_conn_solve() {
         for p in 0..np { c_contrib[i * np + p] = pft.get_contribution(i, p as u8); }
         c_spot[i] = pft.starting_pot; c_regbase[i] = 0; c_nb[i] = NUM_PREFLOP_CLASSES as u32;
         if n.is_chance() {
-            // SEAM: rewire to the cell for this line's (live, commit, pot) key.
-            let ki = key_idx[&cell_key(i)];
+            // SEAM: rewire to the cell for this line's (live, SPR-bin) key.
+            let ki = key_idx[&solver_core::blueprint::conn_seam_bin(&pft, i, np, stack)];
             c_seam[i] = 1; c_nch[i] = 1; c_chstart[i] = children.len() as u32;
             children.push(cell_node_base[ki] as u32);
         } else {

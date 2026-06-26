@@ -13,11 +13,57 @@ use play_harness::match_play::{MatchEnv, Policy};
 use play_harness::pool_preflop::PoolPreflop;
 use play_harness::preflop_player::{splitmix64, PreflopPlayer};
 use solver_core::abstraction::preflop_class::NUM_PREFLOP_CLASSES;
+use solver_core::solver::bucketed_search::BucketedContinuationGame;
+use solver_core::solver::mccfr::CpuMccfr;
 use solver_core::solver::preflop_start_game::PreflopChanceTable;
-use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions};
+use solver_core::tree::action::{production_game_v1, BetSize, BetSizeOptions, BoardState};
 use solver_core::tree::builder::build_tree;
 use solver_core::tree::flat::FlatTree;
 use std::collections::HashMap;
+
+/// Real-time FLOP search for a cell: build the lossless+bucketed-sampled
+/// continuation game from the loaded blueprint, depth-limit at the turn entry,
+/// run depth-limited CFR (k=4 multi-continuation, sharp λ), and extract the
+/// searched per-flop-node strategy [na][nh]. The bot plays this on the flop;
+/// turn/river fall back to the blueprint (the frozen one-round continuation).
+fn search_flop(
+    bp: &play_harness::blueprint::Blueprint,
+    tree: &FlatTree,
+    iters: u32,
+    lambda: f32,
+    sample_m: u32,
+) -> HashMap<usize, Vec<Vec<f32>>> {
+    let game = BucketedContinuationGame::new(&bp.game, &bp.bk, sample_m, 0x5EA12C);
+    let np = tree.num_players as usize;
+    let nh = bp.nh;
+    let flop = BoardState::Flop as u8;
+    let mut depth: Vec<usize> = Vec::new();
+    for n in 0..tree.num_nodes() {
+        if tree.nodes[n].is_player() && tree.nodes[n].board_state == flop {
+            for &c in tree.node_children(n) {
+                let cn = &tree.nodes[c as usize];
+                if cn.is_chance() || cn.board_state != flop {
+                    depth.push(c as usize);
+                }
+            }
+        }
+    }
+    depth.sort_unstable();
+    depth.dedup();
+    let mut s = CpuMccfr::new(tree, vec![nh; np]);
+    s.set_depth_limit(&depth);
+    s.setup_pluribus_continuations(tree, 4, 5.0);
+    s.set_lambda(vec![lambda; np]);
+    s.run(tree, &game, iters);
+    let mut out = HashMap::new();
+    for n in 0..tree.num_nodes() {
+        if tree.nodes[n].is_player() && tree.nodes[n].board_state == flop {
+            let na = tree.nodes[n].num_children as usize;
+            out.insert(n, s.get_average_strategy(n, na, nh));
+        }
+    }
+    out
+}
 
 fn seam_tree(live: u8, commit: i32, pot: i32) -> FlatTree {
     let spec = production_game_v1();
@@ -61,6 +107,14 @@ fn production_baseline_bb100() {
     // owned caches (MatchEnv borrows; rebuilt per hand from cached bp+tree)
     let mut bps: HashMap<(String, usize), Blueprint> = HashMap::new();
     let mut trees: HashMap<(u8, i32, i32), FlatTree> = HashMap::new();
+    // SEARCH=1 → bot plays REAL-TIME FLOP SEARCH (lossless + bucketed-sampled
+    // continuation, k=4, sharp λ) instead of the banked blueprint. Cached per
+    // (cell, flop) — the entering range is the cell's, fixed (blueprint reach
+    // prior). SEARCH_ITERS tunes the per-decision solve depth.
+    let search_on = std::env::var("SEARCH").is_ok();
+    let search_iters: u32 =
+        std::env::var("SEARCH_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(160);
+    let mut search_cache: HashMap<(String, usize), HashMap<usize, Vec<Vec<f32>>>> = HashMap::new();
 
     let n: u64 = std::env::var("BP_HANDS").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);
     let mut rng = 0xBA5E_u64;
@@ -117,8 +171,15 @@ fn production_baseline_bb100() {
                 let live = fe.live;
                 trees.entry((live, commit, pot)).or_insert_with(|| seam_tree(live, commit, pot));
                 bps.entry((dir.clone(), fi)).or_insert_with(|| Blueprint::load(&bp_path).unwrap());
+                let skey = (dir.clone(), fi);
                 let tree = &trees[&(live, commit, pot)];
                 let bp = &bps[&(dir, fi)];
+                // real-time flop search (cached per cell+flop)
+                if search_on && !search_cache.contains_key(&skey) {
+                    let sc = search_flop(bp, tree, search_iters, 300.0, 200);
+                    search_cache.insert(skey.clone(), sc);
+                }
+                let searched = if search_on { search_cache.get(&skey) } else { None };
                 let env = MatchEnv::new(bp, tree);
                 // live seats in order → seam seats 0..live-1
                 let live_seats: Vec<usize> = (0..6).filter(|&p| !fe.folded[p]).collect();
@@ -138,7 +199,7 @@ fn production_baseline_bb100() {
                     })
                     .collect();
                 let dead = (pot - live as i32 * commit).max(0) as u32;
-                match env.play_seam(&sp, &sh, commit as u32, dead, rake_spec, &mut rng, None) {
+                match env.play_seam(&sp, &sh, commit as u32, dead, rake_spec, &mut rng, None, searched) {
                     Some((net, term_live)) => {
                         pf_hands += 1.0;
                         if term_live == 1 { pf_foldout += 1.0; }

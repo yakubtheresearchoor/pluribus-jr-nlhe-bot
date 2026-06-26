@@ -88,35 +88,53 @@ fn main() {
         "live-2 strategy fill: {} buckets × {nflop} flops, {threads} threads, cfv={} → {out}",
         blist.len(), bank_cfv,
     );
+    // FLOP-LEVEL work-stealing: build each bin's tree once, then steal over (bin,flop)
+    // units so ALL threads attack the missing blobs (a RESUME with a few partial bins
+    // would otherwise leave most cores idle under bin-level parallelism). Skip-existing
+    // makes it resume-safe + idempotent.
+    let trees: Vec<_> = blist
+        .iter()
+        .map(|(_, cell)| build_tree(&spec.flop_seam_config(2, cell.commit, cell.pot, bets.clone())).expect("live-2 seam tree"))
+        .collect();
+    for (key, _) in &blist {
+        std::fs::create_dir_all(format!("{out}/S{}", key.1)).expect("mkdir bin");
+    }
+    let nbins = blist.len();
+    let units = nbins * nflop;
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let total = blist.len();
     let t0 = Instant::now();
     std::thread::scope(|s| {
-        for _ in 0..threads.min(total) {
+        for _ in 0..threads {
             s.spawn(|| loop {
-                let k = next.fetch_add(1, Ordering::Relaxed);
-                if k >= total { break; }
-                let (key, cell) = &blist[k];
-                let tree = build_tree(&spec.flop_seam_config(2, cell.commit, cell.pot, bets.clone()))
-                    .expect("live-2 seam tree");
-                let dir = format!("{out}/S{}", key.1);
-                std::fs::create_dir_all(&dir).expect("mkdir bin");
-                for (fi, &canonical) in canon.iter().enumerate().take(nflop) {
-                    let solver = solve_live2(canonical, fi, &tree);
-                    save_live2_v2(&format!("{dir}/flop_{fi:04}.bp2"), &solver, cell.commit, cell.pot, fi)
-                        .expect("save live-2 blob");
-                    if bank_cfv {
-                        let per_live = cfv_live2(canonical, fi, &tree);
-                        write_prebanked(&cfv_root, *key, fi, &per_live);
-                    }
+                let u = next.fetch_add(1, Ordering::Relaxed);
+                if u >= units {
+                    break;
+                }
+                let (bin, fi) = (u / nflop, u % nflop);
+                let (key, cell) = &blist[bin];
+                let path = format!("{out}/S{}/flop_{fi:04}.bp2", key.1);
+                if std::path::Path::new(&path).exists() {
+                    continue; // resume: already banked
+                }
+                let canonical = canon[fi];
+                let solver = solve_live2(canonical, fi, &trees[bin]);
+                save_live2_v2(&path, &solver, cell.commit, cell.pot, fi).expect("save live-2 blob");
+                if bank_cfv {
+                    let per_live = cfv_live2(canonical, fi, &trees[bin]);
+                    write_prebanked(&cfv_root, *key, fi, &per_live);
                 }
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                let el = t0.elapsed().as_secs_f64();
-                eprintln!("[{d}/{total}] bin S{} (c={} p={}) done | {:.1} min | ETA {:.1} min",
-                    key.1, cell.commit, cell.pot, el / 60.0, el / d as f64 * (total - d) as f64 / 60.0);
+                if d % 200 == 0 {
+                    let el = t0.elapsed().as_secs_f64();
+                    eprintln!("  +{d} solved | {:.1} min | {:.2} blob/s", el / 60.0, d as f64 / el);
+                }
             });
         }
     });
-    eprintln!("LIVE2_FILL_COMPLETE: {total} buckets in {:.1} min → {out}", t0.elapsed().as_secs_f64() / 60.0);
+    eprintln!(
+        "LIVE2_FILL_COMPLETE: {} new blobs in {:.1} min → {out}",
+        done.load(Ordering::Relaxed),
+        t0.elapsed().as_secs_f64() / 60.0
+    );
 }
