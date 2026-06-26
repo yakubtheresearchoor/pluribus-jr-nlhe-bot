@@ -206,6 +206,14 @@ pub fn banked_read_source(
     let mut trees: HashMap<(u8, i32, i32), Arc<FlatTree>> = HashMap::new();
     // (bucket_key, canonical) -> per-live layout-ordered CFV
     let mut cache: HashMap<((u8, i64), [Card; 3]), Vec<Vec<f32>>> = HashMap::new();
+    // PROGRESS: instrument the lazy cache-fill so a short run reveals the fill
+    // rate (cells/sec) — the iter-1 oracle fill is the dominant cost and its
+    // size scales with how many distinct SPR-bucket seams the preflop tree
+    // reaches. Gated on PF_ORACLE_PROGRESS to stay silent in production.
+    let progress = std::env::var("PF_ORACLE_PROGRESS").is_ok();
+    let t_fill = std::time::Instant::now();
+    let mut misses: usize = 0;
+    let mut live2_misses: usize = 0;
 
     move |cell, folded_mask, canonical, combo_reaches, traverser| {
         let np = combo_reaches.len();
@@ -262,6 +270,17 @@ pub fn banked_read_source(
                 cfv_rollout_live3plus(canonical, fi, &tree, cell.live, nb)
             };
             cache.insert((key, canonical), per_live);
+            misses += 1;
+            if cell.live == 2 {
+                live2_misses += 1;
+            }
+            if progress && misses % 200 == 0 {
+                let s = t_fill.elapsed().as_secs_f64();
+                eprintln!(
+                    "    [oracle fill] {misses} cells ({live2_misses} live-2 re-solves) in {s:.1}s = {:.1} cells/s",
+                    misses as f64 / s,
+                );
+            }
         }
         cache[&(key, canonical)][trav_live].clone()
     }

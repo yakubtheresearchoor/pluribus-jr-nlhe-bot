@@ -3428,11 +3428,19 @@ fn gpu_conn_solve() {
     // keeping the rich sizing: postflop play is ~SPR-determined, so seams with the same
     // (live, SPR-bin) share one cell built at the FIRST-seen representative (commit,pot).
     let stack = production_game_v1().stack;
+    // COARSE Phase-A cells (god-tier preflop): collapse all SPR bins per live to ONE cell
+    // (bin 0), built at the first-seen (commit,pot) rep. Shrinks post_stride ~600× so the
+    // shared preflop can train over a LARGE orbit-weighted MC_NF flop set within the u32
+    // offset + GPU-memory ceilings. Phase B re-solves each flop's postflop at FULL v4
+    // fidelity against the frozen preflop, so the lean Phase-A postflop only has to be good
+    // enough to converge the preflop — not to ship. (Off ⇒ the rich v4 cell set.)
+    let conn_coarse = std::env::var("MC_CONN_COARSE").is_ok();
     let mut keys: Vec<(u8, i32, i32)> = Vec::new();
     let mut key_idx: std::collections::HashMap<(u8, i64), usize> = std::collections::HashMap::new();
     for i in 0..pnn {
         if pft.nodes[i].is_chance() {
-            let bk = solver_core::blueprint::conn_seam_bin(&pft, i, np, stack);
+            let mut bk = solver_core::blueprint::conn_seam_bin(&pft, i, np, stack);
+            if conn_coarse { bk.1 = 0; }
             if bk.0 >= 2 {
                 key_idx.entry(bk).or_insert_with(|| {
                     keys.push(solver_core::blueprint::conn_seam_rep(&pft, i, np));
@@ -3464,6 +3472,21 @@ fn gpu_conn_solve() {
         (0..nf_flops).map(|i| (i * step) % 1755).collect()
     } else {
         vec![std::env::var("MC_FLOP").ok().and_then(|s| s.parse().ok()).unwrap_or(representative_flop_idx())]
+    };
+    // ORBIT-WEIGHTED flop frequencies (god-tier preflop): a canonical flop stands for
+    // `orbit_of().len()` actual flops (×4 monotone / ×12 two-tone / ×24 rainbow). UNIFORM-
+    // over-canonical sampling over-weights rare suit patterns and biases the SHARED preflop;
+    // sampling each selected flop ∝ its orbit size trains the preflop against the TRUE flop
+    // distribution. NF=1 collapses to weight 1. The CDF gives O(log NF) host-side sampling.
+    let flop_w: Vec<f64> = {
+        use solver_core::abstraction::flop_isomorphism::{enumerate_canonical_flops, orbit_of};
+        let canon = enumerate_canonical_flops();
+        flop_indices.iter().map(|&fi| orbit_of(canon[fi]).len() as f64).collect()
+    };
+    let flop_cdf: Vec<f64> = {
+        let tot: f64 = flop_w.iter().sum();
+        let mut c = 0.0;
+        flop_w.iter().map(|&w| { c += w / tot; c }).collect()
     };
     let mut hand_cls: Vec<u32> = Vec::new();
     let mut flop_b: Vec<u16> = Vec::new();
@@ -3550,7 +3573,9 @@ fn gpu_conn_solve() {
         c_spot[i] = pft.starting_pot; c_regbase[i] = 0; c_nb[i] = NUM_PREFLOP_CLASSES as u32;
         if n.is_chance() {
             // SEAM: rewire to the cell for this line's (live, SPR-bin) key.
-            let ki = key_idx[&solver_core::blueprint::conn_seam_bin(&pft, i, np, stack)];
+            let mut bk = solver_core::blueprint::conn_seam_bin(&pft, i, np, stack);
+            if conn_coarse { bk.1 = 0; }
+            let ki = key_idx[&bk];
             c_seam[i] = 1; c_nch[i] = 1; c_chstart[i] = children.len() as u32;
             children.push(cell_node_base[ki] as u32);
         } else {
@@ -3619,7 +3644,10 @@ fn gpu_conn_solve() {
                 let mut rng = 0x9E3779B97F4A7C15u64.wrapping_mul(total + b as u64 + 1) | 1;
                 let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; rng };
                 seeds[b] = nx() | 1;
-                let fi = (nx() as usize) % nf_flops;
+                // ORBIT-WEIGHTED flop draw (∝ suit-isomorphism multiplicity) so the shared
+                // preflop trains against the true flop distribution, not uniform-over-canonical.
+                let u = (nx() >> 11) as f64 / ((1u64 << 53) as f64);
+                let fi = flop_cdf.partition_point(|&c| c < u).min(nf_flops - 1);
                 fis[b] = fi as u32;
                 let (valid, hcards) = (&valid_f[fi], &hcards_f[fi]);
                 let mut used = 0u64; let mut k = 0;
@@ -3671,6 +3699,32 @@ fn gpu_conn_solve() {
         let rg: &[f32] = unsafe { std::slice::from_raw_parts(b_reg.contents() as *const f32, reg_buf_len) };
         let maxr = rg.iter().cloned().fold(0.0f32, f32::max);
         println!("{:>12} {:>14.4e} {:>10.1}", total, maxr / total as f32, total as f64 / run_s / 1e6);
+        // PHASE-A PREFLOP RANGE (validation): open-node raise/fold% for key hands from the
+        // SHARED preflop avg-strategy (b_cum over pre_region). Sanity for a god-tier preflop:
+        // AA/KK raise ~100% & never fold, AKs raises heavily, T9s mixes, 72o/32o fold. The
+        // NF=1 bias (pairs fold ~0, non-pairs over-fold) shows here as broken non-pair folds.
+        {
+            use solver_core::abstraction::preflop_class::PreflopClass;
+            use solver_core::card::card_from_str;
+            let cum: &[f32] = unsafe { std::slice::from_raw_parts(b_cum.contents() as *const f32, pre_region) };
+            let nc = NUM_PREFLOP_CLASSES;
+            let open = (0..pnn).find(|&i| pre_local[i] >= 0).unwrap_or(0);
+            let local = pre_local[open] as usize;
+            let na = pft.nodes[open].num_children as usize;
+            let off = local * nc * maxna;
+            let labels: Vec<u8> = pft.node_children(open).iter().map(|&c| pft.nodes[c as usize].action_label).collect();
+            let rf = |cl: usize, want: u8| -> f32 {
+                let s: f32 = (0..na).map(|a| cum[off + a*nc + cl].max(0.0)).sum();
+                if s <= 0.0 { return 0.0; }
+                let r: f32 = (0..na).filter(|&a| labels[a]==want).map(|a| cum[off + a*nc + cl].max(0.0)).sum();
+                r / s
+            };
+            let ix = |a:&str,b:&str| PreflopClass::from_combo(card_from_str(a).unwrap(), card_from_str(b).unwrap()).index();
+            let pr = |a:&str,b:&str| (rf(ix(a,b),4)*100.0, rf(ix(a,b),0)*100.0);
+            let (aar,aaf)=pr("Ac","Ad"); let (kkr,kkf)=pr("Kc","Kd"); let (aksr,aksf)=pr("Ac","Kc");
+            let (t9r,t9f)=pr("Tc","9c"); let (o72r,o72f)=pr("7c","2d"); let (o32r,o32f)=pr("3c","2d");
+            println!("  PHASE-A open raise/fold%: AA {aar:.0}/{aaf:.0} | KK {kkr:.0}/{kkf:.0} | AKs {aksr:.0}/{aksf:.0} | T9s {t9r:.0}/{t9f:.0} | 72o {o72r:.0}/{o72f:.0} | 32o {o32r:.0}/{o32f:.0}");
+        }
     }
 
     // ── PER-FLOP BLUEPRINT BUILD (single-pass + reach-prior) ──────────────
