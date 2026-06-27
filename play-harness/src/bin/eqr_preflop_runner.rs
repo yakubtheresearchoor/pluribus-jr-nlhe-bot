@@ -201,7 +201,17 @@ fn main() {
     // realized-EV continuation prices the resulting multiway pots.
     let no_open_limp = std::env::var("PF_OPENLIMP").map(|v| v == "0").unwrap_or(true);
     let threebet_or_fold = std::env::var("PF_3BOF").map(|v| v != "0").unwrap_or(false);
-    let tree = cap3_preflop_tree(&spec, n_raises, no_open_limp, threebet_or_fold);
+    // PF_CONN_TREE: solve on the SHARED connected preflop tree (build_conn_preflop_tree,
+    // now raise-or-fold) so the resulting strategy can be FROZEN into the connected
+    // blueprint solve byte-for-byte (same node/action indexing). Use n_raises=5 ⇒ na=8,
+    // which fits the connected GPU kernel's CL_MAXNA=8 (the standalone 14-size chart is na=16).
+    let conn_tree = std::env::var("PF_CONN_TREE").is_ok();
+    let tree = if conn_tree {
+        eprintln!("PF_CONN_TREE: solving on the shared build_conn_preflop_tree(6, {n_raises}) (na≤8 for the connected blueprint freeze)");
+        solver_core::blueprint::build_conn_preflop_tree(6, n_raises).0
+    } else {
+        cap3_preflop_tree(&spec, n_raises, no_open_limp, threebet_or_fold)
+    };
     let table = PreflopChanceTable::new(
         6,
         vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6],
@@ -377,11 +387,11 @@ fn main() {
             "{{\"format\":1,\"n_raises\":{},\"rake_rate\":{},\"rake_cap\":{},\
              \"stack\":{},\"ante\":{},\"sb\":{},\"bb\":{},\"button_player\":{},\
              \"num_nodes\":{},\"avg_len\":{},\"nc\":{},\"max_na\":{},\
-             \"no_open_limp\":{},\"threebet_or_fold\":{},\"max_bets\":3}}",
+             \"no_open_limp\":{},\"threebet_or_fold\":{},\"conn_tree\":{},\"max_bets\":3}}",
             n_raises, spec.rake_rate, spec.rake_cap, spec.stack, spec.ante,
             spec.sb, spec.bb, 5,
             tree.num_nodes(), avg.len(), NUM_PREFLOP_CLASSES, MAX_NA_PREFLOP,
-            no_open_limp, threebet_or_fold,
+            no_open_limp, threebet_or_fold, conn_tree,
         );
         std::fs::write(format!("{path}.json"), meta).expect("write pf meta");
         eprintln!("SAVED preflop strategy → {path}.f32 ({} f32) + {path}.json", avg.len());

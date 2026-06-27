@@ -225,9 +225,12 @@ pub fn build_conn_preflop_tree(np: usize, nraises: usize) -> (FlatTree, Vec<i32>
     let mut pcfg = spec.preflop_tree_config(pre_bets);
     if nraises > 0 {
         pcfg.max_bets_per_street = BetCap::all(3);
-        // KEEP open-limps + flat-calls (no_open_limp / threebet_or_fold left FALSE):
-        // the production pool is loose-passive, so the bot must model and exploit
-        // limpers and cold-callers — raise-or-fold would throw that away.
+        // RAISE-OR-FOLD opens + FLAT-CALL defense — MATCHES the deployed EQR preflop
+        // (position-aware-tier solve, preflop_eqr_*). The connected blueprint FREEZES that
+        // preflop, so this tree must equal the one EQR was solved on, byte-for-byte. Open-
+        // limping is dominated; the loose-pool limp model (was no_open_limp=false) is dropped.
+        pcfg.no_open_limp = true;
+        pcfg.threebet_or_fold = false;
     }
     let pft = build_tree_preflop_only(&pcfg).expect("preflop tree");
     let pnn = pft.num_nodes();

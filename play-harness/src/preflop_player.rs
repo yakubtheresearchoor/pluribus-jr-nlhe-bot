@@ -36,17 +36,25 @@ impl PreflopPlayer {
         // predate flat-call defense). Mismatch is caught by the num_nodes assert below.
         let no_open_limp = json_bool(&header, "no_open_limp", true);
         let threebet_or_fold = json_bool(&header, "threebet_or_fold", true);
+        // conn_tree: the chart was solved on the SHARED build_conn_preflop_tree (the one
+        // the connected blueprint freezes) rather than the standalone cap3 menu — rebuild
+        // the identical tree so node/action indexing maps 1:1.
+        let conn_tree = json_bool(&header, "conn_tree", false);
 
         let spec = production_game_v1();
-        let mrc = n_raises.min(MAX_NA_PREFLOP.saturating_sub(2)).max(1);
-        let mut cfg = spec.preflop_tree_config(BetSizeOptions {
-            bet: vec![BetSize::PotRelative(1.0)],
-            raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
-        });
-        cfg.max_bets_per_street = BetCap::all(3);
-        cfg.no_open_limp = no_open_limp;
-        cfg.threebet_or_fold = threebet_or_fold;
-        let tree = build_tree_preflop_only(&cfg).expect("preflop tree");
+        let tree = if conn_tree {
+            solver_core::blueprint::build_conn_preflop_tree(6, n_raises).0
+        } else {
+            let mrc = n_raises.min(MAX_NA_PREFLOP.saturating_sub(2)).max(1);
+            let mut cfg = spec.preflop_tree_config(BetSizeOptions {
+                bet: vec![BetSize::PotRelative(1.0)],
+                raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
+            });
+            cfg.max_bets_per_street = BetCap::all(3);
+            cfg.no_open_limp = no_open_limp;
+            cfg.threebet_or_fold = threebet_or_fold;
+            build_tree_preflop_only(&cfg).expect("preflop tree")
+        };
         assert_eq!(
             tree.num_nodes(),
             num_nodes,

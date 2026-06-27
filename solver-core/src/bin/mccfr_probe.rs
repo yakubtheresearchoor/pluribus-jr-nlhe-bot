@@ -3634,7 +3634,13 @@ fn gpu_conn_solve() {
     let mut disc_k = 0u64;
     println!("  combined nodes={nn_total} (pre {pnn}) regret_len={reg_buf_len} maxna={maxna} cells={} nf={nf_flops} discount={disc_int}", np-1);
     println!("{:>12} {:>14} {:>10}", "traj", "GPU maxR/T", "M traj/s");
+    // MC_LOAD_PREFLOP: SKIP Phase A and freeze an EXTERNAL preflop (the EQR chart) into
+    // Phase B — the postflop blueprint is then solved against EQR's reach, not a trained
+    // (previously contaminated) Phase-A preflop. File = a PreflopVectorCfr avg-strategy on
+    // build_conn_preflop_tree (SAME tree ⇒ identical node/action indexing for the load).
+    let load_preflop = std::env::var("MC_LOAD_PREFLOP").ok();
     let mut total = 0u64; let mut run_s = 0.0f64;
+    if load_preflop.is_none() {
     for &target in &[batch as u64, 4*batch as u64, 16*batch as u64, 64*batch as u64] {
         while total < target {
             // per trajectory: sample a flop fi, deal np distinct hands from THAT flop's deck.
@@ -3726,6 +3732,7 @@ fn gpu_conn_solve() {
             println!("  PHASE-A open raise/fold%: AA {aar:.0}/{aaf:.0} | KK {kkr:.0}/{kkf:.0} | AKs {aksr:.0}/{aksf:.0} | T9s {t9r:.0}/{t9f:.0} | 72o {o72r:.0}/{o72f:.0} | 32o {o32r:.0}/{o32f:.0}");
         }
     }
+    } // end Phase A (skipped under MC_LOAD_PREFLOP)
 
     // ── PER-FLOP BLUEPRINT BUILD (single-pass + reach-prior) ──────────────
     // The solve above is PHASE A: it converged the shared preflop over the
@@ -3738,9 +3745,65 @@ fn gpu_conn_solve() {
         use solver_core::blueprint::ssbp2_encode_cum;
         let out_dir = std::env::var("MC_BP_OUT").unwrap_or_else(|_| "blueprint_conn_out".into());
         std::fs::create_dir_all(&out_dir).expect("bp out dir");
-        // Save the converged preflop (regret + avg-strategy) from Phase A.
-        let preA_reg: Vec<f32> = unsafe { std::slice::from_raw_parts(b_reg.contents() as *const f32, pre_region) }.to_vec();
-        let preA_cum: Vec<f32> = unsafe { std::slice::from_raw_parts(b_cum.contents() as *const f32, pre_region) }.to_vec();
+        // The frozen preflop for Phase B: EQR (MC_LOAD_PREFLOP) or Phase-A's trained one.
+        let (preA_reg, preA_cum): (Vec<f32>, Vec<f32>) = if let Some(pf) = &load_preflop {
+            // TRANSPOSE the EQR avg strategy [local][a][c] (stride MAX_NA_PREFLOP) into the
+            // connected preflop-region layout [local][c][a] (stride maxna). Loaded into BOTH
+            // reg and cum: as the frozen "regret" it's ≥0 and sums to 1 per (infoset,class),
+            // so regret-matching reproduces EXACTLY EQR's strategy.
+            let bytes = std::fs::read(format!("{pf}.f32"))
+                .unwrap_or_else(|e| panic!("MC_LOAD_PREFLOP read {pf}.f32: {e}"));
+            let eqr: Vec<f32> =
+                bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let nc = NUM_PREFLOP_CLASSES;
+            let stride_in = solver_core::tree::flat::MAX_NA_PREFLOP;
+            assert_eq!(
+                eqr.len(), pre_ninfo * stride_in * nc,
+                "MC_LOAD_PREFLOP: {pf}.f32 len {} != pre_ninfo {pre_ninfo} × {stride_in} × {nc} \
+                 — tree mismatch (must be solved on build_conn_preflop_tree(6, {nraises}))",
+                eqr.len()
+            );
+            let mut out = vec![0f32; pre_region];
+            for local in 0..pre_ninfo {
+                for c in 0..nc {
+                    for a in 0..maxna {
+                        out[(local * nc + c) * maxna + a] = eqr[local * stride_in * nc + a * nc + c];
+                    }
+                }
+            }
+            println!("  MC_LOAD_PREFLOP: froze {pf}.f32 ({pre_ninfo} infosets) into the preflop region (transposed → stride {maxna})");
+            (out.clone(), out)
+        } else {
+            // Save the converged preflop (regret + avg-strategy) from Phase A.
+            let r = unsafe { std::slice::from_raw_parts(b_reg.contents() as *const f32, pre_region) }.to_vec();
+            let c = unsafe { std::slice::from_raw_parts(b_cum.contents() as *const f32, pre_region) }.to_vec();
+            (r, c)
+        };
+        // LOAD-FIDELITY: read the open-node ranges back out of the frozen preflop region
+        // (layout [local][class][action], stride maxna) — must match the source EQR chart
+        // (UTG: AA raise ~100, 72o/32o fold ~100). This validates the transpose end-to-end.
+        {
+            use solver_core::card::card_from_str;
+            let nc = NUM_PREFLOP_CLASSES;
+            let open = (0..pnn).find(|&i| pre_local[i] >= 0).unwrap_or(0);
+            let local = pre_local[open] as usize;
+            let na = pft.nodes[open].num_children as usize;
+            let labels: Vec<u8> =
+                pft.node_children(open).iter().map(|&c| pft.nodes[c as usize].action_label).collect();
+            let rf = |cl: usize, want: u8| -> f32 {
+                let s: f32 = (0..na).map(|a| preA_cum[(local * nc + cl) * maxna + a].max(0.0)).sum();
+                if s <= 0.0 { return 0.0; }
+                let r: f32 = (0..na).filter(|&a| labels[a] == want).map(|a| preA_cum[(local * nc + cl) * maxna + a].max(0.0)).sum();
+                r / s
+            };
+            let ix = |a: &str, b: &str| PreflopClass::from_combo(card_from_str(a).unwrap(), card_from_str(b).unwrap()).index();
+            let pr = |a: &str, b: &str| (rf(ix(a, b), 4) * 100.0, rf(ix(a, b), 0) * 100.0);
+            let (aar, aaf) = pr("Ac", "Ad");
+            let (t9r, t9f) = pr("Tc", "9c");
+            let (o72r, o72f) = pr("7c", "2d");
+            let (o32r, o32f) = pr("3c", "2d");
+            println!("  FROZEN-PREFLOP open raise/fold%: AA {aar:.0}/{aaf:.0} | T9s {t9r:.0}/{t9f:.0} | 72o {o72r:.0}/{o72f:.0} | 32o {o32r:.0}/{o32f:.0}");
+        }
         // Phase-A continuation/leaf prior: write the preflop block too (shared by all flops).
         ssbp2_write(&format!("{out_dir}/preflop.ssbp2"), &preA_cum);
         let ncan = canonical_flops_cached().len();
@@ -3836,6 +3899,42 @@ fn gpu_conn_solve() {
             }
             // extract this flop's postflop avg-strategy slice → SSBP2.
             let c1 = unsafe { std::slice::from_raw_parts(b_cum1.contents() as *const f32, reg1_len) };
+            // FIDELITY SPOT-CHECK (first solved flop): the postflop strategy must be SANE and
+            // STRENGTH-DEPENDENT, not degenerate. Print the HU (live=2) decision nodes' aggressive
+            // freq (bet+raise+all-in) across hand-strength buckets — strong should be aggressive,
+            // weak passive; a flat or all-one-action profile signals a broken solve.
+            if flop == lo {
+                use solver_core::tree::flat::{ACTION_LABEL_ALLIN, ACTION_LABEL_BET, ACTION_LABEL_RAISE};
+                // pick the HU (live=2) cell whose flop-root has the MOST total reach.
+                let hu: Vec<usize> = (0..keys.len()).filter(|&k| keys[k].0 == 2).collect();
+                let root_of = |ki: usize| (0..cell_trees[ki].num_nodes())
+                    .find(|&i| cell_trees[ki].nodes[i].is_player() && cell_trees[ki].nodes[i].num_children > 1 && cell_trees[ki].nodes[i].board_state == 0);
+                let reach_of = |ki: usize, ri: usize| -> f64 {
+                    let local = cells[ki].node_local[ri] as usize; let na = cell_trees[ki].nodes[ri].num_children as usize;
+                    (0..mnb).map(|bk| { let off = cell_reg_base[ki] as usize + (local*mnb+bk)*maxna; (0..na).map(|a| c1[off+a].max(0.0) as f64).sum::<f64>() }).sum()
+                };
+                if let Some(ki) = hu.iter().copied().filter(|&k| root_of(k).is_some()).max_by(|&a, &b| reach_of(a, root_of(a).unwrap()).partial_cmp(&reach_of(b, root_of(b).unwrap())).unwrap()) {
+                    let ri = root_of(ki).unwrap();
+                    let local = cells[ki].node_local[ri] as usize;
+                    let na = cell_trees[ki].nodes[ri].num_children as usize;
+                    let labels: Vec<u8> = cell_trees[ki].node_children(ri).iter().map(|&c| cell_trees[ki].nodes[c as usize].action_label).collect();
+                    let base0 = cell_reg_base[ki] as usize;
+                    let (mut reached, mut wsum, mut wagg) = (0usize, 0.0f64, 0.0f64);
+                    let (mut lo_agg, mut hi_agg) = (f32::NAN, f32::NAN); // c-bet at lowest/highest reached bucket
+                    for bk in 0..mnb {
+                        let off = base0 + (local*mnb+bk)*maxna;
+                        let s: f32 = (0..na).map(|a| c1[off+a].max(0.0)).sum();
+                        if s <= 0.0 { continue; }
+                        let ag: f32 = (0..na).filter(|&a| matches!(labels[a], ACTION_LABEL_BET|ACTION_LABEL_RAISE|ACTION_LABEL_ALLIN)).map(|a| c1[off+a].max(0.0)).sum();
+                        let agp = ag/s*100.0;
+                        reached += 1; wsum += s as f64; wagg += (s*agp) as f64;
+                        if lo_agg.is_nan() { lo_agg = agp; } hi_agg = agp;
+                    }
+                    let aggregate = if wsum > 0.0 { wagg/wsum } else { -1.0 };
+                    println!("  FIDELITY (flop {flop}, HU cell live=2 commit={} pot={}, nb={mnb}, na={na}): flop-root node{ri}", keys[ki].1, keys[ki].2);
+                    println!("    reached buckets {reached}/{mnb} | reach-weighted aggr(bet+raise+allin) {aggregate:.0}% | bucket-0 {lo_agg:.0}% bucket-last {hi_agg:.0}% (order = GS14 bucket index)");
+                }
+            }
             ssbp2_write(&format!("{out_dir}/flop_{flop:04}.ssbp2"), &c1[pre_region..]);
             if (flop - lo) % 20 == 0 { println!("    flop {flop} done @{done} iters (maxR/T {prev_rt:.3e}, {:.1}s elapsed)", t_b.elapsed().as_secs_f64()); }
         }
