@@ -23,7 +23,7 @@ use solver_core::tree::action::{production_game_v1, BetCap, BetSize, BetSizeOpti
 use solver_core::tree::builder::build_tree_preflop_only;
 use solver_core::tree::flat::{FlatTree, MAX_NA_PREFLOP};
 
-fn cap3_preflop_tree(spec: &GameSpec, n_raises: usize) -> FlatTree {
+fn cap3_preflop_tree(spec: &GameSpec, n_raises: usize, no_open_limp: bool, threebet_or_fold: bool) -> FlatTree {
     // n_raises raise SIZES per decision; default = MAX_NA_PREFLOP-2 (=14 at na=16),
     // a rich big-action menu 0.5×..7.0× pot. Depth stays shallow via cap-3.
     let mrc = n_raises.min(MAX_NA_PREFLOP.saturating_sub(2)).max(1);
@@ -32,8 +32,8 @@ fn cap3_preflop_tree(spec: &GameSpec, n_raises: usize) -> FlatTree {
         raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
     });
     cfg.max_bets_per_street = BetCap::all(3);
-    cfg.no_open_limp = true; // raise-or-fold opens (open-limping is dominated in 6-max)
-    cfg.threebet_or_fold = true; // 3bet-or-fold facing an open (no flat, no jam — sized 3bet plays the EQR postflop)
+    cfg.no_open_limp = no_open_limp; // raise-or-fold opens (open-limping is dominated in 6-max)
+    cfg.threebet_or_fold = threebet_or_fold; // false ⇒ flat-call defense allowed facing a raise
     build_tree_preflop_only(&cfg).expect("cap-3 preflop tree")
 }
 
@@ -72,61 +72,98 @@ fn write_eqr(dir: &str, key: (u8, i64), fi: usize, table: &[f32]) {
     std::fs::rename(&tmp, &path).expect("rename eqr");
 }
 
-/// EQR continuation source (banked_read_source shape). Realized-EV table per
-/// (SPR-bucket cell, canonical flop) — reach- & traverser-independent (symmetric
-/// limped pot). PERSISTENT: each table is read from / written to `dir` so a stall
-/// or restart never recomputes a filled (cell, flop) — it just re-reads. Progress
-/// is logged every `LOG_EVERY` fresh computes.
+/// Per-SEAT effective opponent-continue tier (CONTINUOUS float in [0,3]). The
+/// realized-EV continuation conflates two opposite needs — early opens face a
+/// SELECTIVE field (don't let medium hands over-realize ⇒ HIGH tier) while
+/// late/blind-battle seats DEFEND wide (discipline steals ⇒ LOW tier). Integer
+/// tiers bracket but can't hit every position's GTO width (CO landed at 15.7% on
+/// t2, 66% on t1 — no integer in between). So each seat gets a FLOAT tier and the
+/// continuation BLENDS the two bracketing integer-tier tables. Seats (button=5):
+/// SB=0 BB=1 UTG=2 HJ=3 CO=4 BTN=5. Tuned via PF_TIERS in position order
+/// "UTG,HJ,CO,BTN,SB,BB" (default hits ≈GTO opening widths).
+fn parse_seat_tiers() -> [f32; 6] {
+    // position order: UTG, HJ, CO, BTN, SB, BB.
+    let def = [2.6f32, 2.2, 1.75, 1.0, 1.0, 1.0];
+    let p: [f32; 6] = std::env::var("PF_TIERS")
+        .ok()
+        .and_then(|s| {
+            let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if v.len() == 6 { Some([v[0], v[1], v[2], v[3], v[4], v[5]]) } else { None }
+        })
+        .unwrap_or(def);
+    // map position order → seat index.
+    let mut seat = [2.0f32; 6];
+    seat[2] = p[0]; // UTG
+    seat[3] = p[1]; // HJ
+    seat[4] = p[2]; // CO
+    seat[5] = p[3]; // BTN
+    seat[0] = p[4]; // SB
+    seat[1] = p[5]; // BB
+    seat
+}
+
+/// Read (or compute+write) the realized-EV table for INTEGER tier `t` at (cell, flop).
+/// hero-continue = opp-base = `t` (matches the t{t} dir convention).
+#[allow(clippy::too_many_arguments)]
+fn eqr_table_for_tier(
+    dir: &str, t: u8, cell: &SeamCell, key: (u8, i64), fi: usize, flop: [Card; 3],
+    layout: &[(u8, u8)], stack: i32, rake_rate: f32, rake_cap: f32, policy: EqrPolicy,
+) -> Vec<f32> {
+    if let Some(v) = read_eqr(dir, key, fi, layout.len()) {
+        return v;
+    }
+    let seed = splitmix(
+        (key.0 as u64) ^ ((key.1 as u64) << 8) ^ ((flop[0] as u64) << 24)
+            ^ ((flop[1] as u64) << 32) ^ ((flop[2] as u64) << 40),
+    );
+    let spr = (stack - cell.commit) as f32 / (cell.pot as f32).max(1.0);
+    let mut p = policy;
+    p.continue_min_made = t;
+    let opp_tier = spr_to_opp_tier(spr, t);
+    let v = realized_ev_table_on_flop(
+        layout, flop, cell.live as usize, cell.pot as f32, rake_rate, rake_cap, p, opp_tier, seed,
+    );
+    write_eqr(dir, key, fi, &v);
+    v
+}
+
+/// EQR continuation source, GRADUATED by position: each opener's seat has a FLOAT
+/// effective tier (`seat_tiers`); the table is the BLEND of the two bracketing
+/// integer-tier tables (`tier_dirs[floor]`, `tier_dirs[ceil]`), giving a continuous
+/// tier so every position hits its GTO opening width. Both bracketing dirs are
+/// pre-filled. PERSISTENT + restartable per dir.
 #[allow(clippy::too_many_arguments)]
 fn eqr_source(
-    dir: String,
+    tier_dirs: Vec<String>,
+    seat_tiers: [f32; 6],
     flop_index: HashMap<[Card; 3], usize>,
     stack: i32,
     rake_rate: f32,
     rake_cap: f32,
     policy: EqrPolicy,
 ) -> impl FnMut(SeamCell, u16, [Card; 3], &[Vec<f32>], u8) -> Vec<f32> {
-    const LOG_EVERY: u64 = 500;
-    let mut mem: HashMap<((u8, i64), [Card; 3]), Vec<f32>> = HashMap::new();
-    let mut computed = 0u64;
-    let mut read = 0u64;
-    let t0 = std::time::Instant::now();
-    move |cell, _folded_mask, canonical, _combo_reaches, _traverser| {
+    // mem keyed by (bucket_key, canonical, traverser) — table varies by the seat's tier.
+    let mut mem: HashMap<((u8, i64), [Card; 3], u8), Vec<f32>> = HashMap::new();
+    move |cell, _folded_mask, canonical, _combo_reaches, traverser| {
         let key = cell.bucket_key(stack);
-        if let Some(v) = mem.get(&(key, canonical)) {
+        if let Some(v) = mem.get(&(key, canonical, traverser)) {
             return v.clone();
         }
+        let eff = seat_tiers[traverser as usize].clamp(0.0, 3.0);
+        let lo = eff.floor() as u8;
+        let hi = eff.ceil() as u8;
+        let frac = eff - lo as f32; // higher frac → more of the (tighter) hi tier
         let fi = flop_index[&canonical];
+        let flop = [canonical[0], canonical[1], canonical[2]];
         let layout: Vec<(u8, u8)> = flop_combo_layout(canonical);
-        let table = if let Some(v) = read_eqr(&dir, key, fi, layout.len()) {
-            read += 1;
-            v
+        let lo_t = eqr_table_for_tier(&tier_dirs[lo as usize], lo, &cell, key, fi, flop, &layout, stack, rake_rate, rake_cap, policy);
+        let table: Vec<f32> = if hi == lo {
+            lo_t
         } else {
-            let flop = [canonical[0], canonical[1], canonical[2]];
-            let seed = splitmix(
-                (key.0 as u64)
-                    ^ ((key.1 as u64) << 8)
-                    ^ ((canonical[0] as u64) << 24)
-                    ^ ((canonical[1] as u64) << 32)
-                    ^ ((canonical[2] as u64) << 40),
-            );
-            let spr = (stack - cell.commit) as f32 / (cell.pot as f32).max(1.0);
-            let opp_tier = spr_to_opp_tier(spr, policy.continue_min_made);
-            let t = realized_ev_table_on_flop(
-                &layout, flop, cell.live as usize, cell.pot as f32, rake_rate, rake_cap, policy, opp_tier, seed,
-            );
-            write_eqr(&dir, key, fi, &t);
-            computed += 1;
-            if computed % LOG_EVERY == 0 {
-                eprintln!(
-                    "    [EQR fill] {computed} computed + {read} read-from-disk | {:.0}/s | {:.1} min",
-                    computed as f64 / t0.elapsed().as_secs_f64().max(1e-3),
-                    t0.elapsed().as_secs_f64() / 60.0
-                );
-            }
-            t
+            let hi_t = eqr_table_for_tier(&tier_dirs[hi as usize], hi, &cell, key, fi, flop, &layout, stack, rake_rate, rake_cap, policy);
+            lo_t.iter().zip(&hi_t).map(|(a, b)| a * (1.0 - frac) + b * frac).collect()
         };
-        mem.insert((key, canonical), table.clone());
+        mem.insert((key, canonical, traverser), table.clone());
         table
     }
 }
@@ -157,7 +194,14 @@ fn main() {
     let check = env_u("PF_CHECK", 10) as u32;
 
     let n_raises = env_u("PF_RAISES", MAX_NA_PREFLOP.saturating_sub(2)); // default full na=16 menu
-    let tree = cap3_preflop_tree(&spec, n_raises);
+    // Tree shape (overridable): raise-or-fold opens (no open-limp) + FLAT-CALL defense
+    // facing a raise (threebet_or_fold=false). The 3bet-or-fold default made the in-position
+    // defenders over-fold, handing late positions a free steal (BTN/SB opens → ~90% of trash,
+    // the looseness-grows-by-position tell). Flat-call defense disciplines the steal; the
+    // realized-EV continuation prices the resulting multiway pots.
+    let no_open_limp = std::env::var("PF_OPENLIMP").map(|v| v == "0").unwrap_or(true);
+    let threebet_or_fold = std::env::var("PF_3BOF").map(|v| v != "0").unwrap_or(false);
+    let tree = cap3_preflop_tree(&spec, n_raises, no_open_limp, threebet_or_fold);
     let table = PreflopChanceTable::new(
         6,
         vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6],
@@ -172,16 +216,41 @@ fn main() {
     // different rake/stack/ante/policy never reads a stale fill. Same config ⇒
     // a restart reads every already-filled (cell, flop) instead of recomputing.
     let base = std::env::var("EQR_CACHE").unwrap_or_else(|_| "eqr_cache".into());
-    let tag = format!(
-        "rof3_nr{}_r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
-        n_raises, (spec.rake_rate * 1000.0) as i32, spec.rake_cap, spec.stack, spec.ante,
-        (policy.bet_frac * 100.0) as i32, policy.use_draws as u8, policy.continue_min_made, policy.mc_samples
+    // GRADUATED position-aware tiers: each seat has a FLOAT effective tier; the
+    // continuation blends the two bracketing integer-tier tables. Pre-fill every
+    // integer tier any seat brackets (floor/ceil), so the blend is a pure read.
+    let seat_tiers = parse_seat_tiers();
+    let dir_for = |t: u8| {
+        format!(
+            "{base}/rof3_nr{}_r{}_c{}_s{}_a{}_b{}_d{}_t{}_m{}",
+            n_raises, (spec.rake_rate * 1000.0) as i32, spec.rake_cap, spec.stack, spec.ante,
+            (policy.bet_frac * 100.0) as i32, policy.use_draws as u8, t, policy.mc_samples
+        )
+    };
+    let tier_dirs: Vec<String> = (0u8..4).map(dir_for).collect();
+    let used_tiers: Vec<u8> = {
+        let mut v: Vec<u8> = Vec::new();
+        for &x in &seat_tiers {
+            let e = x.clamp(0.0, 3.0);
+            v.push(e.floor() as u8);
+            v.push(e.ceil() as u8);
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    for &t in &used_tiers {
+        std::fs::create_dir_all(&tier_dirs[t as usize]).expect("mkdir eqr cache base");
+    }
+    eprintln!(
+        "EQR graduated tiers (UTG,HJ,CO,BTN,SB,BB seats 2,3,4,5,0,1) = {:?} | pre-fill int tiers {:?}",
+        seat_tiers, used_tiers
     );
-    let dir = format!("{base}/{tag}");
-    std::fs::create_dir_all(&dir).expect("mkdir eqr cache base");
-    eprintln!("EQR table cache: {dir} (rerunnable — restart reads filled tables)");
 
-    let source = eqr_source(dir.clone(), flop_index, spec.stack, spec.rake_rate as f32, spec.rake_cap as f32, policy);
+    let source = eqr_source(
+        tier_dirs.clone(), seat_tiers, flop_index, spec.stack,
+        spec.rake_rate as f32, spec.rake_cap as f32, policy,
+    );
     let mut oracle = BucketKeyedOracle::new(spec.stack, 6, 0, source);
     let mut solver = PreflopVectorCfr::new(&tree);
 
@@ -220,34 +289,42 @@ fn main() {
         );
         let done = AtomicUsize::new(0);
         let tf = std::time::Instant::now();
-        jobs.par_iter().for_each(|&(key, cell, fi, canonical)| {
-            let layout: Vec<(u8, u8)> = flop_combo_layout(canonical);
-            if read_eqr(&dir, key, fi, layout.len()).is_some() {
-                return; // already filled — rerunnable
-            }
-            let seed = splitmix(
-                (key.0 as u64)
-                    ^ ((key.1 as u64) << 8)
-                    ^ ((canonical[0] as u64) << 24)
-                    ^ ((canonical[1] as u64) << 32)
-                    ^ ((canonical[2] as u64) << 40),
-            );
-            let spr = (spec.stack - cell.commit) as f32 / (cell.pot as f32).max(1.0);
-            let opp_tier = spr_to_opp_tier(spr, policy.continue_min_made);
-            let vals = realized_ev_table_on_flop(
-                &layout, [canonical[0], canonical[1], canonical[2]], cell.live as usize,
-                cell.pot as f32, spec.rake_rate as f32, spec.rake_cap as f32, policy, opp_tier, seed,
-            );
-            write_eqr(&dir, key, fi, &vals);
-            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if d % 5000 == 0 {
-                eprintln!(
-                    "  [pre-fill] {d} computed | {:.0}/s | {:.1} min",
-                    d as f64 / tf.elapsed().as_secs_f64().max(1e-3),
-                    tf.elapsed().as_secs_f64() / 60.0
+        // Fill BOTH tier dirs (early + late). Each (cell,flop) table uses opp_tier and
+        // hero-continue = that tier (matches the t{tier} dir convention). Both dirs are
+        // mostly already on disk from the single-tier runs ⇒ this is a fast skip-pass.
+        for &t in &used_tiers {
+            let tdir = &tier_dirs[t as usize];
+            jobs.par_iter().for_each(|&(key, cell, fi, canonical)| {
+                let layout: Vec<(u8, u8)> = flop_combo_layout(canonical);
+                if read_eqr(tdir, key, fi, layout.len()).is_some() {
+                    return; // already filled — rerunnable
+                }
+                let seed = splitmix(
+                    (key.0 as u64)
+                        ^ ((key.1 as u64) << 8)
+                        ^ ((canonical[0] as u64) << 24)
+                        ^ ((canonical[1] as u64) << 32)
+                        ^ ((canonical[2] as u64) << 40),
                 );
-            }
-        });
+                let spr = (spec.stack - cell.commit) as f32 / (cell.pot as f32).max(1.0);
+                let mut p = policy;
+                p.continue_min_made = t;
+                let opp_tier = spr_to_opp_tier(spr, t);
+                let vals = realized_ev_table_on_flop(
+                    &layout, [canonical[0], canonical[1], canonical[2]], cell.live as usize,
+                    cell.pot as f32, spec.rake_rate as f32, spec.rake_cap as f32, p, opp_tier, seed,
+                );
+                write_eqr(tdir, key, fi, &vals);
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if d % 5000 == 0 {
+                    eprintln!(
+                        "  [pre-fill] {d} computed | {:.0}/s | {:.1} min",
+                        d as f64 / tf.elapsed().as_secs_f64().max(1e-3),
+                        tf.elapsed().as_secs_f64() / 60.0
+                    );
+                }
+            });
+        }
         eprintln!(
             "PRE-FILL done: {} fresh tables in {:.1}s (rest already cached)",
             done.load(Ordering::Relaxed),
@@ -300,10 +377,11 @@ fn main() {
             "{{\"format\":1,\"n_raises\":{},\"rake_rate\":{},\"rake_cap\":{},\
              \"stack\":{},\"ante\":{},\"sb\":{},\"bb\":{},\"button_player\":{},\
              \"num_nodes\":{},\"avg_len\":{},\"nc\":{},\"max_na\":{},\
-             \"no_open_limp\":true,\"threebet_or_fold\":true,\"max_bets\":3}}",
+             \"no_open_limp\":{},\"threebet_or_fold\":{},\"max_bets\":3}}",
             n_raises, spec.rake_rate, spec.rake_cap, spec.stack, spec.ante,
             spec.sb, spec.bb, 5,
             tree.num_nodes(), avg.len(), NUM_PREFLOP_CLASSES, MAX_NA_PREFLOP,
+            no_open_limp, threebet_or_fold,
         );
         std::fs::write(format!("{path}.json"), meta).expect("write pf meta");
         eprintln!("SAVED preflop strategy → {path}.f32 ({} f32) + {path}.json", avg.len());

@@ -85,6 +85,20 @@ fn main() {
                 let k = next.fetch_add(1, Ordering::Relaxed);
                 if k >= total { break; }
                 let (key, (cell, dir)) = &blist[k];
+                // SKIP already-complete buckets (resume): the flop-root CFVs are
+                // stride-independent VALUE vectors, so a bucket with all `canon.len()`
+                // .f32 files is done and reusable. Lets a re-run finish only the
+                // missing buckets (e.g. the slow deepest live-5) instead of redoing
+                // the expensive live-2/3/4 re-solves.
+                let bdir = format!("{cfv_root}/L{}_S{}", key.0, key.1);
+                let have = std::fs::read_dir(&bdir)
+                    .map(|rd| rd.filter(|e| e.as_ref().ok().and_then(|e| e.path().extension().map(|x| x == "f32")).unwrap_or(false)).count())
+                    .unwrap_or(0);
+                if have >= canon.len() {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d % 5 == 0 || d == total { eprintln!("[{d}/{total}] (skip — complete)"); }
+                    continue;
+                }
                 let tree = build_tree(&spec.flop_seam_config(cell.live, cell.commit, cell.pot, bets.clone()))
                     .expect("seam tree");
                 for (fi, &canonical) in canon.iter().enumerate() {

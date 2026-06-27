@@ -241,7 +241,8 @@ pub fn banked_read_source(
                     })
                     .clone();
                 cfv_live2(canonical, fi, &tree)
-            } else if let Some((rlive, rcommit, rpot, dir)) = bucket_map.get(&key).cloned() {
+            } else if cell.live < 5 && bucket_map.contains_key(&key) {
+                let (rlive, rcommit, rpot, dir) = bucket_map.get(&key).cloned().unwrap();
                 let tree = trees
                     .entry((rlive, rcommit, rpot))
                     .or_insert_with(|| {
@@ -250,16 +251,17 @@ pub fn banked_read_source(
                     .clone();
                 cfv_from_banked(&dir, fi, &tree, canonical)
             } else {
-                // No banked rep — legitimate only for EQUITY-ROLLOUT cells:
-                //   • all-in (behind ≤ 0, any live): no chips to bet, and
-                //   • live-6 (full table): the census is live 2..=5, so
-                //     six-way is always rolled out, never solved.
-                // Both are check-down-to-showdown. Solve a CHECK-ONLY tree
-                // (empty bets → 21 nodes for live-6 vs 45k with betting),
-                // cheap. live-2 was handled above (exact path).
+                // ROLLOUT (check-down-to-showdown) for cells without a cheap exact
+                // CFV here:
+                //   • all-in (behind ≤ 0, any live): no chips to bet,
+                //   • live-6 (full table): never solved, and
+                //   • live-5 NOT pre-banked: the exact 5-way root_cfv_from_avg is
+                //     pathologically slow (~26 min/bucket) and 5-way flops are <1%
+                //     of volume — a check-down rollout EV is a fine preflop prior.
+                //     (Pre-banked live-5 still read exact via read_prebanked above.)
                 let is_allin = key.1 == i64::MIN;
                 assert!(
-                    is_allin || cell.live == 6,
+                    is_allin || cell.live >= 5,
                     "non-rollout SPR bucket {key:?} missing from banked fill (cell {cell:?})"
                 );
                 let nb = live_nb.get(&cell.live).copied().unwrap_or(8);

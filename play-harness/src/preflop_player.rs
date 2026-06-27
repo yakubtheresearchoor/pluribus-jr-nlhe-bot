@@ -31,6 +31,11 @@ impl PreflopPlayer {
         let n_raises = json_int(&header, "n_raises") as usize;
         let avg_len = json_int(&header, "avg_len") as usize;
         let num_nodes = json_int(&header, "num_nodes") as usize;
+        // Read the tree-shape flags from the header so the loader rebuilds the EXACT
+        // tree the chart was solved on (default true/true for older artifacts that
+        // predate flat-call defense). Mismatch is caught by the num_nodes assert below.
+        let no_open_limp = json_bool(&header, "no_open_limp", true);
+        let threebet_or_fold = json_bool(&header, "threebet_or_fold", true);
 
         let spec = production_game_v1();
         let mrc = n_raises.min(MAX_NA_PREFLOP.saturating_sub(2)).max(1);
@@ -39,8 +44,8 @@ impl PreflopPlayer {
             raise: (0..mrc).map(|i| BetSize::PotRelative(0.5 + 0.5 * i as f64)).collect(),
         });
         cfg.max_bets_per_street = BetCap::all(3);
-        cfg.no_open_limp = true;
-        cfg.threebet_or_fold = true;
+        cfg.no_open_limp = no_open_limp;
+        cfg.threebet_or_fold = threebet_or_fold;
         let tree = build_tree_preflop_only(&cfg).expect("preflop tree");
         assert_eq!(
             tree.num_nodes(),
@@ -106,6 +111,15 @@ pub fn splitmix64(x: &mut u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
+}
+
+/// Parse `"key":true|false` from the header, falling back to `default` if absent.
+fn json_bool(header: &str, key: &str, default: bool) -> bool {
+    let pat = format!("\"{key}\":");
+    match header.find(&pat) {
+        Some(i) => header[i + pat.len()..].trim_start().starts_with("true"),
+        None => default,
+    }
 }
 
 fn json_int(header: &str, key: &str) -> i64 {
