@@ -115,15 +115,19 @@ The server dispatches on `live` and `board.len()`:
 | `live ∈ {3,4,5}` | **multiway** | per-street depth-limited search over the bucketed blueprint continuation, rich bet sizing | a blueprint cell (`cell_dir` + `flop_id`, or `route = true`). |
 | `live ≥ 6` | **full ring** | equity-rollout model: check when unbet, pot-odds call/fold vs Monte-Carlo all-in equity | `to_call` (or derivable from `street_actions`). |
 
-**Connected blueprint (`CONN_BP`, e.g. `blueprint_conn_v4`).** When set, the server
+**Connected blueprint (`CONN_BP`, e.g. `blueprint_conn_eqr`).** When set, the server
 also loads a single self-contained connected blueprint and tries it first for
 empty-board and 3–5-card-board requests (`ConnDecider::decide`). It serves
-**postflop (flop/turn/river) by lookup** — validated byte-exact and smoke-tested
-sane — and this is the recommended postflop path. **It must NOT serve preflop**
-(its preflop region is an `MC_NF=1` reach prior, broken for non-pairs — see §11);
-preflop must come from `PF_STRAT`. Turn/river via the connected blueprint require
-`prior_actions` (the full postflop betting path) + `cell_dir`/`flop_id` (or
-`route=true`).
+**preflop by lookup** and **postflop (flop/turn/river) by real-time depth-limited
+QRE search** over the connected buckets, warm-started from the blueprint's
+preflop-continuing reach prior (Pluribus: preflop=lookup, postflop=search). The
+preflop region is the **EQR-frozen raise-or-fold preflop the postflop was solved
+against** — self-consistent, no longer the broken `MC_NF=1` reach (the §11 bug is
+resolved by the `blueprint_conn_eqr` rebuild). It is leaner than the standalone EQR
+chart (na=8, 5 pot-relative raises + all-in vs the na=16, 14-size `PF_STRAT`), but
+identical in hand selection; set `PF_STRAT` if you prefer the finer preflop sizing
+(§11). Turn/river via the connected blueprint require `prior_actions` (the full
+postflop betting path) + `cell_dir`/`flop_id` (or `route=true`).
 
 A complete hand is driven by repeated `/decide` calls: one preflop, then one per
 postflop street as the board and `street_actions` grow.
@@ -137,12 +141,15 @@ postflop street as the board and `street_actions` grow.
 > 10 bb), 0.5/1 bb blinds, no-flop-no-drop.** Until the rest are solved, every request
 > snaps to this one blueprint regardless of the table's real stake or depth.
 >
-> **The solved postflop blueprint is `blueprint_conn_v4`** (connected GPU MCCFR):
-> rich preflop menu (5 pot-relative raises + all-in) feeding per-flop solved postflop
-> cells — exact heads-up + fine SPR-binned 3-way/4-way + lean 5-6-way, 1755 flops,
-> validated. Load with `CONN_BP=blueprint_conn_v4 CONN_GS14=gs14_blueprint_cache`
-> (params np=6, nraises=5, nb=200, maxna=7). Serves **postflop**; preflop = `PF_STRAT`
-> (§5, §11).
+> **The solved postflop blueprint is `blueprint_conn_eqr`** (connected GPU MCCFR):
+> the **EQR raise-or-fold preflop** (position-aware flat-call defense, 5 pot-relative
+> raises + all-in) frozen in via `MC_LOAD_PREFLOP`, with per-flop postflop cells
+> **re-solved against it** — exact heads-up + fine SPR-binned 3-way/4-way + lean
+> 5-6-way, 1755 flops. Validated: byte-exact cell layout, board-sensitive postflop
+> (aggression 37%→68% across dry→wet textures), no `MC_NF=1` contamination. Load with
+> `CONN_BP=blueprint_conn_eqr CONN_GS14=gs14_blueprint_cache` (params np=6, nraises=5,
+> nb=200, maxna=7). Serves **preflop + postflop** (self-consistent); `PF_STRAT` is the
+> richer-sizing preflop alternative (§5, §11).
 
 A real deployment needs a **matrix of blueprints** because the equilibrium strategy
 depends on two things the cell grid does **not** capture:
@@ -281,25 +288,28 @@ curl -s localhost:8080/decide -H 'content-type: application/json' -d '{
 
 ## 11. Model caveats (the honest frontier)
 
-**★ KNOWN BUG (preflop), found 2026-06-26 by HTTP smoke test — NOT a deliberate
-choice:** the connected blueprint (`CONN_BP`, e.g. `blueprint_conn_v4`) must serve
-**postflop only**. Its *preflop* region is trained in the connected solve's Phase A
-over a **single representative flop** (`MC_NF=1`, a dry disconnected rainbow board),
-so it is valid as a *reach prior into the postflop cells* but is **NOT a usable
-preflop strategy**: on that one dry board, pairs dominate (fold ≈ 0) and non-pairs
-over-fold, inversely correlated with strength (measured AKs fold 0.83, KQo 0.91,
-72s 0.53). Pairs look fine, which is why the AA-only unit test missed it.
-- **The fix:** serve preflop from the DEDICATED all-flops preflop solve (`PF_STRAT`
-  = `preflop_out_v1`, solved by `preflop_runner` against the banked oracle over all
-  1755 flops), per §5. The connected blueprint's preflop is reach-only.
-- **Current `bot-server` routing is WRONG here:** `decide_handler` tries `conn.decide`
-  FIRST for empty-board requests, so it serves the broken connected preflop instead of
-  `PF_STRAT`. Until fixed, either (a) don't set `CONN_BP` for preflop, or (b) make the
-  empty-board branch prefer `PF_STRAT` and fall back to `conn` only postflop.
-- **To get a sound preflop WITH all-ins** (the rich-abstraction goal): re-run
-  `preflop_runner` with `BetSize::AllIn` in the preflop menu against the banked
-  oracle. Postflop (the connected v4 cells) is per-flop solved and validated — no
-  preflop bias there.
+**✓ RESOLVED (preflop), 2026-06-27 — the `blueprint_conn_eqr` rebuild:** an earlier
+connected blueprint (`blueprint_conn_v4`) trained its shared *preflop* region in the
+solve's Phase A over a **single representative flop** (`MC_NF=1`, a dry disconnected
+rainbow board), so its preflop was a usable reach prior into the postflop cells but
+**not a usable preflop strategy** (on that one dry board pairs dominated and non-pairs
+over-folded inversely to strength — AKs fold 0.83, KQo 0.91, 72s 0.53; the AA-only
+unit test missed it because pairs looked fine).
+- **The fix:** instead of training the preflop in Phase A, the deployed EQR raise-or-fold
+  preflop (`preflop_eqr_conn`, na=8, position-aware flat-call defense) is **frozen into
+  the connected solve** via `MC_LOAD_PREFLOP`, and the postflop cells are re-solved
+  against it. The result is `blueprint_conn_eqr`: preflop and postflop are now
+  self-consistent, so `conn.decide` serves a sound preflop directly. Verified — preflop
+  AA/KK raise (fold ≈ 0), 72o fold-heavy, and the postflop is board-sensitive across
+  textures with no single-board contamination.
+- **Routing:** `decide_handler` tries `conn.decide` first for empty-board requests; with
+  `blueprint_conn_eqr` this now serves the correct EQR preflop, so the previous
+  "prefer `PF_STRAT`" workaround is **no longer needed**. `PF_STRAT` (the standalone
+  `preflop_eqr_v3`, na=16 / 14 sizes) remains a valid override if you want finer
+  preflop sizing — it shares the connected blueprint's EQR hand selection, so the
+  postflop reach-prior stays consistent either way.
+- Low-SPR HU preflop spots additionally route through the jam-subgame search
+  (`CONN_PRE_JAM`) to restore the explicit all-in the lean na=8 menu compresses.
 
 The remaining items below are deliberate model choices, not bugs — every (street ×
 live count) decision is still served:

@@ -26,7 +26,7 @@ fn conn_decider_preflop_jam_hu() {
     let _ = std::fs::remove_file("/tmp/test_pre_hu_eq.bin");
 
     // Needs a VALID full blueprint; skip if absent/unloadable.
-    let Ok(dec) = ConnDecider::load(&std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_v4")), &ws("gs14_blueprint_cache"), 6, 5, 200, 7) else { return; };
+    let Ok(dec) = ConnDecider::load(&std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_eqr")), &ws("gs14_blueprint_cache"), 6, 5, 200, 7) else { return; };
     let stack = production_game_v1().stack;
     // HU low-SPR: opp has put in 70% of stack, hero 30% facing it (post-call SPR≈0.2).
     let c_opp = (0.70 * stack as f32) as i32;
@@ -57,7 +57,7 @@ fn conn_decider_preflop_jam_hu() {
 
 #[test]
 fn conn_decider_serves_preflop_and_turn() {
-    let Ok(dec) = ConnDecider::load(&std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_v4")), &ws("gs14_blueprint_cache"), 6, 5, 200, 7) else { return; };
+    let Ok(dec) = ConnDecider::load(&std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_eqr")), &ws("gs14_blueprint_cache"), 6, 5, 200, 7) else { return; };
 
     // PREFLOP: AA should rarely fold.
     let pre = DecideRequest { board: vec![], hero_cards: [48, 49], live: 6, hero_idx: 3, ..Default::default() };

@@ -78,6 +78,16 @@ impl ChanceTable {
             full_board.push(river_card);
             for (i, &hi) in valid_hand_indices.iter().enumerate() {
                 let (c1, c2) = index_to_card_pair(hi as usize);
+                // Card removal: a hand can't hold a card that lands on the river.
+                // `chance_probability` already zeroes the chance of dealing such a
+                // river for that hand, so this entry is never validly consumed —
+                // but evaluating it would feed a DUPLICATE card to the 7-card
+                // evaluator (5-of-a-rank → eval index OOB on the rare board where
+                // the collision completes quads+). Leave the dead entry at its
+                // rank-0 init (the impossible-hand sentinel).
+                if c1 == river_card || c2 == river_card {
+                    continue;
+                }
                 let mut hand = Hand::new();
                 hand = hand.add_card(c1 as usize);
                 hand = hand.add_card(c2 as usize);

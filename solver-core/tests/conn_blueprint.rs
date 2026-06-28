@@ -11,7 +11,7 @@ use solver_core::solver::preflop_start_game::PreflopChanceTable;
 
 /// Resolve a workspace-root path (tests run with CWD = crate dir).
 fn ws(p: &str) -> String { format!("{}/../{}", env!("CARGO_MANIFEST_DIR"), p) }
-fn bp() -> String { std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_v4")) }
+fn bp() -> String { std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_eqr")) }
 
 /// Serialize a known `gcum` into BLP2 bytes against the REAL rebuilt tree, load
 /// it back, and verify parse + index math + normalization + replay. No GPU
@@ -128,18 +128,18 @@ fn phase_b_output_decodes_sane() {
     }
 }
 
-/// Load the REAL solved production blueprint (blueprint_conn_v2/) via the sharded
+/// Load the REAL solved production blueprint (blueprint_conn_eqr/) via the sharded
 /// loader and verify it serves: preflop distributions are sane (sum to 1, premiums
 /// non-fold-heavy, trash fold-heavy), and a postflop shard decodes + the FlopLayout
 /// resolves a bucket. Skipped if the blueprint isn't present (CI).
 #[test]
 fn sharded_blueprint_serves_decisions() {
     let dir = bp();
-    // production config: np=6, 1 preraise, nb=200, 16×16 runout, maxna=3.
+    // production config: np=6, 5 preraises, nb=200, 16×16 runout, maxna=7.
     let Ok(bp) = ShardedConnBlueprint::load(&dir, 6, 5, 200, 16, 16, 7) else { return; };
 
-    // PREFLOP: open-or-fold from the first acting node (empty history). AA/KK
-    // should be aggressive (low fold), 72o fold-heavier; all sum to 1.
+    // PREFLOP: raise-or-fold opens (EQR-frozen) from the first acting node (empty
+    // history). AA/KK aggressive (low fold), 72o fold-heavier; all sum to 1.
     let probes = [("AA", 48u8, 49u8), ("KK", 44, 45), ("72o", 20, 0)];
     let (mut aa_fold, mut t72_fold) = (1.0f32, 0.0f32);
     for (nm, a, b) in probes {

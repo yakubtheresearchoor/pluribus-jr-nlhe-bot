@@ -983,9 +983,17 @@ impl<'a> TreeBuilder<'a> {
                     child_info.round_starter = player;
                 }
                 Action::AllIn(amount) => {
-                    debug_assert!(amount <= max_player_total,
-                        "AllIn amount {} exceeds player {}'s max committable {}",
-                        amount, player, max_player_total);
+                    // `BetSize::AllIn` emits an all-in TOTAL = max of the configured
+                    // bet/raise totals (add_bet_size_action), which a large pot-relative
+                    // size can push ABOVE this player's physical cap in a short-stacked
+                    // cell (e.g. an asymmetric-commit flop seam, max_committable < stack).
+                    // `clamp_and_force_allin` only clamps Bet/Raise, so the over-cap AllIn
+                    // survives. The FlatTree write already clamps via `.min(cap)`
+                    // (make_child_node); mirror it here so BuildInfo stays consistent.
+                    // All-in closes the street (the sole child is a capped call/fold), so
+                    // the clamp cannot change tree SHAPE — it keeps the BuildInfo's pot/stack
+                    // bookkeeping byte-exact with what the (release) solve built.
+                    let amount = amount.min(max_player_total);
                     child_info.stacks[player] = amount;
                     child_info.allin_flag = true;
                     child_info.has_acted_this_round = vec![false; num_players];
@@ -1181,7 +1189,10 @@ impl<'a> TreeBuilder<'a> {
                 // (max_amount = max_committable) and clamp_and_force_allin,
                 // `a` is already <= max_committable. Set directly.
                 let cap = self.max_committable(player as usize);
-                debug_assert!(*a <= cap,
+                // Bet/Raise are pre-clamped by clamp_and_force_allin; a `BetSize::AllIn`
+                // total can legitimately exceed `cap` in a short-stacked cell (see the
+                // AllIn arm in compute_actions) — the `.min(cap)` below is the clamp.
+                debug_assert!(*a <= cap || matches!(action, Action::AllIn(_)),
                     "post-action commitment {} exceeds player {}'s max {} (action {:?})",
                     a, player, cap, action);
                 self.tree.set_contribution(child_idx, player, (*a).min(cap));

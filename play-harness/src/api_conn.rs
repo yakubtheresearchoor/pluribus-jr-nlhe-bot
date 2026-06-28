@@ -1,9 +1,9 @@
-//! Connected-blueprint `/decide` path. Serves decisions by LOOKUP from the
-//! sharded connected MCCFR blueprint (`blueprint_conn_v1/`) — a different artifact
-//! than the per-cell search blueprint the rest of `api` uses. Currently serves
-//! PREFLOP and FLOP decisions (the cell root is the flop, so a street-local flop
-//! request maps directly). TURN/RIVER need the full postflop betting path, which
-//! the street-local `DecideRequest` doesn't carry — a noted API extension.
+//! Connected-blueprint `/decide` path. Serves decisions from the sharded connected
+//! MCCFR blueprint (`blueprint_conn_eqr/`) — a different artifact than the per-cell
+//! search blueprint the rest of `api` uses. PREFLOP is a blueprint lookup (the
+//! EQR-frozen raise-or-fold preflop the postflop was solved against), POSTFLOP is a
+//! real-time depth-limited QRE search over the connected buckets with the
+//! preflop-continuing reach-prior (Pluribus: preflop=lookup, postflop=search).
 
 use crate::api::{action_name, decide_postflop_with_reach, ActionProb, DecideRequest, DecideResponse};
 use crate::blueprint::Blueprint;
@@ -94,7 +94,7 @@ fn splitmix(s: &mut u64) -> u64 {
 
 impl ConnDecider {
     /// Load the sharded blueprint + reconstruct the cell layout. `(np, nraises, nb,
-    /// maxna)` = the solve config (6, 1, 200, 3 for blueprint_conn_v1). `gs14_dir` =
+    /// maxna)` = the solve config (6, 5, 200, 7 for blueprint_conn_eqr). `gs14_dir` =
     /// the full 49×48 GS14 bucket cache.
     pub fn load(bp_dir: &str, gs14_dir: &str, np: usize, nraises: usize, nb: usize, maxna: usize) -> std::io::Result<Self> {
         let bp = ShardedConnBlueprint::load(bp_dir, np, nraises, nb, 16, 16, maxna)?;

@@ -3903,8 +3903,16 @@ fn gpu_conn_solve() {
             // STRENGTH-DEPENDENT, not degenerate. Print the HU (live=2) decision nodes' aggressive
             // freq (bet+raise+all-in) across hand-strength buckets — strong should be aggressive,
             // weak passive; a flat or all-one-action profile signals a broken solve.
-            if flop == lo {
+            if flop == lo || std::env::var("MC_FIDELITY").is_ok() {
                 use solver_core::tree::flat::{ACTION_LABEL_ALLIN, ACTION_LABEL_BET, ACTION_LABEL_RAISE};
+                // print the board (texture-appropriateness check across flops).
+                {
+                    const R: &[u8] = b"23456789TJQKA";
+                    const S: &[u8] = b"cdhs";
+                    let bd = canonical_flops_cached()[flop];
+                    let cs = |c: u8| format!("{}{}", R[(c >> 2) as usize] as char, S[(c & 3) as usize] as char);
+                    println!("  BOARD flop {flop}: {} {} {}", cs(bd[0] as u8), cs(bd[1] as u8), cs(bd[2] as u8));
+                }
                 // pick the HU (live=2) cell whose flop-root has the MOST total reach.
                 let hu: Vec<usize> = (0..keys.len()).filter(|&k| keys[k].0 == 2).collect();
                 let root_of = |ki: usize| (0..cell_trees[ki].num_nodes())

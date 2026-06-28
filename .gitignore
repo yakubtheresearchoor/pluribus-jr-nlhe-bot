@@ -38,3 +38,15 @@ blueprint_conn_v1/
 blueprint_conn_v2/
 blueprint_conn_v3/
 blueprint_conn_v4/
+blueprint_conn_eqr/
+
+# EQR preflop strategy artifacts (.f32 weights ~3.2GB each, regenerable via eqr_preflop_runner)
+preflop_eqr_v*.f32
+preflop_eqr_v*.json
+preflop_eqr_conn.f32
+preflop_eqr_conn.json
+
+# stray local data / OS cruft
+.DS_Store
+gs14_cache/
+investors_no_email.csv
