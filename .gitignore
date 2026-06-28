@@ -50,3 +50,6 @@ preflop_eqr_conn.json
 .DS_Store
 gs14_cache/
 investors_no_email.csv
+
+# launchd persistent bot-server runtime log
+botserver.log
