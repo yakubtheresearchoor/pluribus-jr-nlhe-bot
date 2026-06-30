@@ -7,6 +7,13 @@ edition = "2021"
 # oracle) and loads blueprints/agents through solver-core. The RULES
 # side must stay in clean-rules — never re-implement or import solver
 # terminal machinery here for scoring.
+[features]
+default = []
+# GPU depth-limited search path (Apple Metal). Opt-in: forwards to solver-core's
+# metal feature so `gpu_search_flop_strat` is available; the runtime GPU branch
+# is additionally gated by the GPU_SEARCH env flag.
+metal = ["solver-core/metal"]
+
 [dependencies]
 clean-rules = { path = "../clean-rules" }
 solver-core = { path = "../solver-core" }

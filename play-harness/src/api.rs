@@ -242,6 +242,23 @@ pub struct DecideResponse {
 /// node. For a uniquely-labelled child (fold/check/call) match the label; for
 /// multiple bet/raise sizes pick the child whose `amount` is closest to the
 /// reported total. Returns None if an action can't be matched (malformed state).
+/// Action class for translation: 0=fold, 1=passive (check/call), 2=aggressive
+/// (bet/raise/allin). Off-menu opponent actions (e.g. a raise the discrete
+/// abstraction doesn't have) snap to the nearest same-class tree action.
+fn action_class(label: u8) -> u8 {
+    match label {
+        0 => 0,
+        1 | 2 => 1,
+        _ => 2,
+    }
+}
+
+/// Walk the discrete tree following `actions`, with ACTION TRANSLATION: when an
+/// action's exact label isn't a child (the runtime sent an off-menu bet/raise
+/// the abstraction lacks), snap it to the closest child of the same class
+/// (passive/aggressive), then to the closest non-fold child by amount. Without
+/// this, a facing-a-bet spot whose size doesn't map returned None and the caller
+/// fell to the crude equity rollout (the multiway-flop "missing cell" path).
 fn walk_to_node(tree: &FlatTree, actions: &[ActionInput]) -> Option<usize> {
     let mut node = 0usize;
     for act in actions {
@@ -249,9 +266,16 @@ fn walk_to_node(tree: &FlatTree, actions: &[ActionInput]) -> Option<usize> {
             return None;
         }
         let children = tree.node_children(node);
-        let cands: Vec<usize> = (0..children.len())
-            .filter(|&i| tree.nodes[children[i] as usize].action_label == act.label)
-            .collect();
+        let lbl_of = |i: usize| tree.nodes[children[i] as usize].action_label;
+        // 1. exact label; 2. same class; 3. any non-fold (unless the act IS a fold).
+        let mut cands: Vec<usize> = (0..children.len()).filter(|&i| lbl_of(i) == act.label).collect();
+        if cands.is_empty() {
+            let cls = action_class(act.label);
+            cands = (0..children.len()).filter(|&i| action_class(lbl_of(i)) == cls).collect();
+        }
+        if cands.is_empty() {
+            cands = (0..children.len()).filter(|&i| act.label == 0 || lbl_of(i) != 0).collect();
+        }
         let pick = match cands.len() {
             0 => return None,
             1 => cands[0],
@@ -290,12 +314,23 @@ pub fn decide_postflop_with_reach(bp: &Blueprint, req: &DecideRequest, cfg: &Sea
     }
     // 2. Multiway (live ≥ 3) turn/river: FACTORED full-nh re-solve of the actual
     //    board — a real solve where the blueprint has no cell, ahead of the crude
-    //    equity rollout. (HU turn/river is served by decide_live2, not here.)
+    //    equity rollout.
     if req.board.len() >= 4 && req.live >= 3 {
         if let Some(r) = decide_postflop_resolve(req) {
             return Some(r);
         }
         // 3. Last resort: equity-rollout (check / pot-odds call-fold).
+        return decide_live6(req);
+    }
+    // 2b. HU (live-2) turn/river: real-time EXACT re-solve of the actual board.
+    //     Without this the bot fell to decide_live6, which CHECKS DOWN first-to-act
+    //     (to_call==0) — checking the nuts on the turn/river. The exact HU solve
+    //     gives a proper value-betting strategy. (Falls to live6 only if it can't
+    //     solve / the hero isn't acting at the node.)
+    if req.board.len() >= 4 && req.live == 2 {
+        if let Some(r) = decide_live2_resolve(req) {
+            return Some(r);
+        }
         return decide_live6(req);
     }
     if req.board.len() >= 4 {
@@ -511,44 +546,56 @@ fn finalize_decision(
 /// we SEARCH the actual board in real time — an exact HU subgame solve (no
 /// abstraction, plays to exact showdown): river ≈100ms, turn ≈5s (see
 /// `solve_live2_street`). So heads-up now has a rich-sizing decision on every street.
+/// HU (live-2) TURN/RIVER real-time EXACT re-solve of the ACTUAL board. No bank,
+/// no SPR routing, no canonicalization — `solve_live2_street` solves the real
+/// cards with the rich M2 menu, so heads-up gets a proper VALUE-BETTING strategy
+/// (not the check-down rollout of `decide_live6`). Self-contained: usable both
+/// from `decide_live2` and the postflop router. Returns None when the hero isn't
+/// acting at the walked node or the solve fails.
+pub fn decide_live2_resolve(req: &DecideRequest) -> Option<DecideResponse> {
+    let t0 = std::time::Instant::now();
+    if req.live != 2 || (req.board.len() != 4 && req.board.len() != 5) {
+        return None;
+    }
+    let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
+    let iters = if req.board.len() == 5 {
+        crate::live2_bank::LIVE2_RT_RIVER_ITERS
+    } else {
+        crate::live2_bank::LIVE2_RT_TURN_ITERS
+    };
+    let solve = crate::live2_bank::solve_live2_street(&req.board, commit, pot, iters)?;
+    let node = walk_to_node(&solve.tree, &req.street_actions)?;
+    if solve.tree.nodes[node].player_id as usize != req.hero_idx as usize {
+        return None;
+    }
+    // Hero's hand index in the table layout (c1<c2, not on board).
+    let (a, b) = (
+        req.hero_cards[0].min(req.hero_cards[1]),
+        req.hero_cards[0].max(req.hero_cards[1]),
+    );
+    let h = (0..solve.nh)
+        .find(|&i| solve.hand_cards[i * 2] == a && solve.hand_cards[i * 2 + 1] == b)?;
+    let na = solve.tree.nodes[node].num_children as usize;
+    let strat = solve.cfr.get_average_strategy(node, na, solve.nh); // [na][nh]
+    let children = solve.tree.node_children(node);
+    let actions: Vec<ActionProb> = (0..na)
+        .map(|a| {
+            let child = children[a] as usize;
+            let label = solve.tree.nodes[child].action_label;
+            let amount = commit + solve.tree.get_contribution(child, req.hero_idx);
+            ActionProb { label, action: action_name(label).to_string(), amount, prob: strat[a][h] }
+        })
+        .collect();
+    let street = if req.board.len() == 5 { "river" } else { "turn" };
+    Some(finalize_live2(actions, street, req.seed, t0))
+}
+
 pub fn decide_live2(live2_root: &str, req: &DecideRequest) -> Option<DecideResponse> {
     let t0 = std::time::Instant::now();
 
-    // TURN (4) / RIVER (5): real-time exact HU search of the actual board. No bank,
-    // no SPR routing, no canonicalization — the solve is exact on the real cards.
+    // TURN (4) / RIVER (5): real-time exact HU search of the actual board.
     if req.board.len() == 4 || req.board.len() == 5 {
-        let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
-        let iters = if req.board.len() == 5 {
-            crate::live2_bank::LIVE2_RT_RIVER_ITERS
-        } else {
-            crate::live2_bank::LIVE2_RT_TURN_ITERS
-        };
-        let solve = crate::live2_bank::solve_live2_street(&req.board, commit, pot, iters)?;
-        let node = walk_to_node(&solve.tree, &req.street_actions)?;
-        if solve.tree.nodes[node].player_id as usize != req.hero_idx as usize {
-            return None;
-        }
-        // Hero's hand index in the table layout (c1<c2, not on board).
-        let (a, b) = (
-            req.hero_cards[0].min(req.hero_cards[1]),
-            req.hero_cards[0].max(req.hero_cards[1]),
-        );
-        let h = (0..solve.nh)
-            .find(|&i| solve.hand_cards[i * 2] == a && solve.hand_cards[i * 2 + 1] == b)?;
-        let na = solve.tree.nodes[node].num_children as usize;
-        let strat = solve.cfr.get_average_strategy(node, na, solve.nh); // [na][nh]
-        let children = solve.tree.node_children(node);
-        let actions: Vec<ActionProb> = (0..na)
-            .map(|a| {
-                let child = children[a] as usize;
-                let label = solve.tree.nodes[child].action_label;
-                // The tree is built in the live commit/pot frame → exact amounts.
-                let amount = commit + solve.tree.get_contribution(child, req.hero_idx);
-                ActionProb { label, action: action_name(label).to_string(), amount, prob: strat[a][h] }
-            })
-            .collect();
-        let street = if req.board.len() == 5 { "river" } else { "turn" };
-        return Some(finalize_live2(actions, street, req.seed, t0));
+        return decide_live2_resolve(req);
     }
 
     if req.board.len() != 3 {
@@ -737,4 +784,56 @@ pub fn decide_preflop(pf: &PreflopPlayer, req: &DecideRequest) -> Option<DecideR
         search_ms: t0.elapsed().as_millis() as u64,
         paired: false,
     })
+}
+
+#[cfg(test)]
+mod walk_translation_tests {
+    use super::*;
+    use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
+    use solver_core::tree::builder::build_tree_depth_limited;
+
+    // A flop tree whose root offers check (1) and bet (3); there is no raise (4)
+    // node at the root. An opponent "raise" must TRANSLATE to the aggressive
+    // class (the bet) rather than return None (which would drop to the rollout).
+    fn flop_tree() -> FlatTree {
+        let cfg = TreeConfig {
+            num_players: 3, initial_state: BoardState::Flop, starting_pot: 30,
+            starting_stacks: vec![400; 3], initial_contributions: vec![0; 3],
+            rake_rate: 0.0, rake_cap: 0.0,
+            bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)], raise: vec![BetSize::PotRelative(1.0)] },
+            add_allin_threshold: 1.0, force_allin_threshold: 1.0,
+            merging_threshold: 0.0, button_player: None,
+            max_bets_per_street: None, no_open_limp: false, threebet_or_fold: false,
+        };
+        build_tree_depth_limited(&cfg).expect("tree")
+    }
+
+    #[test]
+    fn off_menu_aggressive_action_translates_not_none() {
+        let tree = flop_tree();
+        let root_children = tree.node_children(0).to_vec();
+        let labels: Vec<u8> = root_children.iter().map(|&c| tree.nodes[c as usize].action_label).collect();
+        // Sanity: root has a bet (3) but no raise (4).
+        assert!(labels.contains(&3), "tree should offer a bet at root");
+        assert!(!labels.contains(&4), "this fixture assumes no raise at the root");
+
+        // Opponent "raises" 50 (label 4) — not at the root. Must translate to the
+        // closest aggressive child (a bet), NOT return None.
+        let act = vec![ActionInput { label: 4, to_total: 50 }];
+        let node = walk_to_node(&tree, &act);
+        assert!(node.is_some(), "off-menu raise should translate to a bet, got None");
+        let n = node.unwrap();
+        // The landed-on node's action must be aggressive (a bet), not check/fold.
+        let lbl = tree.nodes[ (0..root_children.len())
+            .find(|&i| root_children[i] as usize == n).map(|_| n).unwrap_or(n) ].action_label;
+        assert!(lbl == 3 || lbl == 5, "translated to label {lbl}, expected a bet/allin");
+    }
+
+    #[test]
+    fn exact_label_still_preferred() {
+        let tree = flop_tree();
+        // A plain check (label 1) must still map to the check child exactly.
+        let node = walk_to_node(&tree, &[ActionInput { label: 1, to_total: 0 }]).expect("check walks");
+        assert_eq!(tree.nodes[node].action_label, 1, "exact check should be preferred");
+    }
 }

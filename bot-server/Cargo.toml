@@ -3,6 +3,12 @@ name = "bot-server"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# GPU depth-limited search (Apple Metal) — forwards to play-harness/solver-core.
+# Opt-in; the runtime GPU branch is also gated by the GPU_SEARCH env flag.
+metal = ["play-harness/metal", "solver-core/metal"]
+
 [dependencies]
 play-harness = { path = "../play-harness" }
 solver-core = { path = "../solver-core" }

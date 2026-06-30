@@ -52,8 +52,13 @@ pub fn live2_bet_menu() -> BetSizeOptions {
 /// bigger turn+river betting tree: ~45s @48 at SPR≈9), so the solve uses an ADAPTIVE
 /// iter count — `solve_live2_street` measures one iteration and runs as many as fit
 /// a wall-clock budget, capped at these ceilings.
-pub const LIVE2_RT_TURN_ITERS: u32 = 48;
-pub const LIVE2_RT_RIVER_ITERS: u32 = 96;
+// Ceilings RAISED 2026-06-30: at the old 48/96 the AVERAGE strategy was still
+// diluted by early-uniform CFR iterates — e.g. quads first-to-act value-bet only
+// ~57-63% (should be ~always). The solve is ADAPTIVE (trims to LIVE2_RT_BUDGET_MS),
+// so raising the ceiling only adds iters where there's headroom (cheap river /
+// shallow-SPR turn); deep-SPR turn still auto-trims and stays in budget.
+pub const LIVE2_RT_TURN_ITERS: u32 = 300;
+pub const LIVE2_RT_RIVER_ITERS: u32 = 600;
 /// Wall-clock budget (ms) for a real-time street solve — kept under the ~14s live
 /// budget with margin. At deep SPR the turn may run fewer than the ceiling iters.
 pub const LIVE2_RT_BUDGET_MS: u128 = 9_000;
@@ -117,6 +122,9 @@ pub fn solve_live2_street(board: &[u8], commit: i32, pot: i32, iters: u32) -> Op
     let per_iter = t.elapsed().as_millis().max(1);
     let fit = (LIVE2_RT_BUDGET_MS / per_iter) as u32;
     let total = fit.clamp(LIVE2_RT_MIN_ITERS, iters);
+    if std::env::var("LIVE2_ITER_DEBUG").is_ok() {
+        eprintln!("[live2] street={:?} per_iter={per_iter}ms fit={fit} total={total} (cap={iters})", state);
+    }
     if total > 1 {
         cfr.run(&tree, &game, total - 1);
     }

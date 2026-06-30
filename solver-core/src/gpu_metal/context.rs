@@ -57,23 +57,34 @@ impl MetalContext {
             device.recommended_max_working_set_size() as f64 / 1e9);
         
         let queue = device.new_command_queue();
-        
-        // Load pre-compiled metallib
-        let out_dir = std::env::var("OUT_DIR").unwrap_or_default();
-        let metallib_path = PathBuf::from(out_dir).join("solver.metallib");
-        
-        let library = if metallib_path.exists() {
-            device.new_library_with_file(&metallib_path)
-                .map_err(|e| MetalError::LibraryCompilation(
-                    format!("Failed to load {}: {}", metallib_path.display(), e)
-                ))?
-        } else {
-            return Err(MetalError::ShaderFileNotFound(
-                format!("{}", metallib_path.display())
-            ));
+
+        // The metallib is EMBEDDED at compile time via include_bytes! — env!("OUT_DIR")
+        // is the build-time OUT_DIR (the build script generates solver.metallib there
+        // before this crate compiles). This makes MetalContext work from ANY downstream
+        // crate (play-harness, bot-server): runtime OUT_DIR is unset there, so the old
+        // file-load path silently failed and the GPU search fell back to CPU.
+        // Fallback: an on-disk OUT_DIR/solver.metallib (e.g. if the embedded bytes are
+        // ever stale), preserved for solver-core's own dev loop.
+        const METALLIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/solver.metallib"));
+        let library = match device.new_library_with_data(METALLIB_BYTES) {
+            Ok(lib) => {
+                eprintln!("[Metal] Loaded embedded shader library ({} bytes)", METALLIB_BYTES.len());
+                lib
+            }
+            Err(embed_err) => {
+                let out_dir = std::env::var("OUT_DIR").unwrap_or_default();
+                let metallib_path = PathBuf::from(out_dir).join("solver.metallib");
+                if metallib_path.exists() {
+                    eprintln!("[Metal] Embedded load failed ({embed_err}); falling back to {}", metallib_path.display());
+                    device.new_library_with_file(&metallib_path)
+                        .map_err(|e| MetalError::LibraryCompilation(
+                            format!("Failed to load {}: {}", metallib_path.display(), e)))?
+                } else {
+                    return Err(MetalError::LibraryCompilation(
+                        format!("embedded metallib load failed: {embed_err}")));
+                }
+            }
         };
-        
-        eprintln!("[Metal] Loaded shader library from {}", metallib_path.display());
         
         Ok(MetalContext {
             device,

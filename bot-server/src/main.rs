@@ -197,19 +197,49 @@ async fn decide_handler(
         };
     }
 
-    // POSTFLOP (live 3/4/5): get-or-load the blueprint for this cell+flop.
+    // POSTFLOP (live 3/4/5): get-or-load the LEGACY per-cell blueprint for this
+    // cell+flop. In a CONNECTED-blueprint deployment (CONN_BP set) these legacy
+    // `flop_NNNN.bp` files do NOT exist — so a spot the connected decider can't
+    // serve (e.g. a 3-way flop FACING A BET whose size doesn't map to the cell
+    // tree) used to hard-fail with "load .../flop_NNNN.bp: missing". Fall to the
+    // graceful equity-rollout (decide_live6) instead of a 400. (A real facing-a-
+    // bet 3-way flop strategy from the connected path is the proper follow-up.)
     let key = (req.cell_dir.clone(), req.flop_id);
-    let bp: Arc<SyncBp> = {
+    // None ⇒ the legacy cell is absent in a connected deployment ⇒ fall to the
+    // rollout (handled AFTER the cache lock is released, so no MutexGuard is held
+    // across the .await).
+    let bp_opt: Option<Arc<SyncBp>> = {
         let mut cache = st.cache.lock().unwrap();
         if let Some(bp) = cache.get(&key) {
-            bp.clone()
+            Some(bp.clone())
         } else {
             let path = format!("{}/{}/flop_{:04}.bp", st.bp_root, req.cell_dir, req.flop_id);
-            let bp = Blueprint::load(&path)
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("load {path}: {e}")))?;
-            let bp = Arc::new(SyncBp(bp));
-            cache.insert(key, bp.clone());
-            bp
+            match Blueprint::load(&path) {
+                Ok(bp) => {
+                    let bp = Arc::new(SyncBp(bp));
+                    cache.insert(key, bp.clone());
+                    Some(bp)
+                }
+                Err(e) => {
+                    if st.conn.is_some() {
+                        None // connected deployment: legacy cell absent by design
+                    } else {
+                        return Err((StatusCode::BAD_REQUEST, format!("load {path}: {e}")));
+                    }
+                }
+            }
+        }
+    };
+    let bp: Arc<SyncBp> = match bp_opt {
+        Some(bp) => bp,
+        None => {
+            let out = tokio::task::spawn_blocking(move || play_harness::api::decide_live6(&req))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live6 join: {e}")))?;
+            return match out {
+                Some(r) => Ok(Json(r)),
+                None => Err((StatusCode::UNPROCESSABLE_ENTITY, "postflop: unservable spot".into())),
+            };
         }
     };
     // Per-live latency schedule (parallel + discounted for heavy multiway counts)

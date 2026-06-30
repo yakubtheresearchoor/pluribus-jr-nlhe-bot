@@ -309,7 +309,7 @@ impl ConnDecider {
     /// POSTFLOP decision via real-time depth-limited search over the connected
     /// blueprint's buckets (Pluribus-style: postflop = search, not lookup). The
     /// connected lookup (preflop + postflop_action_dist) is the baseline/continuation.
-    fn decide_postflop_search(&self, req: &DecideRequest) -> Option<DecideResponse> {
+    pub fn decide_postflop_search(&self, req: &DecideRequest) -> Option<DecideResponse> {
         let flop_id = req.flop_id as usize;
         let adapter = self.adapter(flop_id, req.live as usize)?;
         let reach_priors = self.reach_priors(req, &adapter.0);

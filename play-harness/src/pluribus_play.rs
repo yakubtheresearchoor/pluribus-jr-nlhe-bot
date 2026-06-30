@@ -1047,8 +1047,51 @@ pub fn search_decision(
         }
     }
     let seed_salt = board.iter().fold(0u64, |a, &c| a.wrapping_mul(53).wrapping_add(c as u64));
-    let strat = search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides);
+    // GPU depth-limited search (FLOP + TURN; opt-in via GPU_SEARCH + the `metal`
+    // feature). River stays on CPU — its terminals are actual-board showdowns the
+    // GPU's flop-base sorted arrays can't value. Falls back to the CPU search.
+    let gpu_ok = matches!(cont, ContStreet::Flop | ContStreet::Turn(_));
+    let strat = if gpu_ok && std::env::var("GPU_SEARCH").is_ok() {
+        try_gpu_search(bp, &tree, cont, live, &overrides, cfg)
+            .unwrap_or_else(|| search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides))
+    } else {
+        search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides)
+    };
     Some((tree, strat))
+}
+
+/// GPU depth-limited search (Metal) for FLOP or TURN. Per-request `MetalContext`
+/// (thread-safe, ~ms setup). Returns None when the `metal` feature is off or the
+/// GPU is unavailable, so the caller falls back to the CPU search.
+#[cfg(feature = "metal")]
+fn try_gpu_search(
+    bp: &Blueprint,
+    tree: &FlatTree,
+    cont: ContStreet,
+    live: usize,
+    overrides: &[(usize, Vec<f32>)],
+    cfg: &SearchCfg,
+) -> Option<std::collections::HashMap<usize, Vec<Vec<f32>>>> {
+    use solver_core::gpu_metal::{gpu_search_street_strat, GpuSearchCfg, MetalContext};
+    let ctx = MetalContext::new().ok()?;
+    // Board-filtered base range (= the CPU game's initial_weight for this street),
+    // overlaid with the per-seat overrides → [live][nh] reach prior.
+    let scratch = BucketedContinuationGame::new_street(&bp.game, &bp.bk, cont, cfg.sample_m, cfg.seed);
+    let base = scratch.initial_weight(0);
+    let mut reach: Vec<Vec<f32>> = (0..live).map(|_| base.clone()).collect();
+    for (seat, r) in overrides {
+        if *seat < live { reach[*seat] = r.clone(); }
+    }
+    let gcfg = GpuSearchCfg { iters: cfg.iters, sample_m: cfg.sample_m, seed: cfg.seed, factored_terminals: true, lambda: cfg.lambda };
+    Some(gpu_search_street_strat(&ctx, tree, bp.game.table(), &bp.bk, cont, &reach, &gcfg))
+}
+
+#[cfg(not(feature = "metal"))]
+fn try_gpu_search(
+    _bp: &Blueprint, _tree: &FlatTree, _cont: ContStreet, _live: usize,
+    _overrides: &[(usize, Vec<f32>)], _cfg: &SearchCfg,
+) -> Option<std::collections::HashMap<usize, Vec<Vec<f32>>>> {
+    None
 }
 
 /// Hand index of `cards` in the blueprint universe (for reading the searched

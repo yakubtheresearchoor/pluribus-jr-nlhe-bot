@@ -805,6 +805,51 @@ struct StrategiesParams {
     int nh;
 };
 
+// QRE (quantal-response) strategy: σ_a ∝ exp(λ · last_cfv_a/denom), per-hand
+// max-stabilized. Mirrors CPU mccfr.rs:1053-1078. denom = max(iter-1, 1)
+// (time-average action value); first iterate (last_cfv=0) → uniform.
+struct QreParams {
+    int num_infosets;
+    int nh;
+    float lambda;
+    float denom;
+};
+
+kernel void vcfr_compute_strategies_qre(
+    device const float* last_cfv            [[buffer(0)]],
+    device float*       strategy            [[buffer(1)]],
+    device const uint32_t* decision_node_ids [[buffer(2)]],
+    device const FlatNode* nodes            [[buffer(3)]],
+    device const uint32_t* infoset_offsets  [[buffer(4)]],
+    constant QreParams& params              [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int infoset_id = int(gid.x);
+    int h = int(gid.y);
+    if (infoset_id >= params.num_infosets || h >= params.nh) return;
+    int nh = params.nh;
+    uint node_id = decision_node_ids[infoset_id];
+    FlatNode node = nodes[node_id];
+    int na = int(node.num_children);
+    int stride = MAX_NA * nh;
+    const device float* lc = last_cfv + infoset_id * stride;
+    device float* s = strategy + infoset_id * stride;
+    float denom = params.denom;
+
+    float mx = -INFINITY;
+    for (int a = 0; a < na; a++) mx = max(mx, lc[a * nh + h] / denom);
+    float z = 0.0f;
+    for (int a = 0; a < na; a++) {
+        float avg = lc[a * nh + h] / denom;
+        float w = exp(params.lambda * (avg - mx));
+        s[a * nh + h] = w;
+        z += w;
+    }
+    z = (z > 0.0f) ? z : 1.0f;
+    for (int a = 0; a < na; a++) s[a * nh + h] /= z;
+    for (int a = na; a < MAX_NA; a++) s[a * nh + h] = 0.0f;
+}
+
 kernel void vcfr_compute_strategies(
     device const float* regrets             [[buffer(0)]],
     device float*       strategy            [[buffer(1)]],
@@ -893,6 +938,570 @@ kernel void vcfr_zero_buffer(
 ) {
     int idx = int(gid);
     if (idx < params.size) buf[idx] = 0.0f;
+}
+
+// ============================================================================
+// Depth-limited bucketed CONTINUATION LEAF (HU, Arm-1 closed form).
+//
+// Continuation chance leaves are reached by check/call closing the street ⇒
+// equal contributions, fold_mask=0 ⇒ Arm 1 of the CPU collapsed showdown. For
+// HU (num_opp=1) that DP collapses (validated bit-close in
+// hu_continuation_closed_form.rs) to, per traverser bucket bt:
+//
+//   cfv[bt] = half_pot · Σ_bo reach[bo] · ( (f_w-f_l) - rps·(f_w + f_t/2) )
+//
+// Two kernels run per traverser pass AFTER top_down (reach known) and AFTER the
+// d_cfv zero, BEFORE the bottom-up level loop:
+//   1. vcfr_continuation_reduce  : per-hand opp reach → per-bucket reach
+//   2. vcfr_continuation_fill    : closed-form showdown + expand → cfv[leaf][h]
+// 0xFFFF map entries (dead hands) contribute nothing and get cfv=0.
+// ============================================================================
+
+struct ContParams {
+    int nb;
+    int nh;
+    int np;
+    int traverser;
+    int n_leaf;
+    int starting_pot;
+    float rake_rate;
+    float rake_cap;
+    float num_combinations;
+};
+
+#define CONT_NO_BUCKET 0xFFFFu
+
+// One thread per (leaf, opponent-bucket): sum the traverser's opponent reach
+// over the hands that map to that bucket. Grid = (n_leaf, nb).
+kernel void vcfr_continuation_reduce(
+    device float*          bucket_reach   [[buffer(0)]],  // [n_leaf * nb] out
+    device const float*    reach          [[buffer(1)]],  // [nn * np * nh]
+    device const uint16_t* map            [[buffer(2)]],  // [nh] hand→bucket
+    device const uint32_t* leaf_nodes     [[buffer(3)]],  // [n_leaf] node ids
+    constant ContParams&   p              [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int li = int(gid.x);
+    int bo = int(gid.y);
+    if (li >= p.n_leaf || bo >= p.nb) return;
+    uint node_id = leaf_nodes[li];
+    int opp = (p.traverser == 0) ? 1 : 0;  // HU
+    const device float* opp_r = reach + (uint(node_id) * uint(p.np) + uint(opp)) * uint(p.nh);
+    float s = 0.0f;
+    for (int h = 0; h < p.nh; h++) {
+        if (uint(map[h]) == uint(bo)) s += opp_r[h];
+    }
+    bucket_reach[li * p.nb + bo] = s;
+}
+
+// One thread per (leaf, hand): closed-form HU Arm-1 showdown for that hand's
+// bucket, then /num_combinations. Grid = (n_leaf, nh).
+kernel void vcfr_continuation_fill(
+    device float*          cfv            [[buffer(0)]],  // [nn * nh] (write leaf rows)
+    device const float*    bucket_reach   [[buffer(1)]],  // [n_leaf * nb]
+    device const uint16_t* map            [[buffer(2)]],  // [nh]
+    device const uint32_t* leaf_nodes     [[buffer(3)]],  // [n_leaf]
+    device const int32_t*  contributions  [[buffer(4)]],  // [nn * np]
+    device const float*    f_w            [[buffer(5)]],  // [nb * nb]
+    device const float*    f_t            [[buffer(6)]],
+    device const float*    f_l            [[buffer(7)]],
+    device const float*    f_n            [[buffer(8)]],
+    constant ContParams&   p              [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int li = int(gid.x);
+    int h  = int(gid.y);
+    if (li >= p.n_leaf || h >= p.nh) return;
+    uint node_id = leaf_nodes[li];
+    device float* out = cfv + uint(node_id) * uint(p.nh);
+
+    uint bt = uint(map[h]);
+    if (bt == CONT_NO_BUCKET) { out[h] = 0.0f; return; }
+
+    int traverser = p.traverser;
+    int opp = (traverser == 0) ? 1 : 0;
+    int c_t   = contributions[uint(node_id) * uint(p.np) + uint(traverser)];
+    int c_opp = contributions[uint(node_id) * uint(p.np) + uint(opp)];
+    float half_pot = float(p.starting_pot) / float(p.np) + float(c_t);
+    int total_pot = p.starting_pot + c_t + c_opp;
+    float rake = max(min(float(total_pot) * p.rake_rate, p.rake_cap), 0.0f);
+    float rps = (half_pot > 0.0f) ? (rake / half_pot) : 0.0f;
+
+    float accum = 0.0f;
+    int row = int(bt) * p.nb;
+    for (int bo = 0; bo < p.nb; bo++) {
+        float r = bucket_reach[li * p.nb + bo];
+        if (r == 0.0f) continue;
+        int i = row + bo;
+        if (f_n[i] == 0.0f) continue;
+        float fw = f_w[i];
+        float ft = f_t[i];
+        float fl = f_l[i];
+        accum += r * ((fw - fl) - rps * (fw + ft * 0.5f));
+    }
+    float v = half_pot * accum;
+    out[h] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
+}
+
+// ============================================================================
+// MULTIWAY continuation leaf (np ≥ 3), Design-1 Arm-1, MC-sampled — faithful to
+// the deployed CPU `bucketed_showdown_cfv_design1_collapsed_sampled`. Exact
+// bucket enumeration is B^num_opp; sampling draws M opponent bucket-tuples ∝
+// reach. Four kernels: reduce_mw (per-opp bucket reach) → cdf_mw (prefix + zsum)
+// → showdown_mw (per-bucket MC value) → expand (per-hand /nc).
+// ============================================================================
+
+struct ContMwParams {
+    int nb;
+    int nh;
+    int np;
+    int traverser;
+    int n_leaf;
+    int num_opp;
+    int starting_pot;
+    uint sample_m;
+    float rake_rate;
+    float rake_cap;
+    float num_combinations;
+    ulong rng_seed;
+};
+
+// map opponent slot oi (0..num_opp) to player id, skipping the traverser.
+static inline int mw_opp_player(int oi, int traverser) {
+    return (oi < traverser) ? oi : (oi + 1);
+}
+
+// Reduce: bucket_reach[(li*num_opp+oi)*nb + bo] = Σ_{h:map==bo} reach[leaf][player(oi)][h].
+// Grid (n_leaf*num_opp, nb).
+kernel void vcfr_continuation_reduce_mw(
+    device float*          bucket_reach   [[buffer(0)]],
+    device const float*    reach          [[buffer(1)]],
+    device const uint16_t* map            [[buffer(2)]],
+    device const uint32_t* leaf_nodes     [[buffer(3)]],
+    constant ContMwParams& p              [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int row = int(gid.x);              // li*num_opp + oi
+    int bo  = int(gid.y);
+    if (row >= p.n_leaf * p.num_opp || bo >= p.nb) return;
+    int li = row / p.num_opp;
+    int oi = row % p.num_opp;
+    uint node_id = leaf_nodes[li];
+    int player = mw_opp_player(oi, p.traverser);
+    const device float* r = reach + (uint(node_id) * uint(p.np) + uint(player)) * uint(p.nh);
+    float s = 0.0f;
+    for (int h = 0; h < p.nh; h++) {
+        if (uint(map[h]) == uint(bo)) s += r[h];
+    }
+    bucket_reach[row * p.nb + bo] = s;
+}
+
+// CDF: prefix-sum bucket_reach per (leaf,opp) → cdf; zsum = total mass.
+// Grid (n_leaf, num_opp).
+kernel void vcfr_continuation_cdf_mw(
+    device float*          cdf            [[buffer(0)]],  // [n_leaf*num_opp*nb]
+    device float*          zsum           [[buffer(1)]],  // [n_leaf*num_opp]
+    device const float*    bucket_reach   [[buffer(2)]],
+    constant ContMwParams& p              [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int li = int(gid.x);
+    int oi = int(gid.y);
+    if (li >= p.n_leaf || oi >= p.num_opp) return;
+    int row = li * p.num_opp + oi;
+    float c = 0.0f;
+    for (int b = 0; b < p.nb; b++) {
+        c += bucket_reach[row * p.nb + b];
+        cdf[row * p.nb + b] = c;
+    }
+    zsum[row] = c;
+}
+
+static inline ulong sm_next(thread ulong& s) {
+    s += 0x9E3779B97F4A7C15UL;
+    ulong z = s;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+    return z ^ (z >> 31);
+}
+static inline float sm_unif(thread ulong& s) {
+    return (float)(sm_next(s) >> 40) / (float)(1u << 24);
+}
+
+// Showdown (MC): per (leaf, bt) draw M opponent bucket-tuples ∝ reach and
+// accumulate the per-tuple value. Arm 1 (all active equal, no fold) uses the
+// tie-counting state DP; Arm 2 (a player folded during the street ⇒ dead money
+// / side pots) uses the level-DP net_expected port. Grid (n_leaf, nb).
+kernel void vcfr_continuation_showdown_mw(
+    device float*          cfv_bucket     [[buffer(0)]],  // [n_leaf*nb] out
+    device const float*    cdf            [[buffer(1)]],
+    device const float*    zsum           [[buffer(2)]],
+    device const uint32_t* leaf_nodes     [[buffer(3)]],
+    device const int32_t*  contributions  [[buffer(4)]],
+    device const float*    f_w            [[buffer(5)]],
+    device const float*    f_t            [[buffer(6)]],
+    device const float*    f_l            [[buffer(7)]],
+    device const float*    f_n            [[buffer(8)]],
+    device const uint16_t* folded_masks   [[buffer(9)]],
+    constant ContMwParams& p              [[buffer(10)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int li = int(gid.x);
+    int bt = int(gid.y);
+    if (li >= p.n_leaf || bt >= p.nb) return;
+    uint node_id = leaf_nodes[li];
+    int num_opp = p.num_opp;
+    int np = p.np;
+
+    float zprod = 1.0f;
+    for (int oi = 0; oi < num_opp; oi++) zprod *= zsum[li * num_opp + oi];
+    if (zprod <= 0.0f) { cfv_bucket[li * p.nb + bt] = 0.0f; return; }
+
+    // Per-leaf static state.
+    int c[6];
+    for (int q = 0; q < np; q++) c[q] = contributions[uint(node_id) * uint(np) + uint(q)];
+    uint fold_mask = uint(folded_masks[node_id]);
+    int traverser = p.traverser;
+    int c_t = c[traverser];
+    bool trav_folded = ((fold_mask >> uint(traverser)) & 1u) != 0u;
+    float traverser_stake = float(p.starting_pot) / float(np) + float(c_t);
+
+    // opponent player ids / contributions / folded
+    int opp_pl[6]; int opp_c[6]; bool opp_f[6];
+    for (int oi = 0; oi < num_opp; oi++) {
+        int pl = (oi < traverser) ? oi : (oi + 1);
+        opp_pl[oi] = pl; opp_c[oi] = c[pl];
+        opp_f[oi] = ((fold_mask >> uint(pl)) & 1u) != 0u;
+    }
+
+    // Arm classification: all ACTIVE players equal contribution AND no fold.
+    bool all_eq = true; int ref_c = -1;
+    for (int q = 0; q < np; q++) {
+        if (((fold_mask >> uint(q)) & 1u) != 0u) continue;
+        if (ref_c < 0) ref_c = c[q];
+        else if (c[q] != ref_c) { all_eq = false; break; }
+    }
+    bool arm1 = (all_eq && fold_mask == 0u);
+
+    // Arm-1 rake-per-unit-stake; Arm-2 main-pot rake (computed in net_expected).
+    int total = p.starting_pot;
+    for (int q = 0; q < np; q++) total += c[q];
+    float k = float(num_opp);
+    float rpus = 0.0f;
+    if (arm1) {
+        float rake = max(min(float(total) * p.rake_rate, p.rake_cap), 0.0f);
+        rpus = (traverser_stake > 0.0f) ? (rake / traverser_stake) : 0.0f;
+    }
+    // Arm-2: levels + main pot rake (main pot = lowest level × #contributors @≥ + starting_pot).
+    // sorted unique contributions.
+    int lv[6]; int nlv = 0;
+    for (int q = 0; q < np; q++) {
+        int v = c[q]; bool seen = false;
+        for (int z = 0; z < nlv; z++) if (lv[z] == v) { seen = true; break; }
+        if (!seen) lv[nlv++] = v;
+    }
+    for (int a = 0; a < nlv; a++) for (int b = a + 1; b < nlv; b++) if (lv[b] < lv[a]) { int t = lv[a]; lv[a] = lv[b]; lv[b] = t; }
+    float main_pot_rake = 0.0f;
+    if (!arm1 && nlv > 0) {
+        int num_main = 0; for (int q = 0; q < np; q++) if (c[q] >= lv[0]) num_main++;
+        int main_amt = lv[0] * num_main + p.starting_pot;
+        main_pot_rake = max(min(float(main_amt) * p.rake_rate, p.rake_cap), 0.0f);
+    }
+
+    ulong seed = p.rng_seed
+        ^ (ulong(node_id) * 0x9E3779B97F4A7C15UL)
+        ^ (ulong(bt) * 0x9E3779B97F4A7C15UL);
+
+    float sum_g = 0.0f;
+    uint bo[9];
+    for (uint s = 0; s < p.sample_m; s++) {
+        for (int oi = 0; oi < num_opp; oi++) {
+            int row = li * num_opp + oi;
+            float u = sm_unif(seed) * zsum[row];
+            const device float* pref = cdf + row * p.nb;
+            int lo = 0, hi = p.nb;
+            while (lo < hi) { int mid = (lo + hi) >> 1; if (pref[mid] > u) hi = mid; else lo = mid + 1; }
+            bo[oi] = uint(min(lo, p.nb - 1));
+        }
+        // opp-opp blocking weight (shared by both arms)
+        float wpair = 1.0f; bool dead = false;
+        for (int oi = 0; oi < num_opp && !dead; oi++) {
+            uint b = bo[oi];
+            for (int pj = 0; pj < oi; pj++) { float f = f_n[bo[pj] * p.nb + int(b)]; if (f == 0.0f) { dead = true; break; } wpair *= f; }
+        }
+        if (dead) continue;
+
+        if (arm1) {
+            float state[11]; for (int z = 0; z < 11; z++) state[z] = 0.0f; state[1] = 1.0f;
+            for (int oi = 0; oi < num_opp && !dead; oi++) {
+                uint b = bo[oi];
+                int i = bt * p.nb + int(b);
+                float fnn = f_n[i]; if (fnn == 0.0f) { dead = true; break; }
+                float fw = f_w[i], ft = f_t[i], fl = f_l[i];
+                float ns[11]; for (int z = 0; z < 11; z++) ns[z] = 0.0f;
+                if (state[0] != 0.0f) ns[0] += state[0] * fnn;
+                for (int j = 0; j <= oi; j++) { float sj = state[1 + j]; if (sj == 0.0f) continue;
+                    if (fl != 0.0f) ns[0] += sj * fl; if (ft != 0.0f) ns[1 + j + 1] += sj * ft; if (fw != 0.0f) ns[1 + j] += sj * fw; }
+                for (int z = 0; z < 11; z++) state[z] = ns[z];
+            }
+            if (dead) continue;
+            float accum = 0.0f;
+            if (state[0] != 0.0f) accum += state[0] * -1.0f;
+            for (int j = 0; j <= num_opp; j++) { float sj = state[1 + j]; if (sj == 0.0f) continue;
+                float nu; if (j == 0) nu = k - rpus; else { float tf = float(j + 1); nu = (k + 1.0f - tf) / tf - rpus / tf; }
+                accum += sj * nu; }
+            sum_g += wpair * traverser_stake * accum; // half_pot folded in here for arm1
+        } else {
+            // sc[oi] = [w,t,l, n_if_folded]
+            float scw[6], sct[6], scl[6], scn[6];
+            for (int oi = 0; oi < num_opp && !dead; oi++) {
+                uint b = bo[oi]; int i = bt * p.nb + int(b);
+                if (opp_f[oi]) { float n = f_n[i]; if (n == 0.0f) { dead = true; break; } scw[oi]=0; sct[oi]=0; scl[oi]=0; scn[oi]=n; }
+                else { float w=f_w[i], t=f_t[i], l=f_l[i]; if (w==0.0f&&t==0.0f&&l==0.0f){dead=true;break;} scw[oi]=w; sct[oi]=t; scl[oi]=l; scn[oi]=0; }
+            }
+            if (dead) continue;
+            // net_expected
+            float s_total = 1.0f;
+            for (int oi = 0; oi < num_opp; oi++) s_total *= opp_f[oi] ? scn[oi] : (scw[oi] + sct[oi] + scl[oi]);
+            float cash = 0.0f; int prev_l = 0;
+            for (int liv = 0; liv < nlv; liv++) {
+                int lev = lv[liv];
+                int pc = lev - prev_l;
+                int num_contrib = 0; for (int q = 0; q < np; q++) if (c[q] >= lev) num_contrib++;
+                float pot_l = float(pc * num_contrib);
+                if (liv == 0) pot_l += float(p.starting_pot);
+                if (pot_l == 0.0f) { prev_l = lev; continue; }
+                bool trav_elig = (!trav_folded) && (c_t >= lev);
+                int elig_count = trav_elig ? 1 : 0;
+                for (int oi = 0; oi < num_opp; oi++) { if (opp_f[oi]) continue; if (opp_c[oi] < lev) continue; elig_count++; }
+                if (elig_count == 0) {
+                    if (c[traverser] >= lev) {
+                        float tcl = float(pc) + ((liv == 0) ? (float(p.starting_pot) / float(np)) : 0.0f);
+                        cash += tcl * s_total;
+                    }
+                    prev_l = lev; continue;
+                }
+                if (!trav_elig) { prev_l = lev; continue; }
+                float m_out = 1.0f;
+                for (int oi = 0; oi < num_opp; oi++) { if (opp_f[oi]) m_out *= scn[oi]; else if (opp_c[oi] < lev) m_out *= (scw[oi] + sct[oi] + scl[oi]); }
+                float dp[7]; for (int z = 0; z < 7; z++) dp[z] = 0.0f; dp[0] = 1.0f;
+                int ne = 0;
+                for (int oi = 0; oi < num_opp; oi++) {
+                    if (opp_f[oi] || opp_c[oi] < lev) continue;
+                    float w = scw[oi], t = sct[oi];
+                    dp[ne + 1] = 0.0f;
+                    for (int j = ne; j >= 0; j--) { float d = dp[j];
+                        if (d != 0.0f && t != 0.0f) dp[j + 1] += d * t;
+                        dp[j] = (d != 0.0f && w != 0.0f) ? d * w : 0.0f; }
+                    ne++;
+                }
+                float pot_ar = (liv == 0) ? (pot_l - main_pot_rake) : pot_l;
+                for (int j = 0; j <= ne; j++) { float d = dp[j]; if (d == 0.0f) continue;
+                    cash += m_out * d * (pot_ar / float(j + 1)); }
+                prev_l = lev;
+            }
+            float val = cash - traverser_stake * s_total;
+            sum_g += wpair * val;
+        }
+    }
+    // Arm-1 folds half_pot into sum_g; Arm-2 already in absolute chips.
+    cfv_bucket[li * p.nb + bt] = (zprod / float(p.sample_m)) * sum_g;
+}
+
+// Expand per-bucket cfv → per-hand cfv at the leaf, with /num_combinations.
+// Grid (n_leaf, nh).
+kernel void vcfr_continuation_expand(
+    device float*          cfv            [[buffer(0)]],  // [nn*nh]
+    device const float*    cfv_bucket     [[buffer(1)]],  // [n_leaf*nb]
+    device const uint16_t* map            [[buffer(2)]],
+    device const uint32_t* leaf_nodes     [[buffer(3)]],
+    constant ContMwParams& p              [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int li = int(gid.x);
+    int h  = int(gid.y);
+    if (li >= p.n_leaf || h >= p.nh) return;
+    uint node_id = leaf_nodes[li];
+    uint bt = uint(map[h]);
+    device float* out = cfv + uint(node_id) * uint(p.nh);
+    if (bt == CONT_NO_BUCKET) { out[h] = 0.0f; return; }
+    float v = cfv_bucket[li * p.nb + int(bt)];
+    out[h] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
+}
+
+// ============================================================================
+// Fast LONE-SURVIVOR terminal (np=3 / num_opp=2), parallel over (terminal, hand).
+//
+// In a no-all-in depth-limited tree EVERY terminal is a fold ⇒ num_active<=1 ⇒
+// constant payoff; only the opponent-pair compatible reach mass nh_count(h)
+// varies per hand. The base `vcfr_bottom_up` runs this with 1 thread/node and
+// an inner O(nh²) g0×g1 loop ⇒ O(nh³)/node single-threaded (the np≥3 wall). This
+// kernel runs the SAME g0×g1 loop in the SAME order (⇒ bit-exact) but one thread
+// per (terminal, hand), turning O(nh³)/node into O(nh²)/thread nh-way parallel.
+// Mirrors multiway_brute_force_showdown's num_active<=1||traverser_folded path
+// (vcfr.metal ~L408-476) + the /num_combinations normalization.
+// ============================================================================
+
+struct LoneTermParams {
+    int nh;
+    int np;
+    int traverser;
+    int n_term;
+    int starting_pot;
+    float rake_rate;
+    float rake_cap;
+    float num_combinations;
+};
+
+kernel void vcfr_lone_terminal_par(
+    device float*          cfv            [[buffer(0)]],  // [nn*nh] write
+    device const uint32_t* term_nodes     [[buffer(1)]],  // [n_term] lone-survivor terminals
+    device const FlatNode* nodes          [[buffer(2)]],
+    device const int32_t*  contributions  [[buffer(3)]],  // [nn*np]
+    device const uint16_t* folded_masks   [[buffer(4)]],  // [nn]
+    device const float*    reach          [[buffer(5)]],  // [nn*np*nh]
+    device const uint8_t*  hand_cards     [[buffer(6)]],  // [nh*2]
+    constant LoneTermParams& p            [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x);
+    int h  = int(gid.y);
+    if (ti >= p.n_term || h >= p.nh) return;
+    int nh = p.nh; int np = p.np; int traverser = p.traverser;
+    uint node_id = term_nodes[ti];
+    uint16_t fold_mask = folded_masks[node_id];
+    FlatNode node = nodes[node_id];
+
+    int c_t = contributions[node_id * uint(np) + uint(traverser)];
+    float traverser_stake = float(p.starting_pot) / float(np) + float(c_t);
+    bool traverser_folded = (fold_mask & (uint16_t)(1u << traverser)) != 0;
+    bool flop_seen = (node.board_state != 3);
+    float eff_rake_rate = flop_seen ? p.rake_rate : 0.0f;
+    float eff_rake_cap  = flop_seen ? p.rake_cap  : 0.0f;
+
+    // payoff (mirror L409-448): main-pot-only rake; folded traverser loses stake.
+    int total_pot = p.starting_pot;
+    for (int q = 0; q < np; q++) total_pot += contributions[node_id * uint(np) + uint(q)];
+    int min_contrib = contributions[node_id * uint(np) + 0u];
+    for (int q = 1; q < np; q++) { int c = contributions[node_id * uint(np) + uint(q)]; if (c < min_contrib) min_contrib = c; }
+    int num_main = 0;
+    for (int q = 0; q < np; q++) if (contributions[node_id * uint(np) + uint(q)] >= min_contrib) num_main++;
+    int main_pot_amount = min_contrib * num_main + p.starting_pot;
+    float rake = fmax(0.0f, fmin(float(main_pot_amount) * eff_rake_rate, eff_rake_cap));
+    float payoff = traverser_folded ? (-traverser_stake) : ((float(total_pot) - rake) - traverser_stake);
+
+    // opponent reaches (the two non-traverser players), oi mapping as in bottom_up.
+    int opp0 = (0 < traverser) ? 0 : 1;
+    int opp1 = (1 < traverser) ? 1 : 2;
+    const device float* reach_0 = reach + (node_id * uint(np) + uint(opp0)) * uint(nh);
+    const device float* reach_1 = reach + (node_id * uint(np) + uint(opp1)) * uint(nh);
+
+    int hc1 = hand_cards[h * 2];
+    int hc2 = hand_cards[h * 2 + 1];
+    float nh_count = 0.0f;
+    for (int g0 = 0; g0 < nh; g0++) {
+        int g0c1 = hand_cards[g0 * 2];
+        int g0c2 = hand_cards[g0 * 2 + 1];
+        if (g0c1 == hc1 || g0c1 == hc2 || g0c2 == hc1 || g0c2 == hc2) continue;
+        float r0 = reach_0[g0];
+        if (r0 == 0.0f) continue;
+        for (int g1 = 0; g1 < nh; g1++) {
+            int g1c1 = hand_cards[g1 * 2];
+            int g1c2 = hand_cards[g1 * 2 + 1];
+            if (g1c1 == hc1 || g1c1 == hc2 || g1c2 == hc1 || g1c2 == hc2) continue;
+            if (g0c1 == g1c1 || g0c1 == g1c2 || g0c2 == g1c1 || g0c2 == g1c2) continue;
+            float r1 = reach_1[g1];
+            if (r1 == 0.0f) continue;
+            nh_count += r0 * r1;
+        }
+    }
+    float v = payoff * nh_count;
+    cfv[node_id * uint(nh) + uint(h)] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
+}
+
+// ============================================================================
+// FACTORED lone-survivor terminal (np=3): same value as vcfr_lone_terminal_par
+// but the inner O(nh) g1 loop is replaced by single-opponent inclusion-exclusion,
+// giving O(nh)/thread (vs O(nh²)). The opp-1 compatible mass for a fixed g0 is
+//   CompatR1(g0,h) = Sb(h) − Pb_h[g0.a] − Pb_h[g0.b] + r1[g0]
+// where Sb(h)=Σ_{g1∌h} r1, Pb_h[c]=Σ_{g1∌h, c∈g1} r1 = P1[c] − r1[{c,h1}] − r1[{c,h2}].
+// pair2hand[x*52+y] = hand index of {x,y} (or -1). NOT bit-exact to the brute
+// loop (different float order); validated within tolerance.
+// ============================================================================
+kernel void vcfr_lone_terminal_factored(
+    device float*          cfv            [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const FlatNode* nodes          [[buffer(2)]],
+    device const int32_t*  contributions  [[buffer(3)]],
+    device const uint16_t* folded_masks   [[buffer(4)]],
+    device const float*    reach          [[buffer(5)]],
+    device const uint8_t*  hand_cards     [[buffer(6)]],
+    device const int32_t*  pair2hand      [[buffer(7)]],  // [52*52] hand idx or -1
+    constant LoneTermParams& p            [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x);
+    int h  = int(gid.y);
+    if (ti >= p.n_term || h >= p.nh) return;
+    int nh = p.nh; int np = p.np; int traverser = p.traverser;
+    uint node_id = term_nodes[ti];
+    uint16_t fold_mask = folded_masks[node_id];
+    FlatNode node = nodes[node_id];
+
+    int c_t = contributions[node_id * uint(np) + uint(traverser)];
+    float traverser_stake = float(p.starting_pot) / float(np) + float(c_t);
+    bool traverser_folded = (fold_mask & (uint16_t)(1u << traverser)) != 0;
+    bool flop_seen = (node.board_state != 3);
+    float eff_rake_rate = flop_seen ? p.rake_rate : 0.0f;
+    float eff_rake_cap  = flop_seen ? p.rake_cap  : 0.0f;
+    int total_pot = p.starting_pot;
+    for (int q = 0; q < np; q++) total_pot += contributions[node_id * uint(np) + uint(q)];
+    int min_contrib = contributions[node_id * uint(np) + 0u];
+    for (int q = 1; q < np; q++) { int c = contributions[node_id * uint(np) + uint(q)]; if (c < min_contrib) min_contrib = c; }
+    int num_main = 0;
+    for (int q = 0; q < np; q++) if (contributions[node_id * uint(np) + uint(q)] >= min_contrib) num_main++;
+    int main_pot_amount = min_contrib * num_main + p.starting_pot;
+    float rake = fmax(0.0f, fmin(float(main_pot_amount) * eff_rake_rate, eff_rake_cap));
+    float payoff = traverser_folded ? (-traverser_stake) : ((float(total_pot) - rake) - traverser_stake);
+
+    int opp0 = (0 < traverser) ? 0 : 1;
+    int opp1 = (1 < traverser) ? 1 : 2;
+    const device float* reach_0 = reach + (node_id * uint(np) + uint(opp0)) * uint(nh);
+    const device float* reach_1 = reach + (node_id * uint(np) + uint(opp1)) * uint(nh);
+
+    int h1 = hand_cards[h * 2];
+    int h2 = hand_cards[h * 2 + 1];
+
+    // Per-card opp1 mass P1[c] and total S1 (O(nh)).
+    float P1[52];
+    for (int c = 0; c < 52; c++) P1[c] = 0.0f;
+    float S1 = 0.0f;
+    for (int g = 0; g < nh; g++) {
+        float r = reach_1[g];
+        if (r != 0.0f) { S1 += r; P1[hand_cards[g*2]] += r; P1[hand_cards[g*2+1]] += r; }
+    }
+    float r1h = reach_1[h];
+    float Sb = S1 - P1[h1] - P1[h2] + r1h;
+
+    // g0 loop with O(1) inner compatible mass.
+    float nh_count = 0.0f;
+    for (int g0 = 0; g0 < nh; g0++) {
+        int a = hand_cards[g0*2];
+        int b = hand_cards[g0*2+1];
+        if (a == h1 || a == h2 || b == h1 || b == h2) continue;
+        float r0 = reach_0[g0];
+        if (r0 == 0.0f) continue;
+        int i_ah1 = pair2hand[a*52 + h1]; float r1_ah1 = (i_ah1 >= 0) ? reach_1[i_ah1] : 0.0f;
+        int i_ah2 = pair2hand[a*52 + h2]; float r1_ah2 = (i_ah2 >= 0) ? reach_1[i_ah2] : 0.0f;
+        int i_bh1 = pair2hand[b*52 + h1]; float r1_bh1 = (i_bh1 >= 0) ? reach_1[i_bh1] : 0.0f;
+        int i_bh2 = pair2hand[b*52 + h2]; float r1_bh2 = (i_bh2 >= 0) ? reach_1[i_bh2] : 0.0f;
+        float Pb_a = P1[a] - r1_ah1 - r1_ah2;
+        float Pb_b = P1[b] - r1_bh1 - r1_bh2;
+        float compat = Sb - Pb_a - Pb_b + reach_1[g0];
+        nh_count += r0 * compat;
+    }
+    float v = payoff * nh_count;
+    cfv[node_id * uint(nh) + uint(h)] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
 }
 
 // ============================================================================
@@ -1101,6 +1710,15 @@ struct BottomUpParams {
     float regret_floor;
     int32_t starting_pot;
     float num_combinations;
+    // When != 0, the terminal branch SKIPS lone-survivor terminals
+    // (num_active <= 1): they are pre-filled by vcfr_lone_terminal_par
+    // (parallel over hands) before the level loop. Field 11 — kept in
+    // sync with the Rust BuParams (solver.rs) which sends 11 fields.
+    int32_t skip_lone_terminals;
+    // When != 0, accumulate per-action counterfactual values into last_cfv for
+    // the QRE strategy (vcfr_compute_strategies_qre). Field 12 — kept in sync
+    // with the Rust BuParams (now 12 fields).
+    int32_t lambda_active;
     // ─── Slice 2 rake (CPU↔Metal parity) ───
     // Mirror CPU `tree.rake_rate, tree.rake_cap`. Per-terminal gating is
     // applied at evaluation site as: `eff_rate/eff_cap = flop_seen ? rake : 0`.
@@ -1147,6 +1765,9 @@ kernel void vcfr_bottom_up(
     //   2 = rake-correctly-skipped (flop_seen=false, no-flop-no-drop)
     // Written right after multiway_brute_force_showdown returns.
     device uchar* rake_marker                [[buffer(18)]],
+    // QRE: accumulated per-(infoset, action, hand) counterfactual values. Only
+    // written when params.lambda_active != 0; read by vcfr_compute_strategies_qre.
+    device float* last_cfv                   [[buffer(19)]],
     uint gid [[thread_position_in_grid]]
 ) {
     int idx = int(gid);
@@ -1163,6 +1784,15 @@ kernel void vcfr_bottom_up(
         int node_reach_base = node_id * np * nh;
         uint16_t fold_mask = folded_masks[node_id];
         device float* out = cfv + node_id * nh;
+
+        // Fast-terminal skip: lone-survivor terminals (num_active <= 1) are
+        // pre-filled by vcfr_lone_terminal_par (parallel over hands) before
+        // this level loop. Their cfv is already correct — leave it.
+        if (params.skip_lone_terminals != 0) {
+            int n_active = 0;
+            for (int p = 0; p < np; p++) if (!(fold_mask & (1u << p))) n_active++;
+            if (n_active <= 1) return;
+        }
 
         // Copy contributions to thread-local memory for the brute-force helper.
         int32_t contribs_local[8];
@@ -1223,6 +1853,11 @@ kernel void vcfr_bottom_up(
 
     // ═══ CHANCE NODE ═══
     if (node.node_type == NODE_TYPE_CHANCE) {
+        // Childless chance node = depth-limit CONTINUATION LEAF: its cfv is
+        // pre-filled by vcfr_continuation_fill (run after the d_cfv zero,
+        // before this level loop). Keep it — do NOT re-zero. Full trees have
+        // no childless chance nodes, so this is byte-exact for existing uses.
+        if (node.num_children == 0) return;
         for (int h = 0; h < nh; h++) cfv[node_id * nh + h] = 0.0f;
         for (int a = 0; a < int(node.num_children); a++) {
             uint child = children[node.children_start + a];
@@ -1270,6 +1905,17 @@ kernel void vcfr_bottom_up(
             for (int h = 0; h < nh; h++) {
                 uint cidx = offset + a * nh + h;
                 cum_strategy[cidx] = params.gamma_t * cum_strategy[cidx] + sigma[a * nh + h];
+            }
+        }
+
+        // QRE: accumulate the per-action counterfactual value (cfv[child]) so the
+        // logit (vcfr_compute_strategies_qre) responds to the time-average value.
+        if (params.lambda_active != 0) {
+            for (int a = 0; a < na; a++) {
+                uint child = children[node.children_start + a];
+                for (int h = 0; h < nh; h++) {
+                    last_cfv[offset + a * nh + h] += cfv[child * nh + h];
+                }
             }
         }
     } else {
