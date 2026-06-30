@@ -552,17 +552,22 @@ pub fn flop_search_exploitability_2street_sweep(
         depth_bool[n] = true;
     }
     let nodes = tree.num_nodes();
+    // Per-node turn map (read-only) so the continuation reads the in-tree turn from
+    // the tree, not a shared mutable Cell — required for parallel branch valuation.
+    let node_turn = solver_core::solver::bucketed_search::build_node_turn(&tree);
     let mut out = Vec::with_capacity(checkpoints.len());
     for &iters in checkpoints {
-        let game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        let mut game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        game.set_node_turn(node_turn.clone());
+        game.set_cell_free(true);
         let mut s = CpuMccfr::new(&tree, vec![nh; np]);
         s.set_depth_limit(&depth);
         s.set_dcfr(1.5, 0.0, 2.0);
-        // SEQUENTIAL: the chance recursion (in-tree turn deal) is unsupported by the
-        // parallel no-chance traverser walk.
         s.run(&tree, &game, iters);
         let profile = StrategyProfile::from_usize_offsets(s.cum_strategy_slice(), s.node_offsets(), nh);
         let mut eval_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        eval_game.set_node_turn(node_turn.clone());
+        eval_game.set_cell_free(true);
         eval_game.set_normalize_reach(true);
         out.push((iters, exploitability_dl(&tree, &eval_game, &profile, &depth_bool), nodes));
     }
@@ -600,9 +605,12 @@ pub fn flop_search_k4(
     let depth = depth_leaves(&tree, BoardState::Turn as u8, false, np);
     let turn_u8 = BoardState::Turn as u8;
     let flop_u8 = BoardState::Flop as u8;
+    let node_turn = solver_core::solver::bucketed_search::build_node_turn(&tree);
 
     // (1) WARM-UP solve → coherent turn continuation.
-    let warm_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+    let mut warm_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+    warm_game.set_node_turn(node_turn.clone());
+    warm_game.set_cell_free(true);
     let mut warm = CpuMccfr::new(&tree, vec![nh; np]);
     warm.set_depth_limit(&depth);
     warm.set_dcfr(1.5, 0.0, 2.0);
@@ -630,7 +638,9 @@ pub fn flop_search_k4(
     }
     s.set_dcfr(1.5, 0.0, 2.0);
     // (4) RE-SOLVE the flop against the frozen + biased continuation.
-    let game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+    let mut game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+    game.set_node_turn(node_turn.clone());
+    game.set_cell_free(true);
     s.run(&tree, &game, solve_iters);
 
     // (5) Root summary: reach-uniform aggression (P(bet/raise/allin)) + the strategy.

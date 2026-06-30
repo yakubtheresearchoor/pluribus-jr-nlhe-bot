@@ -27,7 +27,6 @@ use crate::solver::bucketed_showdown::bucketed_showdown_cfv_design1_collapsed_sa
 use crate::solver::flop_start_game::FlopStartGame;
 use crate::solver::game::GameSpec;
 use crate::tree::flat::FlatTree;
-use std::cell::Cell;
 
 /// Which street the search is rooted on — selects the bucket map + runout
 /// tables the depth-limit continuation integrates over:
@@ -42,6 +41,29 @@ pub enum ContStreet {
     Flop,
     Turn(usize),
     River(usize, usize),
+}
+
+/// Build the per-node turn map for a BRANCHED 2-street tree (`set_node_turn`):
+/// every chance node's child `j` is runout outcome `j`, so its whole subtree is
+/// tagged `j` (the turn dealt to reach it). Flop nodes above any chance stay `-1`.
+/// One pass, tree-shaped so each node lands in exactly one branch.
+pub fn build_node_turn(tree: &FlatTree) -> Vec<i32> {
+    let mut map = vec![-1i32; tree.num_nodes()];
+    for n in 0..tree.num_nodes() {
+        if !tree.nodes[n].is_chance() {
+            continue;
+        }
+        for (j, &c) in tree.node_children(n).iter().enumerate() {
+            let mut stack = vec![c as usize];
+            while let Some(x) = stack.pop() {
+                map[x] = j as i32;
+                for &ch in tree.node_children(x) {
+                    stack.push(ch as usize);
+                }
+            }
+        }
+    }
+    map
 }
 
 pub struct BucketedContinuationGame<'a> {
@@ -70,14 +92,20 @@ pub struct BucketedContinuationGame<'a> {
     /// point mass (its known hand) and the pool seat to a blocker-narrowed range,
     /// so the bot's continuation value reflects the shared card removal.
     reach_override: Vec<Option<Vec<f32>>>,
-    /// 2-STREET search: the runout-grid index of the turn DEALT IN-TREE (set by the
-    /// turn chance node via `set_chance_outcome`), or None for a 1-street search
-    /// (the turn-deal is the depth leaf, never descended). When Some(ti) at a Flop-
-    /// rooted leaf, the continuation integrates the RIVER runout for turn ti
-    /// (`turn_tables[ti]`) instead of the flop-level turn+river runout — otherwise
-    /// the in-tree turn would be double-counted. Interior-mutable like the inner
-    /// game's chance cells; never touched by the parallel (no-chance) path.
-    current_turn_ti: Cell<Option<usize>>,
+    /// 2-STREET search: per-NODE runout-grid index of the turn dealt IN-TREE to reach
+    /// that node (`node_turn[node]`), or `-1` for nodes at/above the turn-deal (a
+    /// 1-street leaf, or the flop betting). Set ONCE from the branched tree via
+    /// `set_node_turn` — a read-only map, NOT interior-mutable, so the game has no
+    /// shared mutable chance state and the disjoint turn branches can be valued in
+    /// PARALLEL. When `node_turn[leaf] = ti >= 0`, the continuation integrates the
+    /// RIVER runout for turn ti (`turn_tables[ti]`); else the flop-level runout.
+    /// Empty = all `-1` (1-street / non-branched — the legacy behaviour).
+    node_turn: Vec<i32>,
+    /// When true, terminal (fold) values route through the Cell-free bucketed path
+    /// instead of `inner.evaluate_terminal` (which reads the inner game's !Sync turn
+    /// Cell). Required so PARALLEL branches never touch shared mutable state. Off by
+    /// default ⇒ the 1-street deployed path keeps its exact inner fold values.
+    cell_free: bool,
 }
 
 impl<'a> BucketedContinuationGame<'a> {
@@ -110,8 +138,25 @@ impl<'a> BucketedContinuationGame<'a> {
             rng_seed,
             normalize_reach: false,
             reach_override: Vec::new(),
-            current_turn_ti: Cell::new(None),
+            node_turn: Vec::new(),
+            cell_free: false,
         }
+    }
+
+    /// Route terminal valuation through the Cell-free bucketed path (no access to the
+    /// inner game's !Sync turn Cell) so the disjoint branches can be valued in PARALLEL.
+    /// Trades exact HU fold values for the bucketed approximation; leave OFF for the
+    /// 1-street deployed path.
+    pub fn set_cell_free(&mut self, on: bool) {
+        self.cell_free = on;
+    }
+
+    /// Install the per-node turn map for a BRANCHED 2-street tree: `map[node]` = the
+    /// runout-grid turn index dealt in-tree to reach `node`, or `-1` for flop / 1-street
+    /// leaves. Read-only after this — lets the disjoint branches be valued in parallel
+    /// (no shared mutable chance Cell).
+    pub fn set_node_turn(&mut self, map: Vec<i32>) {
+        self.node_turn = map;
     }
 
     /// Set seat `player`'s reach to an explicit vector (length nh), overriding the
@@ -203,9 +248,11 @@ impl<'a> GameSpec for BucketedContinuationGame<'a> {
         // path — else inner.evaluate_terminal indexes a 3-player game with 2-player
         // reach and panics.
         let np_matches_inner = self.np as usize == self.inner.table().num_players as usize;
-        if self.np <= 2 && np_matches_inner {
+        if self.np <= 2 && np_matches_inner && !self.cell_free {
             self.inner.evaluate_terminal(traverser, node_idx, tree, cfreach)
         } else {
+            // Cell-free (or multiway): the bucketed collapsed showdown reads the turn
+            // from `node_turn` + bucketing, never the inner game's Cell — parallel-safe.
             self.evaluate_continuation(traverser, node_idx, tree, cfreach)
         }
     }
@@ -220,19 +267,20 @@ impl<'a> GameSpec for BucketedContinuationGame<'a> {
         let nh = self.inner.table().num_valid;
         let np = self.np as usize;
         let num_opp = np - 1;
-        // Select the bucket map + runout tables for the continuation. A 2-street
-        // flop search that has dealt the turn IN-TREE (current_turn_ti = Some(ti))
-        // must integrate the RIVER runout for that turn (turn-level tables) — using
-        // the flop-level tables here would double-count the in-tree turn. A plain
-        // 1-street search (turn-deal is the depth leaf, ti = None) uses the rooted
-        // street's tables unchanged.
-        let (nb, map, tables) = match (self.street, self.current_turn_ti.get()) {
-            (ContStreet::Flop, Some(ti)) => (
+        // Select the bucket map + runout tables for the continuation. In a BRANCHED
+        // 2-street tree, `node_turn[leaf] = ti >= 0` means the turn was dealt in-tree
+        // to reach this leaf, so integrate the RIVER runout for that turn (turn-level
+        // tables) — flop-level tables here would double-count the in-tree turn. A plain
+        // 1-street leaf (or flop node) has ti = -1 and uses the rooted street's tables.
+        // The map is read-only ⇒ no shared mutable state ⇒ branches value in parallel.
+        let ti_here = self.node_turn.get(node_idx).copied().unwrap_or(-1);
+        let (nb, map, tables) = match (self.street, ti_here) {
+            (ContStreet::Flop, ti) if ti >= 0 => (
                 self.bucketing.nb_turn,
-                &self.bucketing.turn_map[ti],
-                &self.bucketing.turn_tables[ti],
+                &self.bucketing.turn_map[ti as usize],
+                &self.bucketing.turn_tables[ti as usize],
             ),
-            (ContStreet::Flop, None) => (
+            (ContStreet::Flop, _) => (
                 self.bucketing.nb_flop,
                 &self.bucketing.flop_map,
                 &self.bucketing.flop_tables,
@@ -319,20 +367,15 @@ impl<'a> GameSpec for BucketedContinuationGame<'a> {
     }
 
     fn set_chance_outcome(&self, outcome: usize) {
-        // 2-street: the FIRST chance descent is the turn deal (the inner stages
-        // turn→river). Record its runout-grid index so a deeper leaf values the
-        // river runout for THIS turn. A 2-street search only descends the turn (the
-        // river chance is the depth leaf), so we only ever record the turn here.
-        if self.current_turn_ti.get().is_none() {
-            self.current_turn_ti.set(Some(outcome));
-        }
+        // The continuation LEAF reads its turn from the read-only `node_turn` map
+        // (parallel-safe). But the inner game still stages the turn so its TERMINAL
+        // card-removal (a fold terminal excludes hands colliding with the dealt turn)
+        // is correct. This inner Cell is the remaining shared-mutable state; the
+        // parallel path values terminals Cell-free instead (see Step B).
         self.inner.set_chance_outcome(outcome)
     }
 
     fn clear_chance_outcome(&self) {
         self.inner.clear_chance_outcome();
-        // Unwind the in-tree turn (mirrors the inner's clear). Our 2-street search
-        // nests exactly one chance level (the turn), so each clear unwinds it.
-        self.current_turn_ti.set(None);
     }
 }
