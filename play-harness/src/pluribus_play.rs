@@ -643,6 +643,9 @@ pub fn flop_search_k4(
         s.setup_pluribus_continuations(&tree, k, 5.0);
     }
     s.set_dcfr(1.5, 0.0, 2.0);
+    // Parallelize the disjoint frozen turn branches (walk_cfr_par now handles
+    // frozen/boundary nodes); Cell-free game keeps the branches off the inner Cell.
+    s.enable_parallel();
     // (4) RE-SOLVE the flop against the frozen + biased continuation.
     let mut game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
     game.set_node_turn(node_turn.clone());

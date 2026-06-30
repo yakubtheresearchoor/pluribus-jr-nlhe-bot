@@ -359,35 +359,39 @@ impl CpuMccfr {
                 let regrets_addr = self.regrets.as_mut_ptr() as usize;
                 let cum_addr = self.cum_strategy.as_mut_ptr() as usize;
                 let lastcfv_addr = self.last_cfv.as_mut_ptr() as usize;
+                // Selection regret/cum (empty + unused unless k-continuations are set up
+                // — boundary[] is empty, so the ptrs are never dereferenced otherwise).
+                let selr_addr = self.sel_regret.as_mut_ptr() as usize;
+                let selc_addr = self.sel_cum.as_mut_ptr() as usize;
                 // The continuation game is !Sync (FlopStartGame has Cell chance
                 // state) but that state is NEVER touched in a depth-limited walk
                 // (no chance recursion) — only read-only evaluate_* run. Assert
                 // shareability for the parallel map.
                 let sg = SyncGame(game);
-                // Each traverser runs ONCE; collect() preserves index order so
-                // results[0] is traverser 0's root CFV.
-                let results: Vec<Vec<f32>> = (0..np)
-                    .into_par_iter()
-                    .map(|traverser| {
-                        let g = sg.get();
-                        let mut cfreach: Vec<Vec<f32>> =
-                            (0..np).map(|p| g.initial_weight(p as u8)).collect();
-                        let mut traverser_reach = g.initial_weight(traverser as u8);
-                        self.walk_cfr_par(
-                            tree,
-                            g,
-                            traverser as u8,
-                            0,
-                            &mut cfreach,
-                            &mut traverser_reach,
-                            weight,
-                            disc,
-                            regrets_addr as *mut f32,
-                            cum_addr as *mut f32,
-                            lastcfv_addr as *mut f32,
-                        )
-                    })
-                    .collect();
+                let one_traverser = |traverser: usize| -> Vec<f32> {
+                    let g = sg.get();
+                    let mut cfreach: Vec<Vec<f32>> =
+                        (0..np).map(|p| g.initial_weight(p as u8)).collect();
+                    let mut traverser_reach = g.initial_weight(traverser as u8);
+                    let mut var: Vec<Option<usize>> = vec![None; np];
+                    self.walk_cfr_par(
+                        tree, g, traverser as u8, 0, &mut cfreach, &mut traverser_reach,
+                        weight, disc, regrets_addr as *mut f32, cum_addr as *mut f32,
+                        lastcfv_addr as *mut f32, selr_addr as *mut f32, selc_addr as *mut f32,
+                        &mut var,
+                    )
+                };
+                // Each traverser runs ONCE; index order preserved so results[0] is
+                // traverser 0's root CFV. With k-continuations (num_variants>1) the
+                // per-boundary SELECTION strategy reads LIVE sel-regret while the owning
+                // traverser writes it — so traversers must run SEQUENTIALLY then (the
+                // branch parallelism inside walk_cfr_par still gives the speedup; 12
+                // branches ≫ 2 traversers). Without boundaries, traversers parallelize.
+                let results: Vec<Vec<f32>> = if self.num_variants > 1 {
+                    (0..np).map(one_traverser).collect()
+                } else {
+                    (0..np).into_par_iter().map(one_traverser).collect()
+                };
                 for h in 0..nh0 {
                     root_cfv_sum[h] += results[0][h];
                 }
@@ -629,6 +633,7 @@ impl CpuMccfr {
     /// f32s, and all concurrent callers must use DISJOINT traversers so their
     /// written index ranges never overlap.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn walk_cfr_par(
         &self,
         tree: &FlatTree,
@@ -642,6 +647,9 @@ impl CpuMccfr {
         regrets: *mut f32,
         cum: *mut f32,
         last_cfv: *mut f32,
+        sel_r: *mut f32,
+        sel_c: *mut f32,
+        var: &mut Vec<Option<usize>>,
     ) -> Vec<f32> {
         let node = &tree.nodes[node_idx];
 
@@ -672,7 +680,9 @@ impl CpuMccfr {
             use rayon::prelude::*;
             let sg = SyncGame(game);
             let (r_addr, c_addr, l_addr) = (regrets as usize, cum as usize, last_cfv as usize);
+            let (sr_addr, sc_addr) = (sel_r as usize, sel_c as usize);
             let (cf_base, tr_base): (&[Vec<f32>], &[f32]) = (&*cfreach, &*traverser_reach);
+            let var_base: &[Option<usize>] = &*var;
             let results: Vec<Vec<f32>> = (0..count)
                 .into_par_iter()
                 .map(|outcome| {
@@ -681,9 +691,10 @@ impl CpuMccfr {
                     let probs = &all_probs[outcome];
                     // Fold the per-hand chance prob into every player's reach (CFR-
                     // through-chance), on per-branch COPIES so the branches don't share
-                    // mutable reach.
+                    // mutable reach OR the continuation-variant selection state.
                     let mut cf: Vec<Vec<f32>> = cf_base.to_vec();
                     let mut tr: Vec<f32> = tr_base.to_vec();
+                    let mut v: Vec<Option<usize>> = var_base.to_vec();
                     for h in 0..nh_t {
                         tr[h] *= probs[h];
                     }
@@ -695,6 +706,7 @@ impl CpuMccfr {
                     self.walk_cfr_par(
                         tree, g, traverser, child, &mut cf, &mut tr, weight, disc,
                         r_addr as *mut f32, c_addr as *mut f32, l_addr as *mut f32,
+                        sr_addr as *mut f32, sc_addr as *mut f32, &mut v,
                     )
                 })
                 .collect();
@@ -712,9 +724,24 @@ impl CpuMccfr {
         let nh = self.num_hands[player as usize];
         let children = tree.node_children(node_idx);
 
-        // Parallel path is always snapshot mode (frozen nodes absent here).
+        // FROZEN/BOUNDARY (k-continuation re-solve): the owner selects its variant at
+        // its first frozen node, then plays it onward; searched nodes read the snapshot.
+        // `var`/`boundary` are empty for a plain solve (no frozen) ⇒ the snapshot path,
+        // bit-identical to before. (Unreachable in the 1-street deployed search.)
+        let frozen_here = self.frozen[node_idx];
+        if frozen_here && self.boundary[node_idx] && var[player as usize].is_none() {
+            return self.boundary_select_par(
+                tree, game, traverser, node_idx, cfreach, traverser_reach, weight, disc,
+                regrets, cum, last_cfv, sel_r, sel_c, var,
+            );
+        }
         let off = self.node_data_offset[node_idx];
-        let strategy = &self.snapshot[off..off + num_actions * nh];
+        let strategy: Vec<f32> = if frozen_here {
+            let c = var[player as usize].unwrap_or(0);
+            self.frozen_variants[c][off..off + num_actions * nh].to_vec()
+        } else {
+            self.snapshot[off..off + num_actions * nh].to_vec()
+        };
 
         let mut cfv_all: Vec<Vec<f32>> = Vec::with_capacity(num_actions);
         for (a, &child) in children.iter().enumerate() {
@@ -733,7 +760,7 @@ impl CpuMccfr {
             };
             cfv_all.push(self.walk_cfr_par(
                 tree, game, traverser, child as usize, cfreach, traverser_reach, weight, disc,
-                regrets, cum, last_cfv,
+                regrets, cum, last_cfv, sel_r, sel_c, var,
             ));
             if player == traverser {
                 traverser_reach.copy_from_slice(&saved);
@@ -871,6 +898,101 @@ impl CpuMccfr {
             for h in 0..nh {
                 for c in 0..k {
                     self.sel_cum[off + c * nh + h] += weight * traverser_reach[h] * sel[c * nh + h];
+                }
+            }
+        } else {
+            for h in 0..nh_t {
+                for c in 0..k {
+                    cfv_avg[h] += cfv_c[c][h];
+                }
+            }
+        }
+        cfv_avg
+    }
+
+    /// Parallel (`&self`, raw-ptr) twin of `boundary_select`: the per-boundary
+    /// continuation-variant selection, writing sel-regret/sel-cum through raw
+    /// pointers (disjoint per branch) and recursing via `walk_cfr_par`. Selection
+    /// accumulation is undiscounted, matching `boundary_select`.
+    #[allow(clippy::too_many_arguments)]
+    fn boundary_select_par(
+        &self,
+        tree: &FlatTree,
+        game: &dyn GameSpec,
+        traverser: u8,
+        node_idx: usize,
+        cfreach: &mut [Vec<f32>],
+        traverser_reach: &mut [f32],
+        weight: f32,
+        disc: (f32, f32, f32),
+        regrets: *mut f32,
+        cum: *mut f32,
+        last_cfv: *mut f32,
+        sel_r: *mut f32,
+        sel_c: *mut f32,
+        var: &mut Vec<Option<usize>>,
+    ) -> Vec<f32> {
+        let player = tree.nodes[node_idx].player_id;
+        let k = self.num_variants;
+        let nh = self.num_hands[player as usize];
+        let sel = self.compute_sel_strategy(node_idx, k, nh);
+
+        let mut cfv_c: Vec<Vec<f32>> = Vec::with_capacity(k);
+        for c in 0..k {
+            let saved = if player == traverser {
+                let s = traverser_reach.to_vec();
+                for h in 0..nh {
+                    traverser_reach[h] *= sel[c * nh + h];
+                }
+                s
+            } else {
+                let s = cfreach[player as usize].clone();
+                for h in 0..nh {
+                    cfreach[player as usize][h] *= sel[c * nh + h];
+                }
+                s
+            };
+            var[player as usize] = Some(c);
+            cfv_c.push(self.walk_cfr_par(
+                tree, game, traverser, node_idx, cfreach, traverser_reach, weight, disc,
+                regrets, cum, last_cfv, sel_r, sel_c, var,
+            ));
+            var[player as usize] = None;
+            if player == traverser {
+                traverser_reach.copy_from_slice(&saved);
+            } else {
+                cfreach[player as usize] = saved;
+            }
+        }
+
+        let nh_t = self.num_hands[traverser as usize];
+        let mut cfv_avg = vec![0.0f32; nh_t];
+        if player == traverser {
+            for h in 0..nh_t {
+                for c in 0..k {
+                    cfv_avg[h] += sel[c * nh + h] * cfv_c[c][h];
+                }
+            }
+            let off = self.sel_offset[node_idx];
+            // SAFETY: sel_offset ranges are disjoint per boundary node ⇒ disjoint
+            // per branch across the parallel dispatch. Undiscounted (matches the
+            // sequential boundary_select).
+            unsafe {
+                for h in 0..nh {
+                    for c in 0..k {
+                        let idx = off + c * nh + h;
+                        let r = sel_r.add(idx);
+                        *r += weight * (cfv_c[c][h] - cfv_avg[h]);
+                        if *r < self.regret_floor {
+                            *r = self.regret_floor;
+                        }
+                    }
+                }
+                for h in 0..nh {
+                    for c in 0..k {
+                        *sel_c.add(off + c * nh + h) +=
+                            weight * traverser_reach[h] * sel[c * nh + h];
+                    }
                 }
             }
         } else {
