@@ -458,33 +458,48 @@ impl CpuMccfr {
                 return game.evaluate_terminal(traverser, node_idx, tree, cfreach);
             }
             let nh_t = self.num_hands[traverser as usize];
+            let np = self.num_hands.len();
             let mut cfv = vec![0.0f32; nh_t];
 
             let n_outcomes = game.num_chance_outcomes();
-            if n_outcomes > 0 && children.len() == 1 {
-                let child = children[0] as usize;
-                for outcome in 0..n_outcomes {
-                    if outcome > 0 { game.clear_chance_outcome(); }
-                    let probs: Vec<f32> = (0..nh_t).map(|h| game.chance_probability(outcome, h)).collect();
-                    game.set_chance_outcome(outcome);
-                    let child_cfv = self.walk_cfr(tree, game, traverser, child, cfreach, traverser_reach, weight, var);
-                    for h in 0..nh_t {
-                        cfv[h] += probs[h] * child_cfv[h];
+            let single = n_outcomes > 0 && children.len() == 1;
+            let count = if single { n_outcomes } else { children.len() };
+            for outcome in 0..count {
+                if outcome > 0 { game.clear_chance_outcome(); }
+                let probs: Vec<f32> = (0..nh_t).map(|h| game.chance_probability(outcome, h)).collect();
+                game.set_chance_outcome(outcome);
+                let child = if single { children[0] as usize } else { children[outcome] as usize };
+                // CHANCE-THROUGH CFR: fold the per-hand outcome probability into
+                // EVERY player's reach before recursing, so the regret/strategy
+                // updates in the searched street BELOW this chance are counterfactual-
+                // weighted by P(outcome). (The old code weighted only the value passed
+                // UP and left the sub-street regrets unweighted — every runout counted
+                // equally — so a multi-street search never converged.) Reaches are
+                // saved/restored per outcome (the chance subtree is replayed). All
+                // seats share one hand universe here, so `probs[h]` applies to each.
+                // NOTE: unreachable in a 1-street depth-limited search (the next-street
+                // chance is the depth leaf, short-circuited above), so the deployed
+                // path is unaffected.
+                let saved_t = traverser_reach.to_vec();
+                let saved_cf: Vec<Vec<f32>> = cfreach.to_vec();
+                for h in 0..nh_t {
+                    traverser_reach[h] *= probs[h];
+                }
+                for p in 0..np {
+                    for h in 0..self.num_hands[p].min(nh_t) {
+                        cfreach[p][h] *= probs[h];
                     }
                 }
-                game.clear_chance_outcome();
-            } else {
-                for (outcome, &child) in children.iter().enumerate() {
-                    if outcome > 0 { game.clear_chance_outcome(); }
-                    let probs: Vec<f32> = (0..nh_t).map(|h| game.chance_probability(outcome, h)).collect();
-                    game.set_chance_outcome(outcome);
-                    let child_cfv = self.walk_cfr(tree, game, traverser, child as usize, cfreach, traverser_reach, weight, var);
-                    for h in 0..nh_t {
-                        cfv[h] += probs[h] * child_cfv[h];
-                    }
+                let child_cfv = self.walk_cfr(tree, game, traverser, child, cfreach, traverser_reach, weight, var);
+                for h in 0..nh_t {
+                    cfv[h] += child_cfv[h];
                 }
-                game.clear_chance_outcome();
+                traverser_reach.copy_from_slice(&saved_t);
+                for p in 0..np {
+                    cfreach[p].copy_from_slice(&saved_cf[p]);
+                }
             }
+            game.clear_chance_outcome();
             return cfv;
         }
 

@@ -21,12 +21,14 @@ use crate::blueprint::Blueprint;
 use crate::match_play::{pop_postflop_action, splitmix64};
 use clean_rules::eval::best5;
 use clean_rules::table::settle_pots;
-use solver_core::solver::best_response::{exploitability, StrategyProfile};
+use solver_core::solver::best_response::{exploitability, exploitability_dl, StrategyProfile};
 use solver_core::solver::bucketed_search::{BucketedContinuationGame, ContStreet};
 use solver_core::solver::game::GameSpec;
 use solver_core::solver::mccfr::CpuMccfr;
 use solver_core::tree::action::{production_game_v1, BetCap, BetSize, BetSizeOptions, BoardState};
-use solver_core::tree::builder::build_tree_depth_limited;
+use solver_core::tree::builder::{
+    build_tree_depth_limited, build_tree_depth_limited_2, build_tree_depth_limited_2_branched,
+};
 use solver_core::tree::flat::FlatTree;
 use std::collections::HashMap;
 
@@ -455,6 +457,196 @@ pub fn flop_search_exploitability(bp: &Blueprint, commit: i32, pot: i32, cfg: &S
     let mut eval_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
     eval_game.set_normalize_reach(true);
     exploitability(&tree, &eval_game, &profile)
+}
+
+/// Convergence sweep: the flop-subgame exploitability at each iteration checkpoint,
+/// so we can read off how close the deployed iteration count gets to Nash and how
+/// much further iterations would buy. Mirrors `flop_search_exploitability` (same
+/// tree / DCFR / normalized-reach chip units) but solves fresh per checkpoint and
+/// values leaves with `exploitability_dl` — which stops at the search's depth
+/// limit exactly as CpuMccfr does, so the number is the search's convergence on
+/// the game it actually solved (not a deeper game it never explored). Uniform
+/// entering ranges (like `flop_search_exploitability`); the magnitude is a solver-
+/// convergence measure, ~independent of the reach prior. Returns (iters, chips).
+pub fn flop_search_exploitability_sweep(
+    bp: &Blueprint,
+    commit: i32,
+    pot: i32,
+    cfg: &SearchCfg,
+    checkpoints: &[u32],
+) -> Vec<(u32, f32)> {
+    let np = bp.np;
+    let nh = bp.nh;
+    let spec = production_game_v1();
+    let mut tcfg = spec.street_seam_config(BoardState::Flop, np as u8, commit, pot, rich_bets());
+    tcfg.max_bets_per_street = BetCap::all(3);
+    let tree = build_tree_depth_limited(&tcfg).expect("flop tree");
+    let depth = depth_leaves(&tree, BoardState::Flop as u8, false, np);
+    let mut depth_bool = vec![false; tree.num_nodes()];
+    for &n in &depth {
+        depth_bool[n] = true;
+    }
+    let mut out = Vec::with_capacity(checkpoints.len());
+    for &iters in checkpoints {
+        let game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        let mut s = CpuMccfr::new(&tree, vec![nh; np]);
+        s.set_depth_limit(&depth);
+        // PLK>1 attempts Pluribus k-continuation robustification. NOTE: this is a
+        // no-op under set_depth_limit — setup_pluribus_continuations biases ONLY
+        // `freeze_node`-frozen continuation nodes, and a depth-limited (truncated)
+        // tree has none (the recurse short-circuits at depth_limit → static
+        // evaluate_continuation). Exposed here purely to demonstrate that inertness
+        // empirically (PLK=4 must equal PLK=1).
+        let plk: usize = std::env::var("PLK").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        if plk > 1 {
+            s.setup_pluribus_continuations(&tree, plk, 5.0);
+        }
+        s.set_dcfr(1.5, 0.0, 2.0); // match the deployed search (DCFR on)
+        s.enable_parallel();
+        s.run(&tree, &game, iters);
+        let profile = StrategyProfile::from_usize_offsets(s.cum_strategy_slice(), s.node_offsets(), nh);
+        let mut eval_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        eval_game.set_normalize_reach(true);
+        out.push((iters, exploitability_dl(&tree, &eval_game, &profile, &depth_bool)));
+    }
+    out
+}
+
+/// 2-STREET convergence sweep (validation harness for the Pluribus safe-continuation
+/// machinery): build a flop tree that SEARCHES flop + turn and truncates at the
+/// river-deal (the bucketed game now values that leaf with the river runout for the
+/// in-tree-dealt turn). Solves fresh per checkpoint and returns (iters, exploit
+/// chips) on the 2-street game. Used to confirm the 2-street game converges (Gate 2)
+/// before freeze/k=4 are layered on.
+pub fn flop_search_exploitability_2street_sweep(
+    bp: &Blueprint,
+    commit: i32,
+    pot: i32,
+    cfg: &SearchCfg,
+    checkpoints: &[u32],
+) -> Vec<(u32, f32, usize)> {
+    let np = bp.np;
+    let nh = bp.nh;
+    let spec = production_game_v1();
+    let mut tcfg = spec.street_seam_config(BoardState::Flop, np as u8, commit, pot, rich_bets());
+    tcfg.max_bets_per_street = BetCap::all(3);
+    // BRANCHED chance: the turn-deal node forks into one subtree per runout turn
+    // (branch factor = the game's chance-outcome count), so the searched turn street
+    // gets CARD-AWARE per-outcome storage — without this the turn strategy is shared
+    // across all turns (card-agnostic) and a card-aware best-response leaves a ~25%
+    // structural gap that never converges.
+    let nturns = {
+        let g = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        g.num_chance_outcomes()
+    };
+    let tree = if std::env::var("BRANCHED").map(|v| v != "0").unwrap_or(true) {
+        build_tree_depth_limited_2_branched(&tcfg, nturns).expect("branched 2-street flop tree")
+    } else {
+        build_tree_depth_limited_2(&tcfg).expect("2-street flop tree")
+    };
+    // Depth leaf = the TURN→river transition (the river-deal chance). The flop AND
+    // turn player nodes are searched; the river runout is the bucketed continuation.
+    let depth = depth_leaves(&tree, BoardState::Turn as u8, false, np);
+    let mut depth_bool = vec![false; tree.num_nodes()];
+    for &n in &depth {
+        depth_bool[n] = true;
+    }
+    let nodes = tree.num_nodes();
+    let mut out = Vec::with_capacity(checkpoints.len());
+    for &iters in checkpoints {
+        let game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        let mut s = CpuMccfr::new(&tree, vec![nh; np]);
+        s.set_depth_limit(&depth);
+        s.set_dcfr(1.5, 0.0, 2.0);
+        // SEQUENTIAL: the chance recursion (in-tree turn deal) is unsupported by the
+        // parallel no-chance traverser walk.
+        s.run(&tree, &game, iters);
+        let profile = StrategyProfile::from_usize_offsets(s.cum_strategy_slice(), s.node_offsets(), nh);
+        let mut eval_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        eval_game.set_normalize_reach(true);
+        out.push((iters, exploitability_dl(&tree, &eval_game, &profile, &depth_bool), nodes));
+    }
+    out
+}
+
+/// Self-consistent Pluribus k-continuation FLOP search on the card-aware branched
+/// 2-street tree. (1) WARM-UP: solve flop+turn to a coherent equilibrium. (2) FREEZE
+/// every turn (next-street) node to that strategy. (3) `setup_pluribus_continuations(k)`
+/// biases the frozen turn into blueprint + fold/call/raise variants the opponent picks
+/// among. (4) RE-SOLVE the flop against the frozen+biased turn — so the flop strategy
+/// is robust to the opponent deviating in the continuation (the Pluribus safe-
+/// continuation property). SEQUENTIAL (frozen/boundary nodes are unsupported by the
+/// parallel walk). Returns (root reach-uniform aggression, root avg strategy [na][nh],
+/// tree node count).
+pub fn flop_search_k4(
+    bp: &Blueprint,
+    commit: i32,
+    pot: i32,
+    cfg: &SearchCfg,
+    k: usize,
+    warm_iters: u32,
+    solve_iters: u32,
+) -> (f32, Vec<Vec<f32>>, usize) {
+    let np = bp.np;
+    let nh = bp.nh;
+    let spec = production_game_v1();
+    let mut tcfg = spec.street_seam_config(BoardState::Flop, np as u8, commit, pot, rich_bets());
+    tcfg.max_bets_per_street = BetCap::all(3);
+    let nturns = {
+        let g = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        g.num_chance_outcomes()
+    };
+    let tree = build_tree_depth_limited_2_branched(&tcfg, nturns).expect("branched 2-street");
+    let depth = depth_leaves(&tree, BoardState::Turn as u8, false, np);
+    let turn_u8 = BoardState::Turn as u8;
+    let flop_u8 = BoardState::Flop as u8;
+
+    // (1) WARM-UP solve → coherent turn continuation.
+    let warm_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+    let mut warm = CpuMccfr::new(&tree, vec![nh; np]);
+    warm.set_depth_limit(&depth);
+    warm.set_dcfr(1.5, 0.0, 2.0);
+    warm.run(&tree, &warm_game, warm_iters);
+
+    // (2) FREEZE every turn node to the warm-up average strategy.
+    let mut s = CpuMccfr::new(&tree, vec![nh; np]);
+    s.set_depth_limit(&depth);
+    for n in 0..tree.num_nodes() {
+        if tree.nodes[n].is_player() && tree.nodes[n].board_state == turn_u8 {
+            let na = tree.nodes[n].num_children as usize;
+            let avg = warm.get_average_strategy(n, na, nh); // [na][nh]
+            let mut flat = vec![0f32; na * nh];
+            for a in 0..na {
+                for h in 0..nh {
+                    flat[a * nh + h] = avg[a][h];
+                }
+            }
+            s.freeze_node(n, &flat);
+        }
+    }
+    // (3) BIAS the frozen turn into k continuation variants (opponent selects).
+    if k > 1 {
+        s.setup_pluribus_continuations(&tree, k, 5.0);
+    }
+    s.set_dcfr(1.5, 0.0, 2.0);
+    // (4) RE-SOLVE the flop against the frozen + biased continuation.
+    let game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+    s.run(&tree, &game, solve_iters);
+
+    // (5) Root summary: reach-uniform aggression (P(bet/raise/allin)) + the strategy.
+    let na0 = tree.nodes[0].num_children as usize;
+    let root = s.get_average_strategy(0, na0, nh);
+    let labels: Vec<u8> = tree.node_children(0).iter().map(|&c| tree.nodes[c as usize].action_label).collect();
+    let mut aggr = 0.0f32;
+    for h in 0..nh {
+        for a in 0..na0 {
+            if matches!(labels[a], 3 | 4 | 5) {
+                aggr += root[a][h];
+            }
+        }
+    }
+    aggr /= nh as f32;
+    (aggr, root, tree.num_nodes())
 }
 
 /// Run ONE per-street search and extract the strategy for `street_u8` nodes.

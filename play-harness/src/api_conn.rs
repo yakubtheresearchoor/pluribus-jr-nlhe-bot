@@ -317,6 +317,74 @@ impl ConnDecider {
         decide_postflop_with_reach(&adapter.0, req, &self.cfg, &reach_priors)
     }
 
+    /// Convergence diagnostic: flop-subgame exploitability vs iteration count for a
+    /// cell, using the SAME adapter (buckets + continuation) the runtime search
+    /// builds. Returns (iters, exploit_chips, pct_of_pot). Empty if no adapter.
+    pub fn flop_exploitability_sweep(
+        &self,
+        flop_id: usize,
+        live: usize,
+        commit: i32,
+        pot: i32,
+        checkpoints: &[u32],
+    ) -> Vec<(u32, f32, f32)> {
+        let adapter = match self.adapter(flop_id, live) {
+            Some(a) => a,
+            None => return vec![],
+        };
+        crate::pluribus_play::flop_search_exploitability_sweep(&adapter.0, commit, pot, &self.cfg, checkpoints)
+            .into_iter()
+            .map(|(it, chips)| {
+                let pct = if pot > 0 { chips / pot as f32 * 100.0 } else { 0.0 };
+                (it, chips, pct)
+            })
+            .collect()
+    }
+
+    /// 2-STREET convergence diagnostic (validation of the Pluribus safe-continuation
+    /// machinery): flop+turn searched, river continuation. Returns (iters, pct_pot,
+    /// tree_nodes). Empty if no adapter.
+    pub fn flop_exploitability_sweep_2street(
+        &self,
+        flop_id: usize,
+        live: usize,
+        commit: i32,
+        pot: i32,
+        checkpoints: &[u32],
+    ) -> Vec<(u32, f32, usize)> {
+        let adapter = match self.adapter(flop_id, live) {
+            Some(a) => a,
+            None => return vec![],
+        };
+        crate::pluribus_play::flop_search_exploitability_2street_sweep(&adapter.0, commit, pot, &self.cfg, checkpoints)
+            .into_iter()
+            .map(|(it, chips, nodes)| {
+                let pct = if pot > 0 { chips / pot as f32 * 100.0 } else { 0.0 };
+                (it, pct, nodes)
+            })
+            .collect()
+    }
+
+    /// k-continuation probe: run the self-consistent Pluribus k=`k` safe-continuation
+    /// FLOP search on a cell and return (root aggression, root strategy, tree nodes).
+    /// Compare k=1 vs k=4 to confirm the biased continuations are live (non-inert) and
+    /// see their effect on the flop strategy. None if no adapter.
+    pub fn flop_k4_probe(
+        &self,
+        flop_id: usize,
+        live: usize,
+        commit: i32,
+        pot: i32,
+        k: usize,
+        warm_iters: u32,
+        solve_iters: u32,
+    ) -> Option<(f32, Vec<Vec<f32>>, usize)> {
+        let adapter = self.adapter(flop_id, live)?;
+        Some(crate::pluribus_play::flop_search_k4(
+            &adapter.0, commit, pot, &self.cfg, k, warm_iters, solve_iters,
+        ))
+    }
+
     /// Select the `(live, commit, pot)` cell: exact match, else nearest among
     /// same-live cells by |Δcommit| + |Δpot| (SPR-ish fallback).
     fn select_cell(&self, live: u8, commit: i32, pot: i32) -> Option<(u8, i32, i32)> {

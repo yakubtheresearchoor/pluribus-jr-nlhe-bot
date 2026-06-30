@@ -33,6 +33,31 @@ pub fn build_tree_depth_limited(config: &TreeConfig) -> Result<FlatTree, String>
     build_tree_inner(config, config.initial_state.next(), &[])
 }
 
+/// 2-STREET depth-limited build: truncate TWO streets past `config.initial_state`
+/// (a flop-rooted config stops at the RIVER-deal chance). Used by the Pluribus
+/// safe-continuation search: the current street is SEARCHED, the next street is the
+/// FROZEN + k-biased continuation region (`freeze_node` + `setup_pluribus_continuations`),
+/// and the deeper chance is the depth leaf valued by the bucketed continuation. If
+/// there is no second street ahead (river-rooted), this is the full tree.
+pub fn build_tree_depth_limited_2(config: &TreeConfig) -> Result<FlatTree, String> {
+    let truncate_at = config.initial_state.next().and_then(|s| s.next());
+    build_tree_inner(config, truncate_at, &[])
+}
+
+/// 2-STREET depth-limited build with BRANCHED chance: the next-street chance node
+/// branches into `chance_branch` distinct subtrees (one per runout outcome), giving
+/// the searched next street CARD-AWARE per-outcome storage. `chance_branch` MUST
+/// equal the game's `num_chance_outcomes()` for that street (the solver pairs branch
+/// i with outcome i). This is the tree a faithful Pluribus 2-street / safe-continuation
+/// search runs on.
+pub fn build_tree_depth_limited_2_branched(
+    config: &TreeConfig,
+    chance_branch: usize,
+) -> Result<FlatTree, String> {
+    let truncate_at = config.initial_state.next().and_then(|s| s.next());
+    build_tree_inner_branched(config, truncate_at, &[], Some(chance_branch))
+}
+
 /// PREFLOP-ONLY build (2026-06-12, v1 game derivation): truncate the
 /// tree at the preflop→flop chance nodes (they become childless CHANCE
 /// leaves). This is the tree the PRODUCTION preflop layer actually
@@ -54,6 +79,15 @@ fn build_tree_inner(
     config: &TreeConfig,
     truncate_at: Option<BoardState>,
     bet_override: &[(BoardState, BetSizeOptions)],
+) -> Result<FlatTree, String> {
+    build_tree_inner_branched(config, truncate_at, bet_override, None)
+}
+
+fn build_tree_inner_branched(
+    config: &TreeConfig,
+    truncate_at: Option<BoardState>,
+    bet_override: &[(BoardState, BetSizeOptions)],
+    chance_branch: Option<usize>,
 ) -> Result<FlatTree, String> {
     let num_players = config.num_players as usize;
     if num_players < 2 || num_players > 10 {
@@ -95,6 +129,7 @@ fn build_tree_inner(
         config,
         truncate_at,
         bet_override,
+        chance_branch,
         tree: FlatTree::new(
             config.num_players,
             config.starting_pot,
@@ -236,6 +271,15 @@ struct TreeBuilder<'a> {
     /// Per-board-state bet-menu overrides (nested solving). A board state listed
     /// here uses its menu instead of `config.bet_sizes`; empty = uniform.
     bet_override: &'a [(BoardState, BetSizeOptions)],
+    /// If `Some(n)`, a non-truncated chance node BRANCHES into `n` distinct,
+    /// structurally-identical child subtrees (one per runout outcome) instead of a
+    /// single replayed child. Each branch gets its OWN nodes ⇒ its own regret /
+    /// strategy storage ⇒ a CARD-AWARE searched street below the chance (the
+    /// per-outcome storage a faithful 2-street / Pluribus search needs). The
+    /// solver pairs branch `i` with chance outcome `i` (`set_chance_outcome(i)`).
+    /// `None` = the legacy single replayed child (card-agnostic). `n` MUST equal
+    /// the game's `num_chance_outcomes()` for that street.
+    chance_branch: Option<usize>,
     tree: FlatTree,
 }
 
@@ -733,21 +777,9 @@ impl<'a> TreeBuilder<'a> {
             return;
         }
 
-        let child_node = {
-            let first = self.first_postflop_player_with_button(&info.active);
-            FlatNode::player(first, info.board_state, self.tree.nodes[parent_idx].amount)
-        };
-        let child_idx = self.tree.alloc_node(child_node);
-        // The post-chance player's incoming "action" from the chance node is
-        // CHANCE, not FOLD. Without this, gate's FOLD-propagation would treat
-        // the post-chance player as having been reached via a fold.
-        self.tree.nodes[child_idx].action_label =
-            crate::tree::flat::ACTION_LABEL_CHANCE;
-        for p in 0..self.config.num_players as usize {
-            let contrib = self.tree.get_contribution(parent_idx, p as u8);
-            self.tree.set_contribution(child_idx, p as u8, contrib);
-        }
-
+        // Reset round state at the chance boundary (shared by all branches — the
+        // betting structure below a chance is identical; only the dealt card
+        // differs, which the SOLVER supplies per branch via set_chance_outcome).
         info.has_acted_this_round = vec![false; self.config.num_players as usize];
         info.num_bets = 0;
         info.round_starter = self.first_postflop_player_with_button(&info.active) as usize;
@@ -756,10 +788,33 @@ impl<'a> TreeBuilder<'a> {
         // as their "starting" position for the next betting round.
         info.committed_at_round_start = info.stacks.clone();
 
-        // parent_idx IS the chance node now. Its child is the post-chance player.
-        self.tree.set_children(parent_idx, vec![child_idx as u32]);
-
-        self.build_recursive(child_idx, info);
+        // BRANCHED chance (chance_branch = Some(n)): n distinct, structurally-
+        // identical post-chance subtrees, one per runout outcome — each with its
+        // own nodes ⇒ its own storage ⇒ a CARD-AWARE searched street. Default
+        // (None) = a single replayed child (legacy card-agnostic). Branch i is
+        // paired with chance outcome i by the solver's multi-child chance walk.
+        let nbranch = self.chance_branch.unwrap_or(1);
+        let mut child_indices = Vec::with_capacity(nbranch);
+        for _ in 0..nbranch {
+            let child_node = {
+                let first = self.first_postflop_player_with_button(&info.active);
+                FlatNode::player(first, info.board_state, self.tree.nodes[parent_idx].amount)
+            };
+            let child_idx = self.tree.alloc_node(child_node);
+            // Post-chance player's incoming "action" is CHANCE, not FOLD (else the
+            // gate's FOLD-propagation would treat it as reached via a fold).
+            self.tree.nodes[child_idx].action_label = crate::tree::flat::ACTION_LABEL_CHANCE;
+            for p in 0..self.config.num_players as usize {
+                let contrib = self.tree.get_contribution(parent_idx, p as u8);
+                self.tree.set_contribution(child_idx, p as u8, contrib);
+            }
+            child_indices.push(child_idx as u32);
+        }
+        // parent_idx IS the chance node now; its children are the post-chance players.
+        self.tree.set_children(parent_idx, child_indices.clone());
+        for &cidx in &child_indices {
+            self.build_recursive(cidx as usize, info.clone_for_child());
+        }
     }
 
     fn compute_actions(

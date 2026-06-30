@@ -58,6 +58,7 @@ impl<'a> StrategyProfile<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_value(
     tree: &FlatTree,
     game: &dyn GameSpec,
@@ -66,8 +67,18 @@ fn walk_value(
     node_idx: usize,
     cfreach: &mut [Vec<f32>],
     action_selector: &dyn Fn(&[Vec<f32>], usize, &[f32]) -> Vec<f32>,
+    depth: &[bool],
 ) -> Vec<f32> {
     let node = &tree.nodes[node_idx];
+
+    // Depth-limited best-response: value the node via the continuation EXACTLY as
+    // the searcher does (CpuMccfr::set_depth_limit → game.evaluate_continuation).
+    // Empty `depth` ⇒ full-tree walk (original behaviour). This lets us measure
+    // the convergence of a depth-limited search on the SAME game it solved, rather
+    // than a deeper game the search never explored.
+    if !depth.is_empty() && depth[node_idx] {
+        return game.evaluate_continuation(target_player, node_idx, tree, cfreach);
+    }
 
     if node.is_terminal() {
         return game.evaluate_terminal(target_player, node_idx, tree, cfreach);
@@ -88,7 +99,7 @@ fn walk_value(
                 if outcome > 0 { game.clear_chance_outcome(); }
                 let probs: Vec<f32> = (0..nh_t).map(|h| game.chance_probability(outcome, h)).collect();
                 game.set_chance_outcome(outcome);
-                let child_cfv = walk_value(tree, game, strategy, target_player, child, cfreach, action_selector);
+                let child_cfv = walk_value(tree, game, strategy, target_player, child, cfreach, action_selector, depth);
                 for h in 0..nh_t {
                     cfv[h] += probs[h] * child_cfv[h];
                 }
@@ -99,7 +110,7 @@ fn walk_value(
                 if outcome > 0 { game.clear_chance_outcome(); }
                 let probs: Vec<f32> = (0..nh_t).map(|h| game.chance_probability(outcome, h)).collect();
                 game.set_chance_outcome(outcome);
-                let child_cfv = walk_value(tree, game, strategy, target_player, child as usize, cfreach, action_selector);
+                let child_cfv = walk_value(tree, game, strategy, target_player, child as usize, cfreach, action_selector, depth);
                 for h in 0..nh_t {
                     cfv[h] += probs[h] * child_cfv[h];
                 }
@@ -122,7 +133,7 @@ fn walk_value(
         for h in 0..nh {
             cfreach[player as usize][h] = saved[h] * sigma[a * nh + h];
         }
-        cfv_all.push(walk_value(tree, game, strategy, target_player, child as usize, cfreach, action_selector));
+        cfv_all.push(walk_value(tree, game, strategy, target_player, child as usize, cfreach, action_selector, depth));
         cfreach[player as usize] = saved;
     }
 
@@ -158,7 +169,7 @@ pub fn best_response_value(
         })
         .collect();
 
-    walk_value(tree, game, strategy, player, 0, &mut cfreach, &select_best_action)
+    walk_value(tree, game, strategy, player, 0, &mut cfreach, &select_best_action, &[])
 }
 
 pub fn strategy_value(
@@ -179,7 +190,65 @@ pub fn strategy_value(
         })
         .collect();
 
-    walk_value(tree, game, strategy, player, 0, &mut cfreach, &select_strategy_action)
+    walk_value(tree, game, strategy, player, 0, &mut cfreach, &select_strategy_action, &[])
+}
+
+/// Depth-limited best-response value: identical to `best_response_value` but stops
+/// at `depth_limit[node]` leaves and values them via `evaluate_continuation` — the
+/// game the depth-limited searcher (CpuMccfr::set_depth_limit) actually solved.
+pub fn best_response_value_dl(
+    tree: &FlatTree,
+    game: &dyn GameSpec,
+    strategy: &StrategyProfile,
+    player: u8,
+    depth_limit: &[bool],
+) -> Vec<f32> {
+    let np = tree.num_players as usize;
+    let nh = game.num_hands(player);
+    let mut cfreach: Vec<Vec<f32>> = (0..np)
+        .map(|p| if p == player as usize { vec![1.0f32; nh] } else { game.initial_weight(p as u8) })
+        .collect();
+    walk_value(tree, game, strategy, player, 0, &mut cfreach, &select_best_action, depth_limit)
+}
+
+/// Depth-limited on-strategy value (companion to `best_response_value_dl`).
+pub fn strategy_value_dl(
+    tree: &FlatTree,
+    game: &dyn GameSpec,
+    strategy: &StrategyProfile,
+    player: u8,
+    depth_limit: &[bool],
+) -> Vec<f32> {
+    let np = tree.num_players as usize;
+    let nh = game.num_hands(player);
+    let mut cfreach: Vec<Vec<f32>> = (0..np)
+        .map(|p| if p == player as usize { vec![1.0f32; nh] } else { game.initial_weight(p as u8) })
+        .collect();
+    walk_value(tree, game, strategy, player, 0, &mut cfreach, &select_strategy_action, depth_limit)
+}
+
+/// Depth-limited exploitability: sum over players of reach-weighted (BR − strategy)
+/// value, with the tree truncated at `depth_limit` leaves (continuation-valued).
+/// This is the convergence of a depth-limited search WITHIN the game it solved —
+/// NOT full-game exploitability (which would also include the depth/abstraction
+/// truncation error). Returns chips (same units as the leaf values).
+pub fn exploitability_dl(
+    tree: &FlatTree,
+    game: &dyn GameSpec,
+    strategy: &StrategyProfile,
+    depth_limit: &[bool],
+) -> f32 {
+    let np = tree.num_players as usize;
+    let mut total = 0.0f32;
+    for p in 0..np {
+        let br = best_response_value_dl(tree, game, strategy, p as u8, depth_limit);
+        let sv = strategy_value_dl(tree, game, strategy, p as u8, depth_limit);
+        let reach = game.initial_weight(p as u8);
+        for h in 0..br.len() {
+            total += reach[h] * (br[h] - sv[h]);
+        }
+    }
+    total
 }
 
 fn select_best_action(cfv_all: &[Vec<f32>], nh: usize, _sigma: &[f32]) -> Vec<f32> {

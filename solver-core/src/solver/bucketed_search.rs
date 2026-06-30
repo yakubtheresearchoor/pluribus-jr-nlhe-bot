@@ -27,6 +27,7 @@ use crate::solver::bucketed_showdown::bucketed_showdown_cfv_design1_collapsed_sa
 use crate::solver::flop_start_game::FlopStartGame;
 use crate::solver::game::GameSpec;
 use crate::tree::flat::FlatTree;
+use std::cell::Cell;
 
 /// Which street the search is rooted on — selects the bucket map + runout
 /// tables the depth-limit continuation integrates over:
@@ -69,6 +70,14 @@ pub struct BucketedContinuationGame<'a> {
     /// point mass (its known hand) and the pool seat to a blocker-narrowed range,
     /// so the bot's continuation value reflects the shared card removal.
     reach_override: Vec<Option<Vec<f32>>>,
+    /// 2-STREET search: the runout-grid index of the turn DEALT IN-TREE (set by the
+    /// turn chance node via `set_chance_outcome`), or None for a 1-street search
+    /// (the turn-deal is the depth leaf, never descended). When Some(ti) at a Flop-
+    /// rooted leaf, the continuation integrates the RIVER runout for turn ti
+    /// (`turn_tables[ti]`) instead of the flop-level turn+river runout — otherwise
+    /// the in-tree turn would be double-counted. Interior-mutable like the inner
+    /// game's chance cells; never touched by the parallel (no-chance) path.
+    current_turn_ti: Cell<Option<usize>>,
 }
 
 impl<'a> BucketedContinuationGame<'a> {
@@ -101,6 +110,7 @@ impl<'a> BucketedContinuationGame<'a> {
             rng_seed,
             normalize_reach: false,
             reach_override: Vec::new(),
+            current_turn_ti: Cell::new(None),
         }
     }
 
@@ -210,19 +220,29 @@ impl<'a> GameSpec for BucketedContinuationGame<'a> {
         let nh = self.inner.table().num_valid;
         let np = self.np as usize;
         let num_opp = np - 1;
-        // Select the rooted street's bucket map + runout tables.
-        let (nb, map, tables) = match self.street {
-            ContStreet::Flop => (
-                self.bucketing.nb_flop,
-                &self.bucketing.flop_map,
-                &self.bucketing.flop_tables,
-            ),
-            ContStreet::Turn(ti) => (
+        // Select the bucket map + runout tables for the continuation. A 2-street
+        // flop search that has dealt the turn IN-TREE (current_turn_ti = Some(ti))
+        // must integrate the RIVER runout for that turn (turn-level tables) — using
+        // the flop-level tables here would double-count the in-tree turn. A plain
+        // 1-street search (turn-deal is the depth leaf, ti = None) uses the rooted
+        // street's tables unchanged.
+        let (nb, map, tables) = match (self.street, self.current_turn_ti.get()) {
+            (ContStreet::Flop, Some(ti)) => (
                 self.bucketing.nb_turn,
                 &self.bucketing.turn_map[ti],
                 &self.bucketing.turn_tables[ti],
             ),
-            ContStreet::River(ti, ri) => (
+            (ContStreet::Flop, None) => (
+                self.bucketing.nb_flop,
+                &self.bucketing.flop_map,
+                &self.bucketing.flop_tables,
+            ),
+            (ContStreet::Turn(ti), _) => (
+                self.bucketing.nb_turn,
+                &self.bucketing.turn_map[ti],
+                &self.bucketing.turn_tables[ti],
+            ),
+            (ContStreet::River(ti, ri), _) => (
                 self.bucketing.nb_river,
                 &self.bucketing.river_map[ti][ri],
                 &self.bucketing.river_tables[ti][ri],
@@ -299,10 +319,20 @@ impl<'a> GameSpec for BucketedContinuationGame<'a> {
     }
 
     fn set_chance_outcome(&self, outcome: usize) {
+        // 2-street: the FIRST chance descent is the turn deal (the inner stages
+        // turn→river). Record its runout-grid index so a deeper leaf values the
+        // river runout for THIS turn. A 2-street search only descends the turn (the
+        // river chance is the depth leaf), so we only ever record the turn here.
+        if self.current_turn_ti.get().is_none() {
+            self.current_turn_ti.set(Some(outcome));
+        }
         self.inner.set_chance_outcome(outcome)
     }
 
     fn clear_chance_outcome(&self) {
-        self.inner.clear_chance_outcome()
+        self.inner.clear_chance_outcome();
+        // Unwind the in-tree turn (mirrors the inner's clear). Our 2-street search
+        // nests exactly one chance level (the turn), so each clear unwinds it.
+        self.current_turn_ti.set(None);
     }
 }
