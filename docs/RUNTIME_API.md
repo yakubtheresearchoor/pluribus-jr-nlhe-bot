@@ -70,6 +70,9 @@ on a preflop (empty-board) request.
 | `flop_id` | `u32` | live-3/4/5 | Canonical flop id (`0..1754`). Derived by the server when `route = true`. |
 | `route` | `bool` | optional | When `true`, the server canonicalizes the raw `board` (suit isomorphism), derives `flop_id`, and remaps `board`/`hero_cards`/`partner_cards` into the blueprint's canonical suit frame. Lets the runtime send **real cards** and omit `flop_id`. Default `false`. |
 | `seed` | `u64?` | optional | RNG seed for the deterministic action sample. |
+| `prior_actions` | `[ActionInput]` | turn/river | The full postflop betting on **prior** streets (flop[, turn]) in order — lets the connected blueprint replay the whole-postflop cell tree to a turn/river node. Empty for flop. |
+| `preflop_actions` | `[ActionInput]` | optional | The full **preflop** action sequence of the hand. Enables the **Bayesian reach prior** (§5) with `seat_positions`; empty ⇒ symmetric continuing-range fallback. |
+| `seat_positions` | `[u8]` | optional | Map from seam seat (`0..live`) to blueprint position (`0`=SB,`1`=BB,`2`=UTG,`3`=HJ,`4`=CO,`5`=BTN). Required (with `preflop_actions`) for the Bayesian reach prior, because the postflop seam tree is position-agnostic. |
 
 **`ActionInput`** (one element of `street_actions`):
 
