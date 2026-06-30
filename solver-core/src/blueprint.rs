@@ -680,6 +680,55 @@ impl ShardedConnBlueprint {
         }).collect())
     }
 
+    /// BAYESIAN per-seat preflop reach (the Pluribus reach prior): for each seat,
+    /// `reach[seat][class]` = P(class | that seat's observed preflop actions) =
+    /// ∏ over the seat's decisions in `history` of P(action taken | class), from the
+    /// blueprint preflop strategy. Uniform prior ⇒ this IS the posterior range each
+    /// player carries to the flop, conditioned on the ACTUAL line — so the raiser
+    /// (P(raise|·)) and caller (P(call|·)) get DIFFERENT ranges, unlike the symmetric
+    /// "continuing range" v1. Seats that never acted keep 1.0 (uninformative).
+    /// `history` = the full preflop action sequence `(label, to_total)`.
+    pub fn preflop_seat_reach(&self, history: &[(u8, i32)]) -> Vec<Vec<f32>> {
+        let nc = NUM_PREFLOP_CLASSES;
+        let mut reach = vec![vec![1.0f32; nc]; self.np];
+        let mut node = 0usize; // root
+        for &(label, to_total) in history {
+            if !self.pft.nodes[node].is_player() {
+                break;
+            }
+            let seat = self.pft.nodes[node].player_id as usize;
+            let na = self.pft.nodes[node].num_children as usize;
+            // Find the action index taken + the next node (mirror replay_preflop_node).
+            let mut taken: Option<(usize, usize)> = None;
+            for (a, &k) in self.pft.node_children(node).iter().enumerate() {
+                let kn = &self.pft.nodes[k as usize];
+                if kn.action_label != label {
+                    continue;
+                }
+                if matches!(label, 3 | 4 | 5) {
+                    if kn.amount == to_total {
+                        taken = Some((a, k as usize));
+                        break;
+                    }
+                } else {
+                    taken = Some((a, k as usize));
+                    break;
+                }
+            }
+            let (ai, nxt) = match taken {
+                Some(x) => x,
+                None => break, // line not in the tree — stop, keep reach so far
+            };
+            // Multiply this seat's reach by P(action ai | class) for every class.
+            for cls in 0..nc {
+                let dist = normalize_pre_dist(&self.pre_cum, &self.pre_local, self.maxna, node, na, cls);
+                reach[seat][cls] *= dist[ai];
+            }
+            node = nxt;
+        }
+        reach
+    }
+
     /// Decode a flop's postflop cum shard (post_stride floats). Reads disk each
     /// call — the caller should cache hot flops.
     pub fn postflop_cum(&self, flop_id: usize) -> io::Result<Vec<f32>> {

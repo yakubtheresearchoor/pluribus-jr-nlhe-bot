@@ -13,6 +13,66 @@ use solver_core::solver::preflop_start_game::PreflopChanceTable;
 fn ws(p: &str) -> String { format!("{}/../{}", env!("CARGO_MANIFEST_DIR"), p) }
 fn bp() -> String { std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_eqr")) }
 
+/// BAYESIAN per-seat reach prior: walk the preflop tree to a flop-entry along a
+/// raise/call line, compute `preflop_seat_reach`, and verify the LIVE seats get
+/// DIFFERENT, sensible ranges (premiums continue ≥ trash) — the asymmetry the
+/// symmetric "continuing range" v1 lacked. Skipped if the blueprint is absent.
+#[test]
+fn bayesian_seat_reach_is_asymmetric_and_sane() {
+    let Ok(bp) = ShardedConnBlueprint::load(&bp(), 6, 5, 200, 16, 16, 7) else { return; };
+    let pft = &bp.pft;
+    // Walk to a chance (flop-entry) node, recording the line + which seats folded.
+    let mut node = 0usize;
+    let mut history: Vec<(u8, i32)> = Vec::new();
+    let mut folded = [false; 6];
+    let mut guard = 0;
+    while pft.nodes[node].is_player() && guard < 16 {
+        guard += 1;
+        let acting = pft.nodes[node].player_id as usize;
+        let kids = pft.node_children(node);
+        // Prefer raise(4), else call(2), else fold(0), else first child — drives the
+        // line toward a contested (multi-live) flop.
+        let pick = kids.iter().find(|&&k| pft.nodes[k as usize].action_label == 4)
+            .or_else(|| kids.iter().find(|&&k| pft.nodes[k as usize].action_label == 2))
+            .or_else(|| kids.iter().find(|&&k| pft.nodes[k as usize].action_label == 0))
+            .copied()
+            .unwrap_or(kids[0]) as usize;
+        let kn = &pft.nodes[pick];
+        if kn.action_label == 0 { folded[acting] = true; }
+        // Record kn.amount (what replay_preflop_node / preflop_seat_reach match on).
+        history.push((kn.action_label, kn.amount));
+        node = pick;
+    }
+    let reach = bp.preflop_seat_reach(&history);
+    let (aa, kk, t72) = (
+        PreflopClass::from_combo(48, 49).index(),
+        PreflopClass::from_combo(44, 45).index(),
+        PreflopClass::from_combo(20, 0).index(),
+    );
+    // All reach values finite + in [0,1].
+    for s in 0..6 {
+        for &r in &reach[s] {
+            assert!(r.is_finite() && (0.0..=1.0001).contains(&r), "seat {s}: bad reach {r}");
+        }
+    }
+    // LIVE seats (didn't fold) that actually acted (range moved off 1.0).
+    let live: Vec<usize> = (0..6)
+        .filter(|&s| !folded[s] && reach[s].iter().any(|&r| (r - 1.0).abs() > 1e-6))
+        .collect();
+    assert!(live.len() >= 2, "need >=2 live acting seats, got {live:?} (history {history:?})");
+    for &s in &live {
+        eprintln!("seat {s}: AA={:.3} KK={:.3} 72o={:.3}", reach[s][aa], reach[s][kk], reach[s][t72]);
+        // A continuing seat keeps premiums at least as much as trash.
+        assert!(reach[s][aa] >= reach[s][t72] - 1e-4, "seat {s}: AA {} < 72o {}", reach[s][aa], reach[s][t72]);
+    }
+    // The live seats are NOT identical — the Bayesian per-seat asymmetry.
+    let (s0, s1) = (live[0], live[1]);
+    let l1: f32 = (0..NUM_PREFLOP_CLASSES).map(|c| (reach[s0][c] - reach[s1][c]).abs()).sum::<f32>()
+        / NUM_PREFLOP_CLASSES as f32;
+    eprintln!("live seats {s0} vs {s1}: mean-L1 = {l1:.5}");
+    assert!(l1 > 1e-3, "live seats have identical ranges — no Bayesian asymmetry");
+}
+
 /// Serialize a known `gcum` into BLP2 bytes against the REAL rebuilt tree, load
 /// it back, and verify parse + index math + normalization + replay. No GPU
 /// needed — exercises the exact indexing path the runtime serves from.
