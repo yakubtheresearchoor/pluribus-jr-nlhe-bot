@@ -55,6 +55,58 @@ fn conn_decider_preflop_jam_hu() {
     assert!((s - 1.0).abs() < 1e-3, "dist sums to {s}");
 }
 
+/// BAYESIAN reach prior wiring: with a preflop line + seat→position map the postflop
+/// reach prior is per-seat asymmetric (the blueprint posterior per seat); without it,
+/// the symmetric v1 continuing range (all seats identical). Skipped if blueprint absent.
+#[test]
+fn conn_decider_bayesian_reach_prior() {
+    let Ok(dec) = ConnDecider::load(&std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_eqr")), &ws("gs14_blueprint_cache"), 6, 5, 200, 7) else { return; };
+    // Walk the preflop tree to a flop entry, recording the line + non-folded seats.
+    let pft = &dec.blueprint().pft;
+    let (mut node, mut hist, mut folded) = (0usize, Vec::<(u8, i32)>::new(), [false; 6]);
+    let mut guard = 0;
+    while pft.nodes[node].is_player() && guard < 16 {
+        guard += 1;
+        let acting = pft.nodes[node].player_id as usize;
+        let kids = pft.node_children(node);
+        let pick = kids.iter().find(|&&k| pft.nodes[k as usize].action_label == 4)
+            .or_else(|| kids.iter().find(|&&k| pft.nodes[k as usize].action_label == 2))
+            .or_else(|| kids.iter().find(|&&k| pft.nodes[k as usize].action_label == 0))
+            .copied().unwrap_or(kids[0]) as usize;
+        let kn = &pft.nodes[pick];
+        if kn.action_label == 0 { folded[acting] = true; }
+        hist.push((kn.action_label, kn.amount));
+        node = pick;
+    }
+    let live_pos: Vec<u8> = (0..6u8).filter(|&s| !folded[s as usize]).collect();
+    if live_pos.len() < 2 { return; }
+    let live = live_pos.len();
+
+    let mk = |bayes: bool| DecideRequest {
+        board: vec![3, 19, 35], hero_cards: [48, 49], live: live as u8, hero_idx: 0,
+        commit_entry: 6, pot_entry: (6 * live) as u32, flop_id: 0, route: false,
+        preflop_actions: if bayes { hist.iter().map(|&(l, a)| ActionInput { label: l, to_total: a as u32 }).collect() } else { vec![] },
+        seat_positions: if bayes { live_pos.clone() } else { vec![] },
+        ..Default::default()
+    };
+    let v1 = dec.reach_priors_for_cell(0, live, &mk(false)).expect("v1 reach");
+    let bz = dec.reach_priors_for_cell(0, live, &mk(true)).expect("bayes reach");
+
+    // v1: every seat identical (symmetric continuing range).
+    for s in 1..live {
+        assert_eq!(v1[0].1, v1[s].1, "v1 seat {s} differs from seat 0 (should be symmetric)");
+    }
+    // bayes: reach is finite/in-range, and NOT the symmetric v1 (the Bayesian path ran).
+    for (_, r) in &bz {
+        assert!(r.iter().all(|&x| x.is_finite() && (0.0..=1.0001).contains(&x)));
+    }
+    let changed = bz.iter().zip(&v1).any(|((_, b), (_, a))| {
+        let n = b.len();
+        (0..n).map(|i| (b[i] - a[i]).abs()).sum::<f32>() / n as f32 > 1e-4
+    });
+    assert!(changed, "Bayesian reach identical to v1 — wiring not engaged (live_pos {live_pos:?})");
+}
+
 #[test]
 fn conn_decider_serves_preflop_and_turn() {
     let Ok(dec) = ConnDecider::load(&std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_eqr")), &ws("gs14_blueprint_cache"), 6, 5, 200, 7) else { return; };

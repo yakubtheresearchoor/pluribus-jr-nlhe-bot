@@ -253,6 +253,22 @@ impl ConnDecider {
         })
     }
 
+    /// The loaded sharded blueprint (for preflop-line construction / inspection).
+    pub fn blueprint(&self) -> &ShardedConnBlueprint {
+        &self.bp
+    }
+
+    /// Reach priors for a cell, building the adapter (test/inspection helper).
+    pub fn reach_priors_for_cell(
+        &self,
+        flop_id: usize,
+        live: usize,
+        req: &DecideRequest,
+    ) -> Option<Vec<(usize, Vec<f32>)>> {
+        let adapter = self.adapter(flop_id, live)?;
+        Some(self.reach_priors(req, &adapter.0))
+    }
+
     /// Build (or fetch cached) the per-flop `Blueprint` ADAPTER for the search: the
     /// GS14 buckets + full 49×48 runout tables + FlopStartGame ranges, from the
     /// connected GS14 cache. `cum_*` are empty (the search re-solves; it reads only
@@ -296,25 +312,57 @@ impl ConnDecider {
     fn decide_postflop_search(&self, req: &DecideRequest) -> Option<DecideResponse> {
         let flop_id = req.flop_id as usize;
         let adapter = self.adapter(flop_id, req.live as usize)?;
-        // REACH-PRIOR (piece 3): per-seat entering ranges = the connected preflop's
-        // CONTINUING range (per-class non-fold weight at the open node), not uniform.
-        // Same range for all live seats (symmetric v1; position-specific is a
-        // refinement). Hands fold trash out → the search solves realistic ranges.
-        let hc = &adapter.0.game.table().hand_cards;
-        let nh = adapter.0.nh;
-        let mut class_cont: HashMap<usize, f32> = HashMap::new();
-        let reach: Vec<f32> = (0..nh).map(|h| {
-            let (c1, c2) = (hc[h * 2], hc[h * 2 + 1]);
-            let cls = PreflopClass::from_combo(c1 as Card, c2 as Card).index();
-            *class_cont.entry(cls).or_insert_with(|| {
-                self.bp.preflop_action_dist((c1 as Card, c2 as Card), &[])
-                    .map(|d| d.iter().filter(|(l, _, _)| *l != 0).map(|(_, _, p)| p).sum())
-                    .unwrap_or(1.0)
-            })
-        }).collect();
-        let reach_priors: Vec<(usize, Vec<f32>)> = (0..req.live as usize).map(|s| (s, reach.clone())).collect();
+        let reach_priors = self.reach_priors(req, &adapter.0);
         // Tuned base cfg (par+dcfr+iters); QRE λ from CONN_LAMBDA/CONN_OPP_LAMBDA.
         decide_postflop_with_reach(&adapter.0, req, &self.cfg, &reach_priors)
+    }
+
+    /// Per-seat entering ranges for the postflop search. BAYESIAN (Pluribus reach
+    /// prior) when the request supplies the preflop line + seat→position map: each
+    /// seat's range = the blueprint posterior conditioned on that seat's preflop
+    /// actions (raiser ≠ caller). Otherwise the SYMMETRIC v1 "continuing range"
+    /// (per-class non-fold mass at the open) for every seat.
+    pub fn reach_priors(&self, req: &DecideRequest, bp: &Blueprint) -> Vec<(usize, Vec<f32>)> {
+        let hc = &bp.game.table().hand_cards;
+        let nh = bp.nh;
+        let live = req.live as usize;
+        if !req.preflop_actions.is_empty() && req.seat_positions.len() >= live {
+            // BAYESIAN: blueprint posterior per blueprint position, mapped to seam seats.
+            let history: Vec<(u8, i32)> = req
+                .preflop_actions
+                .iter()
+                .map(|a| (a.label, a.to_total as i32))
+                .collect();
+            let seat_reach = self.bp.preflop_seat_reach(&history); // [position][class]
+            return (0..live)
+                .map(|seam_seat| {
+                    let pos = (req.seat_positions[seam_seat] as usize).min(seat_reach.len() - 1);
+                    let pr = &seat_reach[pos];
+                    let reach: Vec<f32> = (0..nh)
+                        .map(|h| {
+                            let (c1, c2) = (hc[h * 2], hc[h * 2 + 1]);
+                            pr[PreflopClass::from_combo(c1 as Card, c2 as Card).index()]
+                        })
+                        .collect();
+                    (seam_seat, reach)
+                })
+                .collect();
+        }
+        // v1 SYMMETRIC continuing range (per-class non-fold weight at the open node).
+        let mut class_cont: HashMap<usize, f32> = HashMap::new();
+        let reach: Vec<f32> = (0..nh)
+            .map(|h| {
+                let (c1, c2) = (hc[h * 2], hc[h * 2 + 1]);
+                let cls = PreflopClass::from_combo(c1 as Card, c2 as Card).index();
+                *class_cont.entry(cls).or_insert_with(|| {
+                    self.bp
+                        .preflop_action_dist((c1 as Card, c2 as Card), &[])
+                        .map(|d| d.iter().filter(|(l, _, _)| *l != 0).map(|(_, _, p)| p).sum())
+                        .unwrap_or(1.0)
+                })
+            })
+            .collect();
+        (0..live).map(|s| (s, reach.clone())).collect()
     }
 
     /// Convergence diagnostic: flop-subgame exploitability vs iteration count for a

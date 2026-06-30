@@ -120,7 +120,11 @@ also loads a single self-contained connected blueprint and tries it first for
 empty-board and 3–5-card-board requests (`ConnDecider::decide`). It serves
 **preflop by lookup** and **postflop (flop/turn/river) by real-time depth-limited
 QRE search** over the connected buckets, warm-started from the blueprint's
-preflop-continuing reach prior (Pluribus: preflop=lookup, postflop=search). The
+preflop reach prior (Pluribus: preflop=lookup, postflop=search). The reach prior is
+the symmetric per-class continuing range by default, OR the **Bayesian per-seat
+posterior** when the request supplies `preflop_actions` (the full preflop line) +
+`seat_positions` (seam-seat→blueprint-position map): each seat's range is then the
+blueprint posterior conditioned on that seat's preflop actions (raiser ≠ caller). The
 preflop region is the **EQR-frozen raise-or-fold preflop the postflop was solved
 against** — self-consistent, no longer the broken `MC_NF=1` reach (the §11 bug is
 resolved by the `blueprint_conn_eqr` rebuild). It is leaner than the standalone EQR

@@ -204,6 +204,19 @@ pub struct DecideRequest {
     /// false (default), the caller supplies `flop_id` and pre-canonicalized cards.
     #[serde(default)]
     pub route: bool,
+    /// BAYESIAN reach prior (optional): the full PREFLOP action sequence `(label,
+    /// to_total)` of the hand. When supplied with `seat_positions`, the postflop
+    /// search seeds each opponent's range with the blueprint's Bayesian posterior
+    /// conditioned on that seat's preflop line (raiser ≠ caller), instead of the
+    /// symmetric continuing-range v1. Empty ⇒ v1 fallback.
+    #[serde(default)]
+    pub preflop_actions: Vec<ActionInput>,
+    /// BAYESIAN reach prior (optional): map from postflop SEAM seat (0..live, the
+    /// search's relabeled seats) to BLUEPRINT position (0=SB,1=BB,2=UTG,3=HJ,4=CO,
+    /// 5=BTN). Needed because the seam tree is position-agnostic but `preflop_seat_reach`
+    /// is position-specific. Must have ≥ `live` entries to enable the Bayesian prior.
+    #[serde(default)]
+    pub seat_positions: Vec<u8>,
 }
 
 #[derive(Serialize, Clone)]
