@@ -563,6 +563,10 @@ pub fn flop_search_exploitability_2street_sweep(
         let mut s = CpuMccfr::new(&tree, vec![nh; np]);
         s.set_depth_limit(&depth);
         s.set_dcfr(1.5, 0.0, 2.0);
+        // PAR2: parallelize the disjoint turn branches (cell_free game ⇒ Cell-free walk).
+        if std::env::var("PAR2").map(|v| v != "0").unwrap_or(false) {
+            s.enable_parallel();
+        }
         s.run(&tree, &game, iters);
         let profile = StrategyProfile::from_usize_offsets(s.cum_strategy_slice(), s.node_offsets(), nh);
         let mut eval_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
@@ -607,13 +611,15 @@ pub fn flop_search_k4(
     let flop_u8 = BoardState::Flop as u8;
     let node_turn = solver_core::solver::bucketed_search::build_node_turn(&tree);
 
-    // (1) WARM-UP solve → coherent turn continuation.
+    // (1) WARM-UP solve → coherent turn continuation. Cell-free game ⇒ the disjoint
+    // turn branches parallelize (no frozen nodes here, so the parallel walk applies).
     let mut warm_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
     warm_game.set_node_turn(node_turn.clone());
     warm_game.set_cell_free(true);
     let mut warm = CpuMccfr::new(&tree, vec![nh; np]);
     warm.set_depth_limit(&depth);
     warm.set_dcfr(1.5, 0.0, 2.0);
+    warm.enable_parallel();
     warm.run(&tree, &warm_game, warm_iters);
 
     // (2) FREEZE every turn node to the warm-up average strategy.

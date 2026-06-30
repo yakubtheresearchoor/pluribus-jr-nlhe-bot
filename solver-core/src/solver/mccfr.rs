@@ -652,7 +652,59 @@ impl CpuMccfr {
             return game.evaluate_terminal(traverser, node_idx, tree, cfreach);
         }
         if node.is_chance() {
-            unreachable!("walk_cfr_par requires a depth-limited search (no chance recursion)");
+            // BRANCHED 2-street: the disjoint turn branches write disjoint storage, so
+            // value them IN PARALLEL. The game must be Cell-free here (node_turn +
+            // cell_free) so the branches never touch the inner game's !Sync chance Cell.
+            // `chance_probability` DOES read that Cell, so compute every outcome's probs
+            // SEQUENTIALLY first (single-threaded), then parallelize the recursion.
+            let children = tree.node_children(node_idx);
+            if children.is_empty() {
+                return game.evaluate_terminal(traverser, node_idx, tree, cfreach);
+            }
+            let nh_t = self.num_hands[traverser as usize];
+            let np = self.num_hands.len();
+            let n_outcomes = game.num_chance_outcomes();
+            let single = n_outcomes > 0 && children.len() == 1;
+            let count = if single { n_outcomes } else { children.len() };
+            let all_probs: Vec<Vec<f32>> = (0..count)
+                .map(|o| (0..nh_t).map(|h| game.chance_probability(o, h)).collect())
+                .collect();
+            use rayon::prelude::*;
+            let sg = SyncGame(game);
+            let (r_addr, c_addr, l_addr) = (regrets as usize, cum as usize, last_cfv as usize);
+            let (cf_base, tr_base): (&[Vec<f32>], &[f32]) = (&*cfreach, &*traverser_reach);
+            let results: Vec<Vec<f32>> = (0..count)
+                .into_par_iter()
+                .map(|outcome| {
+                    let g = sg.get();
+                    let child = if single { children[0] } else { children[outcome] } as usize;
+                    let probs = &all_probs[outcome];
+                    // Fold the per-hand chance prob into every player's reach (CFR-
+                    // through-chance), on per-branch COPIES so the branches don't share
+                    // mutable reach.
+                    let mut cf: Vec<Vec<f32>> = cf_base.to_vec();
+                    let mut tr: Vec<f32> = tr_base.to_vec();
+                    for h in 0..nh_t {
+                        tr[h] *= probs[h];
+                    }
+                    for p in 0..np {
+                        for h in 0..self.num_hands[p].min(nh_t) {
+                            cf[p][h] *= probs[h];
+                        }
+                    }
+                    self.walk_cfr_par(
+                        tree, g, traverser, child, &mut cf, &mut tr, weight, disc,
+                        r_addr as *mut f32, c_addr as *mut f32, l_addr as *mut f32,
+                    )
+                })
+                .collect();
+            let mut cfv = vec![0.0f32; nh_t];
+            for v in &results {
+                for h in 0..nh_t {
+                    cfv[h] += v[h];
+                }
+            }
+            return cfv;
         }
 
         let player = node.player_id;
