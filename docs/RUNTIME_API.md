@@ -351,12 +351,15 @@ live count) decision is still served:
   check). At normal/shallow river SPR the nuts value-bets (~98 %) or jams
   (~88 %), so the trap is confined to deep checked-down spots. Modelling the
   opponent as passive (an HU exploit lever) is the fix; not yet wired.
-- **HU flop facing-a-bet is not fully solved.** §5's "banked exact HU strategy"
-  covers the **first-to-act** flop node well; when the hero is **facing a bet**
-  (`to_call > 0`), only some SPR bins are banked — an unbanked bin returns `422`
-  ("SPR bin not banked"), and some bins fall through to a **uniform-ish fallback**
-  (equal action probs) rather than a real solve. Affects a small fraction of
-  production decisions. The fix (a proper HU flop facing-bet solve / action
-  translation into the connected search, as done for multiway) is pending.
+- **HU flop facing-a-bet — mostly solved, deep raise-wars fall to the rollout.**
+  The connected search (`decide_postflop_search`) **does** real-solve HU flop
+  facing-a-bet — a single/double bet-raise maps through `walk_to_node`'s action
+  translation and returns a proper fold/call/raise (e.g. it raises the nuts). What
+  it can't serve is a betting sequence **deeper than the search tree's cap**
+  (`max_bets_per_street = 3` — a flop raise-war past 3 bets/street): the node falls
+  off the tree, so the spot used to `422`. **Fixed:** those now fall to the equity
+  rollout (sane check / pot-odds call-fold) instead of a hard `422`. ~0.7 % of
+  decisions. A proper deep-stack HU flop facing-bet solve (raise the nuts in a
+  raise-war rather than flat-call the rollout) is the remaining follow-up.
 - **The blueprint strategy is u8-quantized on disk** (SSBP2, ~0.1 % on EV-relevant
   mass, money-test-proven play-safe) — the runtime decompresses to f32 at load.

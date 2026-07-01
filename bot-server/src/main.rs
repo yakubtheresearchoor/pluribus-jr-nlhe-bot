@@ -167,8 +167,14 @@ async fn decide_handler(
     if req.live == 2 {
         let subdir = std::env::var("L2_SUBDIR").unwrap_or_else(|_| "live2".into());
         let live2_root = format!("{}/{}", st.bp_root, subdir);
+        // Try the bank; if it can't serve the spot (unbanked SPR bin, or a betting
+        // sequence deeper than the search tree's cap — e.g. a flop raise-war past
+        // 3 bets/street, which makes walk_to_node fall off the tree), fall to the
+        // equity rollout (sane check / pot-odds) rather than a 422 the live game
+        // can't act on. A proper HU flop facing-bet solve is the follow-up (§11).
         let out = tokio::task::spawn_blocking(move || {
             play_harness::api::decide_live2(&live2_root, &req)
+                .or_else(|| play_harness::api::decide_live6(&req))
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live2 join: {e}")))?;
@@ -176,7 +182,7 @@ async fn decide_handler(
             Some(r) => Ok(Json(r)),
             None => Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "live-2: not a flop decision / SPR bin not banked / all-in (rollout)".into(),
+                "live-2: unresolvable postflop spot (board not 3-5 cards)".into(),
             )),
         };
     }
