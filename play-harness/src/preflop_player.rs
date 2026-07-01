@@ -17,10 +17,35 @@ use solver_core::tree::flat::{FlatTree, MAX_NA_PREFLOP};
 /// `PreflopVectorCfr::local_offset` sentinel for non-decision nodes.
 const UNUSED: usize = usize::MAX;
 
+/// Backing store for the ~3.2 GB `.f32` average-strategy array. `Mapped` is a
+/// zero-copy, read-only memory map of the file — the strategy lives in evictable,
+/// file-backed page cache (macOS drops cold pages for free and re-reads on touch)
+/// instead of a resident `Vec<f32>` heap allocation (which can only be *compressed*
+/// when cold, costing CPU + committed memory). A decision reads a handful of cells,
+/// so the resident working set is a few pages, not 3.2 GB. `Owned` is the fallback
+/// when the file can't be mapped (kept byte-identical to the old path).
+enum StratStore {
+    Mapped(memmap2::Mmap),
+    Owned(Vec<f32>),
+}
+
+impl StratStore {
+    #[inline]
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            // The `.f32` is native-endian little-endian f32; the file is page-aligned
+            // (mmap), so the cast is valid + byte-identical to the old from_le_bytes
+            // load on little-endian hosts (all our targets).
+            StratStore::Mapped(m) => bytemuck::cast_slice(&m[..]),
+            StratStore::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
 pub struct PreflopPlayer {
     pub tree: FlatTree,
     solver: PreflopVectorCfr,
-    strat: Vec<f32>,
+    strat: StratStore,
 }
 
 impl PreflopPlayer {
@@ -63,12 +88,28 @@ impl PreflopPlayer {
         );
 
         let solver = PreflopVectorCfr::new(&tree);
-        let bytes = std::fs::read(format!("{base}.f32"))?;
-        assert_eq!(bytes.len(), avg_len * 4, "strategy .f32 length mismatch vs header avg_len");
-        let strat: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // Memory-map the ~3.2 GB `.f32` strategy (zero-copy, evictable page cache)
+        // rather than reading it into a resident `Vec<f32>`. Falls back to an owned
+        // read if the map fails, so behavior is unchanged when mmap is unavailable.
+        let path = format!("{base}.f32");
+        let expect_bytes = avg_len * 4;
+        let strat = match std::fs::File::open(&path).and_then(|f| {
+            // Safety: the file is opened read-only and not truncated while mapped
+            // (it's a static artifact); the Mmap is owned by the returned struct.
+            let m = unsafe { memmap2::Mmap::map(&f)? };
+            Ok(m)
+        }) {
+            Ok(m) if m.len() == expect_bytes && (m.as_ptr() as usize) % 4 == 0 => {
+                StratStore::Mapped(m)
+            }
+            _ => {
+                let bytes = std::fs::read(&path)?;
+                assert_eq!(bytes.len(), expect_bytes, "strategy .f32 length mismatch vs header avg_len");
+                StratStore::Owned(
+                    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                )
+            }
+        };
 
         Ok(PreflopPlayer { tree, solver, strat })
     }
@@ -91,8 +132,9 @@ impl PreflopPlayer {
             return na;
         }
         let off = local * MAX_NA_PREFLOP * NUM_PREFLOP_CLASSES;
+        let strat = self.strat.as_slice();
         for a in 0..na {
-            out[a] = self.strat[off + a * NUM_PREFLOP_CLASSES + hand_class];
+            out[a] = strat[off + a * NUM_PREFLOP_CLASSES + hand_class];
         }
         na
     }
@@ -135,4 +177,36 @@ fn json_int(header: &str, key: &str) -> i64 {
     let s = &header[header.find(&pat).unwrap_or_else(|| panic!("missing {key}")) + pat.len()..];
     let end = s.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(s.len());
     s[..end].parse().unwrap_or_else(|_| panic!("bad int for {key}"))
+}
+
+#[cfg(test)]
+mod mmap_tests {
+    use super::StratStore;
+    use std::io::Write;
+
+    /// The mmap zero-copy cast must be byte-identical to the old `from_le_bytes`
+    /// load on this (little-endian) host — the correctness gate for swapping the
+    /// resident `Vec<f32>` for a memory-mapped `&[f32]`.
+    #[test]
+    fn mmap_cast_matches_from_le_bytes() {
+        let vals: Vec<f32> = (0..2048).map(|i| (i as f32) * 0.5 - 7.0).collect();
+        let mut bytes = Vec::new();
+        for v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let path = std::env::temp_dir().join(format!("pf_mmap_test_{}.f32", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+
+        let f = std::fs::File::open(&path).unwrap();
+        let m = unsafe { memmap2::Mmap::map(&f).unwrap() };
+        assert_eq!(m.as_ptr() as usize % 4, 0, "mmap must be 4-aligned for the f32 cast");
+        let mapped = StratStore::Mapped(m);
+
+        let owned = StratStore::Owned(
+            bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        );
+        assert_eq!(mapped.as_slice(), owned.as_slice(), "mmap cast != from_le_bytes");
+        assert_eq!(mapped.as_slice(), vals.as_slice(), "mmap values wrong");
+        std::fs::remove_file(&path).ok();
+    }
 }

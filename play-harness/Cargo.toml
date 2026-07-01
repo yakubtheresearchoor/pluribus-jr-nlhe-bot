@@ -20,3 +20,5 @@ solver-core = { path = "../solver-core" }
 rayon = "1.8"
 serde = { version = "1", features = ["derive"] }
 zstd = "0.13"
+memmap2 = "0.9"
+bytemuck = "1"
