@@ -72,7 +72,7 @@ fn pluribus_play_gate() {
     let fmask: u64 = bp.flop.iter().fold(0u64, |m, &c| m | (1u64 << c));
     let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
     let sample_m: u32 = std::env::var("SM").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
-    let cfg = SearchCfg { iters, lambda: 300.0, opp_lambda: 300.0, sample_m, seed: 0xC0FFEE };
+    let cfg = SearchCfg { iters, lambda: 300.0, opp_lambda: 300.0, sample_m, seed: 0xC0FFEE, ..Default::default() };
 
     // ---- (1) exact conservation, rake = 0 ----
     let mut rng = 0xBEEF_u64;

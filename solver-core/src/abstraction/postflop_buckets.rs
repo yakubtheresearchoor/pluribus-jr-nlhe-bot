@@ -925,6 +925,70 @@ pub fn compute_wtl_for_runout(
     WtlMatrices { nb, w, t, l }
 }
 
+/// RIVER-INTEGRATED bucket W/T/L for a real 4-card TURN board — the exact
+/// check-to-showdown model, not the single-strength turn proxy. Averages
+/// `compute_wtl_for_runout` over every possible river card (best-5-of-7
+/// strengths), holding the caller's TURN bucketing fixed. Feeding this to the
+/// depth-limited turn continuation makes the solve value the river deal the same
+/// way the exact `TurnStartGame` (check-only river) does — so the turn strategy
+/// stops over-betting hands whose showdown value the proxy mis-priced.
+///
+/// `hands[i]` are the valid turn hands (2 cards, none on `board`), `bucket_map`
+/// their turn buckets (length nh), `board` the 4 turn cards. Per river r, hands
+/// containing r are excluded (strength = i32::MIN ⇒ skipped). Cost:
+/// ~(52 − 4) × [nh 7-card evals + O(nh·nb)] ≈ sub-second at nb≤200.
+pub fn compute_river_integrated_wtl(
+    hands: &[(Card, Card)],
+    board: &[Card],
+    bucket_map: &[u16],
+    nb: usize,
+) -> WtlMatrices {
+    let bmask: u64 = board.iter().fold(0u64, |m, &c| m | (1u64 << c));
+    let nh = hands.len();
+    let weights = vec![1.0f64; nh];
+    let mut w = vec![0.0f64; nb * nb];
+    let mut t = vec![0.0f64; nb * nb];
+    let mut l = vec![0.0f64; nb * nb];
+    let mut num_rivers = 0.0f64;
+
+    for r in 0u8..52 {
+        if bmask & (1u64 << r) != 0 {
+            continue; // river card already on the turn board
+        }
+        // Per-river strengths (best 5 of hole+board+river); hands holding r skip.
+        let mut str_r = vec![i32::MIN; nh];
+        for (i, &(c1, c2)) in hands.iter().enumerate() {
+            if c1 == r || c2 == r {
+                continue;
+            }
+            let mut hd = Hand::new()
+                .add_card(c1 as usize)
+                .add_card(c2 as usize)
+                .add_card(r as usize);
+            for &bc in board {
+                hd = hd.add_card(bc as usize);
+            }
+            str_r[i] = hd.evaluate_full() as i32;
+        }
+        let wtl_r = compute_wtl_for_runout(hands, &str_r, &weights, bucket_map, nb);
+        for k in 0..nb * nb {
+            w[k] += wtl_r.w[k];
+            t[k] += wtl_r.t[k];
+            l[k] += wtl_r.l[k];
+        }
+        num_rivers += 1.0;
+    }
+
+    if num_rivers > 0.0 {
+        for k in 0..nb * nb {
+            w[k] /= num_rivers;
+            t[k] /= num_rivers;
+            l[k] /= num_rivers;
+        }
+    }
+    WtlMatrices { nb, w, t, l }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Tests — the instrument is anchored before anything is read off it.
 // ─────────────────────────────────────────────────────────────────────

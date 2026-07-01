@@ -558,6 +558,21 @@ pub fn decide_live2_resolve(req: &DecideRequest) -> Option<DecideResponse> {
         return None;
     }
     let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
+
+    // GPU HU TURN solve (opt-in via GPU_SEARCH + the `metal` feature). The CPU
+    // exact solve below CANNOT converge in budget (~208ms/iter ⇒ ~43it/9s), so on
+    // the turn it under-converges (nuts value-bet only ~60% vs the ~100% converged
+    // truth); the GPU converges in ~5s with a river-integrated continuation
+    // (validated 2.4× more faithful than the turn proxy, matches the converged
+    // exact). River stays on the CPU exact (cheap, single-street, converges).
+    #[cfg(feature = "metal")]
+    if req.board.len() == 4 && std::env::var("GPU_SEARCH").is_ok() {
+        if let Some(resp) = try_gpu_hu_turn_resolve(req, commit, pot, t0) {
+            return Some(resp);
+        }
+        // else: GPU unavailable / node absent ⇒ fall through to the CPU exact solve.
+    }
+
     let iters = if req.board.len() == 5 {
         crate::live2_bank::LIVE2_RT_RIVER_ITERS
     } else {
@@ -588,6 +603,68 @@ pub fn decide_live2_resolve(req: &DecideRequest) -> Option<DecideResponse> {
         .collect();
     let street = if req.board.len() == 5 { "river" } else { "turn" };
     Some(finalize_live2(actions, street, req.seed, t0))
+}
+
+/// GPU HU turn resolve — the fast, fully-converged alternative to the budget-capped
+/// CPU `solve_live2_street`. Builds the production turn seam tree (depth-limited to
+/// the river deal), runs the GPU per-hand-continuation solve with the RIVER-INTEGRATED
+/// showdown model (nb=200, 300it ≈ 5s), and reads the hero's node strategy. Returns
+/// None (⇒ CPU fallback) if Metal is unavailable or the walked node isn't the hero's.
+#[cfg(feature = "metal")]
+fn try_gpu_hu_turn_resolve(
+    req: &DecideRequest,
+    commit: i32,
+    pot: i32,
+    t0: std::time::Instant,
+) -> Option<DecideResponse> {
+    use solver_core::card::index_to_card_pair;
+    use solver_core::gpu_metal::{gpu_hu_turn_strat, GpuSearchCfg, MetalContext};
+    use solver_core::tree::action::BoardState;
+    use solver_core::tree::builder::build_tree_depth_limited;
+
+    let ctx = MetalContext::new().ok()?;
+    let cfg = production_game_v1().street_seam_config(
+        BoardState::Turn, 2, commit, pot, crate::live2_bank::live2_bet_menu(),
+    );
+    let tree = build_tree_depth_limited(&cfg).ok()?;
+
+    // Uniform (board-filtered) reach — the real-time prior (same as the CPU path).
+    let bmask: u64 = req.board.iter().fold(0u64, |m, &c| m | (1u64 << c));
+    let nh = (0..(52 * 51 / 2))
+        .filter(|&idx| {
+            let (c1, c2) = index_to_card_pair(idx);
+            bmask & (1u64 << c1) == 0 && bmask & (1u64 << c2) == 0
+        })
+        .count();
+    let reach = vec![vec![1.0f32; nh]; 2];
+    let gcfg = GpuSearchCfg {
+        iters: 300, sample_m: 0, seed: req.seed.unwrap_or(0x5EED),
+        factored_terminals: false, lambda: 0.0,
+    };
+    let (hand_cards, strat_map) =
+        gpu_hu_turn_strat(&ctx, &req.board, &tree, &reach, 200, true, &gcfg);
+
+    let node = walk_to_node(&tree, &req.street_actions)?;
+    if tree.nodes[node].player_id as usize != req.hero_idx as usize {
+        return None;
+    }
+    let (a, b) = (
+        req.hero_cards[0].min(req.hero_cards[1]),
+        req.hero_cards[0].max(req.hero_cards[1]),
+    );
+    let h = (0..nh).find(|&i| hand_cards[i * 2] == a && hand_cards[i * 2 + 1] == b)?;
+    let strat = strat_map.get(&node)?;
+    let na = strat.len();
+    let children = tree.node_children(node);
+    let actions: Vec<ActionProb> = (0..na)
+        .map(|ai| {
+            let child = children[ai] as usize;
+            let label = tree.nodes[child].action_label;
+            let amount = commit + tree.get_contribution(child, req.hero_idx);
+            ActionProb { label, action: action_name(label).to_string(), amount, prob: strat[ai][h] }
+        })
+        .collect();
+    Some(finalize_live2(actions, "turn", req.seed, t0))
 }
 
 pub fn decide_live2(live2_root: &str, req: &DecideRequest) -> Option<DecideResponse> {

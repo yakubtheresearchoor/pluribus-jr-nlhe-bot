@@ -136,3 +136,110 @@ pub fn gpu_search_street_strat(
     }
     out
 }
+
+/// GPU HU (np=2) TURN search on the ACTUAL board — the fast, fully-converged
+/// alternative to the CPU `solve_live2_street` (which is budget-limited to ~43
+/// iters at 208ms/iter). Builds the turn continuation tables directly from the
+/// real board (per-hand best-5-of-6 strength → nb strength-quantile buckets →
+/// `compute_wtl_for_runout`), the SAME single-strength continuation model the
+/// validated `gpu_search_street_strat` uses. `board` = 4 cards (flop+turn);
+/// `tree` = a depth-limited TURN tree (truncates at the river deal); `reach` =
+/// [2][nh] ranges. Returns (hand_cards, strategy at every turn player node).
+#[cfg(feature = "metal")]
+pub fn gpu_hu_turn_strat(
+    ctx: &MetalContext,
+    board: &[u8],
+    tree: &FlatTree,
+    reach: &[Vec<f32>],
+    nb: usize,
+    river_integrated: bool,
+    cfg: &GpuSearchCfg,
+) -> (Vec<u8>, HashMap<usize, Vec<Vec<f32>>>) {
+    use crate::abstraction::postflop_buckets::{compute_river_integrated_wtl, compute_wtl_for_runout};
+    use crate::card::{index_to_card_pair, Card, NUM_POSSIBLE_HANDS};
+    use crate::hand::eval::Hand;
+    use crate::solver::bucketed_showdown::BucketedRunoutTables;
+
+    assert_eq!(tree.num_players, 2, "gpu_hu_turn_strat is HU only");
+    let bmask: u64 = board.iter().fold(0u64, |m, &c| m | (1u64 << c));
+
+    // Valid hands + per-hand turn strength (best 5 of the 6 = hole+board).
+    let mut hand_cards: Vec<u8> = Vec::new();
+    let mut hands: Vec<(Card, Card)> = Vec::new();
+    let mut strengths: Vec<i32> = Vec::new();
+    for idx in 0..NUM_POSSIBLE_HANDS {
+        let (c1, c2) = index_to_card_pair(idx);
+        if bmask & (1u64 << c1) != 0 || bmask & (1u64 << c2) != 0 { continue; }
+        let mut hand = Hand::new().add_card(c1 as usize).add_card(c2 as usize);
+        for &bc in board { hand = hand.add_card(bc as usize); }
+        strengths.push(hand.evaluate_full() as i32);
+        hands.push((c1, c2));
+        hand_cards.push(c1); hand_cards.push(c2);
+    }
+    let nh = hands.len();
+
+    // nb strength-quantile bucket map.
+    let mut order: Vec<usize> = (0..nh).collect();
+    order.sort_by_key(|&i| strengths[i]);
+    let mut map = vec![0u16; nh];
+    for (rank, &i) in order.iter().enumerate() {
+        map[i] = ((rank * nb) / nh).min(nb - 1) as u16;
+    }
+    // Continuation tables (win/tie/lose per bucket pair). `river_integrated` uses
+    // the exact check-to-showdown model (avg over every river card) so the turn
+    // strategy matches the exact solve; otherwise the cheaper single-strength turn
+    // proxy (over-values immediate showdown ⇒ over-bets the tail).
+    let weights = vec![1.0f64; nh];
+    let wtl = if river_integrated {
+        compute_river_integrated_wtl(&hands, board, &map, nb)
+    } else {
+        compute_wtl_for_runout(&hands, &strengths, &weights, &map, nb)
+    };
+    let mut sums = vec![0.0f64; nb];
+    for h in 0..nh { sums[map[h] as usize] += 1.0; }
+    let tables = BucketedRunoutTables::from_wtl(&wtl, &sums);
+
+    // Sorted-strength arrays (needed by MetalVectorCfr::new; HU fold terminals use
+    // reach inclusion-exclusion, not strengths, so these only need to be valid).
+    let mut sps = vec![0u16; nh];
+    let mut spi = vec![0u16; nh];
+    for (si, &i) in order.iter().enumerate() {
+        sps[si] = strengths[i] as u16;
+        spi[si] = i as u16;
+    }
+    let (sos, soi) = (sps.clone(), spi.clone());
+
+    // num_combinations = compatible (hero,opp) hand-pair mass (matches ChanceTable).
+    let mut nc = 0.0f64;
+    for h0 in 0..nh {
+        let m0 = (1u64 << hand_cards[h0 * 2]) | (1u64 << hand_cards[h0 * 2 + 1]);
+        for h1 in 0..nh {
+            let m1 = (1u64 << hand_cards[h1 * 2]) | (1u64 << hand_cards[h1 * 2 + 1]);
+            if m0 & m1 == 0 { nc += (reach[0][h0] as f64) * (reach[1][h1] as f64); }
+        }
+    }
+
+    let mut gpu = MetalVectorCfr::new(ctx, tree, nh, reach, &sos, &soi, &sps, &spi, &hand_cards, nc);
+    if cfg.lambda > 0.0 { gpu.set_lambda(cfg.lambda); }
+
+    let leaf_nodes: Vec<u32> = (0..tree.num_nodes())
+        .filter(|&n| tree.nodes[n].is_chance() && tree.node_children(n).is_empty())
+        .map(|n| n as u32).collect();
+    if !leaf_nodes.is_empty() {
+        gpu.set_continuation(ctx, &leaf_nodes, &map, nb,
+            &tables.f_w, &tables.f_t, &tables.f_l, &tables.f_n,
+            tree.rake_rate as f32, tree.rake_cap as f32, cfg.sample_m, cfg.seed);
+    }
+
+    gpu.run_batched(ctx, tree, cfg.iters);
+
+    let turn = BoardState::Turn as u8;
+    let mut out = HashMap::new();
+    for n in 0..tree.num_nodes() {
+        if tree.nodes[n].is_player() && tree.nodes[n].board_state == turn {
+            let na = tree.nodes[n].num_children as usize;
+            out.insert(n, gpu.get_average_strategy(n, na, nh));
+        }
+    }
+    (hand_cards, out)
+}
