@@ -340,5 +340,23 @@ live count) decision is still served:
   exact). HU river is single-street and converges on the CPU already.
 - **live-2 turn/river ranges are uniform** (unconstrained re-solve — no reach
   narrowing from prior betting).
+- **HU solves are symmetric GTO, not yet exploitative.** `solve_live2_resolve`
+  (and the GPU turn) run a symmetric equilibrium — there is no `opp_lambda`-style
+  exploit lever on the HU path (unlike the multiway search, §9). Consequence: at
+  **deep river SPR** (e.g. commit=10/pot=20 ⇒ SPR≈9.5, a checked-down line) the
+  converged solve **traps the nuts — quads check ~99%** first-to-act (a GTO
+  check-raise line; verified converged, *not* under-convergence: stable at ~0 %
+  bet from 300 to 10 000 iters). This is correct vs a balanced opponent but
+  **leaves value vs the loose-passive target pool** (which under-bets after a
+  check). At normal/shallow river SPR the nuts value-bets (~98 %) or jams
+  (~88 %), so the trap is confined to deep checked-down spots. Modelling the
+  opponent as passive (an HU exploit lever) is the fix; not yet wired.
+- **HU flop facing-a-bet is not fully solved.** §5's "banked exact HU strategy"
+  covers the **first-to-act** flop node well; when the hero is **facing a bet**
+  (`to_call > 0`), only some SPR bins are banked — an unbanked bin returns `422`
+  ("SPR bin not banked"), and some bins fall through to a **uniform-ish fallback**
+  (equal action probs) rather than a real solve. Affects a small fraction of
+  production decisions. The fix (a proper HU flop facing-bet solve / action
+  translation into the connected search, as done for multiway) is pending.
 - **The blueprint strategy is u8-quantized on disk** (SSBP2, ~0.1 % on EV-relevant
   mass, money-test-proven play-safe) — the runtime decompresses to f32 at load.
