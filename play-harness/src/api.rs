@@ -633,11 +633,13 @@ fn try_gpu_hu_turn_resolve(
     t0: std::time::Instant,
 ) -> Option<DecideResponse> {
     use solver_core::card::index_to_card_pair;
-    use solver_core::gpu_metal::{gpu_hu_turn_strat, GpuSearchCfg, MetalContext};
+    use solver_core::gpu_metal::{gpu_hu_turn_strat, shared_context, GpuSearchCfg};
     use solver_core::tree::action::BoardState;
     use solver_core::tree::builder::build_tree_depth_limited;
 
-    let ctx = MetalContext::new().ok()?;
+    // Shared process-wide context (metallib + queue loaded ONCE) — NOT a per-request
+    // MetalContext::new(), which leaked wired GPU memory the driver never reclaimed.
+    let ctx = shared_context()?;
     let cfg = production_game_v1().street_seam_config(
         BoardState::Turn, 2, commit, pot, crate::live2_bank::live2_bet_menu(),
     );
@@ -657,7 +659,7 @@ fn try_gpu_hu_turn_resolve(
         factored_terminals: false, lambda: 0.0,
     };
     let (hand_cards, strat_map) =
-        gpu_hu_turn_strat(&ctx, &req.board, &tree, &reach, 200, true, &gcfg);
+        gpu_hu_turn_strat(ctx, &req.board, &tree, &reach, 200, true, &gcfg);
 
     let node = walk_to_node(&tree, &req.street_actions)?;
     if tree.nodes[node].player_id as usize != req.hero_idx as usize {

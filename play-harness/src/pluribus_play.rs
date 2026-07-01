@@ -1072,8 +1072,10 @@ fn try_gpu_search(
     overrides: &[(usize, Vec<f32>)],
     cfg: &SearchCfg,
 ) -> Option<std::collections::HashMap<usize, Vec<Vec<f32>>>> {
-    use solver_core::gpu_metal::{gpu_search_street_strat, GpuSearchCfg, MetalContext};
-    let ctx = MetalContext::new().ok()?;
+    use solver_core::gpu_metal::{gpu_search_street_strat, shared_context, GpuSearchCfg};
+    // Shared process-wide context (metallib + queue loaded ONCE) — NOT a per-request
+    // MetalContext::new(), which leaked wired GPU memory the driver never reclaimed.
+    let ctx = shared_context()?;
     // Board-filtered base range (= the CPU game's initial_weight for this street),
     // overlaid with the per-seat overrides → [live][nh] reach prior.
     let scratch = BucketedContinuationGame::new_street(&bp.game, &bp.bk, cont, cfg.sample_m, cfg.seed);
@@ -1083,7 +1085,7 @@ fn try_gpu_search(
         if *seat < live { reach[*seat] = r.clone(); }
     }
     let gcfg = GpuSearchCfg { iters: cfg.iters, sample_m: cfg.sample_m, seed: cfg.seed, factored_terminals: true, lambda: cfg.lambda };
-    Some(gpu_search_street_strat(&ctx, tree, bp.game.table(), &bp.bk, cont, &reach, &gcfg))
+    Some(gpu_search_street_strat(ctx, tree, bp.game.table(), &bp.bk, cont, &reach, &gcfg))
 }
 
 #[cfg(not(feature = "metal"))]

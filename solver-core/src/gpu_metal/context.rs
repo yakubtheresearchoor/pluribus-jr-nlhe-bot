@@ -45,6 +45,25 @@ pub struct MetalContext {
     library: Library,
 }
 
+// The device / command queue / library are immutable after creation and the
+// underlying Metal API is thread-safe for command-buffer creation + submission
+// (the metal-rs wrappers just aren't marked Sync). This lets us hold ONE context
+// process-wide (`shared_context`) and use it from every async worker thread,
+// instead of `MetalContext::new()` per request — the per-request path re-loaded
+// the metallib + allocated a command queue every call, and the driver never
+// reclaimed that wired GPU memory, so it leaked ~GBs over hours of traffic.
+unsafe impl Send for MetalContext {}
+unsafe impl Sync for MetalContext {}
+
+/// Process-wide shared Metal context — created ONCE (metallib + queue), reused by
+/// every request. `None` if Metal is unavailable. Use this on the request path
+/// instead of [`MetalContext::new`]; the latter now exists only for tests/tools
+/// and one-off uses where a fresh context is genuinely wanted.
+pub fn shared_context() -> Option<&'static MetalContext> {
+    static SHARED: std::sync::OnceLock<Option<MetalContext>> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| MetalContext::new().ok()).as_ref()
+}
+
 impl MetalContext {
     /// Create a new Metal context using the system default device.
     /// Loads the pre-compiled metallib from OUT_DIR.
@@ -147,6 +166,14 @@ impl MetalContext {
     /// Create a new command buffer.
     pub fn new_command_buffer(&self) -> &metal::CommandBufferRef {
         self.queue.new_command_buffer()
+    }
+
+    /// Current GPU memory (bytes) allocated by all resources on this device —
+    /// used to detect per-request context/buffer leaks (it should return to a
+    /// baseline after solves free their buffers; it grows unbounded if metallibs
+    /// / queues accumulate).
+    pub fn allocated_size(&self) -> u64 {
+        self.device.current_allocated_size()
     }
     
     /// Allocate a zero-initialized buffer.
