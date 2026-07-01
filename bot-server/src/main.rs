@@ -60,9 +60,6 @@ struct AppState {
     // of the timeout-storm + OOM. Bounds concurrent solves to a small N; excess
     // requests wait briefly then fast-fail 503 (better than hanging past the
     // client timeout). Preflop lookups bypass it entirely.
-    // (Currently disabled — see the commented gate in decide_handler. Kept wired
-    // up so re-enabling is a one-line uncomment.)
-    #[allow(dead_code)]
     solve_sema: Arc<tokio::sync::Semaphore>,
 }
 
@@ -221,25 +218,54 @@ async fn decide_handler(
         }
     }
 
-    // ADMISSION CONTROL (disabled for now — the timeout storm was cold lazy-init
-    // on the first request burst, not oversubscription; the startup warm-up fixes
-    // that). Re-enable by uncommenting to bound concurrent heavy solves:
-    //   let _permit = match st.solve_sema.clone().try_acquire_owned() {
-    //       Ok(p) => p,
-    //       Err(_) => match tokio::time::timeout(
-    //           std::time::Duration::from_secs(2), st.solve_sema.clone().acquire_owned()).await {
-    //           Ok(Ok(p)) => p,
-    //           _ => return Err((StatusCode::SERVICE_UNAVAILABLE,
-    //               "server saturated: too many concurrent solves, retry".into())),
-    //       },
-    //   };
+    // ADMISSION CONTROL (REQUIRED with the shared MetalContext). Every GPU solve
+    // shares ONE Metal command queue; concurrent command-buffer creation on it
+    // from multiple threads deadlocks Metal (0% CPU hang). The postflop conn.decide
+    // below also runs its solve on the async worker, so unbounded concurrency
+    // starves the runtime. Gating heavy solves (BOTSERVER_MAX_SOLVES; keep at 1
+    // while the GPU path shares one queue) means one solve at a time — no
+    // concurrent GPU submission, and waiters await the permit ASYNC (they don't
+    // block worker threads, so health/other routes stay responsive). Preflop
+    // lookups returned above and never reach here. Saturated ⇒ wait 2s then 503.
+    let _permit = match st.solve_sema.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.solve_sema.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            _ => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server saturated: too many concurrent solves, retry".into(),
+                ))
+            }
+        },
+    };
 
     // POSTFLOP (flop/turn/river) via the connected blueprint (lookup) when loaded.
     // Turn/river need `prior_actions` (the runtime supplies the full postflop path).
     // Falls through to the existing search/live paths if it can't serve.
     if (3..=5).contains(&req.board.len()) {
-        if let Some(conn) = st.conn.as_ref() {
-            if let Some(r) = conn.decide(&req) {
+        if let Some(conn) = st.conn.clone() {
+            // Run the solve on a BLOCKING thread. conn.decide runs the CPU/GPU
+            // search (seconds); on an async worker it stalls the whole runtime
+            // (health/other routes hang), and — sharing the one Metal command
+            // queue — a concurrent GPU solve deadlocks/pins the GPU. The permit
+            // above caps this to one at a time; spawn_blocking keeps it off the
+            // async workers. Move `req` in and hand it back so the fallthrough
+            // live-2/live-6/legacy paths below can still use it if conn returns None.
+            let (served, returned): (Option<DecideResponse>, DecideRequest) =
+                tokio::task::spawn_blocking(move || {
+                    let r = conn.decide(&req);
+                    (r, req)
+                })
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("conn solve join: {e}")))?;
+            req = returned;
+            if let Some(r) = served {
                 return Ok(Json(r));
             }
         }
