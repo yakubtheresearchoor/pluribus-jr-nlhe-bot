@@ -261,9 +261,17 @@ fn action_class(label: u8) -> u8 {
 /// fell to the crude equity rollout (the multiway-flop "missing cell" path).
 fn walk_to_node(tree: &FlatTree, actions: &[ActionInput]) -> Option<usize> {
     let mut node = 0usize;
+    // Deepest PLAYER node reached — used to CLAMP when the action history runs off
+    // the depth-limited tree (a raise-war deeper than `max_bets_per_street`: the
+    // tree is already all-in/at chance while the real betting kept going). Rather
+    // than fail (→ crude rollout / 422), we return the deepest representable
+    // decision — facing the tree's all-in, the hero still gets a solved fold/call
+    // (correctly getting the nuts in). Well-formed walks consume every action and
+    // end on a player node, so this is strictly additive — their result is unchanged.
+    let mut last_player = if tree.nodes[0].is_player() { Some(0usize) } else { None };
     for act in actions {
         if tree.nodes[node].is_terminal() || tree.nodes[node].is_chance() {
-            return None;
+            break; // off-tree: stop and clamp to the deepest player node below
         }
         let children = tree.node_children(node);
         let lbl_of = |i: usize| tree.nodes[children[i] as usize].action_label;
@@ -277,15 +285,22 @@ fn walk_to_node(tree: &FlatTree, actions: &[ActionInput]) -> Option<usize> {
             cands = (0..children.len()).filter(|&i| act.label == 0 || lbl_of(i) != 0).collect();
         }
         let pick = match cands.len() {
-            0 => return None,
+            0 => break, // no representable action here → clamp
             1 => cands[0],
             _ => *cands.iter().min_by_key(|&&i| {
                 (tree.nodes[children[i] as usize].amount - act.to_total as i32).abs()
             })?,
         };
         node = children[pick] as usize;
+        if tree.nodes[node].is_player() {
+            last_player = Some(node);
+        }
     }
-    Some(node)
+    if tree.nodes[node].is_player() {
+        Some(node)
+    } else {
+        last_player // clamped: deepest player node on the walked line
+    }
 }
 
 /// Run a POSTFLOP decision: search the current street's subgame (pair-blocked if
@@ -912,5 +927,47 @@ mod walk_translation_tests {
         // A plain check (label 1) must still map to the check child exactly.
         let node = walk_to_node(&tree, &[ActionInput { label: 1, to_total: 0 }]).expect("check walks");
         assert_eq!(tree.nodes[node].action_label, 1, "exact check should be preferred");
+    }
+
+    // HU flop tree with the production 3-bet/street cap — a raise-war reaches
+    // all-in after bet→raise→all-in, so a deeper sequence runs off the tree.
+    fn hu_flop_tree_capped() -> FlatTree {
+        use solver_core::tree::action::{production_game_v1, BetCap};
+        let spec = production_game_v1();
+        let mut cfg = spec.street_seam_config(BoardState::Flop, 2, 10, 20,
+            BetSizeOptions { bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)], raise: vec![BetSize::PotRelative(1.0)] });
+        cfg.max_bets_per_street = BetCap::all(3);
+        build_tree_depth_limited(&cfg).expect("hu flop tree")
+    }
+
+    #[test]
+    fn over_cap_raise_war_clamps_to_player_node_not_none() {
+        let tree = hu_flop_tree_capped();
+        // A raise-war deeper than the 3-bet cap (bet, raise, re-raise, re-re-raise).
+        // The tree is all-in by the 3rd aggressive action; the 4th runs off it.
+        let war = vec![
+            ActionInput { label: 3, to_total: 13 },  // seat0 bet
+            ActionInput { label: 4, to_total: 40 },  // seat1 raise
+            ActionInput { label: 4, to_total: 100 }, // seat0 re-raise (→ all-in)
+            ActionInput { label: 4, to_total: 200 }, // over-cap → runs off the tree
+        ];
+        let node = walk_to_node(&tree, &war);
+        // Must NOT be None (would drop to the crude rollout / 422). It clamps to the
+        // deepest representable PLAYER decision (the all-in fold/call node).
+        let n = node.expect("over-cap war must clamp, not return None");
+        assert!(tree.nodes[n].is_player(), "clamp must land on a player node");
+        // That node is a real fold/call decision (the tree's all-in-facing node).
+        let labels: Vec<u8> = tree.node_children(n).iter().map(|&c| tree.nodes[c as usize].action_label).collect();
+        assert!(labels.contains(&0) && labels.contains(&2), "all-in-facing node offers fold+call, got {labels:?}");
+    }
+
+    #[test]
+    fn well_formed_walk_unchanged_by_clamp() {
+        let tree = hu_flop_tree_capped();
+        // seat0 bets; seat1 faces it — a normal facing-bet decision, fully on-tree.
+        let node = walk_to_node(&tree, &[ActionInput { label: 3, to_total: 13 }]).expect("walks");
+        assert!(tree.nodes[node].is_player(), "lands on the facing-bet player node");
+        let labels: Vec<u8> = tree.node_children(node).iter().map(|&c| tree.nodes[c as usize].action_label).collect();
+        assert!(labels.contains(&4), "facing a bet, the hero can raise (on-tree), got {labels:?}");
     }
 }

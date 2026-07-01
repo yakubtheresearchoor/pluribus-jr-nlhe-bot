@@ -351,15 +351,18 @@ live count) decision is still served:
   check). At normal/shallow river SPR the nuts value-bets (~98 %) or jams
   (~88 %), so the trap is confined to deep checked-down spots. Modelling the
   opponent as passive (an HU exploit lever) is the fix; not yet wired.
-- **HU flop facing-a-bet — mostly solved, deep raise-wars fall to the rollout.**
-  The connected search (`decide_postflop_search`) **does** real-solve HU flop
-  facing-a-bet — a single/double bet-raise maps through `walk_to_node`'s action
-  translation and returns a proper fold/call/raise (e.g. it raises the nuts). What
-  it can't serve is a betting sequence **deeper than the search tree's cap**
-  (`max_bets_per_street = 3` — a flop raise-war past 3 bets/street): the node falls
-  off the tree, so the spot used to `422`. **Fixed:** those now fall to the equity
-  rollout (sane check / pot-odds call-fold) instead of a hard `422`. ~0.7 % of
-  decisions. A proper deep-stack HU flop facing-bet solve (raise the nuts in a
-  raise-war rather than flat-call the rollout) is the remaining follow-up.
+- **HU flop facing-a-bet — solved, incl. deep raise-wars.** The connected search
+  (`decide_postflop_search`) real-solves HU flop facing-a-bet: a bet-raise maps
+  through `walk_to_node`'s action translation to a proper fold/call/raise (raises
+  the nuts). A betting sequence **deeper than the tree's cap** (`max_bets_per_street
+  = 3` — a raise-war past 3 bets/street, by which point the tree is all-in) used to
+  run off the tree → `422`. **Fixed** two ways: (1) `walk_to_node` now **clamps** to
+  the deepest representable player node instead of failing, so the hero gets the
+  **solved** strategy at the tree's all-in decision — verified: quads **call the
+  all-in** (get it in), 72o **folds**; (2) any residual unservable HU spot falls to
+  the equity rollout rather than a `422`. Strictly additive — well-formed walks are
+  unchanged. Residual approximation: a rare deep small-raise war with stack still
+  behind is represented as the tree's all-in (call = get-it-in), not a fresh
+  re-rooted raise — negligible EV, noted for completeness.
 - **The blueprint strategy is u8-quantized on disk** (SSBP2, ~0.1 % on EV-relevant
   mass, money-test-proven play-safe) — the runtime decompresses to f32 at load.
