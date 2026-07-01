@@ -8,6 +8,7 @@ itself holds no game state — every request carries the derived per-decision st
 - Crate: `bot-server` (axum + tokio)
 - Decision logic: `play_harness::api`
 - Launch: `BP_ROOT=$PWD/blueprint_out_v1 PF_STRAT=preflop_eqr_bbfix PAR=1 cargo run --release -p bot-server`
+- Launch (Metal GPU, converged HU-turn search): `CONN_BP=blueprint_conn_eqr CONN_GS14=gs14_blueprint_cache GPU_SEARCH=1 cargo run --release -p bot-server --features metal` (see `GPU_SEARCH` in §9)
 
 ---
 
@@ -114,7 +115,7 @@ The server dispatches on `live` and `board.len()`:
 | condition | path | mechanism | needs |
 |-----------|------|-----------|-------|
 | `board == []` | **preflop** | EQR strategy (table lookup, instant) | `PF_STRAT` loaded; `street_actions` (preflop betting), `hero_cards`, `hero_idx`. |
-| `live == 2` | **heads-up** | flop = banked exact HU strategy; turn/river = real-time exact HU search | flop needs the live-2 bank (`{BP_ROOT}/live2`); turn/river need nothing extra. |
+| `live == 2` | **heads-up** | flop = banked exact HU strategy; turn/river = real-time exact HU search (turn → **Metal GPU converged search** when `GPU_SEARCH` set) | flop needs the live-2 bank (`{BP_ROOT}/live2`); turn/river need nothing extra. |
 | `live ∈ {3,4,5}` | **multiway** | per-street depth-limited search over the bucketed blueprint continuation, rich bet sizing | a blueprint cell (`cell_dir` + `flop_id`, or `route = true`). |
 | `live ≥ 6` | **full ring** | equity-rollout model: check when unbet, pot-odds call/fold vs Monte-Carlo all-in equity | `to_call` (or derivable from `street_actions`). |
 
@@ -253,10 +254,14 @@ may map a banked runout to an equivalent un-sampled card → `400`.
 | `PAR` | _(off)_ | enable the parallel search walk. |
 | `DCFR` | _(off)_ | enable Discounted-CFR (faster convergence). |
 | `L2_SUBDIR` | `live2` | live-2 bank subdirectory (e.g. `live2_m2` for the rich-menu bank). |
+| `GPU_SEARCH` | _(off)_ | route the search to the **Metal GPU** (requires the server built `--features metal`; no-op otherwise). Covers the **HU turn** (`decide_live2_resolve`) plus the flop/multiway connected search. The CPU exact HU turn cannot converge in budget (~208 ms/iter ⇒ ~43 it ⇒ the nuts value-bets only ~60 %); the GPU converges in ~5 s with a **river-integrated** continuation (validated 2.4× more faithful than the turn-strength proxy; nuts value-bet ~100 %, matching the converged exact). HU river + multiway keep their existing paths. |
 
 Per-live latency is auto-scheduled (parallel + DCFR for heavy multiway counts) to fit
 a ~14 s real-time budget: live-3 ~0.3 s, live-4 ~3.5 s, live-5 ~4.5 s; live-2 river
-~0.1 s, live-2 turn ~5–8 s; live-6 ~0.5 s.
+~0.1 s, live-2 turn ~5 s (GPU, fully converged) or ~5–8 s (CPU, budget-capped &
+under-converged); live-6 ~0.5 s.
+
+> **Build note:** the GPU path needs the `metal` feature (`cargo build --release -p bot-server --features metal`). Without it the `GPU_SEARCH` flag is inert and every street uses the CPU path (identical behavior to before) — the flag is a safe, opt-in rollout.
 
 ---
 
@@ -326,7 +331,13 @@ live count) decision is still served:
 - **live-6 is check-down equity** — the full-ring model never value-bets; it checks
   when unbet and calls/folds by pot odds.
 - **live-2 turn** uses a nested solve (rich turn menu, check-only river continuation);
-  the river is re-solved exactly on arrival, so it plays correctly.
+  the river is re-solved exactly on arrival, so it plays correctly. **Convergence:** the
+  CPU exact solve is ~208 ms/iter and cannot converge in a real-time budget (~43 it),
+  so it *under-converges* — e.g. the nuts value-bets only ~60 % (the converged truth is
+  ~100 %: exact 250 it = 0.78 → 600 it = 0.87 → 1200 it = 0.997). **Fix (`GPU_SEARCH`, §9):**
+  the Metal GPU converges the turn in ~5 s with a river-integrated continuation (nuts
+  ~100 %, validated 2.4× more faithful than the turn-strength proxy vs the converged
+  exact). HU river is single-street and converges on the CPU already.
 - **live-2 turn/river ranges are uniform** (unconstrained re-solve — no reach
   narrowing from prior betting).
 - **The blueprint strategy is u8-quantized on disk** (SSBP2, ~0.1 % on EV-relevant
