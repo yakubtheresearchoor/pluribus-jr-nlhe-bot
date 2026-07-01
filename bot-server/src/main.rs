@@ -54,6 +54,13 @@ struct AppState {
     pf: Option<Arc<SyncPf>>,
     // Connected blueprint decider (CONN_BP set): serves preflop + flop by lookup.
     conn: Option<Arc<play_harness::api_conn::ConnDecider>>,
+    // Admission control for HEAVY postflop solves (CFR search / re-solve). Each
+    // solve wants most of the machine (all cores + the GPU + GBs of buffers), so
+    // running many at once oversubscribes CPU/GPU and balloons memory — the cause
+    // of the timeout-storm + OOM. Bounds concurrent solves to a small N; excess
+    // requests wait briefly then fast-fail 503 (better than hanging past the
+    // client timeout). Preflop lookups bypass it entirely.
+    solve_sema: Arc<tokio::sync::Semaphore>,
 }
 
 #[tokio::main]
@@ -84,12 +91,17 @@ async fn main() {
         Arc::new(d)
     });
 
+    // Max concurrent heavy solves. Each wants ~the whole machine, so keep this
+    // small (default 2 — one CPU-bound + one GPU-bound overlap well). Tune via
+    // BOTSERVER_MAX_SOLVES.
+    let max_solves = std::env::var("BOTSERVER_MAX_SOLVES").ok().and_then(|s| s.parse().ok()).unwrap_or(2usize).max(1);
     let state = AppState {
         bp_root: bp_root.clone(),
         cfg,
         cache: Arc::new(Mutex::new(HashMap::new())),
         pf,
         conn,
+        solve_sema: Arc::new(tokio::sync::Semaphore::new(max_solves)),
     };
     let app = Router::new()
         .route("/", get(|| async { "poker-bot decision server — POST /decide (see play_harness::api::DecideRequest)" }))
@@ -97,7 +109,7 @@ async fn main() {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
-    eprintln!("decision server on http://{bind}  (bp_root={bp_root}, iters={iters}, PAR={par}, DCFR={dcfr})");
+    eprintln!("decision server on http://{bind}  (bp_root={bp_root}, iters={iters}, PAR={par}, DCFR={dcfr}, max_solves={max_solves})");
     axum::serve(listener, app).await.expect("serve");
 }
 
@@ -150,6 +162,29 @@ async fn decide_handler(
             return Err((StatusCode::BAD_REQUEST, format!("postflop: pot_entry {pot} < live*commit ({live}*{commit})")));
         }
     }
+
+    // ADMISSION CONTROL — bound concurrent heavy postflop solves (preflop already
+    // returned above, so lookups never wait here). Held until the handler returns,
+    // covering every postflop path below. If the pool is saturated, wait briefly
+    // then fast-fail 503 so the caller fails fast instead of hanging past its
+    // timeout (and so the machine can't be driven into oversubscription / OOM).
+    let _permit = match st.solve_sema.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.solve_sema.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            _ => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server saturated: too many concurrent solves, retry".into(),
+                ))
+            }
+        },
+    };
 
     // POSTFLOP (flop/turn/river) via the connected blueprint (lookup) when loaded.
     // Turn/river need `prior_actions` (the runtime supplies the full postflop path).

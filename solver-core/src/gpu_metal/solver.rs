@@ -396,33 +396,39 @@ impl MetalVectorCfr {
         let mut count = 0u32;
 
         for _ in 0..num_iterations {
-            let params = DcfrParams::new(self.iteration);
-            self.iteration += 1;
+            // Drain each iteration's autoreleased command buffers immediately (sync
+            // mode waits per dispatch, so they're already complete) — otherwise they
+            // pile up on the worker thread's never-drained pool, pinning the GPU
+            // buffers they reference (the wired-memory leak). See run_batched.
+            objc::rc::autoreleasepool(|| {
+                let params = DcfrParams::new(self.iteration);
+                self.iteration += 1;
 
-            // Sequential (alternating) updates: recompute strategies and reach
-            // before each traverser's bottom-up pass. This matches the CUDA
-            // GPU solver and Tammelin CFR+ — each traverser sees the most
-            // up-to-date regret state, yielding ~8x faster convergence than
-            // computing strategies once per iteration.
-            for traverser in 0..np {
-                self.launch_compute_strategies(ctx, ni, nh);
-                self.launch_init_reach(ctx, np, nh);
-                self.launch_top_down(ctx, nh, np as u32);
+                // Sequential (alternating) updates: recompute strategies and reach
+                // before each traverser's bottom-up pass. This matches the CUDA
+                // GPU solver and Tammelin CFR+ — each traverser sees the most
+                // up-to-date regret state, yielding ~8x faster convergence than
+                // computing strategies once per iteration.
+                for traverser in 0..np {
+                    self.launch_compute_strategies(ctx, ni, nh);
+                    self.launch_init_reach(ctx, np, nh);
+                    self.launch_top_down(ctx, nh, np as u32);
 
-                self.launch_bottom_up(
-                    ctx, tree, traverser as u32,
-                    params.alpha_t, params.beta_t, params.gamma_t,
-                    nh, np as u32,
-                );
+                    self.launch_bottom_up(
+                        ctx, tree, traverser as u32,
+                        params.alpha_t, params.beta_t, params.gamma_t,
+                        nh, np as u32,
+                    );
 
-                if traverser == 0 {
-                    let cfv = self.d_cfv.as_slice();
-                    for h in 0..nh {
-                        root_cfv_sum[h] += cfv[h];
+                    if traverser == 0 {
+                        let cfv = self.d_cfv.as_slice();
+                        for h in 0..nh {
+                            root_cfv_sum[h] += cfv[h];
+                        }
+                        count += 1;
                     }
-                    count += 1;
                 }
-            }
+            });
         }
 
         for h in 0..nh {
@@ -439,34 +445,43 @@ impl MetalVectorCfr {
     /// d_regrets/d_cfv) orders the stages; a single `flush()` at the end
     /// drains the queue. Use this for the real-time depth-limited search.
     pub fn run_batched(&mut self, ctx: &MetalContext, tree: &FlatTree, num_iterations: u32) {
-        let np = self.num_players as usize;
-        let nh = self.num_hands;
-        let ni = self.num_infosets;
+        // Drain Metal's autoreleased objects (the per-iter command buffers, which
+        // RETAIN the large per-solve GPU buffers) when this solve finishes. Without
+        // this, on a long-lived worker thread the thread's autorelease pool never
+        // drains → command buffers accumulate → the buffers they hold are never
+        // freed → wired GPU memory grows unbounded across requests (the OOM). The
+        // pool wraps the whole solve incl. flush(), so it drains only after the GPU
+        // has completed every committed buffer — safe.
+        objc::rc::autoreleasepool(|| {
+            let np = self.num_players as usize;
+            let nh = self.num_hands;
+            let ni = self.num_infosets;
 
-        self.async_mode.set(true);
-        for _ in 0..num_iterations {
-            let params = DcfrParams::new(self.iteration);
-            self.iteration += 1;
-            for traverser in 0..np {
-                // ONE command buffer per traverser pass: all stage dispatches
-                // (strategies → init_reach → top_down → bottom_up) encode into
-                // it as separate encoders; Metal hazard-tracks the shared state
-                // buffers to order them. Collapses ~23 command-buffer creations
-                // (the measured `_MTLCommandBuffer init` hot path) into 1.
-                let cmd = ctx.new_command_buffer();
-                self.encode_compute_strategies(ctx, cmd, ni, nh);
-                self.encode_init_reach(ctx, cmd, np, nh);
-                self.encode_top_down(ctx, cmd, nh, np as u32);
-                self.encode_bottom_up(
-                    ctx, cmd, tree, traverser as u32,
-                    params.alpha_t, params.beta_t, params.gamma_t,
-                    nh, np as u32,
-                );
-                cmd.commit(); // no wait — serial queue preserves order
+            self.async_mode.set(true);
+            for _ in 0..num_iterations {
+                let params = DcfrParams::new(self.iteration);
+                self.iteration += 1;
+                for traverser in 0..np {
+                    // ONE command buffer per traverser pass: all stage dispatches
+                    // (strategies → init_reach → top_down → bottom_up) encode into
+                    // it as separate encoders; Metal hazard-tracks the shared state
+                    // buffers to order them. Collapses ~23 command-buffer creations
+                    // (the measured `_MTLCommandBuffer init` hot path) into 1.
+                    let cmd = ctx.new_command_buffer();
+                    self.encode_compute_strategies(ctx, cmd, ni, nh);
+                    self.encode_init_reach(ctx, cmd, np, nh);
+                    self.encode_top_down(ctx, cmd, nh, np as u32);
+                    self.encode_bottom_up(
+                        ctx, cmd, tree, traverser as u32,
+                        params.alpha_t, params.beta_t, params.gamma_t,
+                        nh, np as u32,
+                    );
+                    cmd.commit(); // no wait — serial queue preserves order
+                }
             }
-        }
-        self.flush(ctx);
-        self.async_mode.set(false);
+            self.flush(ctx);
+            self.async_mode.set(false);
+        });
     }
 
     fn launch_compute_strategies(&mut self, ctx: &MetalContext, num_infosets: usize, nh: usize) {
