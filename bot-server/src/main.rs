@@ -60,6 +60,9 @@ struct AppState {
     // of the timeout-storm + OOM. Bounds concurrent solves to a small N; excess
     // requests wait briefly then fast-fail 503 (better than hanging past the
     // client timeout). Preflop lookups bypass it entirely.
+    // (Currently disabled — see the commented gate in decide_handler. Kept wired
+    // up so re-enabling is a one-line uncomment.)
+    #[allow(dead_code)]
     solve_sema: Arc<tokio::sync::Semaphore>,
 }
 
@@ -103,6 +106,12 @@ async fn main() {
         conn,
         solve_sema: Arc::new(tokio::sync::Semaphore::new(max_solves)),
     };
+    // WARM-UP: trigger every expensive one-time lazy init BEFORE the port opens,
+    // so the first burst of real requests doesn't all block on cold `get_or_init`
+    // and time out (the "fails ~20 times on startup" symptom). Guarded so a warm-up
+    // failure degrades to a cold (but running) server rather than aborting startup.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| warmup(&state)));
+
     let app = Router::new()
         .route("/", get(|| async { "poker-bot decision server — POST /decide (see play_harness::api::DecideRequest)" }))
         .route("/decide", post(decide_handler))
@@ -111,6 +120,55 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     eprintln!("decision server on http://{bind}  (bp_root={bp_root}, iters={iters}, PAR={par}, DCFR={dcfr}, max_solves={max_solves})");
     axum::serve(listener, app).await.expect("serve");
+}
+
+/// Exercise every expensive one-time lazy init on the decision path so the first
+/// real requests don't pay (and time out on) the cold build. Triggers: the 2.6M-
+/// entry hand-eval `FULL_TABLE`, the board→canonical-flop MAP, the preflop-jam
+/// equity table, a per-flop adapter (GS14 load + search structures), and — when
+/// built `--features metal` with `GPU_SEARCH` — the Metal metallib + pipeline
+/// compilation via a real HU-turn GPU solve. Results are ignored; each path just
+/// needs to run once. Called before the port opens.
+fn warmup(state: &AppState) {
+    use play_harness::api::{route_to_canonical, DecideRequest};
+    let t = std::time::Instant::now();
+
+    // 1. FULL_TABLE — the big one (all 5-card hand values, sorted+deduped).
+    let _ = solver_core::hand::eval::Hand::new()
+        .add_card(0).add_card(1).add_card(2).add_card(3)
+        .add_card(4).add_card(5).add_card(6)
+        .evaluate_full();
+
+    // 2. board→canonical-flop MAP.
+    let mut r = DecideRequest { board: vec![51, 50, 20], route: true, live: 3, ..Default::default() };
+    let _ = route_to_canonical(&mut r);
+
+    // 3. Real decision paths via the connected decider (equity table, adapters,
+    //    GS14 load, and the GPU pipeline). Each returns None-or-Ok harmlessly.
+    if let Some(conn) = state.conn.as_ref() {
+        // preflop lookup
+        let _ = conn.decide(&DecideRequest { board: vec![], hero_cards: [51, 48], live: 6, hero_idx: 2, ..Default::default() });
+        // low-SPR HU preflop → builds/loads the preflop-jam equity table
+        let _ = conn.decide(&DecideRequest {
+            board: vec![], hero_cards: [51, 48], live: 2, hero_idx: 0,
+            commit_entry: 40, pot_entry: 80, to_call: Some(40), ..Default::default()
+        });
+        // multiway flop → per-flop adapter (GS14 deserialize + FlopChanceTable + bucketing)
+        let mut f = DecideRequest {
+            board: vec![51, 50, 20], hero_cards: [48, 49], live: 3, hero_idx: 0,
+            commit_entry: 6, pot_entry: 18, to_call: Some(0), route: true, ..Default::default()
+        };
+        if route_to_canonical(&mut f).is_some() {
+            let _ = conn.decide(&f);
+        }
+        // HU turn → decide_live2_resolve, which warms the Metal metallib + pipeline
+        // compilation (the pricey first-GPU-call cost) when GPU_SEARCH is set.
+        let _ = conn.decide(&DecideRequest {
+            board: vec![51, 50, 20, 1], hero_cards: [48, 49], live: 2, hero_idx: 0,
+            commit_entry: 20, pot_entry: 40, to_call: Some(0), ..Default::default()
+        });
+    }
+    eprintln!("warmup complete in {:.1}s (lazy inits primed)", t.elapsed().as_secs_f32());
 }
 
 async fn decide_handler(
@@ -163,28 +221,18 @@ async fn decide_handler(
         }
     }
 
-    // ADMISSION CONTROL — bound concurrent heavy postflop solves (preflop already
-    // returned above, so lookups never wait here). Held until the handler returns,
-    // covering every postflop path below. If the pool is saturated, wait briefly
-    // then fast-fail 503 so the caller fails fast instead of hanging past its
-    // timeout (and so the machine can't be driven into oversubscription / OOM).
-    let _permit = match st.solve_sema.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.solve_sema.clone().acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            _ => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server saturated: too many concurrent solves, retry".into(),
-                ))
-            }
-        },
-    };
+    // ADMISSION CONTROL (disabled for now — the timeout storm was cold lazy-init
+    // on the first request burst, not oversubscription; the startup warm-up fixes
+    // that). Re-enable by uncommenting to bound concurrent heavy solves:
+    //   let _permit = match st.solve_sema.clone().try_acquire_owned() {
+    //       Ok(p) => p,
+    //       Err(_) => match tokio::time::timeout(
+    //           std::time::Duration::from_secs(2), st.solve_sema.clone().acquire_owned()).await {
+    //           Ok(Ok(p)) => p,
+    //           _ => return Err((StatusCode::SERVICE_UNAVAILABLE,
+    //               "server saturated: too many concurrent solves, retry".into())),
+    //       },
+    //   };
 
     // POSTFLOP (flop/turn/river) via the connected blueprint (lookup) when loaded.
     // Turn/river need `prior_actions` (the runtime supplies the full postflop path).
