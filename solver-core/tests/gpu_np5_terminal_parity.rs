@@ -96,3 +96,38 @@ fn gpu_np5_terminal_matches_rust_reference() {
     }
     eprintln!("np5 GPU vs Rust-reference worst rel = {worst:.3e}");
 }
+
+#[test]
+#[ignore = "np5 full-scale bench: per-iter at full enumeration vs MC"]
+fn gpu_np5_full_scale_bench() {
+    let np = 5u8;
+    let canonical = [3u8, 19, 35];
+    let (turns, river_decks) = solver_core::blueprint::runout_grid(canonical, 12, 12);
+    let turns_u8: Vec<u8> = turns.iter().map(|&c| c as u8).collect();
+    let table = FlopChanceTable::build_full_nh_sampled(canonical, np, &turns_u8, &river_decks);
+    let nh = table.num_valid;
+    let spec = production_game_v1();
+    let mut cfg = spec.street_seam_config(BoardState::Flop, np, 6, 30,
+        BetSizeOptions { bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)], raise: vec![BetSize::PotRelative(1.0)] });
+    cfg.max_bets_per_street = BetCap::all(3);
+    let tree = build_tree_depth_limited(&cfg).expect("tree");
+    let lone: Vec<u32> = (0..tree.num_nodes())
+        .filter(|&n| tree.nodes[n].is_terminal())
+        .filter(|&n| { let fm = tree.get_folded_mask(n);
+            (0..np).filter(|&p| fm & (1 << p) == 0).count() <= 1 })
+        .map(|n| n as u32).collect();
+    let ctx = MetalContext::new().expect("Metal");
+    let (sos, soi, sps, spi, _) = table.sorted_opp_arrays_base();
+    let iw: Vec<Vec<f32>> = (0..np as usize).map(|p| table.initial_weights[p].clone()).collect();
+    let nc = table.num_combinations;
+    for (label, m) in [("MC m=128", 128i32), ("MC m=64", 64), ("FULL enum", 0)] {
+        let mut gpu = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, nc);
+        gpu.set_fast_lone_terminals_ex(&ctx, &lone, true);
+        gpu.set_np5_mc_samples(m);
+        let iters = if m == 0 { 3 } else { 20 };
+        let t0 = std::time::Instant::now();
+        gpu.run_batched(&ctx, &tree, iters);
+        let per = t0.elapsed().as_secs_f64() / iters as f64 * 1000.0;
+        eprintln!("np5 {label}: {per:.1} ms/iter  (150 iters = {:.1}s)", per * 150.0 / 1000.0);
+    }
+}
