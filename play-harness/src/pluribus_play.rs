@@ -88,6 +88,21 @@ impl SearchCfg {
 /// 3 bets + 2 raises — rich betting × multiway × lossless nh blows the tree up
 /// exponentially in the branching factor, so fewer sizes is the lever that keeps
 /// live-3+ search under the 14s budget while staying multi-size (≫ 1×pot).
+/// live-6 LEAN menu: one pot-sized bet + pot raise. The rich menu measured
+/// 695 ms/iter at np=6 (over budget at any usable iter count); facing-bet
+/// decision quality needs fold/call/raise-pot, not sizing breadth — 6-way pots
+/// play simple and the pool is passive. Used by search_decision for live >= 6.
+fn lean_bets_l6() -> BetSizeOptions {
+    BetSizeOptions {
+        bet: vec![BetSize::PotRelative(1.0)],
+        raise: vec![BetSize::PotRelative(1.0)],
+    }
+}
+
+fn bets_for_live(live: usize) -> BetSizeOptions {
+    if live >= 6 { lean_bets_l6() } else { rich_bets() }
+}
+
 fn rich_bets() -> BetSizeOptions {
     BetSizeOptions {
         bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)],
@@ -1009,7 +1024,7 @@ pub fn search_decision(
     // Per-blueprint economics: the seam tree (rake, stack depth) must match the
     // game class the blueprint was solved under (game.json manifest).
     let spec = crate::runtime_spec::runtime_game_spec().clone();
-    let mut tcfg = spec.street_seam_config(street, live as u8, commit_entry, pot_entry, rich_bets());
+    let mut tcfg = spec.street_seam_config(street, live as u8, commit_entry, pot_entry, bets_for_live(live));
     tcfg.max_bets_per_street = BetCap::all(3);
     let tree = build_tree_depth_limited(&tcfg).ok()?;
     let depth = depth_leaves(&tree, street_u8, is_river, live);

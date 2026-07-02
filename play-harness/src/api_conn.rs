@@ -322,7 +322,13 @@ impl ConnDecider {
         // (CONN_ADAPTER_RUNOUT, default 12) keeps full-fidelity BUCKETS (subset of
         // the 49×48 cache) at ~budget cold-build cost. Cached per flop after.
         let ar: usize = std::env::var("CONN_ADAPTER_RUNOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
-        let (turns, river_decks) = runout_grid(canonical, ar, ar);
+        // live >= 5: FULL 49-turn grid (12 sampled rivers/turn). The quantile
+        // bucketing needs no GS14 subset, so the full turn set is affordable —
+        // and it makes EVERY real turn card exact in the tree (no nearest-turn
+        // mapping), unblocking the live-5 TURN search. Flop continuation
+        // integrates more turns as a bonus.
+        let (nt, nr) = if live >= 5 { (49usize, ar) } else { (ar, ar) };
+        let (turns, river_decks) = runout_grid(canonical, nt, nr);
         let turns_u8: Vec<u8> = turns.iter().map(|&c| c as u8).collect();
         let rivers: Vec<Vec<u8>> = turns_u8.iter().map(|&tc| river_decks[tc as usize].clone()).collect();
         let table = FlopChanceTable::build_full_nh_sampled(canonical, live as u8, &turns_u8, &river_decks);
@@ -377,14 +383,31 @@ impl ConnDecider {
         // iters ≈ 5.1s (GPU stays off at np=5 — no K≥4 fast terminal; watchdog).
         // live-6 stays on lookup/rollout: MEASURED 695 ms/iter — even 16 iters
         // ≈ 11s, over budget for too little convergence.
-        if req.live > 5 {
+        if req.live > 6 {
             return None;
         }
-        // live-5 searches the FLOP only: a turn card outside the adapter's
-        // reduced runout grid makes the street search return None, and the
-        // decide_postflop_resolve fallback behind it GRINDS at np=5 (verified
-        // 30s+ e2e). Turn/river live-5 keeps the lookup/rollout path.
-        if req.live == 5 && req.board.len() != 3 {
+        // live-6: search ONLY when FACING a bet/raise — that's where the equity
+        // rollout loses money (naive pot-odds, never raises). First-to-act 6-way
+        // range-checks at equilibrium (confirmed by the live-5 solves), so the
+        // instant lookup serves it. Flop + turn only (the 49-turn adapter covers
+        // live>=6 too); LEAN menu via bets_for_live (MEASURED 203 ms/iter vs 695
+        // rich ⇒ 24 iters ≈ 4.9s).
+        // live-6 search DISABLED pending SUBGAME ROOTING (measured 2026-07-02):
+        // the lean-menu search fits budget (203 ms/iter) and value-raises
+        // correctly (trips → allin 1.0 facing a pot bet), but the street-root
+        // solve leaves the facing-bet subtree OFF-PATH (equilibrium range-checks
+        // 6-way) ⇒ trash hands read UNIFORM (~1/3 call with 6-high — worse than
+        // the rollout's pot-odds fold). Enable after the search is rooted at the
+        // observed action line (forced prefix strategies / Bayes-updated root).
+        if req.live == 6 {
+            return None;
+        }
+        // live-5 searches FLOP + TURN (the adapter now carries the FULL 49-turn
+        // grid, so any real turn card resolves exactly). RIVER stays on the
+        // lookup/rollout path: rivers are 12-sampled per turn (a full 49×48
+        // adapter is the ~37s/flop cold-build hole), and an off-grid river
+        // would fall into decide_postflop_resolve which GRINDS at np=5.
+        if req.live == 5 && req.board.len() > 4 {
             return None;
         }
         let flop_id = req.flop_id as usize;
@@ -396,6 +419,10 @@ impl ConnDecider {
         if req.live == 5 {
             let l5 = std::env::var("CONN_ITERS_L5").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(32);
             cfg.iters = cfg.iters.min(l5);
+        }
+        if req.live == 6 {
+            let l6 = std::env::var("CONN_ITERS_L6").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(24);
+            cfg.iters = cfg.iters.min(l6);
         }
         decide_postflop_with_reach(&adapter.0, req, &cfg, &reach_priors)
     }
