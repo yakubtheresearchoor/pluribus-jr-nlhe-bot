@@ -140,6 +140,14 @@ pub struct MetalVectorCfr {
     regret_floor: f32,
     starting_pot: i32,
     num_combinations: f32,
+    // Tree rake (mirrored to BottomUpParams + LoneTermParams — previously the
+    // real-time path under-filled the shared BottomUpParams and HARDCODED 0.0
+    // rake at the fast lone terminals, so production fold pots went un-raked).
+    rake_rate: f32,
+    rake_cap: f32,
+    // rake_marker instrumentation buffer for vcfr_bottom_up buffer(18) — the
+    // kernel writes it unconditionally at terminals; leaving it UNBOUND was UB.
+    d_rake_marker: MetalBuffer<u8>,
 
     // Scratch buffer for params (legacy sync path; the async path passes
     // params inline via set_bytes so there is no shared-buffer clobber).
@@ -287,6 +295,9 @@ impl MetalVectorCfr {
             regret_floor: -1e30,
             starting_pot: tree.starting_pot,
             num_combinations: num_combinations as f32,
+            rake_rate: tree.rake_rate as f32,
+            rake_cap: tree.rake_cap as f32,
+            d_rake_marker: ctx.alloc_zeros(nn * nh),
             d_params_buf,
             async_mode: std::cell::Cell::new(false),
             continuation: None,
@@ -754,6 +765,17 @@ impl MetalVectorCfr {
                 num_combinations: f32,
                 skip_lone_terminals: i32,
                 lambda_active: i32,
+                // Tail fields of the SHARED Metal BottomUpParams (19 fields).
+                // Previously OMITTED here: the kernel read rake + pruning config
+                // from past the uploaded bytes (UB — zeros in practice, so fold
+                // terminals went silently UN-RAKED on production trees).
+                rake_rate: f32,
+                rake_cap: f32,
+                pruning_enabled: i32,
+                pruning_threshold: f32,
+                iteration: i32,
+                pruning_stride: i32,
+                board_state: i32,
             }
 
             let bu_params = BuParams {
@@ -769,6 +791,13 @@ impl MetalVectorCfr {
                 num_combinations: self.num_combinations,
                 skip_lone_terminals: if self.lone_terminals.is_some() { 1 } else { 0 },
                 lambda_active: if self.lambda > 0.0 { 1 } else { 0 },
+                rake_rate: self.rake_rate,
+                rake_cap: self.rake_cap,
+                pruning_enabled: 0, // real-time search: pruning off (stride 1 = benign)
+                pruning_threshold: 0.0,
+                iteration: self.iteration as i32,
+                pruning_stride: 1,
+                board_state: 2, // river tag = never-prune-safe; unused with pruning off
             };
 
             let enc = cmd.new_compute_command_encoder();
@@ -792,7 +821,10 @@ impl MetalVectorCfr {
             enc.set_buffer(15, Some(self.d_sorted_pl_strength.as_ref()), 0);
             enc.set_buffer(16, Some(self.d_sorted_pl_indices.as_ref()), 0);
             enc.set_buffer(17, Some(self.d_hand_cards.as_ref()), 0);
-            // buffer 18 (rake_marker) intentionally unbound (debug-only, as before).
+            // rake_marker instrumentation: the kernel writes it at every terminal;
+            // an unbound buffer here was UB (worked by luck). Bound to a real
+            // (nn*nh u8) buffer now.
+            enc.set_buffer(18, Some(self.d_rake_marker.as_ref()), 0);
             enc.set_buffer(19, Some(self.d_last_cfv.as_ref()), 0); // QRE accumulator
 
             let (grid, tg) = ctx.dispatch_1d(count as usize, 1);
@@ -813,7 +845,9 @@ impl MetalVectorCfr {
         }
         let params = LoneTermParams {
             nh: nh as i32, np: np as i32, traverser: traverser as i32, n_term: lt.n_term as i32,
-            starting_pot: self.starting_pot, rake_rate: 0.0, rake_cap: 0.0,
+            starting_pot: self.starting_pot,
+            // Real tree rake (was HARDCODED 0.0 — production fold pots un-raked).
+            rake_rate: self.rake_rate, rake_cap: self.rake_cap,
             num_combinations: self.num_combinations,
         };
         // np=4 (K=3 opponents): table-prep P → Q → R, then the main mass kernel.

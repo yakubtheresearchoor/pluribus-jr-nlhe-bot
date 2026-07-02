@@ -12,7 +12,7 @@ use solver_core::solver::flop_start_game::FlopChanceTable;
 use solver_core::tree::action::{BetSize, BetSizeOptions, BoardState, TreeConfig};
 use solver_core::tree::builder::build_tree_depth_limited;
 
-fn build() -> (solver_core::tree::flat::FlatTree, FlopChanceTable) {
+fn build_with_rake(rake_rate: f64, rake_cap: f64) -> (solver_core::tree::flat::FlatTree, FlopChanceTable) {
     let np = 3u8;
     let board: Vec<Card> = vec![3, 19, 35];
     let board_mask: u64 = board.iter().fold(0u64, |m, &c| m | (1u64 << c));
@@ -31,7 +31,7 @@ fn build() -> (solver_core::tree::flat::FlatTree, FlopChanceTable) {
     let cfg = TreeConfig {
         num_players: np, initial_state: BoardState::Flop, starting_pot: 30,
         starting_stacks: vec![400; np as usize], initial_contributions: vec![0; np as usize],
-        rake_rate: 0.0, rake_cap: 0.0,
+        rake_rate, rake_cap,
         bet_sizes: BetSizeOptions { bet: vec![BetSize::PotRelative(1.0)], raise: vec![] },
         add_allin_threshold: 1.0, force_allin_threshold: 1.0,
         merging_threshold: 0.0, button_player: None,
@@ -43,15 +43,30 @@ fn build() -> (solver_core::tree::flat::FlatTree, FlopChanceTable) {
 
 #[test]
 fn gpu_fast_lone_terminal_bit_exact() {
+    run_parity(0.0, 0.0, true);
+}
+
+/// Rake-ON variant: production trees carry rake, and the fast-terminal params
+/// previously HARDCODED rake 0.0 (silently un-raked fold pots) while every
+/// parity tree used rake 0 — invisible. This variant keeps the rake path live.
+#[test]
+fn gpu_fast_lone_terminal_parity_with_rake() {
+    run_parity(0.05, 20.0, false); // brute uses one final multiply; base path per-branch — not bit-exact under rake path differences, tolerance-gated
+}
+
+/// METHOD NOTE: compare at ITERATION 1 on FRESH solvers per traverser — after
+/// CFR updates, dominated fold-lines get zero reach and fold-terminal cfv is
+/// legitimately zero in both paths, making an N-iteration comparison VACUOUS
+/// (0==0) at exactly the nodes under test. Nonzero scale is asserted.
+fn run_parity(rake_rate: f64, rake_cap: f64, expect_bit_exact: bool) {
     let np = 3u8;
-    let (tree, table) = build();
+    let (tree, table) = build_with_rake(rake_rate, rake_cap);
     let nh = table.num_valid;
     let (sos, soi, sps, spi, _) = table.sorted_opp_arrays_base();
     let iw: Vec<Vec<f32>> = (0..np as usize).map(|p| table.initial_weights[p].clone()).collect();
     let nc = table.num_combinations;
     let ctx = MetalContext::new().expect("Metal");
 
-    // lone-survivor terminals (num_active <= 1)
     let lone: Vec<u32> = (0..tree.num_nodes())
         .filter(|&n| tree.nodes[n].is_terminal())
         .filter(|&n| { let fm = tree.get_folded_mask(n);
@@ -59,39 +74,36 @@ fn gpu_fast_lone_terminal_bit_exact() {
         .map(|n| n as u32).collect();
     assert!(!lone.is_empty(), "no lone-survivor terminals");
 
-    // slow path (fast terminals OFF)
-    let mut slow = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, nc);
-    slow.run_batched(&ctx, &tree, 1);
-    let cfv_slow = slow.cfv_slice();
+    for t in 0..np as u32 {
+        let mut slow = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, nc);
+        let snap_slow = slow.run_one_iteration_diagnostic(&ctx, &tree, t);
+        let mut fast = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, nc);
+        fast.set_fast_lone_terminals(&ctx, &lone);
+        let snap_fast = fast.run_one_iteration_diagnostic(&ctx, &tree, t);
+        let mut fac = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, nc);
+        fac.set_fast_lone_terminals_ex(&ctx, &lone, true);
+        let snap_fac = fac.run_one_iteration_diagnostic(&ctx, &tree, t);
 
-    // fast path (fast terminals ON)
-    let mut fast = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, nc);
-    fast.set_fast_lone_terminals(&ctx, &lone);
-    fast.run_batched(&ctx, &tree, 1);
-    let cfv_fast = fast.cfv_slice();
-
-    // The fast kernel runs the IDENTICAL g0×g1 loop ⇒ bit-exact at the lone
-    // terminals; the rest of the tree is untouched ⇒ identical everywhere.
-    let mut max_abs = 0.0f32;
-    let mut max_ulp = 0u32;
-    for (a, b) in cfv_slow.iter().zip(&cfv_fast) {
-        max_abs = max_abs.max((a - b).abs());
-        let ua = a.to_bits() as i64; let ub = b.to_bits() as i64;
-        max_ulp = max_ulp.max((ua - ub).unsigned_abs() as u32);
+        let mut max_abs = 0.0f32;
+        let mut f_rel = 0.0f32;
+        for &term in &lone {
+            let base = term as usize * nh;
+            let mut scale = 1e-6f32;
+            for h in 0..nh { scale = scale.max(snap_slow.cfv[base + h].abs()); }
+            assert!(scale > 1e-6, "t={t} terminal {term}: base cfv all-zero (VACUOUS parity)");
+            for h in 0..nh {
+                max_abs = max_abs.max((snap_slow.cfv[base + h] - snap_fast.cfv[base + h]).abs());
+                f_rel = f_rel.max((snap_slow.cfv[base + h] - snap_fac.cfv[base + h]).abs() / scale);
+            }
+        }
+        eprintln!("t={t} rake={rake_rate}: brute max_abs={max_abs:.3e}  factored rel={f_rel:.3e}");
+        if expect_bit_exact {
+            assert!(max_abs == 0.0, "t={t}: brute fast terminal NOT bit-exact: {max_abs}");
+        } else {
+            let mut scale = 1e-6f32;
+            for v in &snap_slow.cfv { scale = scale.max(v.abs()); }
+            assert!(max_abs / scale < 1e-4, "t={t}: brute fast terminal diverges under rake: {max_abs}");
+        }
+        assert!(f_rel < 1e-3, "t={t}: factored terminal diverges: rel={f_rel:.3e}");
     }
-    eprintln!("fast-terminal parity: {} lone terminals, nh={nh}, max_abs={max_abs:.3e}, max_ulp={max_ulp}", lone.len());
-    assert!(max_abs == 0.0, "fast terminal NOT bit-exact to slow path: max_abs={max_abs}, max_ulp={max_ulp}");
-
-    // FACTORED kernel: O(nh) inclusion-exclusion — same value within f32 tolerance.
-    let mut fac = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, nc);
-    fac.set_fast_lone_terminals_ex(&ctx, &lone, true);
-    fac.run_batched(&ctx, &tree, 1);
-    let cfv_fac = fac.cfv_slice();
-    let mut f_abs = 0.0f32; let mut scale = 1e-6f32;
-    for (a, b) in cfv_slow.iter().zip(&cfv_fac) {
-        f_abs = f_abs.max((a - b).abs());
-        scale = scale.max(a.abs());
-    }
-    eprintln!("factored parity: max_abs={f_abs:.3e}, rel={:.3e}", f_abs / scale);
-    assert!(f_abs / scale < 1e-4, "factored terminal diverges: max_abs={f_abs}, scale={scale}");
 }
