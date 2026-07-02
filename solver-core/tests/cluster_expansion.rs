@@ -624,3 +624,77 @@ fn h_correction_layer_matches_perh() {
     }
     eprintln!("h-correction layer vs per-h rebuild: worst rel = {worst:.2e} (all 42 graphs × sampled h)");
 }
+
+/// PHASE 3b prelude — TERM CENSUS at production deck (52): enumerate every
+/// surviving (partition-block, graph, B-mask, A-partition) term of the full M4
+/// assembly, bucket by card-sum dimension, and estimate direct per-hand eval
+/// cost. Decides the kernel split: dim ≤ D_direct evaluated per-thread,
+/// dim > D_direct precomputed per terminal with h-expansion.
+#[test]
+fn m4_term_census() {
+    let deck = 52usize;
+    let graphs: [Vec<Vec<(usize, usize)>>; 3] = [connected_graphs(2), connected_graphs(3), connected_graphs(4)];
+    // count over ALL blocks of the 15 role-partitions: each block of size k>=2
+    // contributes its connected-graph expansion once per occurrence.
+    let mut block_counts = [0usize; 5]; // how many blocks of each size appear across the 15 partitions
+    for rgs in set_partitions(4) {
+        let nb = rgs.iter().cloned().max().unwrap() + 1;
+        let mut sizes = vec![0usize; nb];
+        for &b in &rgs { sizes[b] += 1; }
+        for &s in &sizes { block_counts[s] += 1; }
+    }
+    eprintln!("blocks by size across 15 partitions: 1s={} 2s={} 3s={} 4s={}",
+        block_counts[1], block_counts[2], block_counts[3], block_counts[4]);
+
+    let mut terms_by_dim = [0usize; 7];
+    let mut ops_by_dim = [0f64; 7];
+    for (ki, k) in [(0usize, 2usize), (1, 3), (2, 4)] {
+        let occurrences = block_counts[k];
+        for edges in &graphs[ki] {
+            let ne = edges.len();
+            for bmask in 0..(1u32 << ne) {
+                let mut parent: Vec<usize> = (0..k).collect();
+                fn find(p: &mut Vec<usize>, x: usize) -> usize {
+                    if p[x] != x { let r = find(p, p[x]); p[x] = r; } p[x]
+                }
+                let mut a_edges: Vec<(usize, usize)> = Vec::new();
+                for (ei, &(u, v)) in edges.iter().enumerate() {
+                    if bmask & (1 << ei) != 0 {
+                        let (ru, rv) = (find(&mut parent, u), find(&mut parent, v));
+                        if ru != rv { parent[ru] = rv; }
+                    } else { a_edges.push((u, v)); }
+                }
+                let mut group_of = vec![0usize; k];
+                for v in 0..k { group_of[v] = find(&mut parent, v); }
+                let roots: Vec<usize> = { let mut r = group_of.clone(); r.sort_unstable(); r.dedup(); r };
+                for part in set_partitions(a_edges.len()) {
+                    let nblocks = part.iter().cloned().max().map(|m| m + 1).unwrap_or(0);
+                    let mut inc: Vec<Vec<usize>> = vec![Vec::new(); roots.len()];
+                    let mut ok = true;
+                    for (ei, &(u, v)) in a_edges.iter().enumerate() {
+                        for vv in [u, v] {
+                            let gi = roots.iter().position(|&r| r == group_of[vv]).unwrap();
+                            if !inc[gi].contains(&part[ei]) { inc[gi].push(part[ei]); }
+                        }
+                    }
+                    for i in &inc { if i.len() > 2 { ok = false; break; } }
+                    if !ok { continue; }
+                    let d = nblocks.min(6);
+                    terms_by_dim[d] += occurrences;
+                    // direct-eval cost: distinct-tuple sum × ~(4 lookups + 4 mults) per group
+                    ops_by_dim[d] += occurrences as f64 * (deck as f64).powi(d as i32) * (roots.len() as f64 * 6.0);
+                }
+            }
+        }
+    }
+    let total_terms: usize = terms_by_dim.iter().sum();
+    eprintln!("M4 term census (× partition occurrences): {terms_by_dim:?}  total={total_terms}");
+    for d in 0..7 {
+        if terms_by_dim[d] > 0 {
+            eprintln!("  dim {d}: {} terms, direct-eval ≈ {:.2e} ops/hand", terms_by_dim[d], ops_by_dim[d]);
+        }
+    }
+    let direct_le2: f64 = ops_by_dim[..3].iter().sum();
+    let over: f64 = ops_by_dim[3..].iter().sum();
+    eprintln!("dim≤2 direct total ≈ {direct_le2:.2e} ops/hand (budget ~3e5); dim≥3 (must precompute) ≈ {over:.2e}");
+}
