@@ -853,9 +853,14 @@ impl MetalVectorCfr {
             enc.set_buffer(7, Some(lt.d_pair2hand.as_ref()), 0);
             enc.set_buffer(8, Some(np4.d_tables.as_ref()), 0);
             enc.set_bytes(9, pbytes, pptr);
-            let max_tpg = np4.main.max_total_threads_per_threadgroup() as usize;
-            let (grid, tg) = ctx.dispatch_2d(lt.n_term, nh, max_tpg);
-            enc.dispatch_thread_groups(grid, tg);
+            // ONE TERMINAL PER THREADGROUP: the kernel cooperatively stages that
+            // terminal's tables + reach rows + pair2hand into threadgroup memory
+            // (~27KB), so tg = (1, TG). The kernel reads the actual tg size via
+            // [[threads_per_threadgroup]], so a pipeline cap below 256 is safe.
+            let tg_y = np4.main.max_total_threads_per_threadgroup().min(256) as u64;
+            let groups = metal::MTLSize::new(lt.n_term as u64, (nh as u64).div_ceil(tg_y), 1);
+            let tg = metal::MTLSize::new(1, tg_y, 1);
+            enc.dispatch_thread_groups(groups, tg);
             enc.end_encoding();
             return;
         }

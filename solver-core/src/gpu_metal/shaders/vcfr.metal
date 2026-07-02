@@ -4653,6 +4653,16 @@ kernel void vcfr_np4_lone_prep_r(
 
 // ── main: cfv[node][h] = payoff * mass3(h) / nc. Grid (n_term, nh). ──
 // LITERAL port of np4_lone_mass_algebra.rs::factored_mass3.
+// ── main: cfv[node][h] = payoff * mass3(h) / nc.
+// OPTIMIZED v2: dispatch with threadgroups of (1, NP4_TG) — one TERMINAL per
+// threadgroup — so the terminal's tables (11.9KB), both reach rows (10.6KB),
+// and pair2hand (as i16, 5.4KB) are cooperatively staged in THREADGROUP memory
+// (27.2KB < 32KB). The per-g0 inner body reads ~50-100 values; from device
+// memory that made the kernel memory-bound (516ms/iter at live-4 full scale).
+// h-only corrections are HOISTED out of the g0 loop (same algebra as the
+// factored_mass3 reference, reassociated — parity-gated).
+constant int NP4_TG = 256;
+
 kernel void vcfr_np4_lone_main(
     device float*          cfv            [[buffer(0)]],
     device const uint32_t* term_nodes     [[buffer(1)]],
@@ -4664,17 +4674,38 @@ kernel void vcfr_np4_lone_main(
     device const int32_t*  pair2hand      [[buffer(7)]],
     device const float*    tables         [[buffer(8)]],
     constant LoneTermParams& p            [[buffer(9)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint2 gid  [[thread_position_in_grid]],
+    uint2 lid  [[thread_position_in_threadgroup]],
+    uint2 tptg [[threads_per_threadgroup]]
 ) {
     int ti = int(gid.x);
     int h  = int(gid.y);
-    if (ti >= p.n_term || h >= p.nh) return;
     int nh = p.nh; int np = p.np; int traverser = p.traverser;
+    if (ti >= p.n_term) return;
+
+    // ── cooperative stage: tables + reach rows + pair2hand into threadgroup ──
+    threadgroup float sh_tab[NP4_STRIDE];   // 11,872 B
+    threadgroup float sh_r1[1326];          // 5,304 B
+    threadgroup float sh_r2[1326];          // 5,304 B
+    threadgroup short sh_p2h[52 * 52];      // 5,408 B
     uint node_id = term_nodes[ti];
+    {
+        const device float* t = tables + ti * NP4_STRIDE;
+        const device float* r1d = np4_opp_reach(reach, node_id, np, nh, traverser, 1);
+        const device float* r2d = np4_opp_reach(reach, node_id, np, nh, traverser, 2);
+        int lane = int(lid.y);
+        int stride = int(tptg.y); // ACTUAL threadgroup size (may be < NP4_TG)
+        for (int i = lane; i < NP4_STRIDE; i += stride) sh_tab[i] = t[i];
+        for (int i = lane; i < nh; i += stride) { sh_r1[i] = r1d[i]; sh_r2[i] = r2d[i]; }
+        for (int i = lane; i < 52 * 52; i += stride) sh_p2h[i] = short(pair2hand[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (h >= nh) return;
+
     uint16_t fold_mask = folded_masks[node_id];
     FlatNode node = nodes[node_id];
 
-    // payoff — byte-identical convention to vcfr_lone_terminal_factored.
+    // payoff — identical convention to vcfr_lone_terminal_factored.
     int c_t = contributions[node_id * uint(np) + uint(traverser)];
     float traverser_stake = float(p.starting_pot) / float(np) + float(c_t);
     bool traverser_folded = (fold_mask & (uint16_t)(1u << traverser)) != 0;
@@ -4692,85 +4723,116 @@ kernel void vcfr_np4_lone_main(
     float payoff = traverser_folded ? (-traverser_stake) : ((float(total_pot) - rake) - traverser_stake);
 
     const device float* r0 = np4_opp_reach(reach, node_id, np, nh, traverser, 0);
-    const device float* r1 = np4_opp_reach(reach, node_id, np, nh, traverser, 1);
-    const device float* r2 = np4_opp_reach(reach, node_id, np, nh, traverser, 2);
-    const device float* t = tables + ti * NP4_STRIDE;
-    float S1  = t[NP4_SCAL + 0];
-    float S2  = t[NP4_SCAL + 1];
-    float TA1 = t[NP4_SCAL + 2];
-    float TB  = t[NP4_SCAL + 3];
+
+    float S1  = sh_tab[NP4_SCAL + 0];
+    float S2  = sh_tab[NP4_SCAL + 1];
+    float TA1 = sh_tab[NP4_SCAL + 2];
+    float TB  = sh_tab[NP4_SCAL + 3];
 
     int h1 = hand_cards[h * 2];
     int h2 = hand_cards[h * 2 + 1];
 
+    // pair-lookup helpers on the staged copies
+    #define P2H(x, y)  int(sh_p2h[(x) * 52 + (y)])
+    #define R1AT(i)    ((i) >= 0 ? sh_r1[i] : 0.0f)
+    #define R2AT(i)    ((i) >= 0 ? sh_r2[i] : 0.0f)
+
+    // ── h-only hoisted corrections ──
+    int i_hh = P2H(h1, h2);
+    float r1_hh = R1AT(i_hh), r2_hh = R2AT(i_hh);
+    float Sh1 = S1 - sh_tab[NP4_P1 + h1] - sh_tab[NP4_P1 + h2] + r1_hh;
+    float Sh2 = S2 - sh_tab[NP4_P2 + h1] - sh_tab[NP4_P2 + h2] + r2_hh;
+    float w_hh = sh_tab[NP4_P2 + h1] + sh_tab[NP4_P2 + h2];
+    float A1h = TA1 - sh_tab[NP4_A1C + h1] - sh_tab[NP4_A1C + h2] + r1_hh * w_hh;
+    float Bh  = TB  - sh_tab[NP4_BC + h1]  - sh_tab[NP4_BC + h2]  + r1_hh * r2_hh;
+    // A2 h-columns: T_d pure-h parts for d in {h1,h2} (pair (h1,h2) folded in).
+    float Th[2];
+    int hcards[2] = { h1, h2 };
+    for (int kd = 0; kd < 2; kd++) {
+        int d = hcards[kd];
+        float u_hh = R2AT(P2H(h1, d)) + R2AT(P2H(h2, d));
+        Th[kd] = sh_tab[NP4_V + d]
+               - sh_tab[NP4_VC + h1 * 52 + d] - sh_tab[NP4_VC + h2 * 52 + d]
+               + r1_hh * u_hh;
+    }
+
     float mass = 0.0f;
     for (int g0 = 0; g0 < nh; g0++) {
+        float rr0 = r0[g0];
+        if (rr0 == 0.0f) continue;
         int a = hand_cards[g0 * 2];
         int b = hand_cards[g0 * 2 + 1];
         if (a == h1 || a == h2 || b == h1 || b == h2) continue;
-        float rr0 = r0[g0];
-        if (rr0 == 0.0f) continue;
 
-        int e[4] = { h1, h2, a, b };
-        // the 6 unordered pairs of E, as pair2hand indices (or -1)
-        int ep[6];
-        ep[0] = pair2hand[h1 * 52 + h2];
-        ep[1] = pair2hand[h1 * 52 + a];
-        ep[2] = pair2hand[h1 * 52 + b];
-        ep[3] = pair2hand[h2 * 52 + a];
-        ep[4] = pair2hand[h2 * 52 + b];
-        ep[5] = pair2hand[a  * 52 + b];
+        // 5 g0-involving E-pairs (the 6th, (h1,h2), is hoisted).
+        int i_ah1 = P2H(a, h1), i_ah2 = P2H(a, h2);
+        int i_bh1 = P2H(b, h1), i_bh2 = P2H(b, h2);
+        int i_ab  = P2H(a, b);
+        float r1_ah1 = R1AT(i_ah1), r2_ah1 = R2AT(i_ah1);
+        float r1_ah2 = R1AT(i_ah2), r2_ah2 = R2AT(i_ah2);
+        float r1_bh1 = R1AT(i_bh1), r2_bh1 = R2AT(i_bh1);
+        float r1_bh2 = R1AT(i_bh2), r2_bh2 = R2AT(i_bh2);
+        float r1_ab  = R1AT(i_ab),  r2_ab  = R2AT(i_ab);
+
+        float P1a = sh_tab[NP4_P1 + a], P1b = sh_tab[NP4_P1 + b];
+        float P2a = sh_tab[NP4_P2 + a], P2b = sh_tab[NP4_P2 + b];
 
         // S1(E), S2(E)
-        float s1e = S1, s2e = S2;
-        for (int k = 0; k < 4; k++) { s1e -= t[NP4_P1 + e[k]]; s2e -= t[NP4_P2 + e[k]]; }
-        for (int k = 0; k < 6; k++) {
-            int i = ep[k];
-            if (i >= 0) { s1e += r1[i]; s2e += r2[i]; }
-        }
+        float s1e = Sh1 - (P1a - r1_ah1 - r1_ah2) - (P1b - r1_bh1 - r1_bh2) + r1_ab;
+        float s2e = Sh2 - (P2a - r2_ah1 - r2_ah2) - (P2b - r2_bh1 - r2_bh2) + r2_ab;
 
-        // A1(E) = Σ_{g1⊥E} r1·W    (f(cd) = r1[cd]·W[cd])
-        float a1e = TA1;
-        for (int k = 0; k < 4; k++) a1e -= t[NP4_A1C + e[k]];
-        for (int k = 0; k < 6; k++) {
-            int i = ep[k];
-            if (i >= 0) {
-                float w = t[NP4_P2 + hand_cards[i * 2]] + t[NP4_P2 + hand_cards[i * 2 + 1]];
-                a1e += r1[i] * w;
-            }
-        }
+        // A1(E): W(xy) = P2[x] + P2[y]
+        float a1e = A1h
+            - (sh_tab[NP4_A1C + a] - r1_ah1 * (P2a + sh_tab[NP4_P2 + h1])
+                                   - r1_ah2 * (P2a + sh_tab[NP4_P2 + h2]))
+            - (sh_tab[NP4_A1C + b] - r1_bh1 * (P2b + sh_tab[NP4_P2 + h1])
+                                   - r1_bh2 * (P2b + sh_tab[NP4_P2 + h2]))
+            + r1_ab * (P2a + P2b);
 
-        // A2(E) = Σ_{d∈E} [ V[d] − Σ_{c∈E} Vc[c][d] + Σ_{pairs} r1[cd]·U_d(cd) ]
+        // B(E)
+        float be = Bh
+            - (sh_tab[NP4_BC + a] - r1_ah1 * r2_ah1 - r1_ah2 * r2_ah2)
+            - (sh_tab[NP4_BC + b] - r1_bh1 * r2_bh1 - r1_bh2 * r2_bh2)
+            + r1_ab * r2_ab;
+
+        // A2(E) = Σ_{d∈E} T_d
         float a2e = 0.0f;
-        for (int kd = 0; kd < 4; kd++) {
-            int d = e[kd];
-            float td = t[NP4_V + d];
-            for (int k = 0; k < 4; k++) td -= t[NP4_VC + e[k] * 52 + d];
-            for (int k = 0; k < 6; k++) {
-                int i = ep[k];
-                if (i >= 0) {
-                    int ca = hand_cards[i * 2];
-                    int cb = hand_cards[i * 2 + 1];
-                    int iad = pair2hand[ca * 52 + d];
-                    int ibd = pair2hand[cb * 52 + d];
-                    float u = ((iad >= 0) ? r2[iad] : 0.0f) + ((ibd >= 0) ? r2[ibd] : 0.0f);
-                    td += r1[i] * u;
-                }
-            }
+        // d ∈ {h1,h2}: hoisted pure-h part + g0-dependent corrections.
+        for (int kd = 0; kd < 2; kd++) {
+            int d = hcards[kd];
+            float td = Th[kd]
+                - sh_tab[NP4_VC + a * 52 + d] - sh_tab[NP4_VC + b * 52 + d];
+            // pairs (h1,a),(h1,b),(h2,a),(h2,b),(a,b): + r1(pair)·U_d(pair)
+            td += r1_ah1 * (R2AT(P2H(a, d)) + R2AT(P2H(h1, d)));
+            td += r1_bh1 * (R2AT(P2H(b, d)) + R2AT(P2H(h1, d)));
+            td += r1_ah2 * (R2AT(P2H(a, d)) + R2AT(P2H(h2, d)));
+            td += r1_bh2 * (R2AT(P2H(b, d)) + R2AT(P2H(h2, d)));
+            td += r1_ab  * (R2AT(P2H(a, d)) + R2AT(P2H(b, d)));
             a2e += td;
         }
-
-        // B(E) = Σ_{g1⊥E} r1·r2
-        float be = TB;
-        for (int k = 0; k < 4; k++) be -= t[NP4_BC + e[k]];
-        for (int k = 0; k < 6; k++) {
-            int i = ep[k];
-            if (i >= 0) be += r1[i] * r2[i];
+        // d ∈ {a,b}: fully per-g0.
+        int gcards[2] = { a, b };
+        for (int kd = 0; kd < 2; kd++) {
+            int d = gcards[kd];
+            float td = sh_tab[NP4_V + d]
+                - sh_tab[NP4_VC + h1 * 52 + d] - sh_tab[NP4_VC + h2 * 52 + d]
+                - sh_tab[NP4_VC + a * 52 + d]  - sh_tab[NP4_VC + b * 52 + d];
+            float u_hh_d = R2AT(P2H(h1, d)) + R2AT(P2H(h2, d));
+            td += r1_hh  * u_hh_d;
+            td += r1_ah1 * (R2AT(P2H(a, d)) + R2AT(P2H(h1, d)));
+            td += r1_bh1 * (R2AT(P2H(b, d)) + R2AT(P2H(h1, d)));
+            td += r1_ah2 * (R2AT(P2H(a, d)) + R2AT(P2H(h2, d)));
+            td += r1_bh2 * (R2AT(P2H(b, d)) + R2AT(P2H(h2, d)));
+            td += r1_ab  * (R2AT(P2H(a, d)) + R2AT(P2H(b, d)));
+            a2e += td;
         }
 
         float m2 = s1e * s2e - (a1e - a2e) + be;
         mass += rr0 * m2;
     }
+    #undef P2H
+    #undef R1AT
+    #undef R2AT
 
     float v = payoff * mass;
     cfv[node_id * uint(nh) + uint(h)] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
