@@ -254,10 +254,10 @@ may map a banked runout to an equivalent un-sampled card → `400`.
 | `PAR` | _(off)_ | enable the parallel search walk. |
 | `DCFR` | _(off)_ | enable Discounted-CFR (faster convergence). |
 | `L2_SUBDIR` | `live2` | live-2 bank subdirectory (e.g. `live2_m2` for the rich-menu bank). |
-| `GPU_SEARCH` | _(off)_ | route the search to the **Metal GPU** (requires the server built `--features metal`; no-op otherwise). Covers the **HU turn** (`decide_live2_resolve`) plus the flop/multiway connected search. The CPU exact HU turn cannot converge in budget (~208 ms/iter ⇒ ~43 it ⇒ the nuts value-bets only ~60 %); the GPU converges in ~5 s with a **river-integrated** continuation (validated 2.4× more faithful than the turn-strength proxy; nuts value-bet ~100 %, matching the converged exact). HU river + multiway keep their existing paths. |
+| `GPU_SEARCH` | _(off)_ | route the search to the **Metal GPU** (requires the server built `--features metal`; no-op otherwise). Covers the **HU turn** (`decide_live2_resolve`) plus the flop/turn connected search for **live ≤ 4** (live-4 enabled by the np=4 factored terminal kernels; live-5+ stays on the CPU/rollout paths). The CPU exact HU turn cannot converge in budget (~208 ms/iter ⇒ ~43 it ⇒ the nuts value-bets only ~60 %); the GPU converges in ~5 s with a **river-integrated** continuation (validated 2.4× more faithful than the turn-strength proxy; nuts value-bet ~100 %, matching the converged exact). HU river + multiway keep their existing paths. |
 
 Per-live latency is auto-scheduled (parallel + DCFR for heavy multiway counts) to fit
-a ~14 s real-time budget: live-3 ~0.3 s, live-4 ~3.5 s, live-5 ~4.5 s; live-2 river
+a ~14 s real-time budget: live-3 ~2.2 s (GPU), live-4 ~6 s (GPU; was ~33 s CPU), live-5 ~4.5 s; live-2 river
 ~0.1 s, live-2 turn ~5 s (GPU, fully converged) or ~5–8 s (CPU, budget-capped &
 under-converged); live-6 ~0.5 s.
 
