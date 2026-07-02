@@ -644,3 +644,109 @@ fn closed_form_sub_parts_and_total() {
     eprintln!("closed-form worst rel: S={:.2e} B={:.2e} D={:.2e} TOTAL={:.2e} (|X|=2 all hands + |X|=4 random, 25 trials)",
         worst[0], worst[1], worst[2], worst[3]);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// K=4 (np=5) lone-survivor mass — the live-5 GPU terminal math gate.
+//   mass4(h) = Σ over MUTUALLY DISJOINT (g0,g1,g2,g3) ⊥ h of r0·r1·r2·r3
+//            = Σ_{g0⊥h} r0[g0] · mass3_{r1,r2,r3}(h ∪ g0)
+// The inner mass3 with |X|=4 is the ALREADY-VALIDATED closed form (mod cf,
+// 2.1e-14). Also gates the MC-SAMPLED outer estimator (the budget lever):
+//   mass4 ≈ (W/M)·Σ_{s=1..M, g_s~r0/W} [g_s⊥h]·mass3(h∪g_s),  W = Σ r0
+// (unbiased; samples shared across h within a terminal — the kernel design).
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn brute_mass4(hands: &[(u8, u8)], h: usize, rs: [&[f64]; 4]) -> f64 {
+    let hh = hands[h];
+    let mut m = 0.0;
+    for (g0, &c0) in hands.iter().enumerate() {
+        if rs[0][g0] == 0.0 || !disjoint(c0, hh) { continue; }
+        for (g1, &c1) in hands.iter().enumerate() {
+            if rs[1][g1] == 0.0 || !disjoint(c1, hh) || !disjoint(c1, c0) { continue; }
+            for (g2, &c2) in hands.iter().enumerate() {
+                if rs[2][g2] == 0.0 || !disjoint(c2, hh) || !disjoint(c2, c0) || !disjoint(c2, c1) { continue; }
+                for (g3, &c3) in hands.iter().enumerate() {
+                    if rs[3][g3] == 0.0 || !disjoint(c3, hh) || !disjoint(c3, c0)
+                        || !disjoint(c3, c1) || !disjoint(c3, c2) { continue; }
+                    m += rs[0][g0] * rs[1][g1] * rs[2][g2] * rs[3][g3];
+                }
+            }
+        }
+    }
+    m
+}
+
+/// The kernel algorithm: outer g0 loop × closed-form mass3 with X = h∪g0.
+fn mass4_closed_inner(
+    hands: &[(u8, u8)], h: usize,
+    r0: &[f64], roles: &cf::Roles, agg: &cf::Agg,
+) -> f64 {
+    let hh = hands[h];
+    let mut m = 0.0;
+    for (g0, &(a, b)) in hands.iter().enumerate() {
+        if r0[g0] == 0.0 || !disjoint((a, b), hh) { continue; }
+        m += r0[g0] * cf::mass3_closed(roles, hands, agg, &[hh.0, hh.1, a, b]);
+    }
+    m
+}
+
+/// MC outer: M draws ∝ r0 (shared across h), importance weight W/M.
+fn mass4_mc(
+    hands: &[(u8, u8)], h: usize,
+    r0: &[f64], roles: &cf::Roles, agg: &cf::Agg,
+    m_draws: usize, seed: u64,
+) -> f64 {
+    let hh = hands[h];
+    let w: f64 = r0.iter().sum();
+    if w <= 0.0 { return 0.0; }
+    // CDF sample (the kernel will binary-search a per-terminal CDF).
+    let cdf: Vec<f64> = r0.iter().scan(0.0, |s, &v| { *s += v; Some(*s) }).collect();
+    let mut rng = Lcg(seed);
+    let mut acc = 0.0;
+    for _ in 0..m_draws {
+        let u = rng.f() * w;
+        let g0 = cdf.partition_point(|&c| c < u).min(hands.len() - 1);
+        let (a, b) = hands[g0];
+        if !disjoint((a, b), hh) { continue; }
+        acc += cf::mass3_closed(roles, hands, agg, &[hh.0, hh.1, a, b]);
+    }
+    acc * w / m_draws as f64
+}
+
+#[test]
+fn k4_mass4_closed_inner_matches_brute() {
+    let deck_n = 12usize;
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let mut rng = Lcg(0x4A55);
+    let mut worst = 0.0f64;
+    let mut mc_worst = 0.0f64;
+    let mut mc_cv_max = 0.0f64;
+    for trial in 0..6 {
+        let mk = |rng: &mut Lcg| -> Vec<f64> {
+            (0..nh).map(|_| if rng.f() < 0.25 { 0.0 } else { rng.f() }).collect()
+        };
+        let (r0, r1, r2, r3) = (mk(&mut rng), mk(&mut rng), mk(&mut rng), mk(&mut rng));
+        let roles = cf::roles(&hands, &r1, &r2, &r3);
+        let agg = cf::build(&roles, &hands);
+        for h in (trial % 8..nh).step_by(9) {
+            let bt = brute_mass4(&hands, h, [&r0, &r1, &r2, &r3]);
+            let ct = mass4_closed_inner(&hands, h, &r0, &roles, &agg);
+            let rel = (ct - bt).abs() / bt.abs().max(1e-12);
+            worst = worst.max(rel);
+            assert!(rel < 1e-9, "trial {trial} h={h}: closed {ct} vs brute {bt}");
+            // MC estimator: 256-seed mean at M=128 must converge to exact
+            // (noise floor of the mean ≈ single-draw σ/16 ≈ 1%; gate 1.5×).
+            let draws: Vec<f64> = (0..256)
+                .map(|s| mass4_mc(&hands, h, &r0, &roles, &agg, 128, 0x9E3779B9 + s))
+                .collect();
+            let mc_mean: f64 = draws.iter().sum::<f64>() / draws.len() as f64;
+            let var: f64 = draws.iter().map(|d| (d - mc_mean).powi(2)).sum::<f64>() / draws.len() as f64;
+            let cv = var.sqrt() / bt.abs().max(1e-12); // single-estimate σ / truth
+            mc_cv_max = mc_cv_max.max(cv);
+            let mc_rel = (mc_mean - bt).abs() / bt.abs().max(1e-12);
+            mc_worst = mc_worst.max(mc_rel);
+        }
+    }
+    eprintln!("mass4 closed-inner worst rel={worst:.2e}; MC(M=128): 256-seed-mean worst rel={mc_worst:.2e}, single-estimate CV max={mc_cv_max:.3}");
+    assert!(mc_worst < 0.015, "MC outer biased? {mc_worst}");
+}
