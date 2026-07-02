@@ -161,7 +161,7 @@ impl GameSpec for TurnStartGame {
                         opp_reach[oi]
                     })
                     .collect();
-                factored_showdown_eq_cfv(
+                let mut out = factored_showdown_eq_cfv(
                     &active_reach,
                     &self.table.hand_cards,
                     nh,
@@ -176,7 +176,39 @@ impl GameSpec for TurnStartGame {
                     rake_rate,
                     rake_cap,
                     true,
-                )
+                );
+                // FOLDED-OPPONENT MASS FACTOR (P0 fix, 2026-07-02): the exact
+                // path sums over ALL opponents' hand configs — a folder still
+                // contributes its compatible reach MASS as a multiplicative
+                // factor. Dropping it left fold-branch showdowns ~mass× (≈10³)
+                // smaller than all-live ones — terminal classes in different
+                // UNITS, which poisons any solve containing folds (measured:
+                // f=21,087 vs e=26,249,340 at a 2-survivor np=3 terminal).
+                // Per-folder I-E card removal vs h (independent across folders
+                // — the same approximation class as the factored showdown).
+                let hc = &self.table.hand_cards;
+                for p in 0..np {
+                    if p == traverser as usize || fold_mask & (1u16 << p) == 0 {
+                        continue;
+                    }
+                    let oi = if p < traverser as usize { p } else { p - 1 };
+                    let r = opp_reach[oi];
+                    let mut s = 0.0f32;
+                    let mut minus = [0.0f32; 52];
+                    for g in 0..nh {
+                        let rr = r[g];
+                        if rr != 0.0 {
+                            s += rr;
+                            minus[hc[g * 2] as usize] += rr;
+                            minus[hc[g * 2 + 1] as usize] += rr;
+                        }
+                    }
+                    for h in 0..nh {
+                        let m = s - minus[hc[h * 2] as usize] - minus[hc[h * 2 + 1] as usize] + r[h];
+                        out[h] *= m.max(0.0);
+                    }
+                }
+                out
             } else {
                 side_pot_showdown_cfv_with_rake(
                     &opp_reach,

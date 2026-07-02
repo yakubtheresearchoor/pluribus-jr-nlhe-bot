@@ -1678,6 +1678,17 @@ pub fn factored_showdown_eq_cfv(
     let rake = (total_pot as f32 * eff_rake_rate).min(eff_rake_cap).max(0.0);
     let rpu = if half_pot > 0.0 { rake / half_pot } else { 0.0 };
     let k = num_opp as f32;
+    // DEAD MONEY (P0 fix, 2026-07-02): `k` counts ACTIVE opponents only, so the
+    // (k+1−t)/t at-top payout missed FOLDED players' stakes (their contributions
+    // + their starting-pot share). Winner take must be total_pot − rake − own
+    // stake; without this the fold-branch winner was paid ~active-pot only
+    // (measured 0.795× exact = 24/30 at np=3 one-folder). Split among the
+    // at-top set like the rest of the pot.
+    let dead_per_half = if half_pot > 0.0 {
+        ((total_pot as f32) - (k + 1.0) * half_pot).max(0.0) / half_pot
+    } else {
+        0.0
+    };
 
     // Per-opponent card-removal-correct win/tie/total reach for each h.
     let mut win = vec![vec![0.0f32; nh]; num_opp];
@@ -1739,7 +1750,7 @@ pub fn factored_showdown_eq_cfv(
                 }
             }
             let tf = t as f32;
-            let net = (k + 1.0 - tf) / tf - rpu / tf;
+            let net = (k + 1.0 - tf) / tf - rpu / tf + dead_per_half / tf;
             at_top += prod * net;
         }
         let loss = tot_prod - wt_prod; // some opponent beats h

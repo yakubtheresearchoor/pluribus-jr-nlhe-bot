@@ -347,7 +347,10 @@ pub fn decide_postflop_with_reach(bp: &Blueprint, req: &DecideRequest, cfg: &Sea
     // off-grid live-3/4 rivers in production (bluff-raising air). Rivers fall to
     // the rollout (pot-odds folds trash correctly) until the resolve passes the
     // dry-board trash gate. Turns keep the resolve (same engine — audit filed).
-    if req.board.len() == 4 && req.live >= 3 {
+    // Rivers RE-ENABLED (P0 fixed 2026-07-02: folded-opponent mass factor +
+    // dead-money at-top payout in the factored showdown — fold-branch terminals
+    // were ~10^3x mis-scaled, poisoning any solve containing folds).
+    if req.board.len() >= 4 && req.live >= 3 {
         if let Some(r) = decide_postflop_resolve(req) {
             return Some(r);
         }
