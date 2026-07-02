@@ -73,7 +73,7 @@ fn gpu_vs_exact_turn_fidelity() {
             bmask & (1u64 << c1) == 0 && bmask & (1u64 << c2) == 0 })
         .count();
     let reach = vec![vec![1.0f32; nh_g]; 2];
-    let gcfg = GpuSearchCfg { iters: 400, sample_m: 0, seed: 7, factored_terminals: false, lambda: 0.0 };
+    let gcfg = GpuSearchCfg { iters: 400, sample_m: 0, seed: 7, factored_terminals: false, lambda: 0.0 , budget_ms: 120_000 };
     let (hc_p, st_p) = gpu_hu_turn_strat(&ctx, &board, &tree_g, &reach, 200, false, &gcfg);
     let (hc_r, st_r) = gpu_hu_turn_strat(&ctx, &board, &tree_g, &reach, 200, true, &gcfg);
     let rg = root_turn(&tree_g);

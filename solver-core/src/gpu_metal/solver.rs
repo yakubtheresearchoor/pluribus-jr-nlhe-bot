@@ -146,6 +146,14 @@ pub struct MetalVectorCfr {
     // QRE inverse-temperature λ. 0 = off (regret-matching / DCFR). > 0 ⇒ the
     // strategy is a logit over time-averaged action cfv (matches CPU set_lambda).
     lambda: f32,
+
+    // PER-SOLVE command queue (created from the shared device). Every command
+    // buffer this solver creates goes through its OWN queue, so concurrent
+    // solvers never build command buffers on the same queue — that was the
+    // shared-context deadlock (Metal command-buffer creation is not safe across
+    // threads on ONE queue). The device + metallib stay shared (the leak fix);
+    // queues are cheap and per-instance. flush() waits on THIS queue.
+    queue: metal::CommandQueue,
 }
 
 impl MetalVectorCfr {
@@ -224,7 +232,11 @@ impl MetalVectorCfr {
         // Params scratch buffer (large enough for all param structs)
         let d_params_buf = ctx.alloc_zeros(64);
 
+        // Per-solve command queue from the shared device (see struct field doc).
+        let queue = ctx.device().new_command_queue();
+
         MetalVectorCfr {
+            queue,
             strategies_pipeline,
             qre_strategies_pipeline,
             init_reach_pipeline,
@@ -374,7 +386,7 @@ impl MetalVectorCfr {
     /// serializes command buffers within a queue, so waiting on a LATER buffer
     /// guarantees all prior committed buffers completed. Terminates async runs.
     fn flush(&self, ctx: &MetalContext) {
-        let final_buf = ctx.new_command_buffer();
+        let final_buf = self.queue.new_command_buffer();
         final_buf.commit();
         final_buf.wait_until_completed();
     }
@@ -467,7 +479,7 @@ impl MetalVectorCfr {
                     // it as separate encoders; Metal hazard-tracks the shared state
                     // buffers to order them. Collapses ~23 command-buffer creations
                     // (the measured `_MTLCommandBuffer init` hot path) into 1.
-                    let cmd = ctx.new_command_buffer();
+                    let cmd = self.queue.new_command_buffer();
                     self.encode_compute_strategies(ctx, cmd, ni, nh);
                     self.encode_init_reach(ctx, cmd, np, nh);
                     self.encode_top_down(ctx, cmd, nh, np as u32);
@@ -484,8 +496,37 @@ impl MetalVectorCfr {
         });
     }
 
+    /// `run_batched` with a HARD WALL-CLOCK BUDGET — the runaway guard for the
+    /// real-time path. The unbudgeted loop commits ALL iterations up front, so a
+    /// big tree (deep multiway) can pin the GPU for minutes with no way to stop —
+    /// and if the caller vanishes (client disconnect), the work grinds on orphaned.
+    /// Here iterations are committed in CHUNKS with a flush (GPU sync) between
+    /// them; once `budget_ms` is spent the loop stops committing. Worst-case
+    /// overrun is one chunk. Returns the number of iterations actually run.
+    /// The per-chunk flush costs one sync per chunk (negligible vs chunk runtime).
+    pub fn run_batched_budget(
+        &mut self,
+        ctx: &MetalContext,
+        tree: &FlatTree,
+        num_iterations: u32,
+        budget_ms: u64,
+    ) -> u32 {
+        const CHUNK: u32 = 25;
+        let start = std::time::Instant::now();
+        let mut done = 0u32;
+        while done < num_iterations {
+            let n = CHUNK.min(num_iterations - done);
+            self.run_batched(ctx, tree, n); // commits n iters + flushes (autoreleasepool inside)
+            done += n;
+            if start.elapsed().as_millis() as u64 >= budget_ms {
+                break;
+            }
+        }
+        done
+    }
+
     fn launch_compute_strategies(&mut self, ctx: &MetalContext, num_infosets: usize, nh: usize) {
-        let cmd = ctx.new_command_buffer();
+        let cmd = self.queue.new_command_buffer();
         self.encode_compute_strategies(ctx, cmd, num_infosets, nh);
         cmd.commit();
         self.maybe_wait(cmd);
@@ -524,7 +565,7 @@ impl MetalVectorCfr {
     }
 
     fn launch_init_reach(&mut self, ctx: &MetalContext, np: usize, nh: usize) {
-        let cmd = ctx.new_command_buffer();
+        let cmd = self.queue.new_command_buffer();
         self.encode_init_reach(ctx, cmd, np, nh);
         cmd.commit();
         self.maybe_wait(cmd);
@@ -548,7 +589,7 @@ impl MetalVectorCfr {
     }
 
     fn launch_top_down(&mut self, ctx: &MetalContext, nh: usize, np: u32) {
-        let cmd = ctx.new_command_buffer();
+        let cmd = self.queue.new_command_buffer();
         self.encode_top_down(ctx, cmd, nh, np);
         cmd.commit();
         self.maybe_wait(cmd);
@@ -592,7 +633,7 @@ impl MetalVectorCfr {
         nh: usize,
         np: u32,
     ) {
-        let cmd = ctx.new_command_buffer();
+        let cmd = self.queue.new_command_buffer();
         self.encode_bottom_up(ctx, cmd, tree, traverser, alpha_t, beta_t, gamma_t, nh, np);
         cmd.commit();
         self.maybe_wait(cmd);

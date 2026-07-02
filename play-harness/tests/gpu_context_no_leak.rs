@@ -36,7 +36,7 @@ fn shared_context_does_not_leak_gpu_memory() {
             bmask & (1u64 << c1) == 0 && bmask & (1u64 << c2) == 0 })
         .count();
     let reach = vec![vec![1.0f32; nh]; 2];
-    let gcfg = GpuSearchCfg { iters: 30, sample_m: 0, seed: 7, factored_terminals: false, lambda: 0.0 };
+    let gcfg = GpuSearchCfg { iters: 30, sample_m: 0, seed: 7, factored_terminals: false, lambda: 0.0 , budget_ms: 120_000 };
 
     let ctx = shared_context().expect("Metal");
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
@@ -68,4 +68,45 @@ fn shared_context_does_not_leak_gpu_memory() {
         end < base + 64 * 1024 * 1024,
         "shared context accumulated {:.1}MB over {n} solves (leak)", mb(end.saturating_sub(base))
     );
+}
+
+/// The deadlock regression: CONCURRENT solves through the shared context. Before
+/// per-solve command queues, two threads building command buffers on the ONE
+/// shared queue deadlocked Metal (server hung at 0% CPU / GPU pinned). With
+/// per-solve queues this must complete: 3 threads × 2 solves each, all sharing
+/// the device+metallib but each MetalVectorCfr owning its queue.
+#[test]
+fn concurrent_solves_do_not_deadlock() {
+    let board = [card("As"), card("Ah"), card("7c"), card("2d")];
+    let cfg_t = production_game_v1().street_seam_config(
+        BoardState::Turn, 2, 20, 40,
+        BetSizeOptions {
+            bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)],
+            raise: vec![BetSize::PotRelative(1.0)],
+        },
+    );
+    let tree = std::sync::Arc::new(build_tree_depth_limited(&cfg_t).expect("turn tree"));
+    let bmask: u64 = board.iter().fold(0u64, |m, &c| m | (1u64 << c));
+    let nh = (0..(52 * 51 / 2))
+        .filter(|&idx| { let (c1, c2) = solver_core::card::index_to_card_pair(idx);
+            bmask & (1u64 << c1) == 0 && bmask & (1u64 << c2) == 0 })
+        .count();
+
+    let t0 = std::time::Instant::now();
+    let handles: Vec<_> = (0..3).map(|ti| {
+        let tree = tree.clone();
+        std::thread::spawn(move || {
+            let reach = vec![vec![1.0f32; nh]; 2];
+            let gcfg = GpuSearchCfg { iters: 30, sample_m: 0, seed: 7 + ti as u64,
+                factored_terminals: false, lambda: 0.0, budget_ms: 60_000 };
+            let ctx = shared_context().expect("Metal");
+            for _ in 0..2 {
+                let (_hc, strat) = gpu_hu_turn_strat(ctx, &board, &tree, &reach, 64, true, &gcfg);
+                assert!(!strat.is_empty(), "solve returned no strategy");
+            }
+        })
+    }).collect();
+    for h in handles { h.join().expect("solver thread panicked"); }
+    eprintln!("3 threads x 2 concurrent shared-context solves completed in {:.1}s (no deadlock)",
+        t0.elapsed().as_secs_f32());
 }

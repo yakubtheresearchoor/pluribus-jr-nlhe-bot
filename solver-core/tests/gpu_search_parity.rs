@@ -80,7 +80,7 @@ fn gpu_flop_search_matches_cpu_search() {
     cpu.set_depth_limit(&leaf_nodes);
     cpu.set_dcfr(1.5, 0.0, 2.0);
     cpu.run(&tree, &cpu_game, iters);
-    let gcfg = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda: 0.0 };
+    let gcfg = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda: 0.0 , budget_ms: 120_000 };
     let gpu_strat = gpu_search_flop_strat(&ctx, &tree, fsg.table(), &bk, &reach, &gcfg);
     let (mean_l1, worst) = compare(&cpu, &gpu_strat);
     eprintln!("DCFR: GPU vs CPU mean_L1={mean_l1:.4}, worst={worst:.4}");
@@ -93,7 +93,7 @@ fn gpu_flop_search_matches_cpu_search() {
     cpu_q.set_depth_limit(&leaf_nodes);
     cpu_q.set_lambda(vec![lambda; np as usize]);
     cpu_q.run(&tree, &cpu_game2, iters);
-    let gcfg_q = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda };
+    let gcfg_q = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda , budget_ms: 120_000 };
     let gpu_q = gpu_search_flop_strat(&ctx, &tree, fsg.table(), &bk, &reach, &gcfg_q);
     let (q_l1, q_worst) = compare(&cpu_q, &gpu_q);
     eprintln!("QRE λ={lambda}: GPU vs CPU mean_L1={q_l1:.4}, worst={q_worst:.4}");
@@ -112,7 +112,7 @@ fn gpu_flop_search_matches_cpu_search() {
     cpu_qb.set_depth_limit(&leaf_nodes);
     cpu_qb.set_lambda(vec![lambda; np as usize]);
     cpu_qb.run(&tree, &cpu_game3, iters);
-    let gcfg_qb = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda };
+    let gcfg_qb = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda , budget_ms: 120_000 };
     let gpu_qb = gpu_search_flop_strat(&ctx, &tree, fsg.table(), &qbk, &reach, &gcfg_qb);
     let (qb_l1, qb_worst) = compare(&cpu_qb, &gpu_qb);
     eprintln!("QRE λ={lambda} + quantile nb=16: GPU vs CPU mean_L1={qb_l1:.4}, worst={qb_worst:.4}");
@@ -174,7 +174,7 @@ fn gpu_turn_search_matches_cpu() {
     cpu.run(&tree, &cpu_game, iters);
 
     let ctx = MetalContext::new().expect("Metal");
-    let gcfg = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda };
+    let gcfg = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda , budget_ms: 120_000 };
     let gpu = gpu_search_street_strat(&ctx, &tree, fsg.table(), &bk, ContStreet::Turn(0), &reach, &gcfg);
 
     let turn = BoardState::Turn as u8;

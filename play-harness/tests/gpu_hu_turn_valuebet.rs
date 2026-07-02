@@ -51,7 +51,7 @@ fn gpu_hu_turn_quads_value_bets() {
     // River-integrated continuation (default): exact check-to-showdown model, so
     // the nuts value-bets at the proper ~78% instead of the proxy's ~100%.
     let river: bool = std::env::var("GPU_TURN_PROXY").is_err();
-    let gcfg = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda: 0.0 };
+    let gcfg = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda: 0.0 , budget_ms: 120_000 };
     let t = Instant::now();
     let (hand_cards, strat) = gpu_hu_turn_strat(&ctx, &board, &tree, &reach, nb, river, &gcfg);
     let elapsed = t.elapsed().as_secs_f32();

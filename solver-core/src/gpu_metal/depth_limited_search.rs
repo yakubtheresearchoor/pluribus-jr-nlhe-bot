@@ -31,11 +31,17 @@ pub struct GpuSearchCfg {
     /// QRE inverse-temperature λ (0 = off / DCFR). Matches the CPU search's
     /// `set_lambda(cfg.lambda)` — the production runtime uses QRE smoothing.
     pub lambda: f32,
+    /// HARD wall-clock budget for the solve (ms). The GPU loop stops committing
+    /// iterations once spent (worst-case overrun ≈ one 25-iter chunk) — the
+    /// runaway guard: without it a deep multiway tree can pin the GPU for
+    /// minutes, and a client disconnect leaves that work grinding orphaned.
+    /// Mirrors the CPU path's adaptive LIVE2_RT_BUDGET_MS.
+    pub budget_ms: u64,
 }
 
 impl Default for GpuSearchCfg {
     fn default() -> Self {
-        Self { iters: 300, sample_m: 500, seed: 0x5EED, factored_terminals: true, lambda: 0.0 }
+        Self { iters: 300, sample_m: 500, seed: 0x5EED, factored_terminals: true, lambda: 0.0, budget_ms: 9_000 }
     }
 }
 
@@ -125,7 +131,10 @@ pub fn gpu_search_street_strat(
         }
     }
 
-    gpu.run_batched(ctx, tree, cfg.iters);
+    let ran = gpu.run_batched_budget(ctx, tree, cfg.iters, cfg.budget_ms);
+    if ran < cfg.iters {
+        eprintln!("[gpu-search] budget hit: ran {ran}/{} iters in {}ms budget", cfg.iters, cfg.budget_ms);
+    }
 
     let mut out = HashMap::new();
     for n in 0..tree.num_nodes() {
@@ -231,7 +240,10 @@ pub fn gpu_hu_turn_strat(
             tree.rake_rate as f32, tree.rake_cap as f32, cfg.sample_m, cfg.seed);
     }
 
-    gpu.run_batched(ctx, tree, cfg.iters);
+    let ran = gpu.run_batched_budget(ctx, tree, cfg.iters, cfg.budget_ms);
+    if ran < cfg.iters {
+        eprintln!("[gpu-search] budget hit: ran {ran}/{} iters in {}ms budget", cfg.iters, cfg.budget_ms);
+    }
 
     let turn = BoardState::Turn as u8;
     let mut out = HashMap::new();
