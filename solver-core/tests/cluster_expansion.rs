@@ -698,3 +698,117 @@ fn m4_term_census() {
     let over: f64 = ops_by_dim[3..].iter().sum();
     eprintln!("dim≤2 direct total ≈ {direct_le2:.2e} ops/hand (budget ~3e5); dim≥3 (must precompute) ≈ {over:.2e}");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 3b — EDGE-VARIABLE (contraction) BASIS. The partition device was only
+// an evaluation trick; the ORIGINAL object is already unrestricted:
+//   W_H(B) = Σ over card vars c_e (one per A-edge, full h-excluded deck,
+//            NO ≠ constraints) of Π_groups F_group(assigned incident cards)
+// with the group factor determined by the DISTINCT SET S of incident values:
+//   |S|=0 → Scalar^h, 1 → PerCard^h, 2 → Pair^h, ≥3 → 0.
+// Because F(c,c)=PerCard[c] and F(c,d)=Pair(c,d) form ONE fixed diagonal-
+// extended table, this sum is a PURE TENSOR CONTRACTION — the prep-kernel
+// form. Gated vs the distinct-partition evaluator (brute-proven chain).
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn w_h_edgevar(
+    gp_full: &GroupPrim, hh: (u8, u8), k: usize, edges: &[(usize, usize)], deck_n: usize,
+) -> f64 {
+    let (h1, h2) = (hh.0 as usize, hh.1 as usize);
+    let ne = edges.len();
+    let mut total = 0.0;
+    for bmask in 0..(1u32 << ne) {
+        let mut parent: Vec<usize> = (0..k).collect();
+        fn find(p: &mut Vec<usize>, x: usize) -> usize {
+            if p[x] != x { let r = find(p, p[x]); p[x] = r; } p[x]
+        }
+        let mut a_edges: Vec<(usize, usize)> = Vec::new();
+        for (ei, &(u, v)) in edges.iter().enumerate() {
+            if bmask & (1 << ei) != 0 {
+                let (ru, rv) = (find(&mut parent, u), find(&mut parent, v));
+                if ru != rv { parent[ru] = rv; }
+            } else { a_edges.push((u, v)); }
+        }
+        let mut group_of = vec![0usize; k];
+        for v in 0..k { group_of[v] = find(&mut parent, v); }
+        let roots: Vec<usize> = { let mut r = group_of.clone(); r.sort_unstable(); r.dedup(); r };
+        let sign = if bmask.count_ones() % 2 == 0 { 1.0 } else { -1.0 };
+        // per-group incident A-edge indices
+        let mut inc: Vec<Vec<usize>> = vec![Vec::new(); roots.len()];
+        for (ei, &(u, v)) in a_edges.iter().enumerate() {
+            for vv in [u, v] {
+                let gi = roots.iter().position(|&r| r == group_of[vv]).unwrap();
+                if !inc[gi].contains(&ei) { inc[gi].push(ei); }
+            }
+        }
+        let masks: Vec<usize> = roots.iter().map(|&root| {
+            (0..k).filter(|&v| group_of[v] == root).fold(0usize, |m, v| m | (1 << v))
+        }).collect();
+        // recursion over A-edge card variables (unrestricted, h-excluded)
+        let mut cards = vec![usize::MAX; a_edges.len()];
+        #[allow(clippy::too_many_arguments)]
+        fn rec(
+            ei: usize, ne: usize, cards: &mut Vec<usize>, deck_n: usize,
+            gp: &GroupPrim, masks: &[usize], inc: &[Vec<usize>], h1: usize, h2: usize,
+        ) -> f64 {
+            if ei == ne {
+                let mut v = 1.0;
+                for (gi, m) in masks.iter().enumerate() {
+                    // distinct incident value set
+                    let mut s: Vec<usize> = inc[gi].iter().map(|&e| cards[e]).collect();
+                    s.sort_unstable(); s.dedup();
+                    v *= match s.len() {
+                        0 => gp.scalar[*m] - gp.per_card[*m][h1] - gp.per_card[*m][h2]
+                             + gp.pair[*m][h1 * deck_n + h2],
+                        1 => gp.per_card[*m][s[0]] - gp.pair[*m][s[0] * deck_n + h1]
+                             - gp.pair[*m][s[0] * deck_n + h2],
+                        2 => gp.pair[*m][s[0] * deck_n + s[1]],
+                        _ => 0.0,
+                    };
+                    if v == 0.0 { return 0.0; }
+                }
+                v
+            } else {
+                let mut acc = 0.0;
+                for c in 0..deck_n {
+                    if c == h1 || c == h2 { continue; }
+                    cards[ei] = c;
+                    acc += rec(ei + 1, ne, cards, deck_n, gp, masks, inc, h1, h2);
+                }
+                cards[ei] = usize::MAX;
+                acc
+            }
+        }
+        total += sign * rec(0, a_edges.len(), &mut cards, deck_n, gp_full, &masks, &inc, h1, h2);
+    }
+    total
+}
+
+#[test]
+fn edgevar_basis_matches_distinct() {
+    let deck_n = 10usize; // 45 hands — keeps the 6-var unrestricted sums fast
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let graphs4 = connected_graphs(4);
+    let graphs3 = connected_graphs(3);
+    let mut rng = Lcg(0xED6E);
+    let mk = |rng: &mut Lcg| -> Vec<f64> {
+        (0..nh).map(|_| if rng.f() < 0.3 { 0.0 } else { rng.f() }).collect()
+    };
+    let rs: Vec<Vec<f64>> = (0..4).map(|_| mk(&mut rng)).collect();
+    let rr: Vec<&[f64]> = rs.iter().map(|r| r.as_slice()).collect();
+    let gp_full = group_prim(&hands, &rr, (255, 254), deck_n);
+    let mut worst = 0.0f64;
+    for h in (0..nh).step_by(16) {
+        let hh = hands[h];
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-12);
+        for edges in graphs4.iter().chain(graphs3.iter()) {
+            let kk = edges.iter().flat_map(|&(u, v)| [u, v]).max().unwrap() + 1;
+            let a = w_h_edgevar(&gp_full, hh, kk, edges, deck_n);
+            let b = w_h_generic_fast(&gp_full, hh, kk, edges, deck_n);
+            worst = worst.max(rel(a, b));
+            assert!(rel(a, b) < 1e-10, "h={h} {edges:?}: edgevar {a} vs distinct {b}");
+        }
+    }
+    eprintln!("edge-variable (pure-contraction) basis vs distinct evaluator: worst rel = {worst:.2e}");
+}
