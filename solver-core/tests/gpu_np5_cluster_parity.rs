@@ -195,3 +195,49 @@ fn gpu_np5_cluster_in_solver_matches_cpu() {
     eprintln!("np5 cluster IN-SOLVER vs CPU reference: worst scale-rel = {worst:.3e}");
     assert!(worst < 5e-3, "in-solver cluster diverges: {worst}");
 }
+
+/// WATCHDOG SOAK: ~90s of 2-way concurrent live-5 cluster GPU solves. The
+/// machine kernel-panicked twice on long non-preemptible dispatches — this
+/// deliberately recreates that load shape. Pass = completes, machine alive.
+#[test]
+#[ignore = "90s GPU soak"]
+fn gpu_np5_cluster_sustained_load_soak() {
+    use solver_core::gpu_metal::shared_context;
+    let np = 5u8;
+    let canonical = [3u8, 19, 35];
+    let (turns, river_decks) = solver_core::blueprint::runout_grid(canonical, 12, 12);
+    let turns_u8: Vec<u8> = turns.iter().map(|&c| c as u8).collect();
+    let table = std::sync::Arc::new(FlopChanceTable::build_full_nh_sampled(canonical, np, &turns_u8, &river_decks));
+    let spec = production_game_v1();
+    let mut cfg = spec.street_seam_config(BoardState::Flop, np, 6, 30,
+        BetSizeOptions { bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)], raise: vec![BetSize::PotRelative(1.0)] });
+    cfg.max_bets_per_street = BetCap::all(3);
+    let tree = std::sync::Arc::new(build_tree_depth_limited(&cfg).expect("tree"));
+    let lone: std::sync::Arc<Vec<u32>> = std::sync::Arc::new((0..tree.num_nodes())
+        .filter(|&n| tree.nodes[n].is_terminal())
+        .filter(|&n| { let fm = tree.get_folded_mask(n);
+            (0..np).filter(|&p| fm & (1 << p) == 0).count() <= 1 })
+        .map(|n| n as u32).collect());
+    let t0 = std::time::Instant::now();
+    let handles: Vec<_> = (0..2).map(|wi| {
+        let table = table.clone(); let tree = tree.clone(); let lone = lone.clone();
+        std::thread::spawn(move || {
+            let ctx = shared_context().expect("Metal");
+            let nh = table.num_valid;
+            let (sos, soi, sps, spi, _) = table.sorted_opp_arrays_base();
+            let iw: Vec<Vec<f32>> = (0..5).map(|p| table.initial_weights[p].clone()).collect();
+            let mut solves = 0u32;
+            while t0.elapsed().as_secs() < 90 {
+                let mut gpu = MetalVectorCfr::new(ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, table.num_combinations);
+                gpu.set_fast_lone_terminals_ex(ctx, &lone, true);
+                let ran = gpu.run_batched_budget(ctx, &tree, 100, 16_000);
+                solves += 1;
+                eprintln!("[w{wi}] solve #{solves}: {ran} iters, t={:.0}s", t0.elapsed().as_secs_f32());
+            }
+            solves
+        })
+    }).collect();
+    let total: u32 = handles.into_iter().map(|h| h.join().expect("worker")).sum();
+    eprintln!("np5-cluster soak: {total} solves in {:.0}s — no deadlock, machine alive", t0.elapsed().as_secs_f32());
+    assert!(total >= 6);
+}

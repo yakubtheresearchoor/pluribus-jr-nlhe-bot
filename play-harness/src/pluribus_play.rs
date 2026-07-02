@@ -1118,7 +1118,15 @@ pub fn search_decision(
     // interleavable), parity 2.5e-7 vs the base path. Measured/validated paths:
     // HU ~12ms/iter, live-3 ~43ms/iter, live-4 ~81ms/iter. live-5+ has no fast
     // terminal (K=4) and stays on the CPU/rollout path.
-    let gpu_ok = live <= 4 && matches!(cont, ContStreet::Flop | ContStreet::Turn(_));
+    // live-5 GPU (2026-07-02): np5 CLUSTER terminal kernels (104.8 ms/iter,
+    // in-solver parity 5.4e-8, 98s watchdog soak clean). Pairs-only cluster
+    // mass = 6.5× MORE accurate than the factored mass the CPU search uses for
+    // the same fold terminals — GPU live-5 is faster AND more accurate.
+    // FIRST-IN ONLY at live-5: the GPU search has no freeze_prefix rooting, so
+    // facing-bet solves (off-path training needs the observed line forced)
+    // stay on the rooted CPU path.
+    let gpu_ok = (live <= 4 || (live == 5 && prefix.is_empty()))
+        && matches!(cont, ContStreet::Flop | ContStreet::Turn(_));
     let strat = if gpu_ok && std::env::var("GPU_SEARCH").is_ok() {
         try_gpu_search(bp, &tree, cont, live, &overrides, cfg)
             .unwrap_or_else(|| search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides, prefix))
