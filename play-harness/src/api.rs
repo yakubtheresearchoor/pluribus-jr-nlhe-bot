@@ -373,23 +373,36 @@ pub fn decide_postflop_with_reach(bp: &Blueprint, req: &DecideRequest, cfg: &Sea
 /// Uniform entering ranges (a real-time prior); the factored showdown is an
 /// independent-opponent approximation (<1% of pot per-hand EV vs exact).
 pub fn decide_postflop_resolve(req: &DecideRequest) -> Option<DecideResponse> {
-    let t0 = std::time::Instant::now();
-    if req.live < 3 || (req.board.len() != 4 && req.board.len() != 5) {
-        return None;
-    }
-    let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
     let iters = if req.board.len() == 5 {
         crate::live2_bank::LIVE2_RT_RIVER_ITERS
     } else {
         crate::live2_bank::LIVE2_RT_TURN_ITERS
     };
-    let solve = crate::live2_bank::solve_multiway_street(
+    decide_postflop_resolve_with(req, iters, crate::live2_bank::LIVE2_RT_BUDGET_MS)
+}
+
+/// Exact multiway street re-solve with EXPLICIT iteration/budget caps — the
+/// live-5/6 RIVER path (measured: ~48 ms/iter np=5, ~224 ms/iter np=6; the
+/// default 600-iter config is a live-3/4 sizing and blows the budget at 5/6).
+pub fn decide_postflop_resolve_with(req: &DecideRequest, iters: u32, budget_ms: u128) -> Option<DecideResponse> {
+    decide_postflop_resolve_ranged(req, iters, budget_ms, None)
+}
+
+/// Range-conditioned exact re-solve (the conn live-5/6 river path).
+pub fn decide_postflop_resolve_ranged(req: &DecideRequest, iters: u32, budget_ms: u128, ranges: Option<Vec<Vec<f32>>>) -> Option<DecideResponse> {
+    let t0 = std::time::Instant::now();
+    if req.live < 3 || (req.board.len() != 4 && req.board.len() != 5) {
+        return None;
+    }
+    let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
+    let solve = crate::live2_bank::solve_multiway_street_ranged(
         &req.board,
         req.live,
         commit,
         pot,
         iters,
-        crate::live2_bank::LIVE2_RT_BUDGET_MS,
+        budget_ms,
+        ranges,
     )?;
     let node = walk_to_node(&solve.tree, &req.street_actions)?;
     if solve.tree.nodes[node].player_id as usize != req.hero_idx as usize {

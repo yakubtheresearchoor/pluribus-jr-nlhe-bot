@@ -155,12 +155,30 @@ pub fn solve_multiway_street(
     iters: u32,
     budget_ms: u128,
 ) -> Option<Live2StreetSolve> {
+    solve_multiway_street_ranged(board, np, commit, pot, iters, budget_ms, None)
+}
+
+/// Range-conditioned variant: `ranges` = per-seat 1326-combo entering reach
+/// (None ⇒ uniform). MEASURED consequence of uniform ranges at multiway
+/// rivers: 62o bluff-JAMMED 0.78 facing a pot bet — "correct" vs an all-air
+/// model, a leak vs real 5-way river ranges. The conn river path passes the
+/// blueprint reach priors.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_multiway_street_ranged(
+    board: &[u8],
+    np: u8,
+    commit: i32,
+    pot: i32,
+    iters: u32,
+    budget_ms: u128,
+    ranges_in: Option<Vec<Vec<f32>>>,
+) -> Option<Live2StreetSolve> {
     if np < 3 {
         return None; // HU goes through solve_live2_street (exact)
     }
     let spec = crate::runtime_spec::runtime_game_spec().clone();
     let board_c: Vec<Card> = board.to_vec();
-    let ranges = vec![vec![1.0f32; 1326]; np as usize];
+    let ranges = ranges_in.unwrap_or_else(|| vec![vec![1.0f32; 1326]; np as usize]);
     let (state, table) = match board.len() {
         4 => (BoardState::Turn, ChanceTable::compute_turn_start(&board_c, &ranges, np)),
         5 => (BoardState::River, ChanceTable::compute_river_start(&board_c, &ranges, np)),
@@ -169,7 +187,23 @@ pub fn solve_multiway_street(
     let nh = table.num_valid;
     let hand_cards = table.hand_cards.clone();
     let game = TurnStartGame::new(table).with_factored();
-    let cfg = spec.street_seam_config(state, np, commit, pot, live2_bet_menu());
+    // PER-NP MENU TAPER (measured 2026-07-02): the rich live-2 menu at np>=5
+    // explodes the exact tree (24,686 nodes np=5 / 78,817 np=6) and the SETUP
+    // (per-node hand vectors) costs 30s/140s REGARDLESS of iters. Lean menu
+    // (pot bet + pot raise, cap 2) keeps multiway rivers solvable in budget —
+    // the same taper philosophy as the conn cells and the live-6 search menu.
+    let menu = if np >= 5 {
+        BetSizeOptions {
+            bet: vec![solver_core::tree::action::BetSize::PotRelative(1.0)],
+            raise: vec![solver_core::tree::action::BetSize::PotRelative(1.0)],
+        }
+    } else {
+        live2_bet_menu()
+    };
+    let mut cfg = spec.street_seam_config(state, np, commit, pot, menu);
+    if np >= 5 {
+        cfg.max_bets_per_street = solver_core::tree::action::BetCap::all(2);
+    }
     let tree = if board.len() == 4 {
         let check_only = BetSizeOptions { bet: vec![], raise: vec![] };
         build_tree_with_bet_override(&cfg, &[(BoardState::River, check_only)]).ok()?
