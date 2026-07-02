@@ -320,6 +320,17 @@ pub fn decide_postflop(bp: &Blueprint, req: &DecideRequest, cfg: &SearchCfg) -> 
 /// `decide_postflop` + per-seat REACH PRIORS for the search's entering ranges
 /// (empty = uniform `initial_weight`). The connected-blueprint path supplies the
 /// preflop-continuing range here (Pluribus reach-prior).
+fn decide_postflop_search(
+    bp: &Blueprint,
+    req: &DecideRequest,
+    cfg: &SearchCfg,
+    reach_priors: &[(usize, Vec<f32>)],
+) -> Option<DecideResponse> {
+    let t0 = std::time::Instant::now();
+    let (tree, strat) = solve_street(bp, req, cfg, reach_priors)?;
+    read_street_decision(bp, &tree, &strat, req, t0.elapsed().as_millis() as u64)
+}
+
 pub fn decide_postflop_with_reach(bp: &Blueprint, req: &DecideRequest, cfg: &SearchCfg, reach_priors: &[(usize, Vec<f32>)]) -> Option<DecideResponse> {
     // 1. Bucketed blueprint search (the per-cell 1×1-runout strategy). Returns
     //    None on the multiway turn/river hole (an arbitrary runout the blueprint
@@ -406,16 +417,17 @@ pub fn decide_postflop_resolve(req: &DecideRequest) -> Option<DecideResponse> {
     Some(finalize_decision(actions, street, req.live, false, req.seed, t0))
 }
 
-fn decide_postflop_search(
+/// Solve the street subgame only (no node read) — the STREET-SOLVE CACHE unit.
+/// The solved (tree, strat) covers EVERY decision node on the street for this
+/// (hero cards, priors, pot) — later same-street decisions replay onto it.
+pub fn solve_street(
     bp: &Blueprint,
     req: &DecideRequest,
     cfg: &SearchCfg,
     reach_priors: &[(usize, Vec<f32>)],
-) -> Option<DecideResponse> {
-    let t0 = std::time::Instant::now();
+) -> Option<(FlatTree, std::collections::HashMap<usize, Vec<Vec<f32>>>)> {
     let blockers: Vec<u8> = req.partner_cards.map(|c| c.to_vec()).unwrap_or_default();
-    let paired = req.partner_cards.is_some();
-    let (tree, strat) = search_decision(
+    search_decision(
         bp,
         &req.board,
         req.live as usize,
@@ -426,8 +438,20 @@ fn decide_postflop_search(
         req.pot_entry as i32,
         cfg,
         reach_priors,
-    )?;
-    let node = walk_to_node(&tree, &req.street_actions)?;
+    )
+}
+
+/// Read one decision out of a solved street (replay street_actions → node →
+/// hero-hand action distribution → response). Pure read — no solving.
+pub fn read_street_decision(
+    bp: &Blueprint,
+    tree: &FlatTree,
+    strat: &std::collections::HashMap<usize, Vec<Vec<f32>>>,
+    req: &DecideRequest,
+    search_ms: u64,
+) -> Option<DecideResponse> {
+    let paired = req.partner_cards.is_some();
+    let node = walk_to_node(tree, &req.street_actions)?;
     // The hero must be the acting player at this node.
     if tree.nodes[node].player_id as usize != req.hero_idx as usize {
         return None;
@@ -477,7 +501,7 @@ fn decide_postflop_search(
         live: req.live,
         chosen: actions[sel].clone(),
         actions,
-        search_ms: t0.elapsed().as_millis() as u64,
+        search_ms,
         paired,
     })
 }

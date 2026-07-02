@@ -73,6 +73,14 @@ pub struct ConnDecider {
     bp_cache: Mutex<(HashMap<(usize, usize), (Arc<SyncBlueprint>, u64)>, u64)>,
     /// Max cached adapters (CONN_ADAPTER_CACHE, default 24 ~= 3-6GB).
     adapter_cache_cap: usize,
+    /// STREET-SOLVE CACHE: one solve serves every decision the hero makes on
+    /// that street (Pluribus: solve the round once, play from it). Key includes
+    /// hero cards (they BLOCK opponents' ranges in the solve), the street board,
+    /// pot state, and a reach-prior hash. LRU (CONN_SOLVE_CACHE, default 16
+    /// ≈ 200MB; a live-5 (tree,strat) ≈ 10-15MB). street_actions are READ-time.
+    #[allow(clippy::type_complexity)]
+    solve_cache: Mutex<(HashMap<(usize, u8, Vec<u8>, u32, u32, u8, [u8; 2], u64), (Arc<(solver_core::tree::flat::FlatTree, HashMap<usize, Vec<Vec<f32>>>)>, u64)>, u64)>,
+    solve_cache_cap: usize,
     /// Preflop jam-subgame (Option A): restore the high-SPR all-in the lean na=8
     /// blueprint omits. Tables built lazily on first low-SPR HU preflop decision.
     jam_cfg: JamCfg,
@@ -174,6 +182,8 @@ impl ConnDecider {
             cfg,
             bp_cache: Mutex::new((HashMap::new(), 0)),
             adapter_cache_cap: std::env::var("CONN_ADAPTER_CACHE").ok().and_then(|s| s.parse().ok()).unwrap_or(24).max(1),
+            solve_cache: Mutex::new((HashMap::new(), 0)),
+            solve_cache_cap: std::env::var("CONN_SOLVE_CACHE").ok().and_then(|s| s.parse().ok()).unwrap_or(16).max(1),
             jam_cfg,
             jam_tables: Mutex::new(None),
             rep_combos,
@@ -423,6 +433,46 @@ impl ConnDecider {
         if req.live == 6 {
             let l6 = std::env::var("CONN_ITERS_L6").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(24);
             cfg.iters = cfg.iters.min(l6);
+        }
+        // STREET-SOLVE CACHE: same (hero, street, pot, priors) ⇒ reuse the solved
+        // street strategy for later decisions on this street (ms reads).
+        let prior_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            for a in &req.preflop_actions { (a.label, a.to_total).hash(&mut hs); }
+            req.seat_positions.hash(&mut hs);
+            req.partner_cards.hash(&mut hs);
+            req.partner_idx.hash(&mut hs);
+            hs.finish()
+        };
+        let skey = (flop_id, req.live, req.board.clone(), req.commit_entry, req.pot_entry,
+                    req.hero_idx, req.hero_cards, prior_hash);
+        if let Some(solved) = {
+            let mut c = self.solve_cache.lock().unwrap();
+            let (map, stamp) = &mut *c;
+            map.get_mut(&skey).map(|(s, st)| { *stamp += 1; *st = *stamp; s.clone() })
+        } {
+            let t0 = std::time::Instant::now();
+            if let Some(r) = crate::api::read_street_decision(&adapter.0, &solved.0, &solved.1, req, t0.elapsed().as_millis() as u64) {
+                return Some(r);
+            }
+            // read miss (off-tree action) → fall through to the full chain below.
+        } else if let Some((tree, strat)) = crate::api::solve_street(&adapter.0, req, &cfg, &reach_priors) {
+            let t0 = std::time::Instant::now();
+            let solved = Arc::new((tree, strat));
+            {
+                let mut c = self.solve_cache.lock().unwrap();
+                let (map, stamp) = &mut *c;
+                while map.len() >= self.solve_cache_cap {
+                    let Some(old) = map.iter().min_by_key(|(_, (_, s))| *s).map(|(k, _)| k.clone()) else { break };
+                    map.remove(&old);
+                }
+                *stamp += 1;
+                map.insert(skey, (solved.clone(), *stamp));
+            }
+            if let Some(r) = crate::api::read_street_decision(&adapter.0, &solved.0, &solved.1, req, t0.elapsed().as_millis() as u64) {
+                return Some(r);
+            }
         }
         decide_postflop_with_reach(&adapter.0, req, &cfg, &reach_priors)
     }
