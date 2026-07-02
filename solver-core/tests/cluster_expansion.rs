@@ -205,3 +205,299 @@ fn cluster_expansion_mass3() {
     eprintln!("cluster-expansion mass3 worst rel: C={:.2e} W_path={:.2e} W_tri={:.2e} M3={:.2e}",
         worst[0], worst[1], worst[2], worst[3]);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 2 — K=4: the GENERIC W_H evaluator. For a labeled collision graph H:
+//   W_H = Σ_{B ⊆ E(H)} (−1)^{|B|} Σ_{partitions P of A-edges} val(B, P)
+// B-edges contract hands (same-hand); each A-edge carries a card VARIABLE;
+// blocks of P share one distinct card value. A hand-GROUP's factor by its
+// incident distinct blocks: 0 → Scalar(group), 1 → PerCard(group, c),
+// 2 → PairReach(group, {c,d}), ≥3 → ZERO (a 2-card hand can't hold 3 cards).
+// Sums run over DISTINCT card tuples per partition. All ⊥h.
+// Gated: (a) generic == manual κ3 forms on 3-vertex graphs; (b) per-graph
+// brute scans at K=4; (c) assembled M4 vs brute quadruple enumeration.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Per-h group primitives for every role-subset mask: Σ Π r_i over ⊥h hands.
+struct GroupPrim {
+    scalar: Vec<f64>,        // [mask]
+    per_card: Vec<Vec<f64>>, // [mask][card]
+    pair: Vec<Vec<f64>>,     // [mask][c*deck+d] product-reach at hand {c,d}
+}
+fn group_prim(hands: &[(u8, u8)], rs: &[&[f64]], hh: (u8, u8), deck_n: usize) -> GroupPrim {
+    let k = rs.len();
+    let nmask = 1usize << k;
+    let mut scalar = vec![0.0; nmask];
+    let mut per_card = vec![vec![0.0; deck_n]; nmask];
+    let mut pair = vec![vec![0.0; deck_n * deck_n]; nmask];
+    for (g, &(a, b)) in hands.iter().enumerate() {
+        if !disjoint((a, b), hh) { continue; }
+        for mask in 1..nmask {
+            let mut w = 1.0;
+            for i in 0..k { if mask & (1 << i) != 0 { w *= rs[i][g]; } }
+            if w == 0.0 { continue; }
+            scalar[mask] += w;
+            per_card[mask][a as usize] += w;
+            per_card[mask][b as usize] += w;
+            pair[mask][a as usize * deck_n + b as usize] += w;
+            pair[mask][b as usize * deck_n + a as usize] += w;
+        }
+    }
+    GroupPrim { scalar, per_card, pair }
+}
+
+/// Set partitions of 0..n via restricted-growth strings.
+fn set_partitions(n: usize) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut rgs = vec![0usize; n];
+    loop {
+        out.push(rgs.clone());
+        // next RGS
+        let mut i = n as isize - 1;
+        loop {
+            if i <= 0 { return out; }
+            let maxp = rgs[..i as usize].iter().cloned().max().unwrap_or(0);
+            if rgs[i as usize] <= maxp { rgs[i as usize] += 1; break; }
+            i -= 1;
+        }
+        for j in (i as usize + 1)..n { rgs[j] = 0; }
+    }
+}
+
+/// Generic W_H for a labeled graph on `k` vertices (roles rs[0..k]).
+/// edges: list of (u, v). All ⊥h via `gp` primitives.
+fn w_h_generic(gp: &GroupPrim, k: usize, edges: &[(usize, usize)], deck_n: usize) -> f64 {
+    let ne = edges.len();
+    let mut total = 0.0;
+    for bmask in 0..(1u32 << ne) {
+        // contract B-edges: union-find over vertices
+        let mut parent: Vec<usize> = (0..k).collect();
+        fn find(p: &mut Vec<usize>, x: usize) -> usize {
+            if p[x] != x { let r = find(p, p[x]); p[x] = r; }
+            p[x]
+        }
+        let mut a_edges: Vec<(usize, usize)> = Vec::new();
+        for (ei, &(u, v)) in edges.iter().enumerate() {
+            if bmask & (1 << ei) != 0 {
+                let (ru, rv) = (find(&mut parent, u), find(&mut parent, v));
+                if ru != rv { parent[ru] = rv; }
+            } else {
+                a_edges.push((u, v));
+            }
+        }
+        // group masks
+        let mut group_of = vec![0usize; k];
+        for v in 0..k { group_of[v] = find(&mut parent, v); }
+        let roots: Vec<usize> = { let mut r: Vec<usize> = group_of.clone(); r.sort_unstable(); r.dedup(); r };
+        let gmask = |root: usize| -> usize {
+            (0..k).filter(|&v| group_of[v] == root).fold(0usize, |m, v| m | (1 << v))
+        };
+        let sign = if bmask.count_ones() % 2 == 0 { 1.0 } else { -1.0 };
+        let na = a_edges.len();
+        for part in set_partitions(na) {
+            let nblocks = part.iter().cloned().max().map(|m| m + 1).unwrap_or(0);
+            // group -> set of incident distinct blocks
+            let mut ok = true;
+            let mut inc: Vec<Vec<usize>> = vec![Vec::new(); roots.len()];
+            for (ei, &(u, v)) in a_edges.iter().enumerate() {
+                let b = part[ei];
+                for vv in [u, v] {
+                    let gi = roots.iter().position(|&r| r == group_of[vv]).unwrap();
+                    if !inc[gi].contains(&b) { inc[gi].push(b); }
+                }
+            }
+            for i in &inc { if i.len() > 2 { ok = false; break; } }
+            if !ok { continue; }
+            // sum over DISTINCT card assignments to blocks (recursive)
+            let mut cards = vec![usize::MAX; nblocks];
+            fn rec(
+                bi: usize, nblocks: usize, cards: &mut Vec<usize>, deck_n: usize,
+                gp: &GroupPrim, roots: &[usize], inc: &[Vec<usize>],
+                gmask: &dyn Fn(usize) -> usize,
+            ) -> f64 {
+                if bi == nblocks {
+                    let mut v = 1.0;
+                    for (gi, &root) in roots.iter().enumerate() {
+                        let m = gmask(root);
+                        v *= match inc[gi].len() {
+                            0 => gp.scalar[m],
+                            1 => gp.per_card[m][cards[inc[gi][0]]],
+                            _ => gp.pair[m][cards[inc[gi][0]] * deck_n + cards[inc[gi][1]]],
+                        };
+                        if v == 0.0 { return 0.0; }
+                    }
+                    return v;
+                }
+                let mut s = 0.0;
+                for c in 0..deck_n {
+                    if cards[..bi].contains(&c) { continue; }
+                    cards[bi] = c;
+                    s += rec(bi + 1, nblocks, cards, deck_n, gp, roots, inc, gmask);
+                }
+                cards[bi] = usize::MAX;
+                s
+            }
+            total += sign * rec(0, nblocks, &mut cards, deck_n, gp, &roots, &inc, &gmask);
+        }
+    }
+    total
+}
+
+#[test]
+fn generic_evaluator_matches_manual_k3() {
+    let deck_n = 12usize;
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let mut rng = Lcg(0x6E4E_71C);
+    let mk = |rng: &mut Lcg| -> Vec<f64> {
+        (0..nh).map(|_| if rng.f() < 0.25 { 0.0 } else { rng.f() }).collect()
+    };
+    let (r1, r2, r3) = (mk(&mut rng), mk(&mut rng), mk(&mut rng));
+    let mut worst = 0.0f64;
+    for h in (0..nh).step_by(23) {
+        let hh = hands[h];
+        let p1 = prim(&hands, &r1, hh, deck_n);
+        let p2 = prim(&hands, &r2, hh, deck_n);
+        let p3 = prim(&hands, &r3, hh, deck_n);
+        let gp = group_prim(&hands, &[&r1, &r2, &r3], hh, deck_n);
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-12);
+        // path centered at 2 = edges (0,1),(1,2)
+        let g_path = w_h_generic(&gp, 3, &[(0, 1), (1, 2)], deck_n);
+        let m_path = closed_w_path(&hands, &r2, &p1, &p3, &r1, &r3, hh);
+        worst = worst.max(rel(g_path, m_path));
+        assert!(rel(g_path, m_path) < 1e-10, "generic path {g_path} vs manual {m_path}");
+        // triangle
+        let g_tri = w_h_generic(&gp, 3, &[(0, 1), (1, 2), (0, 2)], deck_n);
+        let m_tri = closed_w_tri(&hands, [&r1, &r2, &r3], [&p1, &p2, &p3], hh, deck_n);
+        worst = worst.max(rel(g_tri, m_tri));
+        assert!(rel(g_tri, m_tri) < 1e-10, "generic tri {g_tri} vs manual {m_tri}");
+    }
+    eprintln!("generic-vs-manual κ3 worst rel = {worst:.2e}");
+}
+
+/// All connected labeled graphs on `k` vertices (as edge lists over pairs).
+fn connected_graphs(k: usize) -> Vec<Vec<(usize, usize)>> {
+    let mut pairs = Vec::new();
+    for u in 0..k { for v in (u + 1)..k { pairs.push((u, v)); } }
+    let ne = pairs.len();
+    let mut out = Vec::new();
+    for mask in 1u32..(1 << ne) {
+        let edges: Vec<(usize, usize)> = (0..ne).filter(|&i| mask & (1 << i) != 0).map(|i| pairs[i]).collect();
+        // spanning-connected over ALL k vertices
+        let mut parent: Vec<usize> = (0..k).collect();
+        fn find(p: &mut Vec<usize>, x: usize) -> usize {
+            if p[x] != x { let r = find(p, p[x]); p[x] = r; } p[x]
+        }
+        for &(u, v) in &edges {
+            let (ru, rv) = (find(&mut parent, u), find(&mut parent, v));
+            if ru != rv { parent[ru] = rv; }
+        }
+        let r0 = find(&mut parent, 0);
+        if (1..k).all(|v| find(&mut parent, v) == r0) { out.push(edges); }
+    }
+    out
+}
+
+#[test]
+fn cluster_expansion_mass4() {
+    let deck_n = 12usize;
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let graphs4 = connected_graphs(4);
+    assert_eq!(graphs4.len(), 38, "connected labeled graphs on 4 vertices");
+    let graphs3 = connected_graphs(3);
+    assert_eq!(graphs3.len(), 4);
+
+    let mut rng = Lcg(0x4444_C1);
+    let mut worst_wh = 0.0f64;
+    let mut worst_m4 = 0.0f64;
+    for trial in 0..2 {
+        let mk = |rng: &mut Lcg| -> Vec<f64> {
+            (0..nh).map(|_| if rng.f() < 0.3 { 0.0 } else { rng.f() }).collect()
+        };
+        let rs: Vec<Vec<f64>> = (0..4).map(|_| mk(&mut rng)).collect();
+        let rr: Vec<&[f64]> = rs.iter().map(|r| r.as_slice()).collect();
+        for h in (7 + trial * 13..nh).step_by(29) {
+            let hh = hands[h];
+            let ok = |g: (u8, u8)| disjoint(g, hh);
+            let gp4 = group_prim(&hands, &rr, hh, deck_n);
+            let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-9);
+
+            // (b) per-graph gates: generic W_H vs brute constrained scan, all 38
+            for edges in &graphs4 {
+                let gw = w_h_generic(&gp4, 4, edges, deck_n);
+                let mut bw = 0.0;
+                for (g0, &c0) in hands.iter().enumerate() {
+                    if rs[0][g0] == 0.0 || !ok(c0) { continue; }
+                    for (g1, &c1) in hands.iter().enumerate() {
+                        if rs[1][g1] == 0.0 || !ok(c1) { continue; }
+                        if edges.contains(&(0, 1)) && !collide(c0, c1) { continue; }
+                        for (g2, &c2) in hands.iter().enumerate() {
+                            if rs[2][g2] == 0.0 || !ok(c2) { continue; }
+                            if edges.contains(&(0, 2)) && !collide(c0, c2) { continue; }
+                            if edges.contains(&(1, 2)) && !collide(c1, c2) { continue; }
+                            for (g3, &c3) in hands.iter().enumerate() {
+                                if rs[3][g3] == 0.0 || !ok(c3) { continue; }
+                                if edges.contains(&(0, 3)) && !collide(c0, c3) { continue; }
+                                if edges.contains(&(1, 3)) && !collide(c1, c3) { continue; }
+                                if edges.contains(&(2, 3)) && !collide(c2, c3) { continue; }
+                                bw += rs[0][g0] * rs[1][g1] * rs[2][g2] * rs[3][g3];
+                            }
+                        }
+                    }
+                }
+                worst_wh = worst_wh.max(rel(gw, bw));
+                assert!(rel(gw, bw) < 1e-9, "W_H {edges:?}: generic {gw} vs brute {bw}");
+            }
+
+            // (c) assembled M4 vs brute quadruple disjoint enumeration
+            let kappa = |block: &[usize]| -> f64 {
+                let brs: Vec<&[f64]> = block.iter().map(|&i| rs[i].as_slice()).collect();
+                let gp = group_prim(&hands, &brs, hh, deck_n);
+                match block.len() {
+                    1 => gp.scalar[1],
+                    2 => -w_h_generic(&gp, 2, &[(0, 1)], deck_n),
+                    3 => graphs3.iter().map(|e| {
+                        let s = if e.len() % 2 == 0 { 1.0 } else { -1.0 };
+                        s * w_h_generic(&gp, 3, e, deck_n)
+                    }).sum(),
+                    _ => graphs4.iter().map(|e| {
+                        let s = if e.len() % 2 == 0 { 1.0 } else { -1.0 };
+                        s * w_h_generic(&gp, 4, e, deck_n)
+                    }).sum(),
+                }
+            };
+            // 15 partitions of {0,1,2,3}
+            let parts: Vec<Vec<Vec<usize>>> = {
+                let mut out = Vec::new();
+                for rgs in set_partitions(4) {
+                    let nb = rgs.iter().cloned().max().unwrap() + 1;
+                    let mut blocks = vec![Vec::new(); nb];
+                    for (i, &b) in rgs.iter().enumerate() { blocks[b].push(i); }
+                    out.push(blocks);
+                }
+                out
+            };
+            assert_eq!(parts.len(), 15);
+            let m4: f64 = parts.iter().map(|blocks| blocks.iter().map(|b| kappa(b)).product::<f64>()).sum();
+
+            let mut bm = 0.0;
+            for (g0, &c0) in hands.iter().enumerate() {
+                if rs[0][g0] == 0.0 || !ok(c0) { continue; }
+                for (g1, &c1) in hands.iter().enumerate() {
+                    if rs[1][g1] == 0.0 || !ok(c1) || !disjoint(c0, c1) { continue; }
+                    for (g2, &c2) in hands.iter().enumerate() {
+                        if rs[2][g2] == 0.0 || !ok(c2) || !disjoint(c0, c2) || !disjoint(c1, c2) { continue; }
+                        for (g3, &c3) in hands.iter().enumerate() {
+                            if rs[3][g3] == 0.0 || !ok(c3) || !disjoint(c0, c3) || !disjoint(c1, c3) || !disjoint(c2, c3) { continue; }
+                            bm += rs[0][g0] * rs[1][g1] * rs[2][g2] * rs[3][g3];
+                        }
+                    }
+                }
+            }
+            worst_m4 = worst_m4.max(rel(m4, bm));
+            assert!(rel(m4, bm) < 1e-8, "M4 h={h}: cluster {m4} vs brute {bm}");
+        }
+    }
+    eprintln!("K=4 cluster expansion: 38 graphs each gated (worst W_H rel={worst_wh:.2e}); assembled M4 worst rel={worst_m4:.2e}");
+}
