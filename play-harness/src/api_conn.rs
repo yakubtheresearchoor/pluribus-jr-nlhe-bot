@@ -474,7 +474,7 @@ impl ConnDecider {
             // GPU serves live-5 (cluster kernels, ~105-140 ms/iter incl
             // continuation) for first-in AND facing-bet (GPU rooting): 48 iters
             // ≈ 5-7s — a 50% convergence raise over the CPU-era 32.
-            let l5 = std::env::var("CONN_ITERS_L5").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(48);
+            let l5 = std::env::var("CONN_ITERS_L5").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(40);
             cfg.iters = cfg.iters.min(l5);
         }
         if req.live == 6 {

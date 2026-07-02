@@ -5,10 +5,10 @@
 #![cfg(feature = "metal")]
 
 use solver_core::gpu_metal::{MetalBuffer, MetalContext};
-use solver_core::solver::cluster_mass::mass_cluster_pairs_fast;
+use solver_core::solver::cluster_mass::{mass_cluster_k23_fast, mass_cluster_pairs_fast};
 use solver_core::tree::flat::FlatNode;
 
-const STRIDE: usize = 28200;
+const STRIDE: usize = 31968;
 
 #[test]
 fn gpu_np5_cluster_matches_cpu() {
@@ -62,6 +62,9 @@ fn gpu_np5_cluster_matches_cpu() {
     let d_cfv = MetalBuffer::<f32>::zeros(dev, nh);
 
     let pm = ctx.create_pipeline("vcfr_np5cl_prep_pm").unwrap();
+    let k3p0 = ctx.create_pipeline("vcfr_np5cl_prep_k3p0").unwrap();
+    let k3p1 = ctx.create_pipeline("vcfr_np5cl_prep_k3p1").unwrap();
+    let k3tri = ctx.create_pipeline("vcfr_np5cl_prep_k3tri").unwrap();
     let scc = ctx.create_pipeline("vcfr_np5cl_prep_scc").unwrap();
     let dota = ctx.create_pipeline("vcfr_np5cl_prep_dota").unwrap();
     let pb = ctx.create_pipeline("vcfr_np5cl_prep_b").unwrap();
@@ -89,6 +92,9 @@ fn gpu_np5_cluster_matches_cpu() {
         let (g,t)=ctx.dispatch_1d(1, scc.max_total_threads_per_threadgroup() as usize);
         e.dispatch_thread_groups(g,t); e.end_encoding();
     }
+    enc2(&k3p0, &[d_tab.as_ref(), d_term.as_ref(), d_reach.as_ref(), d_hc.as_ref()], 4, 12);
+    enc2(&k3p1, &[d_tab.as_ref(), d_term.as_ref(), d_reach.as_ref(), d_hc.as_ref()], 4, 12*52);
+    enc2(&k3tri, &[d_tab.as_ref(), d_term.as_ref(), d_reach.as_ref(), d_hc.as_ref()], 4, 4);
     enc2(&dota, &[d_tab.as_ref(), d_term.as_ref()], 2, 52);
     enc2(&pb, &[d_tab.as_ref(), d_term.as_ref()], 2, 52);
     // main (1,nh): tab is buffer 8
@@ -108,7 +114,7 @@ fn gpu_np5_cluster_matches_cpu() {
 
     // CPU reference
     let opp: Vec<&[f32]> = (1..np).map(|p| &reach[p*nh..(p+1)*nh]).collect();
-    let mass = mass_cluster_pairs_fast(&opp, &hand_cards, nh);
+    let mass = mass_cluster_k23_fast(&opp, &hand_cards, nh);
     // payoff for trav=0, uncontested win, no rake: total_pot - stake
     let total_pot = starting_pot + contributions.iter().sum::<i32>();
     let stake = starting_pot as f32/np as f32 + contributions[0] as f32;
@@ -170,7 +176,7 @@ fn gpu_np5_cluster_in_solver_matches_cpu() {
                 snap.reach_after_topdown[base..base + nh].to_vec()
             }).collect();
             let refs: Vec<&[f32]> = rows.iter().map(|r| r.as_slice()).collect();
-            let mass = mass_cluster_pairs_fast(&refs, &hand_cards, nh);
+            let mass = mass_cluster_k23_fast(&refs, &hand_cards, nh);
             // payoff mirror
             let fm = tree.get_folded_mask(node);
             let c_t = tree.contributions[node * np as usize + t as usize];

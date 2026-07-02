@@ -5629,7 +5629,21 @@ constant int NP5CL_DOT  = 11346;   // 6
 constant int NP5CL_AIJ  = 11352;   // 312
 constant int NP5CL_AJI  = 11664;   // 312
 constant int NP5CL_BIJ  = 11976;   // 16224
-constant int NP5CL_STRIDE = 28200;
+// κ3 extension (order-consistent truncation — mirror of mass_cluster_k23_fast):
+// 12 ordered paths (ctr;i,k): T0 scalar + T0_row[52] + T1a[52] + T1b[52];
+// 4 triples: {aaa, aab, rrr} scalar + row[52] each.
+constant int NP5CL_P_T0   = 28200;             // 12
+constant int NP5CL_P_ROW  = 28212;             // 12*52 = 624
+constant int NP5CL_P_T1A  = 28836;             // 624
+constant int NP5CL_P_T1B  = 29460;             // 624
+constant int NP5CL_TRI    = 30084;             // 4*3 scalars (aaa,aab,rrr)
+constant int NP5CL_TRIROW = 30096;             // 4*3*52 = 624
+constant int NP5CL_P_UI   = 30720;             // 12*52: U_i[c]=Σ_{g∋c} r_c·X_i
+constant int NP5CL_P_UK   = 31344;             // 12*52: U_k[c]=Σ_{g∋c} r_c·X_k
+constant int NP5CL_STRIDE = 31968;
+constant int NP5CL_TRIPLES[12] = {0,1,2, 0,1,3, 0,2,3, 1,2,3};
+// ordered path (ctr,i,k) per triple: ctr rotates over the 3 members
+constant int NP5CL_PATH_CTR[12] = {0,1,2, 0,1,3, 0,2,3, 1,2,3};
 constant int NP5CL_PI[6] = {0,0,0,1,1,2};
 constant int NP5CL_PJ[6] = {1,2,3,2,3,3};
 
@@ -5809,7 +5823,50 @@ kernel void vcfr_np5cl_main(
         for (int m=0;m<4;m++) if (m!=i && m!=j) rest *= sh[m];
         corr += cij * rest;
     }
-    float mass = fmax(prod_all - corr, 0.0f);
+    // κ2 values per pair (cij) for the k23 assembly — recompute from corr's
+    // components: we already have each pair's cij inline above; rebuild array.
+    // (corr accumulated cij*rest; we need the raw cij per pair for triples.)
+    float c2v[6];
+    for (int q=0;q<6;q++) {
+        int i = NP5CL_PI[q], j = NP5CL_PJ[q];
+        float rih = (ghh >= 0) ? rr[i][ghh] : 0.0f;
+        float rjh = (ghh >= 0) ? rr[j][ghh] : 0.0f;
+        float dotp = t[NP5CL_DOT+q]
+            - t[NP5CL_AIJ+q*52+h1] - t[NP5CL_AIJ+q*52+h2]
+            - t[NP5CL_AJI+q*52+h1] - t[NP5CL_AJI+q*52+h2]
+            + t[NP5CL_BIJ+q*2704+h1*52+h1] + t[NP5CL_BIJ+q*2704+h1*52+h2]
+            + t[NP5CL_BIJ+q*2704+h2*52+h1] + t[NP5CL_BIJ+q*2704+h2*52+h2];
+        float pmi_h1 = t[NP5CL_PM+i*52+h1] - rih; float pmj_h1 = t[NP5CL_PM+j*52+h1] - rjh;
+        float pmi_h2 = t[NP5CL_PM+i*52+h2] - rih; float pmj_h2 = t[NP5CL_PM+j*52+h2] - rjh;
+        dotp -= pmi_h1*pmj_h1 + pmi_h2*pmj_h2;
+        float ccp = t[NP5CL_CCF+q] - t[NP5CL_CCR+q*52+h1] - t[NP5CL_CCR+q*52+h2] + rih*rjh;
+        c2v[q] = dotp - ccp;
+    }
+    // κ3 per triple: Σ_paths [T0⊥h − T1 corrections] − W_tri⊥h (leading order)
+    float k3v[4];
+    for (int tri=0;tri<4;tri++) {
+        float acc = 0.0f;
+        for (int c=0;c<3;c++) {
+            int pidx = tri*3 + c;
+            float t0h = t[NP5CL_P_T0+pidx] - t[NP5CL_P_ROW+pidx*52+h1] - t[NP5CL_P_ROW+pidx*52+h2];
+            float cor = t[NP5CL_P_T1A+pidx*52+h1] + t[NP5CL_P_T1A+pidx*52+h2]
+                      + t[NP5CL_P_T1B+pidx*52+h1] + t[NP5CL_P_T1B+pidx*52+h2];
+            acc += t0h - cor;
+        }
+        float wt = (t[NP5CL_TRI+tri*3+0] - t[NP5CL_TRIROW+(tri*3+0)*52+h1] - t[NP5CL_TRIROW+(tri*3+0)*52+h2])
+                 - (t[NP5CL_TRI+tri*3+1] - t[NP5CL_TRIROW+(tri*3+1)*52+h1] - t[NP5CL_TRIROW+(tri*3+1)*52+h2])
+                 + 5.0f * (t[NP5CL_TRI+tri*3+2] - t[NP5CL_TRIROW+(tri*3+2)*52+h1] - t[NP5CL_TRIROW+(tri*3+2)*52+h2]);
+        k3v[tri] = acc - wt;
+    }
+    // 14-partition assembly (κ4 dropped): pairs indexed q: (0,1)(0,2)(0,3)(1,2)(1,3)(2,3)
+    float m = sh[0]*sh[1]*sh[2]*sh[3];
+    m += -c2v[0]*sh[2]*sh[3] - c2v[1]*sh[1]*sh[3] - c2v[2]*sh[1]*sh[2]
+         - c2v[3]*sh[0]*sh[3] - c2v[4]*sh[0]*sh[2] - c2v[5]*sh[0]*sh[1];
+    m += c2v[0]*c2v[5] + c2v[1]*c2v[4] + c2v[2]*c2v[3];
+    // triples: (0,1,2)+s3, (0,1,3)+s2, (0,2,3)+s1, (1,2,3)+s0
+    m += k3v[0]*sh[3] + k3v[1]*sh[2] + k3v[2]*sh[1] + k3v[3]*sh[0];
+    float mass = fmax(m, 0.0f);
+    (void)prod_all; (void)corr;
     float v = payoff * mass;
     cfv[node*uint(nh)+uint(h)] = (p.num_combinations > 0.0f) ? (v/p.num_combinations) : v;
 }
@@ -5832,5 +5889,144 @@ kernel void vcfr_force_strategies(
     int na = forced[f*3 + 2];
     for (int a = 0; a < na; a++) {
         strategy[off + a * p.nh + h] = (a == action) ? 1.0f : 0.0f;
+    }
+}
+
+
+// prep_k3p0: grid (t, 12) — per ordered path: T0 + T0_row (nh scan).
+kernel void vcfr_np5cl_prep_k3p0(
+    device float* tab [[buffer(0)]],
+    device const uint32_t* term_nodes [[buffer(1)]],
+    device const float* reach [[buffer(2)]],
+    device const uint8_t* hand_cards [[buffer(3)]],
+    constant LoneTermParams& p [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int pidx = int(gid.y);
+    if (ti >= p.n_term || pidx >= 12) return;
+    int nh = p.nh; uint node = term_nodes[ti];
+    device float* t = tab + size_t(ti) * NP5CL_STRIDE;
+    int tri = pidx / 3; int c = pidx % 3;
+    int m0 = NP5CL_TRIPLES[tri*3+0], m1 = NP5CL_TRIPLES[tri*3+1], m2 = NP5CL_TRIPLES[tri*3+2];
+    int ctr = (c==0)?m0:((c==1)?m1:m2);
+    int ri_ = (c==0)?m1:((c==1)?m0:m0);
+    int rk_ = (c==0)?m2:((c==1)?m2:m1);
+    const device float* rc = np4_opp_reach(reach, node, p.np, nh, p.traverser, ctr);
+    const device float* rri = np4_opp_reach(reach, node, p.np, nh, p.traverser, ri_);
+    const device float* rrk = np4_opp_reach(reach, node, p.np, nh, p.traverser, rk_);
+    float v0 = 0.0f;
+    float row[52], ui[52], uk[52];
+    for (int cc=0;cc<52;cc++) { row[cc]=0.0f; ui[cc]=0.0f; uk[cc]=0.0f; }
+    for (int g = 0; g < nh; g++) {
+        float r = rc[g];
+        if (r == 0.0f) continue;
+        int a = hand_cards[g*2], b = hand_cards[g*2+1];
+        float xi = t[NP5CL_PM + ri_*52 + a] + t[NP5CL_PM + ri_*52 + b] - rri[g];
+        float xk = t[NP5CL_PM + rk_*52 + a] + t[NP5CL_PM + rk_*52 + b] - rrk[g];
+        float v = r * xi * xk;
+        v0 += v; row[a] += v; row[b] += v;
+        float rxi = r * xi; float rxk = r * xk;
+        ui[a] += rxi; ui[b] += rxi;
+        uk[a] += rxk; uk[b] += rxk;
+    }
+    t[NP5CL_P_T0 + pidx] = v0;
+    for (int cc=0;cc<52;cc++) {
+        t[NP5CL_P_ROW + pidx*52 + cc] = row[cc];
+        t[NP5CL_P_UI + pidx*52 + cc] = ui[cc];
+        t[NP5CL_P_UK + pidx*52 + cc] = uk[cc];
+    }
+}
+
+// prep_k3p1: grid (t, 12*52) — T1a[e], T1b[e] per (path, e).
+kernel void vcfr_np5cl_prep_k3p1(
+    device float* tab [[buffer(0)]],
+    device const uint32_t* term_nodes [[buffer(1)]],
+    device const float* reach [[buffer(2)]],
+    device const uint8_t* hand_cards [[buffer(3)]],
+    constant LoneTermParams& p [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    // T1a[e] = Σ_c pair_k(c,e)·U_i[c];  T1b[e] = Σ_c pair_i(c,e)·U_k[c]
+    // (exact identity: U scatters r_c·X at both of g's cards). Pure matvec.
+    int ti = int(gid.x); int cell = int(gid.y);
+    if (ti >= p.n_term || cell >= 12*52) return;
+    int pidx = cell / 52; int e = cell % 52;
+    device float* t = tab + size_t(ti) * NP5CL_STRIDE;
+    int tri = pidx / 3; int c = pidx % 3;
+    int m0 = NP5CL_TRIPLES[tri*3+0], m1 = NP5CL_TRIPLES[tri*3+1], m2 = NP5CL_TRIPLES[tri*3+2];
+    int ri_ = (c==0)?m1:((c==1)?m0:m0);
+    int rk_ = (c==0)?m2:((c==1)?m2:m1);
+    float c1 = 0.0f, c2 = 0.0f;
+    for (int cc = 0; cc < 52; cc++) {
+        c1 += t[NP5CL_PAIR + rk_*2704 + cc*52 + e] * t[NP5CL_P_UI + pidx*52 + cc];
+        c2 += t[NP5CL_PAIR + ri_*2704 + cc*52 + e] * t[NP5CL_P_UK + pidx*52 + cc];
+    }
+    t[NP5CL_P_T1A + pidx*52 + e] = c1;
+    t[NP5CL_P_T1B + pidx*52 + e] = c2;
+    (void)term_nodes; (void)reach; (void)hand_cards;
+}
+
+// prep_k3tri: grid (t, 4) — per triple: aaa (card sums) + aab/rrr (nh scans) + rows.
+kernel void vcfr_np5cl_prep_k3tri(
+    device float* tab [[buffer(0)]],
+    device const uint32_t* term_nodes [[buffer(1)]],
+    device const float* reach [[buffer(2)]],
+    device const uint8_t* hand_cards [[buffer(3)]],
+    constant LoneTermParams& p [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int tri = int(gid.y);
+    if (ti >= p.n_term || tri >= 4) return;
+    int nh = p.nh; uint node = term_nodes[ti];
+    device float* t = tab + size_t(ti) * NP5CL_STRIDE;
+    int i = NP5CL_TRIPLES[tri*3+0], j = NP5CL_TRIPLES[tri*3+1], kk = NP5CL_TRIPLES[tri*3+2];
+    const device float* rri = np4_opp_reach(reach, node, p.np, nh, p.traverser, i);
+    const device float* rrj = np4_opp_reach(reach, node, p.np, nh, p.traverser, j);
+    const device float* rrk = np4_opp_reach(reach, node, p.np, nh, p.traverser, kk);
+    // T_AAA: all-distinct + coincidence cases
+    float aaa = 0.0f;
+    for (int c1 = 0; c1 < 52; c1++) {
+        for (int c2 = 0; c2 < 52; c2++) {
+            if (c2 == c1) continue;
+            float pj12 = t[NP5CL_PAIR + j*2704 + c1*52 + c2];
+            if (pj12 == 0.0f) continue;
+            for (int c3 = 0; c3 < 52; c3++) {
+                if (c3 == c1 || c3 == c2) continue;
+                aaa += t[NP5CL_PAIR + i*2704 + c1*52 + c3] * pj12 * t[NP5CL_PAIR + kk*2704 + c2*52 + c3];
+            }
+        }
+    }
+    for (int a = 0; a < 52; a++) {
+        for (int b = 0; b < 52; b++) {
+            if (a == b) continue;
+            aaa += t[NP5CL_PAIR + i*2704 + a*52 + b] * t[NP5CL_PM + j*52 + a] * t[NP5CL_PAIR + kk*2704 + a*52 + b];
+            aaa += t[NP5CL_PAIR + i*2704 + b*52 + a] * t[NP5CL_PAIR + j*2704 + b*52 + a] * t[NP5CL_PM + kk*52 + a];
+            aaa += t[NP5CL_PM + i*52 + a] * t[NP5CL_PAIR + j*2704 + a*52 + b] * t[NP5CL_PAIR + kk*2704 + a*52 + b];
+        }
+    }
+    for (int c = 0; c < 52; c++) aaa += t[NP5CL_PM + i*52 + c] * t[NP5CL_PM + j*52 + c] * t[NP5CL_PM + kk*52 + c];
+    t[NP5CL_TRI + tri*3 + 0] = aaa;
+    for (int c = 0; c < 52; c++)
+        t[NP5CL_TRIROW + (tri*3+0)*52 + c] = t[NP5CL_PM + i*52 + c] * t[NP5CL_PM + j*52 + c] * t[NP5CL_PM + kk*52 + c];
+    // T_AAB + rrr (+rows)
+    float aab = 0.0f, rrr = 0.0f;
+    float aabrow[52], rrrrow[52];
+    for (int c = 0; c < 52; c++) { aabrow[c] = 0.0f; rrrrow[c] = 0.0f; }
+    for (int g = 0; g < nh; g++) {
+        int a = hand_cards[g*2], b = hand_cards[g*2+1];
+        float ri = rri[g], rj = rrj[g], rk = rrk[g];
+        float xj = t[NP5CL_PM + j*52 + a] + t[NP5CL_PM + j*52 + b] + 2.0f*rj;
+        float xk = t[NP5CL_PM + kk*52 + a] + t[NP5CL_PM + kk*52 + b] + 2.0f*rk;
+        float xi = t[NP5CL_PM + i*52 + a] + t[NP5CL_PM + i*52 + b] + 2.0f*ri;
+        float v = ri*rk*xj + ri*rj*xk + rj*rk*xi;
+        aab += v; aabrow[a] += v; aabrow[b] += v;
+        float w = ri*rj*rk;
+        rrr += w; rrrrow[a] += w; rrrrow[b] += w;
+    }
+    t[NP5CL_TRI + tri*3 + 1] = aab;
+    t[NP5CL_TRI + tri*3 + 2] = rrr;
+    for (int c = 0; c < 52; c++) {
+        t[NP5CL_TRIROW + (tri*3+1)*52 + c] = aabrow[c];
+        t[NP5CL_TRIROW + (tri*3+2)*52 + c] = rrrrow[c];
     }
 }

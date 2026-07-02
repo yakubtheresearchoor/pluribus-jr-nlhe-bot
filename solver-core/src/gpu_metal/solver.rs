@@ -99,13 +99,16 @@ const NP4CF_STRIDE: usize = 317_792;
 /// accurate than the factored mass, O(1)/hand after prep; bit-exact parity vs
 /// cluster_mass::mass_cluster_pairs_fast). The DEFAULT np5 path; the full-enum
 /// Np5Lone family remains as the exact parity reference (set_np5_use_cluster).
-const NP5CL_STRIDE: usize = 28_200;
+const NP5CL_STRIDE: usize = 31_968;
 
 struct Np5Cluster {
     prep_pm: ComputePipelineState,
     prep_scc: ComputePipelineState,
     prep_dota: ComputePipelineState,
     prep_b: ComputePipelineState,
+    prep_k3p0: ComputePipelineState,
+    prep_k3p1: ComputePipelineState,
+    prep_k3tri: ComputePipelineState,
     main: ComputePipelineState,
     d_tables: MetalBuffer<f32>, // [n_term * NP5CL_STRIDE]
 }
@@ -462,6 +465,9 @@ impl MetalVectorCfr {
                 prep_scc: ctx.create_pipeline("vcfr_np5cl_prep_scc").expect("np5cl prep_scc"),
                 prep_dota: ctx.create_pipeline("vcfr_np5cl_prep_dota").expect("np5cl prep_dota"),
                 prep_b: ctx.create_pipeline("vcfr_np5cl_prep_b").expect("np5cl prep_b"),
+                prep_k3p0: ctx.create_pipeline("vcfr_np5cl_prep_k3p0").expect("np5cl k3p0"),
+                prep_k3p1: ctx.create_pipeline("vcfr_np5cl_prep_k3p1").expect("np5cl k3p1"),
+                prep_k3tri: ctx.create_pipeline("vcfr_np5cl_prep_k3tri").expect("np5cl k3tri"),
                 main: ctx.create_pipeline("vcfr_np5cl_main").expect("np5cl main"),
                 d_tables: ctx.alloc_zeros(term_nodes.len().max(1) * NP5CL_STRIDE),
             })
@@ -1026,6 +1032,18 @@ impl MetalVectorCfr {
                 enc.set_buffer(3, Some(self.d_hand_cards.as_ref()), 0);
                 enc.set_bytes(4, pbytes, pptr);
                 let (g, t) = ctx.dispatch_1d(lt.n_term, np5c.prep_scc.max_total_threads_per_threadgroup() as usize);
+                enc.dispatch_thread_groups(g, t);
+                enc.end_encoding();
+            }
+            for (pipe, gy) in [(&np5c.prep_k3p0, 12usize), (&np5c.prep_k3p1, 12*52), (&np5c.prep_k3tri, 4)] {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(np5c.d_tables.as_ref()), 0);
+                enc.set_buffer(1, Some(lt.d_term_nodes.as_ref()), 0);
+                enc.set_buffer(2, Some(self.d_reach.as_ref()), 0);
+                enc.set_buffer(3, Some(self.d_hand_cards.as_ref()), 0);
+                enc.set_bytes(4, pbytes, pptr);
+                let (g, t) = ctx.dispatch_2d(lt.n_term, gy, pipe.max_total_threads_per_threadgroup() as usize);
                 enc.dispatch_thread_groups(g, t);
                 enc.end_encoding();
             }
