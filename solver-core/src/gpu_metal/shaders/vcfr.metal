@@ -5609,3 +5609,207 @@ kernel void vcfr_np5_lone_main(
     float v = payoff * mass;
     cfv[node_id * uint(nh) + uint(h)] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
 }
+
+// ============================================================================
+// np=5 (K=4) CLUSTER-MASS terminal (pairs-only D-form correction). A literal
+// transcription of cluster_mass::mass_cluster_pairs_fast (validated bit-exact
+// vs brute at K=2, 10x better than factored at K=4). O(1)/hand after per-
+// terminal prep. Fast APPROXIMATE fold-terminal mass for the live-5 search
+// (6.5x more accurate than the factored path the CPU accepts today).
+//   Pairs (i<j) for K=4: (0,1)(0,2)(0,3)(1,2)(1,3)(2,3).
+//   Per-terminal table stride NP5CL_STRIDE:
+//     PM[4*52] PAIR[4*2704] S[4] CCF[6] CCR[6*52] DOT[6] AIJ[6*52] AJI[6*52] BIJ[6*2704]
+// ============================================================================
+constant int NP5CL_PM   = 0;       // 208
+constant int NP5CL_PAIR = 208;     // 10816
+constant int NP5CL_S    = 11024;   // 4
+constant int NP5CL_CCF  = 11028;   // 6
+constant int NP5CL_CCR  = 11034;   // 312
+constant int NP5CL_DOT  = 11346;   // 6
+constant int NP5CL_AIJ  = 11352;   // 312
+constant int NP5CL_AJI  = 11664;   // 312
+constant int NP5CL_BIJ  = 11976;   // 16224
+constant int NP5CL_STRIDE = 28200;
+constant int NP5CL_PI[6] = {0,0,0,1,1,2};
+constant int NP5CL_PJ[6] = {1,2,3,2,3,3};
+
+// prep_pm: thread (ti, c) owns card-c row for all 4 roles: pm[r][c] + pair[r][c][*].
+kernel void vcfr_np5cl_prep_pm(
+    device float* tab [[buffer(0)]],
+    device const uint32_t* term_nodes [[buffer(1)]],
+    device const float* reach [[buffer(2)]],
+    device const uint8_t* hand_cards [[buffer(3)]],
+    constant LoneTermParams& p [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int c = int(gid.y);
+    if (ti >= p.n_term || c >= 52) return;
+    int nh = p.nh; uint node = term_nodes[ti];
+    device float* t = tab + size_t(ti) * NP5CL_STRIDE;
+    for (int r = 0; r < 4; r++) {
+        const device float* rr = np4_opp_reach(reach, node, p.np, nh, p.traverser, r);
+        float pmc = 0.0f;
+        for (int g = 0; g < nh; g++) {
+            int a = hand_cards[g*2], b = hand_cards[g*2+1];
+            if (a == c) { pmc += rr[g]; t[NP5CL_PAIR + r*2704 + c*52 + b] = rr[g]; }
+            else if (b == c) { pmc += rr[g]; t[NP5CL_PAIR + r*2704 + c*52 + a] = rr[g]; }
+        }
+        t[NP5CL_PM + r*52 + c] = pmc;
+    }
+}
+
+// prep_scc: thread ti computes s[r] and cc (full + rows). O(nh*K^2).
+kernel void vcfr_np5cl_prep_scc(
+    device float* tab [[buffer(0)]],
+    device const uint32_t* term_nodes [[buffer(1)]],
+    device const float* reach [[buffer(2)]],
+    device const uint8_t* hand_cards [[buffer(3)]],
+    constant LoneTermParams& p [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid);
+    if (ti >= p.n_term) return;
+    int nh = p.nh; uint node = term_nodes[ti];
+    device float* t = tab + size_t(ti) * NP5CL_STRIDE;
+    const device float* rr[4];
+    for (int r = 0; r < 4; r++) rr[r] = np4_opp_reach(reach, node, p.np, nh, p.traverser, r);
+    float s[4] = {0,0,0,0};
+    float ccf[6] = {0,0,0,0,0,0};
+    for (int q = 0; q < 6; q++) for (int c = 0; c < 52; c++) t[NP5CL_CCR + q*52 + c] = 0.0f;
+    for (int g = 0; g < nh; g++) {
+        int a = hand_cards[g*2], b = hand_cards[g*2+1];
+        for (int r = 0; r < 4; r++) s[r] += rr[r][g];
+        for (int q = 0; q < 6; q++) {
+            float v = rr[NP5CL_PI[q]][g] * rr[NP5CL_PJ[q]][g];
+            if (v != 0.0f) { ccf[q] += v; t[NP5CL_CCR + q*52 + a] += v; t[NP5CL_CCR + q*52 + b] += v; }
+        }
+    }
+    for (int r = 0; r < 4; r++) t[NP5CL_S + r] = s[r];
+    for (int q = 0; q < 6; q++) t[NP5CL_CCF + q] = ccf[q];
+}
+
+// prep_dot_a: thread (ti, d) owns column d of A_ij/A_ji for all pairs; c==... no,
+// dot is a reduction over c handled here by d==0 thread; A uses pm & pair.
+kernel void vcfr_np5cl_prep_dota(
+    device float* tab [[buffer(0)]],
+    device const uint32_t* term_nodes [[buffer(1)]],
+    constant LoneTermParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int d = int(gid.y);
+    if (ti >= p.n_term || d >= 52) return;
+    device float* t = tab + size_t(ti) * NP5CL_STRIDE;
+    for (int q = 0; q < 6; q++) {
+        int i = NP5CL_PI[q], j = NP5CL_PJ[q];
+        // A_ij[d] = Σ_c pm_i[c]·pair_j(c,d);  A_ji[d] = Σ_c pm_j[c]·pair_i(c,d)
+        float aij = 0.0f, aji = 0.0f;
+        for (int c = 0; c < 52; c++) {
+            aij += t[NP5CL_PM + i*52 + c] * t[NP5CL_PAIR + j*2704 + c*52 + d];
+            aji += t[NP5CL_PM + j*52 + c] * t[NP5CL_PAIR + i*2704 + c*52 + d];
+        }
+        t[NP5CL_AIJ + q*52 + d] = aij;
+        t[NP5CL_AJI + q*52 + d] = aji;
+        if (d == 0) {
+            float dot = 0.0f;
+            for (int c = 0; c < 52; c++) dot += t[NP5CL_PM + i*52 + c] * t[NP5CL_PM + j*52 + c];
+            t[NP5CL_DOT + q] = dot;
+        }
+    }
+}
+
+// prep_b: thread (ti, d) owns row d of B_ij for all pairs: B_ij[d][e]=Σ_c pair_i[c][d]·pair_j[c][e].
+kernel void vcfr_np5cl_prep_b(
+    device float* tab [[buffer(0)]],
+    device const uint32_t* term_nodes [[buffer(1)]],
+    constant LoneTermParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int d = int(gid.y);
+    if (ti >= p.n_term || d >= 52) return;
+    device float* t = tab + size_t(ti) * NP5CL_STRIDE;
+    for (int q = 0; q < 6; q++) {
+        int i = NP5CL_PI[q], j = NP5CL_PJ[q];
+        float acc[52];
+        for (int e = 0; e < 52; e++) acc[e] = 0.0f;
+        for (int c = 0; c < 52; c++) {
+            float pid = t[NP5CL_PAIR + i*2704 + c*52 + d];
+            if (pid == 0.0f) continue;
+            for (int e = 0; e < 52; e++) acc[e] += pid * t[NP5CL_PAIR + j*2704 + c*52 + e];
+        }
+        for (int e = 0; e < 52; e++) t[NP5CL_BIJ + q*2704 + d*52 + e] = acc[e];
+    }
+}
+
+// main: cfv[node][h] = payoff · mass(h)/nc, O(1) per (terminal,hand).
+kernel void vcfr_np5cl_main(
+    device float* cfv [[buffer(0)]],
+    device const uint32_t* term_nodes [[buffer(1)]],
+    device const FlatNode* nodes [[buffer(2)]],
+    device const int32_t* contributions [[buffer(3)]],
+    device const uint16_t* folded_masks [[buffer(4)]],
+    device const float* reach [[buffer(5)]],
+    device const uint8_t* hand_cards [[buffer(6)]],
+    device const int32_t* p2h [[buffer(7)]],
+    device const float* tab [[buffer(8)]],
+    constant LoneTermParams& p [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int h = int(gid.y);
+    if (ti >= p.n_term || h >= p.nh) return;
+    int nh = p.nh; int np = p.np; int trav = p.traverser;
+    uint node = term_nodes[ti];
+    const device float* t = tab + size_t(ti) * NP5CL_STRIDE;
+
+    uint16_t fm = folded_masks[node];
+    FlatNode nd = nodes[node];
+    int c_t = contributions[node*uint(np)+uint(trav)];
+    float stake = float(p.starting_pot)/float(np) + float(c_t);
+    bool tf = (fm & (uint16_t)(1u<<trav)) != 0;
+    bool flop_seen = (nd.board_state != 3);
+    float rr_rate = flop_seen ? p.rake_rate : 0.0f;
+    float rr_cap = flop_seen ? p.rake_cap : 0.0f;
+    int total_pot = p.starting_pot;
+    for (int q=0;q<np;q++) total_pot += contributions[node*uint(np)+uint(q)];
+    int minc = contributions[node*uint(np)+0u];
+    for (int q=1;q<np;q++){int c=contributions[node*uint(np)+uint(q)]; if(c<minc)minc=c;}
+    int nm=0; for(int q=0;q<np;q++) if(contributions[node*uint(np)+uint(q)]>=minc) nm++;
+    int mainpot = minc*nm + p.starting_pot;
+    float rake = fmax(0.0f, fmin(float(mainpot)*rr_rate, rr_cap));
+    float payoff = tf ? (-stake) : ((float(total_pot)-rake)-stake);
+
+    const device float* rr[4];
+    for (int r=0;r<4;r++) rr[r] = np4_opp_reach(reach, node, np, nh, trav, r);
+    int h1 = hand_cards[h*2], h2 = hand_cards[h*2+1];
+    int ghh = p2h[h1*52+h2];
+
+    // S_i^h and product
+    float sh[4];
+    for (int r=0;r<4;r++) {
+        float rih = (ghh >= 0) ? rr[r][ghh] : 0.0f;
+        sh[r] = t[NP5CL_S+r] - t[NP5CL_PM+r*52+h1] - t[NP5CL_PM+r*52+h2] + rr[r][h];
+    }
+    float prod_all = sh[0]*sh[1]*sh[2]*sh[3];
+
+    float corr = 0.0f;
+    for (int q=0;q<6;q++) {
+        int i = NP5CL_PI[q], j = NP5CL_PJ[q];
+        float rih = (ghh >= 0) ? rr[i][ghh] : 0.0f;
+        float rjh = (ghh >= 0) ? rr[j][ghh] : 0.0f;
+        float dotp = t[NP5CL_DOT+q]
+            - t[NP5CL_AIJ+q*52+h1] - t[NP5CL_AIJ+q*52+h2]
+            - t[NP5CL_AJI+q*52+h1] - t[NP5CL_AJI+q*52+h2]
+            + t[NP5CL_BIJ+q*2704+h1*52+h1] + t[NP5CL_BIJ+q*2704+h1*52+h2]
+            + t[NP5CL_BIJ+q*2704+h2*52+h1] + t[NP5CL_BIJ+q*2704+h2*52+h2];
+        float pmi_h1 = t[NP5CL_PM+i*52+h1] - rih; float pmj_h1 = t[NP5CL_PM+j*52+h1] - rjh;
+        float pmi_h2 = t[NP5CL_PM+i*52+h2] - rih; float pmj_h2 = t[NP5CL_PM+j*52+h2] - rjh;
+        dotp -= pmi_h1*pmj_h1 + pmi_h2*pmj_h2;
+        float ccp = t[NP5CL_CCF+q] - t[NP5CL_CCR+q*52+h1] - t[NP5CL_CCR+q*52+h2] + rih*rjh;
+        float cij = dotp - ccp;
+        float rest = 1.0f;
+        for (int m=0;m<4;m++) if (m!=i && m!=j) rest *= sh[m];
+        corr += cij * rest;
+    }
+    float mass = fmax(prod_all - corr, 0.0f);
+    float v = payoff * mass;
+    cfv[node*uint(nh)+uint(h)] = (p.num_combinations > 0.0f) ? (v/p.num_combinations) : v;
+}
