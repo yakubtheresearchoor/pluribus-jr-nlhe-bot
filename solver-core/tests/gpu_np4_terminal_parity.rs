@@ -113,8 +113,13 @@ fn gpu_np4_full_scale_bench() {
     use solver_core::tree::action::{production_game_v1, BetCap};
     let np = 4u8;
     let board: Vec<Card> = vec![3, 19, 35];
-    let ranges: Vec<Vec<f32>> = (0..np).map(|_| vec![1.0f32 / NUM_POSSIBLE_HANDS as f32; NUM_POSSIBLE_HANDS]).collect();
-    let table = FlopChanceTable::compute_flop_start(&board, &ranges, np);
+    // Build the table the way the RUNTIME adapter does (build_full_nh_sampled +
+    // reduced runout grid) — compute_flop_start at np=4 grinds a combinatorial
+    // CPU setup for ~hours (learned the hard way; killed at 31min).
+    let canonical = [board[0], board[1], board[2]];
+    let (turns, river_decks) = solver_core::blueprint::runout_grid(canonical, 12, 12);
+    let turns_u8: Vec<u8> = turns.iter().map(|&c| c as u8).collect();
+    let table = FlopChanceTable::build_full_nh_sampled(canonical, np, &turns_u8, &river_decks);
     let nh = table.num_valid;
     let spec = production_game_v1();
     // Mirror search_decision's tree: rich menu + 3-bet cap, live-4 seam.
