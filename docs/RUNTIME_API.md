@@ -116,7 +116,8 @@ The server dispatches on `live` and `board.len()`:
 |-----------|------|-----------|-------|
 | `board == []` | **preflop** | EQR strategy (table lookup, instant) | `PF_STRAT` loaded; `street_actions` (preflop betting), `hero_cards`, `hero_idx`. |
 | `live == 2` | **heads-up** | flop = banked exact HU strategy; turn/river = real-time exact HU search (turn → **Metal GPU converged search** when `GPU_SEARCH` set) | flop needs the live-2 bank (`{BP_ROOT}/live2`); turn/river need nothing extra. |
-| `live ∈ {3,4,5}` | **multiway** | per-street depth-limited search over the bucketed blueprint continuation, rich bet sizing | a blueprint cell (`cell_dir` + `flop_id`, or `route = true`). |
+| `live ∈ {3,4}` | **multiway** | per-street depth-limited search over the bucketed blueprint continuation, rich bet sizing |
+| `live == 5` | **5-way** | FLOP = real CPU search at the actual (commit,pot), rich menu, coarse nb=16 quantile continuation (~3 s; `CONN_ITERS_L5`/`CONN_L5_NB`); turn/river = connected lookup/rollout | a blueprint cell (`cell_dir` + `flop_id`, or `route = true`). |
 | `live ≥ 6` | **full ring** | equity-rollout model: check when unbet, pot-odds call/fold vs Monte-Carlo all-in equity | `to_call` (or derivable from `street_actions`). |
 
 **Connected blueprint (`CONN_BP`, e.g. `blueprint_conn_eqr`).** When set, the server

@@ -328,15 +328,26 @@ impl ConnDecider {
         let table = FlopChanceTable::build_full_nh_sampled(canonical, live as u8, &turns_u8, &river_decks);
         let nh = table.num_valid;
         let game = FlopStartGame::new(table);
-        let full = load_gs14_cache(
-            &gs14_cache_path(&self.gs14_dir, flop_id, self.nb, self.bnt, self.bnr),
-            self.nb, self.bnt, self.bnr,
-        )?;
-        let (fm, tm, rm) = solver_core::blueprint::subset_gs14(&full, canonical, self.bnt, self.bnr, ar, ar);
-        let bk = FlopBucketing::from_maps(game.table(), self.nb, self.nb, self.nb, fm, tm, rm);
+        // NAMED APPROXIMATION (live ≥ 5): coarse nb=16 QUANTILE continuation
+        // instead of the nb=200 GS14 buckets. Continuation evaluation scales
+        // with nb — at np=5 the nb=200 search MEASURED ~2s/iter (32 iters would
+        // blow the budget ~12×); nb=16 measures 159 ms/iter ⇒ 32 iters ≈ 5.1s.
+        // The in-street solve stays LOSSLESS full-nh either way; only the
+        // depth-limit leaf values coarsen (B-ladder-studied knob; CONN_L5_NB).
+        let (bk, nb) = if live >= 5 {
+            let l5nb: usize = std::env::var("CONN_L5_NB").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+            (FlopBucketing::quantile(game.table(), l5nb), l5nb)
+        } else {
+            let full = load_gs14_cache(
+                &gs14_cache_path(&self.gs14_dir, flop_id, self.nb, self.bnt, self.bnr),
+                self.nb, self.bnt, self.bnr,
+            )?;
+            let (fm, tm, rm) = solver_core::blueprint::subset_gs14(&full, canonical, self.bnt, self.bnr, ar, ar);
+            (FlopBucketing::from_maps(game.table(), self.nb, self.nb, self.nb, fm, tm, rm), self.nb)
+        };
         let blueprint = Blueprint {
             flop: [canonical[0] as u8, canonical[1] as u8, canonical[2] as u8],
-            turns: turns_u8, rivers, np: live, nb: self.nb, nh,
+            turns: turns_u8, rivers, np: live, nb, nh,
             cum_flop: vec![], cum_turn: vec![], cum_river: vec![], bk, game,
         };
         let arc = Arc::new(SyncBlueprint(blueprint));
@@ -358,21 +369,35 @@ impl ConnDecider {
     /// blueprint's buckets (Pluribus-style: postflop = search, not lookup). The
     /// connected lookup (preflop + postflop_action_dist) is the baseline/continuation.
     pub fn decide_postflop_search(&self, req: &DecideRequest) -> Option<DecideResponse> {
-        // REAL-TIME SEARCH IS live ≤ 4 ONLY. live-5/6 have no fast path (GPU is
-        // gated ≤4 — no K≥4 factored terminal — and the CPU search at np=5/6 is
-        // a MINUTES-long solve): under fleet load these hung past the client
-        // timeout while HOLDING an admission permit, starving other requests.
-        // Returning None routes live-5/6 to the connected LOOKUP (instant,
-        // blueprint-solved) and, failing that, the equity rollout — the intended
-        // design (live-5/6 = lookup/rollout, not search).
-        if req.live > 4 {
+        // REAL-TIME SEARCH IS live ≤ 5. The blueprint's 5-6-way cells are ONE
+        // shared cell per live count (single 1×pot bet, no raises, cap 1, SPR
+        // collapsed, solved as "~never reached") — but vs THIS loose pool
+        // multiway pots are COMMON, so live-5 gets a real CPU search at the
+        // actual (commit, pot) with the rich menu. MEASURED: 159 ms/iter ⇒ 32
+        // iters ≈ 5.1s (GPU stays off at np=5 — no K≥4 fast terminal; watchdog).
+        // live-6 stays on lookup/rollout: MEASURED 695 ms/iter — even 16 iters
+        // ≈ 11s, over budget for too little convergence.
+        if req.live > 5 {
+            return None;
+        }
+        // live-5 searches the FLOP only: a turn card outside the adapter's
+        // reduced runout grid makes the street search return None, and the
+        // decide_postflop_resolve fallback behind it GRINDS at np=5 (verified
+        // 30s+ e2e). Turn/river live-5 keeps the lookup/rollout path.
+        if req.live == 5 && req.board.len() != 3 {
             return None;
         }
         let flop_id = req.flop_id as usize;
         let adapter = self.adapter(flop_id, req.live as usize)?;
         let reach_priors = self.reach_priors(req, &adapter.0);
         // Tuned base cfg (par+dcfr+iters); QRE λ from CONN_LAMBDA/CONN_OPP_LAMBDA.
-        decide_postflop_with_reach(&adapter.0, req, &self.cfg, &reach_priors)
+        // live-5 trims iterations to its measured budget (CONN_ITERS_L5 overrides).
+        let mut cfg = self.cfg;
+        if req.live == 5 {
+            let l5 = std::env::var("CONN_ITERS_L5").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(32);
+            cfg.iters = cfg.iters.min(l5);
+        }
+        decide_postflop_with_reach(&adapter.0, req, &cfg, &reach_priors)
     }
 
     /// Per-seat entering ranges for the postflop search. BAYESIAN (Pluribus reach
