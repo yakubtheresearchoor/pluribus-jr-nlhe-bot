@@ -1050,7 +1050,16 @@ pub fn search_decision(
     // GPU depth-limited search (FLOP + TURN; opt-in via GPU_SEARCH + the `metal`
     // feature). River stays on CPU — its terminals are actual-board showdowns the
     // GPU's flop-base sorted arrays can't value. Falls back to the CPU search.
-    let gpu_ok = matches!(cont, ContStreet::Flop | ContStreet::Turn(_));
+    //
+    // ★ live ≤ 3 ONLY (2026-07-01 kernel-panic postmortem): live-4/5 trees put
+    // SECONDS-long single kernel dispatches on the GPU (huge node×hand bottom-up
+    // grids, np≥4 has no fast terminals). A kernel dispatch cannot be preempted
+    // mid-flight, so under fleet load those dispatches starved WindowServer of
+    // GPU time >120s → macOS userspace-watchdog KERNEL PANIC (2 machine crashes,
+    // identical panic signature). The validated-fast paths are HU (~12ms/iter)
+    // and live-3 (~43ms/iter) — short dispatches the compositor can interleave.
+    // live-4+ routes to the CPU search (PAR/DCFR-scheduled, production-proven).
+    let gpu_ok = live <= 3 && matches!(cont, ContStreet::Flop | ContStreet::Turn(_));
     let strat = if gpu_ok && std::env::var("GPU_SEARCH").is_ok() {
         try_gpu_search(bp, &tree, cont, live, &overrides, cfg)
             .unwrap_or_else(|| search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides))
