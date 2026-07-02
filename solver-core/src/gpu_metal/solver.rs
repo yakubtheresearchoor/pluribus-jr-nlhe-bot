@@ -81,6 +81,10 @@ struct LoneTerminals {
 
 /// Table stride per terminal for the np=4 kernels (must match NP4_STRIDE in
 /// vcfr.metal): P1[52] P2[52] A1c[52] Bc[52] V[52] Vc[52*52] scalars[4].
+/// NOTE: this is the DEPLOYED v2 (threadgroup-staged g0 loop, 81ms/iter). The
+/// closed-form v3 kernels (vcfr_np4cf_*) exist + are parity-validated but are
+/// a REGRESSION at live-4 (prep O(nh·52²) > the O(nh²) loop since nh<52²);
+/// they are retained for the live-5 K=4 path where the asymptotics invert.
 const NP4_STRIDE: usize = 2968;
 
 struct Np4Lone {

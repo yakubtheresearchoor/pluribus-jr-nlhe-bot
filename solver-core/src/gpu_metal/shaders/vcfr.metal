@@ -4837,3 +4837,465 @@ kernel void vcfr_np4_lone_main(
     float v = payoff * mass;
     cfv[node_id * uint(nh) + uint(h)] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
 }
+
+// ============================================================================
+// np=4 CLOSED-FORM lone-survivor terminal (v3): O(1) eval per (terminal,hand).
+// LITERAL port of `mod cf` in solver-core/tests/np4_lone_mass_algebra.rs
+// (validated 2.1e-14 vs brute; see commit 26779e1). Replaces the O(nh)-per-
+// thread g0 loop of vcfr_np4_lone_main.
+//   mass3(X) = S_part + B_part − D_part over aggregates with ⊥X restriction
+//   (total − rows[h1] − rows[h2] + rA[hpair]·feature(hpair)).
+// Table layout per terminal (floats), STRIDE NP4CF_STRIDE:
+//   PB[52] PC[52] G1[52] BCC[52] G2[2704] GS[4]{SB,SC,G0,TBC}
+//   SKT[13] SKR[13*52] VKT[10*52] VKR[10*52*52] MKT[2*2704] MKR[2*52*2704]
+// ============================================================================
+
+constant int NP4CF_PB  = 0;
+constant int NP4CF_PC  = 52;
+constant int NP4CF_G1  = 104;
+constant int NP4CF_BCC = 156;
+constant int NP4CF_G2  = 208;
+constant int NP4CF_GS  = 2912;   // SB,SC,G0,TBC
+constant int NP4CF_SKT = 2916;
+constant int NP4CF_SKR = 2929;   // k*52 + c
+constant int NP4CF_VKT = 3605;   // k*52 + e
+constant int NP4CF_VKR = 4125;   // k*2704 + c*52 + e
+constant int NP4CF_MKT = 31165;  // k*2704 + e*52 + ep
+constant int NP4CF_MKR = 36573;  // k*140608 + c*2704 + e*52 + ep
+constant int NP4CF_STRIDE = 317792; // 317789 padded
+
+// SK indices (must match cf::SK_*)
+#define SKN 0
+#define SKQB 1
+#define SKQC 2
+#define SKUB 3
+#define SKUC 4
+#define SKDP 5
+#define SKG1 6
+#define SKG2G 7
+#define SKVBC 8
+#define SKQBQC 9
+#define SKQBUC 10
+#define SKUBQC 11
+#define SKUBUC 12
+// VK indices
+#define VKYB 0
+#define VKYC 1
+#define VKWBC 2
+#define VKKAP 3
+#define VKROW 4
+#define VKCOL 5
+#define VKQBYC 6
+#define VKYBQC 7
+#define VKUBYC 8
+#define VKYBUC 9
+// MK indices
+#define MKTYY 0
+#define MKZSAME 1
+
+// pair reach helper: reach of role r's pair-hand {c,e} (0 if invalid).
+static inline float np4cf_pr(const device float* r, const device int32_t* p2h, int c, int e) {
+    if (c == e) return 0.0f;
+    int i = p2h[c * 52 + e];
+    return (i >= 0) ? r[i] : 0.0f;
+}
+
+// ── prep A: PB/PC/BCC per card (+ c==0: SB,SC,TBC). Grid (n_term, 52). ──
+kernel void vcfr_np4cf_prep_a(
+    device float*          tab            [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const float*    reach          [[buffer(2)]],
+    device const uint8_t*  hand_cards     [[buffer(3)]],
+    constant LoneTermParams& p            [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int c = int(gid.y);
+    if (ti >= p.n_term || c >= 52) return;
+    int nh = p.nh;
+    uint node_id = term_nodes[ti];
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    device float* t = tab + size_t(ti) * NP4CF_STRIDE;
+    float pb = 0.0f, pc = 0.0f, bcc = 0.0f, sb = 0.0f, sc = 0.0f, tbc = 0.0f;
+    for (int g = 0; g < nh; g++) {
+        int a = hand_cards[g * 2], b = hand_cards[g * 2 + 1];
+        float vb = rb[g], vc = rc[g];
+        if (a == c || b == c) { pb += vb; pc += vc; bcc += vb * vc; }
+        if (c == 0) { sb += vb; sc += vc; tbc += vb * vc; }
+    }
+    t[NP4CF_PB + c] = pb; t[NP4CF_PC + c] = pc; t[NP4CF_BCC + c] = bcc;
+    if (c == 0) { t[NP4CF_GS + 0] = sb; t[NP4CF_GS + 1] = sc; t[NP4CF_GS + 3] = tbc; }
+}
+
+// ── prep B: G1[e], G2[e][*] (+ e==0: G0). Needs PB/PC. Grid (n_term, 52). ──
+kernel void vcfr_np4cf_prep_b(
+    device float*          tab            [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const float*    reach          [[buffer(2)]],
+    device const int32_t*  p2h            [[buffer(3)]],
+    constant LoneTermParams& p            [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int e = int(gid.y);
+    if (ti >= p.n_term || e >= 52) return;
+    uint node_id = term_nodes[ti];
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, p.nh, p.traverser, 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, p.nh, p.traverser, 2);
+    device float* t = tab + size_t(ti) * NP4CF_STRIDE;
+    float g1 = 0.0f, g0 = 0.0f;
+    for (int c = 0; c < 52; c++) {
+        float pbce = np4cf_pr(rb, p2h, c, e);
+        float pcce = np4cf_pr(rc, p2h, c, e);
+        g1 += t[NP4CF_PB + c] * pcce + t[NP4CF_PC + c] * pbce;
+        if (e == 0) g0 += t[NP4CF_PB + c] * t[NP4CF_PC + c];
+    }
+    t[NP4CF_G1 + e] = g1;
+    if (e == 0) t[NP4CF_GS + 2] = g0;
+    for (int ep = 0; ep < 52; ep++) {
+        float s = 0.0f;
+        for (int c = 0; c < 52; c++) {
+            s += np4cf_pr(rb, p2h, c, e) * np4cf_pr(rc, p2h, c, ep);
+        }
+        t[NP4CF_G2 + e * 52 + ep] = s;
+    }
+}
+
+// scalar features of hand g (cards a,b) given built G-tables.
+static inline void np4cf_sk_feats(
+    const device float* t, const device float* rb, const device float* rc,
+    int g, int a, int b, thread float* out /*13*/
+) {
+    float qb = rb[g], qc = rc[g];
+    float ub = t[NP4CF_PB + a] + t[NP4CF_PB + b];
+    float uc = t[NP4CF_PC + a] + t[NP4CF_PC + b];
+    out[SKN] = 1.0f; out[SKQB] = qb; out[SKQC] = qc; out[SKUB] = ub; out[SKUC] = uc;
+    out[SKDP] = t[NP4CF_PB + a] * t[NP4CF_PC + a] + t[NP4CF_PB + b] * t[NP4CF_PC + b];
+    out[SKG1] = t[NP4CF_G1 + a] + t[NP4CF_G1 + b];
+    out[SKG2G] = t[NP4CF_G2 + a * 52 + a] + t[NP4CF_G2 + a * 52 + b]
+               + t[NP4CF_G2 + b * 52 + a] + t[NP4CF_G2 + b * 52 + b];
+    out[SKVBC] = t[NP4CF_BCC + a] + t[NP4CF_BCC + b];
+    out[SKQBQC] = qb * qc; out[SKQBUC] = qb * uc; out[SKUBQC] = ub * qc; out[SKUBUC] = ub * uc;
+}
+
+// ── prep SK: totals (cell 52) + rows (cell c). Grid (n_term, 53). ──
+kernel void vcfr_np4cf_prep_sk(
+    device float*          tab            [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const float*    reach          [[buffer(2)]],
+    device const uint8_t*  hand_cards     [[buffer(3)]],
+    constant LoneTermParams& p            [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int cell = int(gid.y);
+    if (ti >= p.n_term || cell >= 53) return;
+    int nh = p.nh;
+    uint node_id = term_nodes[ti];
+    const device float* ra = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 0);
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    device float* t = tab + size_t(ti) * NP4CF_STRIDE;
+    float acc[13];
+    for (int k = 0; k < 13; k++) acc[k] = 0.0f;
+    float f[13];
+    for (int g = 0; g < nh; g++) {
+        float w = ra[g];
+        if (w == 0.0f) continue;
+        int a = hand_cards[g * 2], b = hand_cards[g * 2 + 1];
+        if (cell < 52 && a != cell && b != cell) continue;
+        np4cf_sk_feats(t, rb, rc, g, a, b, f);
+        for (int k = 0; k < 13; k++) acc[k] += w * f[k];
+    }
+    if (cell == 52) { for (int k = 0; k < 13; k++) t[NP4CF_SKT + k] = acc[k]; }
+    else { for (int k = 0; k < 13; k++) t[NP4CF_SKR + k * 52 + cell] = acc[k]; }
+}
+
+// vector features at (g, e).
+static inline void np4cf_vk_feats(
+    const device float* t, const device float* rb, const device float* rc,
+    const device int32_t* p2h, int g, int a, int b, int e, thread float* out /*10*/
+) {
+    float pba = np4cf_pr(rb, p2h, a, e), pbb = np4cf_pr(rb, p2h, b, e);
+    float pca = np4cf_pr(rc, p2h, a, e), pcb = np4cf_pr(rc, p2h, b, e);
+    float yb = pba + pbb, yc = pca + pcb;
+    float qb = rb[g], qc = rc[g];
+    float ub = t[NP4CF_PB + a] + t[NP4CF_PB + b];
+    float uc = t[NP4CF_PC + a] + t[NP4CF_PC + b];
+    out[VKYB] = yb; out[VKYC] = yc;
+    out[VKWBC] = pba * pca + pbb * pcb;
+    out[VKKAP] = t[NP4CF_PB + a] * pca + t[NP4CF_PC + a] * pba
+               + t[NP4CF_PB + b] * pcb + t[NP4CF_PC + b] * pbb;
+    out[VKROW] = t[NP4CF_G2 + e * 52 + a] + t[NP4CF_G2 + e * 52 + b];
+    out[VKCOL] = t[NP4CF_G2 + a * 52 + e] + t[NP4CF_G2 + b * 52 + e];
+    out[VKQBYC] = qb * yc; out[VKYBQC] = yb * qc;
+    out[VKUBYC] = ub * yc; out[VKYBUC] = yb * uc;
+}
+
+// ── prep VK: thread (t, e) owns column e: totals + rows[c][e] for all c. ──
+kernel void vcfr_np4cf_prep_vk(
+    device float*          tab            [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const float*    reach          [[buffer(2)]],
+    device const uint8_t*  hand_cards     [[buffer(3)]],
+    device const int32_t*  p2h            [[buffer(4)]],
+    constant LoneTermParams& p            [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int e = int(gid.y);
+    if (ti >= p.n_term || e >= 52) return;
+    int nh = p.nh;
+    uint node_id = term_nodes[ti];
+    const device float* ra = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 0);
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    device float* t = tab + size_t(ti) * NP4CF_STRIDE;
+    float tot[10];
+    for (int k = 0; k < 10; k++) tot[k] = 0.0f;
+    // zero this thread's row column first (rows are accumulated)
+    for (int k = 0; k < 10; k++)
+        for (int c = 0; c < 52; c++)
+            t[NP4CF_VKR + k * 2704 + c * 52 + e] = 0.0f;
+    float f[10];
+    for (int g = 0; g < nh; g++) {
+        float w = ra[g];
+        if (w == 0.0f) continue;
+        int a = hand_cards[g * 2], b = hand_cards[g * 2 + 1];
+        np4cf_vk_feats(t, rb, rc, p2h, g, a, b, e, f);
+        for (int k = 0; k < 10; k++) {
+            float v = w * f[k];
+            if (v == 0.0f) continue;
+            tot[k] += v;
+            t[NP4CF_VKR + k * 2704 + a * 52 + e] += v;
+            t[NP4CF_VKR + k * 2704 + b * 52 + e] += v;
+        }
+    }
+    for (int k = 0; k < 10; k++) t[NP4CF_VKT + k * 52 + e] = tot[k];
+}
+
+// ── prep MK: thread (t, e, ep) owns (e,ep): totals + rows. Grid 3D. ──
+kernel void vcfr_np4cf_prep_mk(
+    device float*          tab            [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const float*    reach          [[buffer(2)]],
+    device const uint8_t*  hand_cards     [[buffer(3)]],
+    device const int32_t*  p2h            [[buffer(4)]],
+    constant LoneTermParams& p            [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x); int e = int(gid.y); int ep = int(gid.z);
+    if (ti >= p.n_term || e >= 52 || ep >= 52) return;
+    int nh = p.nh;
+    uint node_id = term_nodes[ti];
+    const device float* ra = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 0);
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    device float* t = tab + size_t(ti) * NP4CF_STRIDE;
+    float t_tyy = 0.0f, t_zs = 0.0f;
+    for (int c = 0; c < 52; c++) {
+        t[NP4CF_MKR + 0 * 140608 + c * 2704 + e * 52 + ep] = 0.0f;
+        t[NP4CF_MKR + 1 * 140608 + c * 2704 + e * 52 + ep] = 0.0f;
+    }
+    for (int g = 0; g < nh; g++) {
+        float w = ra[g];
+        if (w == 0.0f) continue;
+        int a = hand_cards[g * 2], b = hand_cards[g * 2 + 1];
+        float pba = np4cf_pr(rb, p2h, a, e), pbb = np4cf_pr(rb, p2h, b, e);
+        float pca = np4cf_pr(rc, p2h, a, ep), pcb = np4cf_pr(rc, p2h, b, ep);
+        float tyy = (pba + pbb) * (pca + pcb);
+        float zs = pba * pca + pbb * pcb;
+        if (tyy != 0.0f) {
+            float v = w * tyy;
+            t_tyy += v;
+            t[NP4CF_MKR + 0 * 140608 + a * 2704 + e * 52 + ep] += v;
+            t[NP4CF_MKR + 0 * 140608 + b * 2704 + e * 52 + ep] += v;
+        }
+        if (zs != 0.0f) {
+            float v = w * zs;
+            t_zs += v;
+            t[NP4CF_MKR + 1 * 140608 + a * 2704 + e * 52 + ep] += v;
+            t[NP4CF_MKR + 1 * 140608 + b * 2704 + e * 52 + ep] += v;
+        }
+    }
+    t[NP4CF_MKT + 0 * 2704 + e * 52 + ep] = t_tyy;
+    t[NP4CF_MKT + 1 * 2704 + e * 52 + ep] = t_zs;
+}
+
+// ── restricted-lookup helpers for X = {h1,h2} (single pair add-back). ──
+// hp = pair2hand index of {h1,h2} (-1 if invalid); wA = rA[hp] (0 if invalid).
+struct Np4cfCtx {
+    const device float* t;
+    const device float* ra;
+    const device float* rb;
+    const device float* rc;
+    const device int32_t* p2h;
+    int h1; int h2;
+    int hp;        // pair2hand(h1,h2)
+    float wa;      // rA[hp] or 0
+};
+
+static inline float np4cf_rsk(thread const Np4cfCtx& x, int k, thread const float* hp_sk) {
+    float v = x.t[NP4CF_SKT + k] - x.t[NP4CF_SKR + k * 52 + x.h1] - x.t[NP4CF_SKR + k * 52 + x.h2];
+    if (x.wa != 0.0f) v += x.wa * hp_sk[k];
+    return v;
+}
+static inline float np4cf_rvk(thread const Np4cfCtx& x, int k, int e) {
+    float v = x.t[NP4CF_VKT + k * 52 + e]
+        - x.t[NP4CF_VKR + k * 2704 + x.h1 * 52 + e]
+        - x.t[NP4CF_VKR + k * 2704 + x.h2 * 52 + e];
+    if (x.wa != 0.0f) {
+        float f[10];
+        np4cf_vk_feats(x.t, x.rb, x.rc, x.p2h, x.hp, x.h1, x.h2, e, f);
+        v += x.wa * f[k];
+    }
+    return v;
+}
+static inline float np4cf_rmk(thread const Np4cfCtx& x, int k, int e, int ep) {
+    float v = x.t[NP4CF_MKT + k * 2704 + e * 52 + ep]
+        - x.t[NP4CF_MKR + k * 140608 + x.h1 * 2704 + e * 52 + ep]
+        - x.t[NP4CF_MKR + k * 140608 + x.h2 * 2704 + e * 52 + ep];
+    if (x.wa != 0.0f) {
+        float pba = np4cf_pr(x.rb, x.p2h, x.h1, e), pbb = np4cf_pr(x.rb, x.p2h, x.h2, e);
+        float pca = np4cf_pr(x.rc, x.p2h, x.h1, ep), pcb = np4cf_pr(x.rc, x.p2h, x.h2, ep);
+        float f = (k == MKTYY) ? (pba + pbb) * (pca + pcb) : (pba * pca + pbb * pcb);
+        v += x.wa * f;
+    }
+    return v;
+}
+
+// ── main v3: cfv[node][h] = payoff · mass3({h1,h2}) / nc — O(1) per thread. ──
+kernel void vcfr_np4cf_main(
+    device float*          cfv            [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const FlatNode* nodes          [[buffer(2)]],
+    device const int32_t*  contributions  [[buffer(3)]],
+    device const uint16_t* folded_masks   [[buffer(4)]],
+    device const float*    reach          [[buffer(5)]],
+    device const uint8_t*  hand_cards     [[buffer(6)]],
+    device const int32_t*  p2h            [[buffer(7)]],
+    device const float*    tab            [[buffer(8)]],
+    constant LoneTermParams& p            [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x);
+    int h  = int(gid.y);
+    if (ti >= p.n_term || h >= p.nh) return;
+    int nh = p.nh; int np = p.np; int traverser = p.traverser;
+    uint node_id = term_nodes[ti];
+    uint16_t fold_mask = folded_masks[node_id];
+    FlatNode node = nodes[node_id];
+
+    // payoff — identical to vcfr_np4_lone_main.
+    int c_t = contributions[node_id * uint(np) + uint(traverser)];
+    float traverser_stake = float(p.starting_pot) / float(np) + float(c_t);
+    bool traverser_folded = (fold_mask & (uint16_t)(1u << traverser)) != 0;
+    bool flop_seen = (node.board_state != 3);
+    float eff_rake_rate = flop_seen ? p.rake_rate : 0.0f;
+    float eff_rake_cap  = flop_seen ? p.rake_cap  : 0.0f;
+    int total_pot = p.starting_pot;
+    for (int q = 0; q < np; q++) total_pot += contributions[node_id * uint(np) + uint(q)];
+    int min_contrib = contributions[node_id * uint(np) + 0u];
+    for (int q = 1; q < np; q++) { int c = contributions[node_id * uint(np) + uint(q)]; if (c < min_contrib) min_contrib = c; }
+    int num_main = 0;
+    for (int q = 0; q < np; q++) if (contributions[node_id * uint(np) + uint(q)] >= min_contrib) num_main++;
+    int main_pot_amount = min_contrib * num_main + p.starting_pot;
+    float rake = fmax(0.0f, fmin(float(main_pot_amount) * eff_rake_rate, eff_rake_cap));
+    float payoff = traverser_folded ? (-traverser_stake) : ((float(total_pot) - rake) - traverser_stake);
+
+    Np4cfCtx x;
+    x.t = tab + size_t(ti) * NP4CF_STRIDE;
+    x.ra = np4_opp_reach(reach, node_id, np, nh, traverser, 0);
+    x.rb = np4_opp_reach(reach, node_id, np, nh, traverser, 1);
+    x.rc = np4_opp_reach(reach, node_id, np, nh, traverser, 2);
+    x.p2h = p2h;
+    x.h1 = hand_cards[h * 2];
+    x.h2 = hand_cards[h * 2 + 1];
+    x.hp = p2h[x.h1 * 52 + x.h2];
+    x.wa = (x.hp >= 0) ? x.ra[x.hp] : 0.0f;
+
+    // add-back scalar features of the h-pair hand (computed once).
+    float hp_sk[13];
+    if (x.wa != 0.0f) np4cf_sk_feats(x.t, x.rb, x.rc, x.hp, x.h1, x.h2, hp_sk);
+    else for (int k = 0; k < 13; k++) hp_sk[k] = 0.0f;
+
+    const device float* t = x.t;
+    int h1 = x.h1, h2 = x.h2;
+    int xs[2] = { h1, h2 };
+    float pbhh = np4cf_pr(x.rb, p2h, h1, h2);
+    float pchh = np4cf_pr(x.rc, p2h, h1, h2);
+
+    float n_r = np4cf_rsk(x, SKN, hp_sk);
+
+    // ── S_part ──
+    float ab = t[NP4CF_GS + 0] - t[NP4CF_PB + h1] - t[NP4CF_PB + h2] + pbhh;
+    float ac = t[NP4CF_GS + 1] - t[NP4CF_PC + h1] - t[NP4CF_PC + h2] + pchh;
+    float sb_sum = np4cf_rsk(x, SKQB, hp_sk) - np4cf_rsk(x, SKUB, hp_sk);
+    float sc_sum = np4cf_rsk(x, SKQC, hp_sk) - np4cf_rsk(x, SKUC, hp_sk);
+    for (int i = 0; i < 2; i++) {
+        sb_sum += np4cf_rvk(x, VKYB, xs[i]);
+        sc_sum += np4cf_rvk(x, VKYC, xs[i]);
+    }
+    float cross = np4cf_rsk(x, SKQBQC, hp_sk) - np4cf_rsk(x, SKQBUC, hp_sk)
+                - np4cf_rsk(x, SKUBQC, hp_sk) + np4cf_rsk(x, SKUBUC, hp_sk);
+    for (int i = 0; i < 2; i++) {
+        cross += np4cf_rvk(x, VKQBYC, xs[i]);
+        cross -= np4cf_rvk(x, VKUBYC, xs[i]);
+        cross += np4cf_rvk(x, VKYBQC, xs[i]);
+        cross -= np4cf_rvk(x, VKYBUC, xs[i]);
+    }
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            cross += np4cf_rmk(x, MKTYY, xs[i], xs[j]);
+    float s_part = ab * ac * n_r + ab * sc_sum + ac * sb_sum + cross;
+
+    // ── B_part ──
+    float tbcx = t[NP4CF_GS + 3] - t[NP4CF_BCC + h1] - t[NP4CF_BCC + h2] + pbhh * pchh;
+    float b_part = tbcx * n_r + np4cf_rsk(x, SKQBQC, hp_sk) - np4cf_rsk(x, SKVBC, hp_sk);
+    for (int i = 0; i < 2; i++) b_part += np4cf_rvk(x, VKWBC, xs[i]);
+
+    // ── D_part ──
+    // ΦBX(c) = Σ_{e∈X} pB(c,e): for c=h1 → pB(h1,h2); c=h2 → pB(h2,h1).
+    float phib[2] = { pbhh, pbhh };
+    float phic[2] = { pchh, pchh };
+    float dx = t[NP4CF_GS + 2]; // G0
+    for (int i = 0; i < 2; i++) dx -= t[NP4CF_PB + xs[i]] * t[NP4CF_PC + xs[i]];
+    for (int i = 0; i < 2; i++) dx -= t[NP4CF_G1 + xs[i]];
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            dx += t[NP4CF_PB + xs[j]] * np4cf_pr(x.rc, p2h, xs[j], xs[i])
+                + t[NP4CF_PC + xs[j]] * np4cf_pr(x.rb, p2h, xs[j], xs[i]);
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            dx += t[NP4CF_G2 + xs[i] * 52 + xs[j]];
+    for (int i = 0; i < 2; i++) dx -= phib[i] * phic[i];
+
+    float d_part = dx * n_r;
+    d_part -= np4cf_rsk(x, SKDP, hp_sk);
+    d_part -= np4cf_rsk(x, SKG1, hp_sk);
+    for (int i = 0; i < 2; i++) d_part += np4cf_rvk(x, VKKAP, xs[i]);
+    for (int i = 0; i < 2; i++) {
+        d_part += t[NP4CF_PB + xs[i]] * np4cf_rvk(x, VKYC, xs[i])
+                + t[NP4CF_PC + xs[i]] * np4cf_rvk(x, VKYB, xs[i]);
+    }
+    d_part += np4cf_rsk(x, SKUBQC, hp_sk) + np4cf_rsk(x, SKQBUC, hp_sk);
+    for (int i = 0; i < 2; i++) {
+        d_part += np4cf_rvk(x, VKROW, xs[i]);
+        d_part += np4cf_rvk(x, VKCOL, xs[i]);
+    }
+    d_part += np4cf_rsk(x, SKG2G, hp_sk);
+    for (int i = 0; i < 2; i++) {
+        d_part -= phib[i] * np4cf_rvk(x, VKYC, xs[i]);
+        d_part -= phic[i] * np4cf_rvk(x, VKYB, xs[i]);
+        d_part -= np4cf_rmk(x, MKTYY, xs[i], xs[i]);
+    }
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            d_part -= np4cf_rmk(x, MKZSAME, xs[i], xs[j]);
+    for (int i = 0; i < 2; i++) {
+        d_part -= np4cf_rvk(x, VKYBQC, xs[i]);
+        d_part -= np4cf_rvk(x, VKQBYC, xs[i]);
+    }
+    d_part -= 2.0f * np4cf_rsk(x, SKQBQC, hp_sk);
+
+    float mass = s_part + b_part - d_part;
+    float v = payoff * mass;
+    cfv[node_id * uint(nh) + uint(h)] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
+}
