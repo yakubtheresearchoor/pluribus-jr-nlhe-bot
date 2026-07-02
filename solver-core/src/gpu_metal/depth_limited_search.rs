@@ -41,7 +41,7 @@ pub struct GpuSearchCfg {
 
 impl Default for GpuSearchCfg {
     fn default() -> Self {
-        Self { iters: 300, sample_m: 500, seed: 0x5EED, factored_terminals: true, lambda: 0.0, budget_ms: 9_000 }
+        Self { iters: 300, sample_m: 500, seed: 0x5EED, factored_terminals: true, lambda: 0.0, budget_ms: 16_000 }
     }
 }
 

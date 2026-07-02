@@ -1087,7 +1087,7 @@ fn try_gpu_search(
     // budget_ms: HARD runaway guard — a deep multiway tree must stop at the
     // real-time budget (matches the CPU path's adaptive trim), and an orphaned
     // solve (client disconnect) dies within it instead of pinning the GPU.
-    let gcfg = GpuSearchCfg { iters: cfg.iters, sample_m: cfg.sample_m, seed: cfg.seed, factored_terminals: true, lambda: cfg.lambda, budget_ms: 9_000 };
+    let gcfg = GpuSearchCfg { iters: cfg.iters, sample_m: cfg.sample_m, seed: cfg.seed, factored_terminals: true, lambda: cfg.lambda, budget_ms: 16_000 };
     Some(gpu_search_street_strat(ctx, tree, bp.game.table(), &bp.bk, cont, &reach, &gcfg))
 }
 

@@ -659,7 +659,7 @@ fn try_gpu_hu_turn_resolve(
         factored_terminals: false, lambda: 0.0,
         // Hard runaway guard (see GpuSearchCfg::budget_ms) — the HU turn normally
         // finishes ~5s; this only bites if something degenerates.
-        budget_ms: 9_000,
+        budget_ms: 16_000,
     };
     let (hand_cards, strat_map) =
         gpu_hu_turn_strat(ctx, &req.board, &tree, &reach, 200, true, &gcfg);
