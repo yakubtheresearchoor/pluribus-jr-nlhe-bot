@@ -150,3 +150,54 @@ fn gpu_np4_full_scale_bench() {
     eprintln!("live-4 per-iter (np4 fast terminals, no continuation): {per_iter_ms:.1} ms/iter");
     eprintln!("  -> 150 iters = {:.1}s, 300 iters = {:.1}s", per_iter_ms * 150.0 / 1000.0, per_iter_ms * 300.0 / 1000.0);
 }
+
+/// SUSTAINED-LOAD SAFETY SOAK: recreate the panic conditions deliberately —
+/// concurrent live-4 GPU solves back-to-back for ~90s through the shared
+/// context (per-solve queues). Pass criteria: completes (no deadlock), and the
+/// machine survives (the old failure was a WindowServer-starvation kernel
+/// panic; with ~15-20ms max dispatches the compositor interleaves fine).
+#[test]
+#[ignore = "90s GPU soak. Run on demand, watch the machine stays responsive."]
+fn gpu_np4_sustained_load_soak() {
+    use solver_core::gpu_metal::shared_context;
+    use solver_core::tree::action::{production_game_v1, BetCap};
+    let np = 4u8;
+    let board: Vec<Card> = vec![3, 19, 35];
+    let canonical = [board[0], board[1], board[2]];
+    let (turns, river_decks) = solver_core::blueprint::runout_grid(canonical, 12, 12);
+    let turns_u8: Vec<u8> = turns.iter().map(|&c| c as u8).collect();
+    let table = std::sync::Arc::new(FlopChanceTable::build_full_nh_sampled(canonical, np, &turns_u8, &river_decks));
+    let spec = production_game_v1();
+    let mut cfg = spec.street_seam_config(BoardState::Flop, np, 6, 24,
+        BetSizeOptions { bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)], raise: vec![BetSize::PotRelative(1.0)] });
+    cfg.max_bets_per_street = BetCap::all(3);
+    let tree = std::sync::Arc::new(build_tree_depth_limited(&cfg).expect("tree"));
+    let lone: std::sync::Arc<Vec<u32>> = std::sync::Arc::new((0..tree.num_nodes())
+        .filter(|&n| tree.nodes[n].is_terminal())
+        .filter(|&n| { let fm = tree.get_folded_mask(n);
+            (0..np).filter(|&p| fm & (1 << p) == 0).count() <= 1 })
+        .map(|n| n as u32).collect());
+
+    let t0 = std::time::Instant::now();
+    let handles: Vec<_> = (0..2).map(|wi| {
+        let table = table.clone(); let tree = tree.clone(); let lone = lone.clone();
+        std::thread::spawn(move || {
+            let ctx = shared_context().expect("Metal");
+            let nh = table.num_valid;
+            let (sos, soi, sps, spi, _) = table.sorted_opp_arrays_base();
+            let iw: Vec<Vec<f32>> = (0..4).map(|p| table.initial_weights[p].clone()).collect();
+            let mut solves = 0u32;
+            while t0.elapsed().as_secs() < 90 {
+                let mut gpu = MetalVectorCfr::new(ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, table.num_combinations);
+                gpu.set_fast_lone_terminals_ex(ctx, &lone, true);
+                let ran = gpu.run_batched_budget(ctx, &tree, 150, 16_000);
+                solves += 1;
+                eprintln!("[worker {wi}] solve #{solves}: ran {ran} iters, t={:.0}s", t0.elapsed().as_secs_f32());
+            }
+            solves
+        })
+    }).collect();
+    let total: u32 = handles.into_iter().map(|h| h.join().expect("worker")).sum();
+    eprintln!("soak complete: {total} concurrent live-4 solves in {:.0}s — no deadlock, machine alive", t0.elapsed().as_secs_f32());
+    assert!(total >= 8, "expected sustained throughput, got {total} solves");
+}
