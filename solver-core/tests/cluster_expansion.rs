@@ -1212,3 +1212,49 @@ fn kernel_shape_matches_generic_trees() {
     }
     eprintln!("kernel-shape (star, path4, truncated assembly) vs generic: worst rel = {worst_shape:.2e}");
 }
+
+/// TRUNCATION LADDER @deck-49: pairs-only (κ2, O(52)/h, FAST) vs trees vs full.
+#[test]
+#[ignore = "slow deck-49"]
+fn mass4_truncation_ladder() {
+    let deck_n = 49usize;
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let graphs4 = connected_graphs(4);
+    let graphs3 = connected_graphs(3);
+    let mut rng = Lcg(0x1ADDE1);
+    let mk = |rng: &mut Lcg| -> Vec<f64> { (0..nh).map(|_| if rng.f()<0.3 {0.0} else {rng.f()}).collect() };
+    let rs: Vec<Vec<f64>> = (0..4).map(|_| mk(&mut rng)).collect();
+    let hs: Vec<usize> = (7..nh).step_by(nh/6).collect();
+    let mut fulls=Vec::new(); let mut pairs=Vec::new(); let mut nok3=Vec::new();
+    for &h in &hs {
+        let hh = hands[h];
+        let kappa = |block: &[usize], mode: u8| -> f64 {
+            let brs: Vec<&[f64]> = block.iter().map(|&i| rs[i].as_slice()).collect();
+            let gp = group_prim(&hands, &brs, hh, deck_n);
+            match block.len() {
+                1 => gp.scalar[1],
+                2 => -w_h_generic(&gp, 2, &[(0,1)], deck_n),
+                3 => if mode==0 {0.0} else { graphs3.iter().map(|e| { let s=if e.len()%2==0 {1.0} else {-1.0}; s*w_h_generic(&gp,3,e,deck_n)}).sum() },
+                _ => if mode<=1 {0.0} else { graphs4.iter().map(|e| { let s=if e.len()%2==0 {1.0} else {-1.0}; s*w_h_generic(&gp,4,e,deck_n)}).sum() },
+            }
+        };
+        let m4 = |mode: u8| -> f64 {
+            set_partitions(4).iter().map(|rgs| {
+                let nb=rgs.iter().cloned().max().unwrap()+1; let mut b=vec![Vec::new();nb];
+                for (i,&x) in rgs.iter().enumerate(){b[x].push(i);}
+                b.iter().map(|bl| kappa(bl,mode)).product::<f64>()
+            }).sum()
+        };
+        fulls.push(m4(2)); pairs.push(m4(0)); nok3.push(m4(1));
+    }
+    // factored = product of singleton totals with NO collision correction
+    let fact: Vec<f64> = hs.iter().map(|&h| {
+        let hh = hands[h];
+        (0..4).map(|i| { let gp=group_prim(&hands,&[rs[i].as_slice()],hh,deck_n); gp.scalar[1] }).product()
+    }).collect();
+    let scale = fulls.iter().cloned().fold(0.0,|a:f64,b| a.max(b.abs()));
+    let w = |xs: &[f64]| xs.iter().zip(&fulls).map(|(x,f)| (x-f).abs()/scale).fold(0.0,f64::max);
+    eprintln!("deck-49 scale-rel vs FULL: factored={:.2e}  pairs-only(κ2)={:.2e}  trees(no-κ4)={:.2e}",
+        w(&fact), w(&pairs), w(&nok3));
+}
