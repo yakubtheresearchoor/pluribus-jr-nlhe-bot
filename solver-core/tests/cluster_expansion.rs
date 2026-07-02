@@ -812,3 +812,131 @@ fn edgevar_basis_matches_distinct() {
     }
     eprintln!("edge-variable (pure-contraction) basis vs distinct evaluator: worst rel = {worst:.2e}");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 4a — TERM PLANS: the tree-independent, kernel-consumable form. Each
+// (connected graph, B-mask) becomes one TermPlan {sign, per-group role masks,
+// per-group incident A-edge variable ids}. Generated ONCE on the CPU (this is
+// the const buffer the Metal kernels interpret). The plan-driven evaluator is
+// gated == w_h_edgevar (itself gated to brute through the full chain).
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Debug)]
+struct TermPlan {
+    sign: f64,
+    nvars: usize,
+    /// per group: (role-subset mask over the BLOCK's roles, incident var ids)
+    groups: Vec<(usize, Vec<usize>)>,
+}
+
+fn gen_term_plans(k: usize, edges: &[(usize, usize)]) -> Vec<TermPlan> {
+    let ne = edges.len();
+    let mut plans = Vec::new();
+    for bmask in 0..(1u32 << ne) {
+        let mut parent: Vec<usize> = (0..k).collect();
+        fn find(p: &mut Vec<usize>, x: usize) -> usize {
+            if p[x] != x { let r = find(p, p[x]); p[x] = r; } p[x]
+        }
+        let mut a_edges: Vec<(usize, usize)> = Vec::new();
+        for (ei, &(u, v)) in edges.iter().enumerate() {
+            if bmask & (1 << ei) != 0 {
+                let (ru, rv) = (find(&mut parent, u), find(&mut parent, v));
+                if ru != rv { parent[ru] = rv; }
+            } else { a_edges.push((u, v)); }
+        }
+        let mut group_of = vec![0usize; k];
+        for v in 0..k { group_of[v] = find(&mut parent, v); }
+        let roots: Vec<usize> = { let mut r = group_of.clone(); r.sort_unstable(); r.dedup(); r };
+        let groups: Vec<(usize, Vec<usize>)> = roots.iter().map(|&root| {
+            let mask = (0..k).filter(|&v| group_of[v] == root).fold(0usize, |m, v| m | (1 << v));
+            let inc: Vec<usize> = a_edges.iter().enumerate()
+                .filter(|(_, &(u, v))| group_of[u] == root || group_of[v] == root)
+                .map(|(ei, _)| ei).collect();
+            (mask, inc)
+        }).collect();
+        plans.push(TermPlan {
+            sign: if bmask.count_ones() % 2 == 0 { 1.0 } else { -1.0 },
+            nvars: a_edges.len(),
+            groups,
+        });
+    }
+    plans
+}
+
+/// Plan-driven W_H eval — EXACTLY the arithmetic the Metal main/prep kernels
+/// run: per plan, sum over per-var cards (h-excluded, unrestricted) of the
+/// product of group factors read via O(1) h-corrected accessors.
+fn w_h_from_plans(
+    gp_full: &GroupPrim, hh: (u8, u8), plans: &[TermPlan], deck_n: usize,
+) -> f64 {
+    let (h1, h2) = (hh.0 as usize, hh.1 as usize);
+    let mut total = 0.0;
+    for plan in plans {
+        let mut cards = vec![usize::MAX; plan.nvars];
+        fn rec(
+            vi: usize, plan: &TermPlan, cards: &mut Vec<usize>, deck_n: usize,
+            gp: &GroupPrim, h1: usize, h2: usize,
+        ) -> f64 {
+            if vi == plan.nvars {
+                let mut v = 1.0;
+                for (mask, inc) in &plan.groups {
+                    let mut s: Vec<usize> = inc.iter().map(|&e| cards[e]).collect();
+                    s.sort_unstable(); s.dedup();
+                    v *= match s.len() {
+                        0 => gp.scalar[*mask] - gp.per_card[*mask][h1] - gp.per_card[*mask][h2]
+                             + gp.pair[*mask][h1 * deck_n + h2],
+                        1 => gp.per_card[*mask][s[0]] - gp.pair[*mask][s[0] * deck_n + h1]
+                             - gp.pair[*mask][s[0] * deck_n + h2],
+                        2 => gp.pair[*mask][s[0] * deck_n + s[1]],
+                        _ => 0.0,
+                    };
+                    if v == 0.0 { return 0.0; }
+                }
+                v
+            } else {
+                let mut acc = 0.0;
+                for c in 0..deck_n {
+                    if c == h1 || c == h2 { continue; }
+                    cards[vi] = c;
+                    acc += rec(vi + 1, plan, cards, deck_n, gp, h1, h2);
+                }
+                cards[vi] = usize::MAX;
+                acc
+            }
+        }
+        total += plan.sign * rec(0, plan, &mut cards, deck_n, gp_full, h1, h2);
+    }
+    total
+}
+
+#[test]
+fn term_plans_match_edgevar() {
+    let deck_n = 10usize;
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let graphs4 = connected_graphs(4);
+    let graphs3 = connected_graphs(3);
+    let mut rng = Lcg(0x9147);
+    let mk = |rng: &mut Lcg| -> Vec<f64> {
+        (0..nh).map(|_| if rng.f() < 0.3 { 0.0 } else { rng.f() }).collect()
+    };
+    let rs: Vec<Vec<f64>> = (0..4).map(|_| mk(&mut rng)).collect();
+    let rr: Vec<&[f64]> = rs.iter().map(|r| r.as_slice()).collect();
+    let gp_full = group_prim(&hands, &rr, (255, 254), deck_n);
+    let mut worst = 0.0f64;
+    let mut nplans = 0usize;
+    for h in (0..nh).step_by(13) {
+        let hh = hands[h];
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-12);
+        for edges in graphs4.iter().chain(graphs3.iter()) {
+            let kk = edges.iter().flat_map(|&(u, v)| [u, v]).max().unwrap() + 1;
+            let plans = gen_term_plans(kk, edges);
+            nplans += plans.len();
+            let a = w_h_from_plans(&gp_full, hh, &plans, deck_n);
+            let b = w_h_edgevar(&gp_full, hh, kk, edges, deck_n);
+            worst = worst.max(rel(a, b));
+            assert!(rel(a, b) < 1e-12, "h={h} {edges:?}");
+        }
+    }
+    eprintln!("term-plan evaluator == edgevar: worst rel = {worst:.2e}; plans/pass = {}", nplans / ((nh + 12) / 13));
+}
