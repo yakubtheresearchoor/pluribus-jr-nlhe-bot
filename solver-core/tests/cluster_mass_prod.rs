@@ -123,3 +123,40 @@ fn fast_cost() {
     let perf=tf.elapsed().as_secs_f64()/n as f64*1000.0;
     eprintln!("fast per-terminal (nh={nh}): {per:.3}ms  vs factored {perf:.3}ms  ratio={:.1}x  (acc {acc:.0})", per/perf.max(1e-6));
 }
+
+#[test]
+fn k23_accuracy_and_cost() {
+    use solver_core::solver::cluster_mass::{mass_cluster_k23_fast, mass_cluster_pairs_fast};
+    // accuracy vs brute at deck-15 (K=4)
+    let deck=15u8; let hc=hands_deck(deck); let nh=hc.len()/2;
+    let mut rng=Lcg(0x23);
+    let rs:Vec<Vec<f32>>=(0..4).map(|_|(0..nh).map(|_| if rng.f()<0.3{0.0}else{rng.f()}).collect()).collect();
+    let refs:Vec<&[f32]>=rs.iter().map(|r|r.as_slice()).collect();
+    let k23=mass_cluster_k23_fast(&refs,&hc,nh);
+    let k2=mass_cluster_pairs_fast(&refs,&hc,nh);
+    let fac=factored_total_reach_product(&refs,&hc,nh);
+    let mut scale=1e-9f64; let mut w23=0.0f64; let mut w2=0.0f64; let mut wf=0.0f64;
+    for h in (0..nh).step_by(4) {
+        let mut b=0.0f64;
+        for g0 in 0..nh { if rs[0][g0]==0.0||!disj(&hc,g0,h){continue;}
+          for g1 in 0..nh { if rs[1][g1]==0.0||!disj(&hc,g1,h)||!disj(&hc,g1,g0){continue;}
+            for g2 in 0..nh { if rs[2][g2]==0.0||!disj(&hc,g2,h)||!disj(&hc,g2,g0)||!disj(&hc,g2,g1){continue;}
+              for g3 in 0..nh { if rs[3][g3]==0.0||!disj(&hc,g3,h)||!disj(&hc,g3,g0)||!disj(&hc,g3,g1)||!disj(&hc,g3,g2){continue;}
+                b+=(rs[0][g0]*rs[1][g1]*rs[2][g2]*rs[3][g3]) as f64; }}}}
+        scale=scale.max(b.abs());
+        w23=w23.max((k23[h] as f64-b).abs()); w2=w2.max((k2[h] as f64-b).abs()); wf=wf.max((fac[h] as f64-b).abs());
+    }
+    eprintln!("deck-15 vs brute (scale-rel): k23={:.3e}  pairs={:.3e}  factored={:.3e}", w23/scale, w2/scale, wf/scale);
+    assert!(w23 < w2, "k23 must beat pairs-only");
+    // cost at production nh
+    let mut hc2=Vec::new(); let dk:Vec<u8>=(0..47).collect();
+    'o: for i in 0..dk.len(){for j in (i+1)..dk.len(){hc2.push(dk[i]);hc2.push(dk[j]); if hc2.len()/2>=1081{break 'o;}}}
+    let nh2=hc2.len()/2; let mut rng2=Lcg(0xC057);
+    let rs2:Vec<Vec<f32>>=(0..4).map(|_|(0..nh2).map(|_| if rng2.f()<0.3{0.0}else{rng2.f()}).collect()).collect();
+    let refs2:Vec<&[f32]>=rs2.iter().map(|r|r.as_slice()).collect();
+    let n=50; let mut acc=0.0f32;
+    let t=std::time::Instant::now();
+    for _ in 0..n { acc+=mass_cluster_k23_fast(&refs2,&hc2,nh2)[0]; }
+    let per=t.elapsed().as_secs_f64()/n as f64*1000.0;
+    eprintln!("k23 per-terminal (nh={nh2}): {per:.3}ms (acc {acc:.0})");
+}
