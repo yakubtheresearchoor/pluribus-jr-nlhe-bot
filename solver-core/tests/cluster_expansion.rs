@@ -940,3 +940,275 @@ fn term_plans_match_edgevar() {
     }
     eprintln!("term-plan evaluator == edgevar: worst rel = {worst:.2e}; plans/pass = {}", nplans / ((nh + 12) / 13));
 }
+
+/// TRUNCATION MEASUREMENT: drop κ4 (the 38-graph quad cluster) — error vs the
+/// full expansion. The cluster series is in collision probability (~8%/pair at
+/// production deck, ~3x larger on the 12-card test deck ⇒ this OVER-estimates).
+#[test]
+fn mass4_truncation_error() {
+    let deck_n = 12usize;
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let graphs4 = connected_graphs(4);
+    let graphs3 = connected_graphs(3);
+    let mut rng = Lcg(0x7241C);
+    let mk = |rng: &mut Lcg| -> Vec<f64> {
+        (0..nh).map(|_| if rng.f() < 0.3 { 0.0 } else { rng.f() }).collect()
+    };
+    let mut worst_noq = 0.0f64;   // drop κ4 entirely
+    let mut worst_tree = 0.0f64;  // κ4 ≈ trees only (|E|=3)
+    for _trial in 0..3 {
+        let rs: Vec<Vec<f64>> = (0..4).map(|_| mk(&mut rng)).collect();
+        for h in (5..nh).step_by(23) {
+            let hh = hands[h];
+            let kappa = |block: &[usize], mode: u8| -> f64 {
+                let brs: Vec<&[f64]> = block.iter().map(|&i| rs[i].as_slice()).collect();
+                let gp = group_prim(&hands, &brs, hh, deck_n);
+                match block.len() {
+                    1 => gp.scalar[1],
+                    2 => -w_h_generic(&gp, 2, &[(0, 1)], deck_n),
+                    3 => graphs3.iter().map(|e| {
+                        let s = if e.len() % 2 == 0 { 1.0 } else { -1.0 };
+                        s * w_h_generic(&gp, 3, e, deck_n)
+                    }).sum(),
+                    _ => match mode {
+                        0 => 0.0, // dropped
+                        1 => graphs4.iter().filter(|e| e.len() == 3).map(|e| -w_h_generic(&gp, 4, e, deck_n)).sum(),
+                        _ => graphs4.iter().map(|e| {
+                            let s = if e.len() % 2 == 0 { 1.0 } else { -1.0 };
+                            s * w_h_generic(&gp, 4, e, deck_n)
+                        }).sum(),
+                    },
+                }
+            };
+            let m4 = |mode: u8| -> f64 {
+                set_partitions(4).iter().map(|rgs| {
+                    let nb = rgs.iter().cloned().max().unwrap() + 1;
+                    let mut blocks = vec![Vec::new(); nb];
+                    for (i, &b) in rgs.iter().enumerate() { blocks[b].push(i); }
+                    blocks.iter().map(|b| kappa(b, mode)).product::<f64>()
+                }).sum()
+            };
+            let full = m4(2);
+            if full.abs() < 1e-9 { continue; }
+            worst_noq = worst_noq.max(((m4(0) - full) / full).abs());
+            worst_tree = worst_tree.max(((m4(1) - full) / full).abs());
+        }
+    }
+    eprintln!("mass4 truncation @deck-12 (over-estimates production): drop-κ4 worst rel = {worst_noq:.4}; κ4≈trees-only worst rel = {worst_tree:.4}");
+}
+
+/// PRODUCTION-SCALE truncation: deck 49 (river-ish unseen count), SCALE-relative
+/// metric (|err| / max_h |full| — the repo's parity convention; per-hand
+/// relative explodes at cancellation points and is not what CFR feels).
+#[test]
+#[ignore = "slow: full 38-graph eval at deck-49 for sampled hands"]
+fn mass4_truncation_production_deck() {
+    let deck_n = 49usize;
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let graphs4 = connected_graphs(4);
+    let graphs3 = connected_graphs(3);
+    let mut rng = Lcg(0x9210D);
+    let mk = |rng: &mut Lcg| -> Vec<f64> {
+        (0..nh).map(|_| if rng.f() < 0.3 { 0.0 } else { rng.f() }).collect()
+    };
+    let rs: Vec<Vec<f64>> = (0..4).map(|_| mk(&mut rng)).collect();
+    let hs: Vec<usize> = (7..nh).step_by(nh / 6).collect();
+    let mut fulls = Vec::new();
+    let mut noqs = Vec::new();
+    let mut trees = Vec::new();
+    for &h in &hs {
+        let hh = hands[h];
+        let kappa = |block: &[usize], mode: u8| -> f64 {
+            let brs: Vec<&[f64]> = block.iter().map(|&i| rs[i].as_slice()).collect();
+            let gp = group_prim(&hands, &brs, hh, deck_n);
+            match block.len() {
+                1 => gp.scalar[1],
+                2 => -w_h_generic(&gp, 2, &[(0, 1)], deck_n),
+                3 => graphs3.iter().map(|e| {
+                    let s = if e.len() % 2 == 0 { 1.0 } else { -1.0 };
+                    s * w_h_generic(&gp, 3, e, deck_n)
+                }).sum(),
+                _ => match mode {
+                    0 => 0.0,
+                    1 => graphs4.iter().filter(|e| e.len() == 3).map(|e| -w_h_generic(&gp, 4, e, deck_n)).sum(),
+                    _ => graphs4.iter().map(|e| {
+                        let s = if e.len() % 2 == 0 { 1.0 } else { -1.0 };
+                        s * w_h_generic(&gp, 4, e, deck_n)
+                    }).sum(),
+                },
+            }
+        };
+        let m4 = |mode: u8| -> f64 {
+            set_partitions(4).iter().map(|rgs| {
+                let nb = rgs.iter().cloned().max().unwrap() + 1;
+                let mut blocks = vec![Vec::new(); nb];
+                for (i, &b) in rgs.iter().enumerate() { blocks[b].push(i); }
+                blocks.iter().map(|b| kappa(b, mode)).product::<f64>()
+            }).sum()
+        };
+        fulls.push(m4(2)); noqs.push(m4(0)); trees.push(m4(1));
+    }
+    let scale = fulls.iter().cloned().fold(0.0f64, |a, b| a.max(b.abs()));
+    let w = |xs: &[f64]| xs.iter().zip(&fulls).map(|(x, f)| (x - f).abs() / scale).fold(0.0f64, f64::max);
+    eprintln!("deck-49 SCALE-relative truncation: drop-κ4 = {:.2e}; κ4≈trees = {:.2e}  ({} hands sampled)",
+        w(&noqs), w(&trees), hs.len());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL-SHAPE reference for the TRUNCATED (κ4 ≈ trees) mass4 — the exact
+// per-(terminal,hand) algorithm the Metal kernel ports literally:
+//   mass4_trees(h) = Σ_{15 partitions} Π κ,  κ4 = −Σ_{16 trees} W_tree
+// New shapes beyond κ3 (both gated vs the generic evaluator):
+//   W_star(j; i,k,l)   = Σ_{g⊥h} r_j[g]·X_i(g)·X_k(g)·X_l(g)      (O(nh) loop)
+//   W_path4(i-j-k-l)   = Σ_c U_{j,i}(c)·U_{k,l}(c) − Σ_{g⊥h} r_j r_k X_i X_l
+//     where U_{j,i}(c) = Σ_{g∋c,g⊥h} r_j[g]·X_i(g)   (the A−B edge pattern
+//     applied to the middle edge (j,k); share-2 hands corrected by the loop).
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn xval(p: &Prim, r: &[f64], g: usize, a: usize, b: usize) -> f64 {
+    p.pm[a] + p.pm[b] - r[g]
+}
+
+fn w_star(hands: &[(u8, u8)], hh: (u8, u8), rj: &[f64], pi: &Prim, pk: &Prim, pl: &Prim,
+          ri: &[f64], rk: &[f64], rl: &[f64]) -> f64 {
+    let mut v = 0.0;
+    for (g, &(a, b)) in hands.iter().enumerate() {
+        if rj[g] == 0.0 || !disjoint((a, b), hh) { continue; }
+        let (a, b) = (a as usize, b as usize);
+        v += rj[g] * xval(pi, ri, g, a, b) * xval(pk, rk, g, a, b) * xval(pl, rl, g, a, b);
+    }
+    v
+}
+
+fn w_path4(hands: &[(u8, u8)], hh: (u8, u8), deck_n: usize,
+           ri: &[f64], rj: &[f64], rk: &[f64], rl: &[f64],
+           pi: &Prim, pl: &Prim) -> f64 {
+    // U_{j,i}[c] = Σ_{g∋c, g⊥h} r_j[g]·X_i(g);  V analog for (k,l).
+    let mut u = vec![0.0f64; deck_n];
+    let mut w = vec![0.0f64; deck_n];
+    let mut share2 = 0.0f64;
+    for (g, &(a, b)) in hands.iter().enumerate() {
+        if !disjoint((a, b), hh) { continue; }
+        let (a, b) = (a as usize, b as usize);
+        let xi = xval(pi, ri, g, a, b);
+        let xl = xval(pl, rl, g, a, b);
+        if rj[g] != 0.0 {
+            u[a] += rj[g] * xi;
+            u[b] += rj[g] * xi;
+        }
+        if rk[g] != 0.0 {
+            w[a] += rk[g] * xl;
+            w[b] += rk[g] * xl;
+        }
+        share2 += rj[g] * rk[g] * xi * xl;
+    }
+    let mut v = 0.0;
+    for c in 0..deck_n { v += u[c] * w[c]; }
+    v - share2
+}
+
+/// The truncated assembly, kernel-shaped (per-h Prim tables + closed forms).
+fn mass4_trees_kernel(
+    hands: &[(u8, u8)], deck_n: usize, h: usize, rs: &[Vec<f64>],
+) -> f64 {
+    let hh = hands[h];
+    let prims: Vec<Prim> = (0..4).map(|i| prim(hands, &rs[i], hh, deck_n)).collect();
+    let s = |i: usize| prims[i].s;
+    let c_pair = |i: usize, j: usize| closed_c(hands, &rs[i], &rs[j], &prims[i], &prims[j], hh, deck_n);
+    let k3 = |i: usize, j: usize, k: usize| -> f64 {
+        let wp = |ctr: usize, x: usize, y: usize| closed_w_path(hands, &rs[ctr], &prims[x], &prims[y], &rs[x], &rs[y], hh);
+        let wt = closed_w_tri(hands, [&rs[i], &rs[j], &rs[k]], [&prims[i], &prims[j], &prims[k]], hh, deck_n);
+        wp(i, j, k) + wp(j, i, k) + wp(k, i, j) - wt
+    };
+    // κ4 ≈ −Σ trees: 4 stars (center m) + 12 labeled paths (i-j-k-l, unordered ends)
+    let mut k4 = 0.0f64;
+    for ctr in 0..4usize {
+        let leaves: Vec<usize> = (0..4).filter(|&x| x != ctr).collect();
+        k4 -= w_star(hands, hh, &rs[ctr], &prims[leaves[0]], &prims[leaves[1]], &prims[leaves[2]],
+                     &rs[leaves[0]], &rs[leaves[1]], &rs[leaves[2]]);
+    }
+    // paths: choose the middle EDGE (j,k) ordered pair j<k? Labeled paths i-j-k-l:
+    // middle pair {j,k} (6 choices) × assignment of the remaining two as ends (2) = 12.
+    for j in 0..4usize {
+        for k in (j + 1)..4 {
+            let rest: Vec<usize> = (0..4).filter(|&x| x != j && x != k).collect();
+            for (i, l) in [(rest[0], rest[1]), (rest[1], rest[0])] {
+                // path i - j - k - l (edges (i,j),(j,k),(k,l))
+                k4 -= w_path4(hands, hh, deck_n, &rs[i], &rs[j], &rs[k], &rs[l], &prims[i], &prims[l]);
+            }
+        }
+    }
+    // 15-partition assembly
+    let kappa = |block: &[usize]| -> f64 {
+        match block.len() {
+            1 => s(block[0]),
+            2 => -c_pair(block[0], block[1]),
+            3 => k3(block[0], block[1], block[2]),
+            _ => k4,
+        }
+    };
+    set_partitions(4).iter().map(|rgs| {
+        let nb = rgs.iter().cloned().max().unwrap() + 1;
+        let mut blocks = vec![Vec::new(); nb];
+        for (i, &b) in rgs.iter().enumerate() { blocks[b].push(i); }
+        blocks.iter().map(|b| kappa(b)).product::<f64>()
+    }).sum()
+}
+
+#[test]
+fn kernel_shape_matches_generic_trees() {
+    let deck_n = 12usize;
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let graphs4 = connected_graphs(4);
+    let graphs3 = connected_graphs(3);
+    let mut rng = Lcg(0x5487E);
+    let mk = |rng: &mut Lcg| -> Vec<f64> {
+        (0..nh).map(|_| if rng.f() < 0.3 { 0.0 } else { rng.f() }).collect()
+    };
+    let rs: Vec<Vec<f64>> = (0..4).map(|_| mk(&mut rng)).collect();
+    let mut worst_shape = 0.0f64;
+    for h in (0..nh).step_by(9) {
+        let hh = hands[h];
+        // per-shape gates: W_star and W_path4 vs generic single-graph evals
+        let gp4 = group_prim(&hands, &[&rs[0], &rs[1], &rs[2], &rs[3]], hh, deck_n);
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-9);
+        // star center 1: edges (0,1),(1,2),(1,3)
+        let prims: Vec<Prim> = (0..4).map(|i| prim(&hands, &rs[i], hh, deck_n)).collect();
+        let gs = w_h_generic(&gp4, 4, &[(0, 1), (1, 2), (1, 3)], deck_n);
+        let ks = w_star(&hands, hh, &rs[1], &prims[0], &prims[2], &prims[3], &rs[0], &rs[2], &rs[3]);
+        worst_shape = worst_shape.max(rel(ks, gs));
+        assert!(rel(ks, gs) < 1e-10, "star: {ks} vs {gs}");
+        // path 0-1-2-3: edges (0,1),(1,2),(2,3)
+        let gpp = w_h_generic(&gp4, 4, &[(0, 1), (1, 2), (2, 3)], deck_n);
+        let kp = w_path4(&hands, hh, deck_n, &rs[0], &rs[1], &rs[2], &rs[3], &prims[0], &prims[3]);
+        worst_shape = worst_shape.max(rel(kp, gpp));
+        assert!(rel(kp, gpp) < 1e-10, "path4: {kp} vs {gpp}");
+        // full truncated assembly vs generic trees-mode
+        let kappa_g = |block: &[usize]| -> f64 {
+            let brs: Vec<&[f64]> = block.iter().map(|&i| rs[i].as_slice()).collect();
+            let gp = group_prim(&hands, &brs, hh, deck_n);
+            match block.len() {
+                1 => gp.scalar[1],
+                2 => -w_h_generic(&gp, 2, &[(0, 1)], deck_n),
+                3 => graphs3.iter().map(|e| {
+                    let sg = if e.len() % 2 == 0 { 1.0 } else { -1.0 };
+                    sg * w_h_generic(&gp, 3, e, deck_n)
+                }).sum(),
+                _ => graphs4.iter().filter(|e| e.len() == 3).map(|e| -w_h_generic(&gp, 4, e, deck_n)).sum(),
+            }
+        };
+        let m_g: f64 = set_partitions(4).iter().map(|rgs| {
+            let nb = rgs.iter().cloned().max().unwrap() + 1;
+            let mut blocks = vec![Vec::new(); nb];
+            for (i, &b) in rgs.iter().enumerate() { blocks[b].push(i); }
+            blocks.iter().map(|b| kappa_g(b)).product::<f64>()
+        }).sum();
+        let m_k = mass4_trees_kernel(&hands, deck_n, h, &rs);
+        worst_shape = worst_shape.max(rel(m_k, m_g));
+        assert!(rel(m_k, m_g) < 1e-9, "assembly h={h}: {m_k} vs {m_g}");
+    }
+    eprintln!("kernel-shape (star, path4, truncated assembly) vs generic: worst rel = {worst_shape:.2e}");
+}
