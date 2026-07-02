@@ -511,16 +511,32 @@ impl MetalVectorCfr {
         num_iterations: u32,
         budget_ms: u64,
     ) -> u32 {
-        const CHUNK: u32 = 25;
         let start = std::time::Instant::now();
         let mut done = 0u32;
+        // ADAPTIVE first probe: run ONE iteration and time it before committing
+        // any batch. A fixed first chunk is unbounded in wall-clock — a deep
+        // multiway tree at ~seconds/iter turned "25 iters then check" into a
+        // multi-minute GPU pin (the fleet incident). One iter bounds the initial
+        // exposure to a single iteration's cost, then chunks are sized from the
+        // measured rate so each stays ~1s of GPU work (frequent budget checks,
+        // small overrun).
+        if num_iterations == 0 {
+            return 0;
+        }
+        self.run_batched(ctx, tree, 1);
+        done += 1;
+        let per_iter_ms = (start.elapsed().as_millis() as u64).max(1);
         while done < num_iterations {
-            let n = CHUNK.min(num_iterations - done);
-            self.run_batched(ctx, tree, n); // commits n iters + flushes (autoreleasepool inside)
-            done += n;
-            if start.elapsed().as_millis() as u64 >= budget_ms {
+            let remaining_ms = budget_ms.saturating_sub(start.elapsed().as_millis() as u64);
+            if remaining_ms < per_iter_ms {
                 break;
             }
+            // ~1s of GPU work per chunk (min 1, max 25 iters), bounded by budget.
+            let by_time = (1_000 / per_iter_ms).clamp(1, 25) as u32;
+            let by_budget = (remaining_ms / per_iter_ms).max(1) as u32;
+            let n = by_time.min(by_budget).min(num_iterations - done);
+            self.run_batched(ctx, tree, n);
+            done += n;
         }
         done
     }
