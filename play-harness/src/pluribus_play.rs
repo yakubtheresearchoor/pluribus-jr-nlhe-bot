@@ -257,7 +257,7 @@ pub fn play_seam_pluribus(
             for n in 0..tree.num_nodes() {
                 if tree.nodes[n].is_player() && tree.nodes[n].board_state == street_u8 {
                     let na = tree.nodes[n].num_children as usize;
-                    m.insert(n, s.get_average_strategy(n, na, nh));
+                    m.insert(n, s.get_average_strategy_fb(n, na, nh, tree.nodes[n].player_id));
                 }
             }
             Some(m)
@@ -686,6 +686,42 @@ pub fn flop_search_k4(
 /// Run ONE per-street search and extract the strategy for `street_u8` nodes.
 /// `overrides` = per-subgame-seat reach overrides (paired-bot shared info).
 #[allow(clippy::too_many_arguments)]
+
+/// SUBGAME ROOTING: freeze the OBSERVED street-action prefix to probability 1
+/// so every solve iteration trains the ACTUAL line. Without this, equilibrium
+/// range-checking leaves facing-bet subtrees off-path/under-trained (measured:
+/// trash hands read UNIFORM facing 6-way pot bets — worse than pot-odds).
+/// Matching mirrors api::walk_to_node (label → class → non-fold; nearest
+/// amount) so the solve trains exactly the node the read will land on.
+fn freeze_prefix(solver: &mut CpuMccfr, tree: &FlatTree, nh: usize, prefix: &[(u8, u32)]) {
+    let class = |l: u8| -> u8 { match l { 0 => 0, 1 | 2 => 1, _ => 2 } };
+    let mut node = 0usize;
+    for &(label, to_total) in prefix {
+        if !tree.nodes[node].is_player() { break; }
+        let children = tree.node_children(node).to_vec();
+        let lbl = |i: usize| tree.nodes[children[i] as usize].action_label;
+        let mut cands: Vec<usize> = (0..children.len()).filter(|&i| lbl(i) == label).collect();
+        if cands.is_empty() {
+            cands = (0..children.len()).filter(|&i| class(lbl(i)) == class(label)).collect();
+        }
+        if cands.is_empty() {
+            cands = (0..children.len()).filter(|&i| label == 0 || lbl(i) != 0).collect();
+        }
+        let pick = match cands.len() {
+            0 => break,
+            1 => cands[0],
+            _ => *cands.iter().min_by_key(|&&i| {
+                (tree.nodes[children[i] as usize].amount - to_total as i32).abs()
+            }).unwrap(),
+        };
+        let na = children.len();
+        let mut one_hot = vec![0.0f32; na * nh];
+        for h in 0..nh { one_hot[pick * nh + h] = 1.0; }
+        solver.freeze_node(node, &one_hot);
+        node = children[pick] as usize;
+    }
+}
+
 pub fn search_street_strat(
     bp: &Blueprint,
     tree: &FlatTree,
@@ -696,6 +732,7 @@ pub fn search_street_strat(
     cfg: &SearchCfg,
     seed_salt: u64,
     overrides: &[(usize, Vec<f32>)],
+    prefix: &[(u8, u32)],
 ) -> HashMap<usize, Vec<Vec<f32>>> {
     let nh = bp.nh;
     let mut game =
@@ -717,6 +754,9 @@ pub fn search_street_strat(
     let par = cfg.par.unwrap_or_else(|| std::env::var("PAR").is_ok());
     if par {
         s.enable_parallel();
+    }
+    if !prefix.is_empty() {
+        freeze_prefix(&mut s, tree, nh, prefix);
     }
     s.run(tree, &game, cfg.iters);
     let mut m = HashMap::new();
@@ -834,17 +874,17 @@ pub fn play_seam_pair(
         let b_live = live_seats.contains(&bot_b);
         // share=false ⇒ one shared equilibrium search; share=true ⇒ per-bot.
         let strat_shared = if !share && (a_live || b_live) {
-            Some(search_street_strat(bp, &tree, &depth, cont, l, street_u8, cfg, seed_salt, &[]))
+            Some(search_street_strat(bp, &tree, &depth, cont, l, street_u8, cfg, seed_salt, &[], &[]))
         } else {
             None
         };
         let strat_a = if share && a_live {
-            Some(search_street_strat(bp, &tree, &depth, cont, l, street_u8, cfg, seed_salt ^ 0xA, &make_overrides(bot_a, bot_b)))
+            Some(search_street_strat(bp, &tree, &depth, cont, l, street_u8, cfg, seed_salt ^ 0xA, &make_overrides(bot_a, bot_b), &[]))
         } else {
             None
         };
         let strat_b = if share && b_live {
-            Some(search_street_strat(bp, &tree, &depth, cont, l, street_u8, cfg, seed_salt ^ 0xB, &make_overrides(bot_b, bot_a)))
+            Some(search_street_strat(bp, &tree, &depth, cont, l, street_u8, cfg, seed_salt ^ 0xB, &make_overrides(bot_b, bot_a), &[]))
         } else {
             None
         };
@@ -1003,6 +1043,7 @@ pub fn search_decision(
     pot_entry: i32,
     cfg: &SearchCfg,
     reach_priors: &[(usize, Vec<f32>)],
+    prefix: &[(u8, u32)],
 ) -> Option<(FlatTree, std::collections::HashMap<usize, Vec<Vec<f32>>>)> {
     let nh = bp.nh;
     let hc = &bp.game.table().hand_cards;
@@ -1080,9 +1121,9 @@ pub fn search_decision(
     let gpu_ok = live <= 4 && matches!(cont, ContStreet::Flop | ContStreet::Turn(_));
     let strat = if gpu_ok && std::env::var("GPU_SEARCH").is_ok() {
         try_gpu_search(bp, &tree, cont, live, &overrides, cfg)
-            .unwrap_or_else(|| search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides))
+            .unwrap_or_else(|| search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides, prefix))
     } else {
-        search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides)
+        search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides, prefix)
     };
     Some((tree, strat))
 }

@@ -427,6 +427,9 @@ pub fn solve_street(
     reach_priors: &[(usize, Vec<f32>)],
 ) -> Option<(FlatTree, std::collections::HashMap<usize, Vec<Vec<f32>>>)> {
     let blockers: Vec<u8> = req.partner_cards.map(|c| c.to_vec()).unwrap_or_default();
+    // SUBGAME ROOTING: the observed street actions are frozen to prob 1 in the
+    // solve, so all iterations train the line actually being played.
+    let prefix: Vec<(u8, u32)> = req.street_actions.iter().map(|a| (a.label, a.to_total)).collect();
     search_decision(
         bp,
         &req.board,
@@ -438,6 +441,7 @@ pub fn solve_street(
         req.pot_entry as i32,
         cfg,
         reach_priors,
+        &prefix,
     )
 }
 

@@ -1143,6 +1143,39 @@ impl CpuMccfr {
         result
     }
 
+    /// Average strategy with a ZERO-REACH FALLBACK: hands whose cumulative
+    /// strategy never accumulated (their own reach at the node is 0 under the
+    /// prior — e.g. trash in a multiway pot the blueprint preflop would never
+    /// produce, yet the REAL loose pool does) read their CURRENT regret-matched
+    /// / QRE strategy instead of uniform. Regrets are COUNTERFACTUAL (weighted
+    /// by opponents' reach), so they are trained regardless of own reach —
+    /// uniform was calling 6-way pot bets with 6-high a third of the time.
+    pub fn get_average_strategy_fb(&self, node_idx: usize, num_actions: usize, nh: usize, player: u8) -> Vec<Vec<f32>> {
+        let offset = self.node_data_offset[node_idx];
+        if offset == UNUSED {
+            return vec![];
+        }
+        let mut result = vec![vec![0.0f32; nh]; num_actions];
+        let mut current: Option<Vec<f32>> = None;
+        for h in 0..nh {
+            let mut total = 0.0f32;
+            for a in 0..num_actions {
+                total += self.cum_strategy[offset + a * nh + h];
+            }
+            if total > 0.0 {
+                for a in 0..num_actions {
+                    result[a][h] = self.cum_strategy[offset + a * nh + h] / total;
+                }
+            } else {
+                let cur = current.get_or_insert_with(|| self.compute_strategy(node_idx, num_actions, nh, player));
+                for a in 0..num_actions {
+                    result[a][h] = cur[a * nh + h];
+                }
+            }
+        }
+        result
+    }
+
     pub fn get_average_strategy(&self, node_idx: usize, num_actions: usize, nh: usize) -> Vec<Vec<f32>> {
         let offset = self.node_data_offset[node_idx];
         if offset == UNUSED {

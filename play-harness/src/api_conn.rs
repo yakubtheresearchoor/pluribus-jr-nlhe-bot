@@ -402,13 +402,13 @@ impl ConnDecider {
         // instant lookup serves it. Flop + turn only (the 49-turn adapter covers
         // live>=6 too); LEAN menu via bets_for_live (MEASURED 203 ms/iter vs 695
         // rich ⇒ 24 iters ≈ 4.9s).
-        // live-6 search DISABLED pending SUBGAME ROOTING (measured 2026-07-02):
-        // the lean-menu search fits budget (203 ms/iter) and value-raises
-        // correctly (trips → allin 1.0 facing a pot bet), but the street-root
-        // solve leaves the facing-bet subtree OFF-PATH (equilibrium range-checks
-        // 6-way) ⇒ trash hands read UNIFORM (~1/3 call with 6-high — worse than
-        // the rollout's pot-odds fold). Enable after the search is rooted at the
-        // observed action line (forced prefix strategies / Bayes-updated root).
+        // live-6 search STILL DISABLED. SUBGAME ROOTING (freeze observed prefix)
+        // is wired but did NOT fix the off-path uniform-trash defect: the search
+        // runs in QRE mode, whose strategy reads ACCUMULATED last_cfv, and a
+        // zero-own-reach hand never accumulates cfv ⇒ QRE returns uniform there
+        // (the get_average_strategy_fb fallback then reads that same uniform).
+        // Real fix = QRE unreached-infoset handling (regret-matched fallback, or
+        // reach-flooring the prior). Filed. live-6 keeps lookup/rollout.
         if req.live == 6 {
             return None;
         }
@@ -440,6 +440,8 @@ impl ConnDecider {
             use std::hash::{Hash, Hasher};
             let mut hs = std::collections::hash_map::DefaultHasher::new();
             for a in &req.preflop_actions { (a.label, a.to_total).hash(&mut hs); }
+            // ROOTED solves are conditioned on the observed street line — key it.
+            for a in &req.street_actions { (a.label, a.to_total).hash(&mut hs); }
             req.seat_positions.hash(&mut hs);
             req.partner_cards.hash(&mut hs);
             req.partner_idx.hash(&mut hs);
