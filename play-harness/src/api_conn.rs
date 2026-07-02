@@ -402,15 +402,17 @@ impl ConnDecider {
         // instant lookup serves it. Flop + turn only (the 49-turn adapter covers
         // live>=6 too); LEAN menu via bets_for_live (MEASURED 203 ms/iter vs 695
         // rich ⇒ 24 iters ≈ 4.9s).
-        // live-6 search STILL DISABLED. SUBGAME ROOTING (freeze observed prefix)
-        // is wired but did NOT fix the off-path uniform-trash defect: the search
-        // runs in QRE mode, whose strategy reads ACCUMULATED last_cfv, and a
-        // zero-own-reach hand never accumulates cfv ⇒ QRE returns uniform there
-        // (the get_average_strategy_fb fallback then reads that same uniform).
-        // Real fix = QRE unreached-infoset handling (regret-matched fallback, or
-        // reach-flooring the prior). Filed. live-6 keeps lookup/rollout.
+        // live-6: search only FACING a bet/raise (first-in range-checks at
+        // equilibrium — the lookup serves it instantly). Lean menu (203 ms/iter),
+        // flop+turn. The off-path defect chain is closed by SUBGAME ROOTING
+        // (observed prefix frozen to prob 1) + the HERO-SEAT PRIOR FLOOR in
+        // reach_priors (zero-prior hands got no cfv anywhere ⇒ QRE uniform;
+        // probe-validated: trash folds 0.999, trips raise 0.75 facing pot bets).
         if req.live == 6 {
-            return None;
+            let facing = req.street_actions.iter().any(|a| matches!(a.label, 3 | 4 | 5));
+            if !facing || req.board.len() > 4 {
+                return None;
+            }
         }
         // live-5 searches FLOP + TURN (the adapter now carries the FULL 49-turn
         // grid, so any real turn card resolves exactly). RIVER stays on the
@@ -485,6 +487,31 @@ impl ConnDecider {
     /// actions (raiser ≠ caller). Otherwise the SYMMETRIC v1 "continuing range"
     /// (per-class non-fold mass at the open) for every seat.
     pub fn reach_priors(&self, req: &DecideRequest, bp: &Blueprint) -> Vec<(usize, Vec<f32>)> {
+        let mut priors = self.reach_priors_raw(req, bp);
+        // HERO-SEAT PRIOR FLOOR (measured 2026-07-02, rooting_probe): a hand
+        // with ZERO own-prior gets NO cfv computed anywhere (terminal evals skip
+        // zero-reach hands), so QRE reads UNIFORM for it — trash called 6-way
+        // pot bets 1/3 of the time. Reality overrides the range model for the
+        // HERO: he is holding the hand, whatever the blueprint thinks — floor
+        // his own prior with ε·max so every hand trains. Opponents' ranges stay
+        // tight (the Bayes value). ε=1e-3 perturbs the equilibrium negligibly.
+        let hero = req.hero_idx as usize;
+        for (seat, reach) in priors.iter_mut() {
+            if *seat != hero {
+                continue;
+            }
+            let mx = reach.iter().cloned().fold(0.0f32, f32::max);
+            let floor = (mx * 1e-3).max(f32::MIN_POSITIVE);
+            for r in reach.iter_mut() {
+                if *r < floor {
+                    *r = floor;
+                }
+            }
+        }
+        priors
+    }
+
+    fn reach_priors_raw(&self, req: &DecideRequest, bp: &Blueprint) -> Vec<(usize, Vec<f32>)> {
         let hc = &bp.game.table().hand_cards;
         let nh = bp.nh;
         let live = req.live as usize;
