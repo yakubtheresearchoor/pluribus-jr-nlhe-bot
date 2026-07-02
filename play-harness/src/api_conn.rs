@@ -358,6 +358,16 @@ impl ConnDecider {
     /// blueprint's buckets (Pluribus-style: postflop = search, not lookup). The
     /// connected lookup (preflop + postflop_action_dist) is the baseline/continuation.
     pub fn decide_postflop_search(&self, req: &DecideRequest) -> Option<DecideResponse> {
+        // REAL-TIME SEARCH IS live ≤ 4 ONLY. live-5/6 have no fast path (GPU is
+        // gated ≤4 — no K≥4 factored terminal — and the CPU search at np=5/6 is
+        // a MINUTES-long solve): under fleet load these hung past the client
+        // timeout while HOLDING an admission permit, starving other requests.
+        // Returning None routes live-5/6 to the connected LOOKUP (instant,
+        // blueprint-solved) and, failing that, the equity rollout — the intended
+        // design (live-5/6 = lookup/rollout, not search).
+        if req.live > 4 {
+            return None;
+        }
         let flop_id = req.flop_id as usize;
         let adapter = self.adapter(flop_id, req.live as usize)?;
         let reach_priors = self.reach_priors(req, &adapter.0);
