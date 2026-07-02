@@ -501,3 +501,126 @@ fn cluster_expansion_mass4() {
     }
     eprintln!("K=4 cluster expansion: 38 graphs each gated (worst W_H rel={worst_wh:.2e}); assembled M4 worst rel={worst_m4:.2e}");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 3a — the H-CORRECTION LAYER (what the Metal kernel evaluates):
+// primitives built ONCE on the FULL deck; per-h evaluation via O(1) corrections:
+//   Scalar_m^h    = Scalar_m − PC_m[h1] − PC_m[h2] + PR_m(h1,h2)
+//   PerCard_m^h[c]= PC_m[c] − PR_m(c,h1) − PR_m(c,h2)   (c ∉ {h1,h2})
+//   Pair_m^h(c,d) = PR_m(c,d), 0 if it touches h
+// and the card-tuple sums SKIP h1,h2. Gated against the per-h-rebuilt
+// evaluator (phases 1-2, brute-proven) — this is the kernel's exact math.
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn w_h_generic_fast(
+    gp_full: &GroupPrim, hh: (u8, u8), k: usize, edges: &[(usize, usize)], deck_n: usize,
+) -> f64 {
+    let (h1, h2) = (hh.0 as usize, hh.1 as usize);
+    let pairq = |m: usize, c: usize, d: usize| -> f64 {
+        if c == h1 || c == h2 || d == h1 || d == h2 { 0.0 } else { gp_full.pair[m][c * deck_n + d] }
+    };
+    let ne = edges.len();
+    let mut total = 0.0;
+    for bmask in 0..(1u32 << ne) {
+        let mut parent: Vec<usize> = (0..k).collect();
+        fn find(p: &mut Vec<usize>, x: usize) -> usize {
+            if p[x] != x { let r = find(p, p[x]); p[x] = r; } p[x]
+        }
+        let mut a_edges: Vec<(usize, usize)> = Vec::new();
+        for (ei, &(u, v)) in edges.iter().enumerate() {
+            if bmask & (1 << ei) != 0 {
+                let (ru, rv) = (find(&mut parent, u), find(&mut parent, v));
+                if ru != rv { parent[ru] = rv; }
+            } else { a_edges.push((u, v)); }
+        }
+        let mut group_of = vec![0usize; k];
+        for v in 0..k { group_of[v] = find(&mut parent, v); }
+        let roots: Vec<usize> = { let mut r = group_of.clone(); r.sort_unstable(); r.dedup(); r };
+        let gmask = |root: usize| -> usize {
+            (0..k).filter(|&v| group_of[v] == root).fold(0usize, |m, v| m | (1 << v))
+        };
+        let sign = if bmask.count_ones() % 2 == 0 { 1.0 } else { -1.0 };
+        for part in set_partitions(a_edges.len()) {
+            let nblocks = part.iter().cloned().max().map(|m| m + 1).unwrap_or(0);
+            let mut inc: Vec<Vec<usize>> = vec![Vec::new(); roots.len()];
+            let mut ok = true;
+            for (ei, &(u, v)) in a_edges.iter().enumerate() {
+                let b = part[ei];
+                for vv in [u, v] {
+                    let gi = roots.iter().position(|&r| r == group_of[vv]).unwrap();
+                    if !inc[gi].contains(&b) { inc[gi].push(b); }
+                }
+            }
+            for i in &inc { if i.len() > 2 { ok = false; break; } }
+            if !ok { continue; }
+            let mut cards = vec![usize::MAX; nblocks];
+            #[allow(clippy::too_many_arguments)]
+            fn rec(
+                bi: usize, nblocks: usize, cards: &mut Vec<usize>, deck_n: usize,
+                gp: &GroupPrim, roots: &[usize], inc: &[Vec<usize>],
+                gmask: &dyn Fn(usize) -> usize, h1: usize, h2: usize,
+                pairq: &dyn Fn(usize, usize, usize) -> f64,
+            ) -> f64 {
+                if bi == nblocks {
+                    let mut v = 1.0;
+                    for (gi, &root) in roots.iter().enumerate() {
+                        let m = gmask(root);
+                        v *= match inc[gi].len() {
+                            0 => gp.scalar[m] - gp.per_card[m][h1] - gp.per_card[m][h2]
+                                 + gp.pair[m][h1 * deck_n + h2],
+                            1 => {
+                                let c = cards[inc[gi][0]];
+                                gp.per_card[m][c] - gp.pair[m][c * deck_n + h1] - gp.pair[m][c * deck_n + h2]
+                            }
+                            _ => pairq(m, cards[inc[gi][0]], cards[inc[gi][1]]),
+                        };
+                        if v == 0.0 { return 0.0; }
+                    }
+                    return v;
+                }
+                let mut s = 0.0;
+                for c in 0..deck_n {
+                    if c == h1 || c == h2 || cards[..bi].contains(&c) { continue; }
+                    cards[bi] = c;
+                    s += rec(bi + 1, nblocks, cards, deck_n, gp, roots, inc, gmask, h1, h2, pairq);
+                }
+                cards[bi] = usize::MAX;
+                s
+            }
+            total += sign * rec(0, nblocks, &mut cards, deck_n, gp_full, &roots, &inc, &gmask, h1, h2, &pairq);
+        }
+    }
+    total
+}
+
+#[test]
+fn h_correction_layer_matches_perh() {
+    let deck_n = 12usize;
+    let hands = make_hands(deck_n as u8);
+    let nh = hands.len();
+    let graphs4 = connected_graphs(4);
+    let graphs3 = connected_graphs(3);
+    let mut rng = Lcg(0xFA57_C0);
+    let mk = |rng: &mut Lcg| -> Vec<f64> {
+        (0..nh).map(|_| if rng.f() < 0.3 { 0.0 } else { rng.f() }).collect()
+    };
+    let rs: Vec<Vec<f64>> = (0..4).map(|_| mk(&mut rng)).collect();
+    let rr: Vec<&[f64]> = rs.iter().map(|r| r.as_slice()).collect();
+    // FULL-deck primitives built ONCE (hh = sentinel that blocks nothing).
+    let gp_full = group_prim(&hands, &rr, (255, 254), deck_n);
+
+    let mut worst = 0.0f64;
+    for h in (0..nh).step_by(11) {
+        let hh = hands[h];
+        let gp_perh = group_prim(&hands, &rr, hh, deck_n);
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-12);
+        for edges in graphs4.iter().chain(graphs3.iter()) {
+            let kk = edges.iter().flat_map(|&(u, v)| [u, v]).max().unwrap() + 1;
+            let slow = w_h_generic(&gp_perh, kk, edges, deck_n);
+            let fast = w_h_generic_fast(&gp_full, hh, kk, edges, deck_n);
+            worst = worst.max(rel(fast, slow));
+            assert!(rel(fast, slow) < 1e-10, "h={h} {edges:?}: fast {fast} vs perh {slow}");
+        }
+    }
+    eprintln!("h-correction layer vs per-h rebuild: worst rel = {worst:.2e} (all 42 graphs × sampled h)");
+}
