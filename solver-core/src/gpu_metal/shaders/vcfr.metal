@@ -4489,3 +4489,289 @@ kernel void vcfr_bottom_up_tg_parallel(
         }
     }
 }
+
+// ============================================================================
+// np=4 (K=3 opponents) FACTORED lone-survivor terminal.
+//
+// ALL depth-limited street-tree terminals are lone-survivor folds (a fold only
+// ends the hand at 1 survivor; showdowns live at the continuation leaves), so
+// this kernel family is the live-4 GPU enabler: it replaces the base K>=3
+// per-NODE single-thread path (per-h loop x g0 loop x O(nh) k2 inner =
+// O(nh^3)/node serial — the seconds-long dispatch that starved WindowServer)
+// with one thread per (terminal, hand) at O(nh) each.
+//
+// Math (EXACT, full joint card removal — validated 1e-14 vs brute triple
+// enumeration in solver-core/tests/np4_lone_mass_algebra.rs, whose
+// factored_mass3() is the locked reference this ports LITERALLY):
+//   cfv[h] = payoff * mass3(h) / num_combinations
+//   mass3(h) = sum_{g0 disjoint h} r0[g0] * M2(E),  E = h ∪ g0 (4 cards)
+//   M2(E) = S1(E)*S2(E) − (A1(E) − A2(E)) + B(E)
+// with per-(terminal,traverser) tables built by the prep kernels below:
+//   P1[c], P2[c]      per-card reach mass of opp1 / opp2
+//   S1, S2            total masses
+//   W[g] = P2[g.a]+P2[g.b]                      (recomputed O(1) from P2)
+//   TA1, A1c[c]       total / per-card of  r1[g]*W[g]
+//   TB,  Bc[c]        total / per-card of  r1[g]*r2[g]
+//   V[d], Vc[c][d]    total / per-card of  r1[g]*U_d[g],
+//                     U_d[g] = r2({g.a,d}) + r2({g.b,d})
+// Restrictions use  sum_{g⊥E} f = T − Σ_{c∈E} Fc[c] + Σ_{c<d∈E} f(cd-hand).
+//
+// Table layout per terminal (floats), stride NP4_STRIDE:
+//   [0..52)      P1        [52..104)   P2
+//   [104..156)   A1c       [156..208)  Bc
+//   [208..260)   V         [260..2964) Vc (row-major c*52+d)
+//   [2964..2968) scalars: S1, S2, TA1, TB
+// ============================================================================
+
+constant int NP4_STRIDE = 2968;
+#define NP4_P1   0
+#define NP4_P2   52
+#define NP4_A1C  104
+#define NP4_BC   156
+#define NP4_V    208
+#define NP4_VC   260
+#define NP4_SCAL 2964
+
+// Opponent reach rows for np=4: the three non-traverser players in seat order.
+static inline const device float* np4_opp_reach(
+    const device float* reach, uint node_id, int np, int nh, int traverser, int oi
+) {
+    int p = 0, seen = 0, opp = -1;
+    for (p = 0; p < np; p++) {
+        if (p == traverser) continue;
+        if (seen == oi) { opp = p; break; }
+        seen++;
+    }
+    return reach + (node_id * uint(np) + uint(opp)) * uint(nh);
+}
+
+// ── prep P: P1[c], P2[c] (+ c==0: S1, S2). Grid (n_term, 52). ──
+kernel void vcfr_np4_lone_prep_p(
+    device float*          tables         [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const float*    reach          [[buffer(2)]],
+    device const uint8_t*  hand_cards     [[buffer(3)]],
+    constant LoneTermParams& p            [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x);
+    int c  = int(gid.y);
+    if (ti >= p.n_term || c >= 52) return;
+    int nh = p.nh;
+    uint node_id = term_nodes[ti];
+    const device float* r1 = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
+    const device float* r2 = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    device float* t = tables + ti * NP4_STRIDE;
+
+    float p1 = 0.0f, p2 = 0.0f, s1 = 0.0f, s2 = 0.0f;
+    for (int g = 0; g < nh; g++) {
+        int a = hand_cards[g * 2];
+        int b = hand_cards[g * 2 + 1];
+        float x1 = r1[g], x2 = r2[g];
+        if (a == c || b == c) { p1 += x1; p2 += x2; }
+        if (c == 0) { s1 += x1; s2 += x2; }
+    }
+    t[NP4_P1 + c] = p1;
+    t[NP4_P2 + c] = p2;
+    if (c == 0) { t[NP4_SCAL + 0] = s1; t[NP4_SCAL + 1] = s2; }
+}
+
+// ── prep Q: A1c[c], Bc[c] (+ c==0: TA1, TB). Needs P2 (hazard-ordered). ──
+kernel void vcfr_np4_lone_prep_q(
+    device float*          tables         [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const float*    reach          [[buffer(2)]],
+    device const uint8_t*  hand_cards     [[buffer(3)]],
+    constant LoneTermParams& p            [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x);
+    int c  = int(gid.y);
+    if (ti >= p.n_term || c >= 52) return;
+    int nh = p.nh;
+    uint node_id = term_nodes[ti];
+    const device float* r1 = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
+    const device float* r2 = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    device float* t = tables + ti * NP4_STRIDE;
+
+    float a1c = 0.0f, bc = 0.0f, ta1 = 0.0f, tb = 0.0f;
+    for (int g = 0; g < nh; g++) {
+        float x1 = r1[g];
+        if (x1 == 0.0f) continue;
+        int a = hand_cards[g * 2];
+        int b = hand_cards[g * 2 + 1];
+        float w = t[NP4_P2 + a] + t[NP4_P2 + b];
+        float xw = x1 * w;
+        float xy = x1 * r2[g];
+        if (a == c || b == c) { a1c += xw; bc += xy; }
+        if (c == 0) { ta1 += xw; tb += xy; }
+    }
+    t[NP4_A1C + c] = a1c;
+    t[NP4_BC + c]  = bc;
+    if (c == 0) { t[NP4_SCAL + 2] = ta1; t[NP4_SCAL + 3] = tb; }
+}
+
+// ── prep R: V[d] + Vc[·][d] column. Grid (n_term, 52); thread owns column d. ──
+kernel void vcfr_np4_lone_prep_r(
+    device float*          tables         [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const float*    reach          [[buffer(2)]],
+    device const uint8_t*  hand_cards     [[buffer(3)]],
+    device const int32_t*  pair2hand      [[buffer(4)]],
+    constant LoneTermParams& p            [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x);
+    int d  = int(gid.y);
+    if (ti >= p.n_term || d >= 52) return;
+    int nh = p.nh;
+    uint node_id = term_nodes[ti];
+    const device float* r1 = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
+    const device float* r2 = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    device float* t = tables + ti * NP4_STRIDE;
+
+    float col[52];
+    for (int c = 0; c < 52; c++) col[c] = 0.0f;
+    float v = 0.0f;
+    for (int g = 0; g < nh; g++) {
+        float x1 = r1[g];
+        if (x1 == 0.0f) continue;
+        int a = hand_cards[g * 2];
+        int b = hand_cards[g * 2 + 1];
+        int iad = pair2hand[a * 52 + d];
+        int ibd = pair2hand[b * 52 + d];
+        float u = ((iad >= 0) ? r2[iad] : 0.0f) + ((ibd >= 0) ? r2[ibd] : 0.0f);
+        if (u == 0.0f) continue;
+        float x = x1 * u;
+        v += x;
+        col[a] += x;
+        col[b] += x;
+    }
+    t[NP4_V + d] = v;
+    for (int c = 0; c < 52; c++) t[NP4_VC + c * 52 + d] = col[c];
+}
+
+// ── main: cfv[node][h] = payoff * mass3(h) / nc. Grid (n_term, nh). ──
+// LITERAL port of np4_lone_mass_algebra.rs::factored_mass3.
+kernel void vcfr_np4_lone_main(
+    device float*          cfv            [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const FlatNode* nodes          [[buffer(2)]],
+    device const int32_t*  contributions  [[buffer(3)]],
+    device const uint16_t* folded_masks   [[buffer(4)]],
+    device const float*    reach          [[buffer(5)]],
+    device const uint8_t*  hand_cards     [[buffer(6)]],
+    device const int32_t*  pair2hand      [[buffer(7)]],
+    device const float*    tables         [[buffer(8)]],
+    constant LoneTermParams& p            [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x);
+    int h  = int(gid.y);
+    if (ti >= p.n_term || h >= p.nh) return;
+    int nh = p.nh; int np = p.np; int traverser = p.traverser;
+    uint node_id = term_nodes[ti];
+    uint16_t fold_mask = folded_masks[node_id];
+    FlatNode node = nodes[node_id];
+
+    // payoff — byte-identical convention to vcfr_lone_terminal_factored.
+    int c_t = contributions[node_id * uint(np) + uint(traverser)];
+    float traverser_stake = float(p.starting_pot) / float(np) + float(c_t);
+    bool traverser_folded = (fold_mask & (uint16_t)(1u << traverser)) != 0;
+    bool flop_seen = (node.board_state != 3);
+    float eff_rake_rate = flop_seen ? p.rake_rate : 0.0f;
+    float eff_rake_cap  = flop_seen ? p.rake_cap  : 0.0f;
+    int total_pot = p.starting_pot;
+    for (int q = 0; q < np; q++) total_pot += contributions[node_id * uint(np) + uint(q)];
+    int min_contrib = contributions[node_id * uint(np) + 0u];
+    for (int q = 1; q < np; q++) { int c = contributions[node_id * uint(np) + uint(q)]; if (c < min_contrib) min_contrib = c; }
+    int num_main = 0;
+    for (int q = 0; q < np; q++) if (contributions[node_id * uint(np) + uint(q)] >= min_contrib) num_main++;
+    int main_pot_amount = min_contrib * num_main + p.starting_pot;
+    float rake = fmax(0.0f, fmin(float(main_pot_amount) * eff_rake_rate, eff_rake_cap));
+    float payoff = traverser_folded ? (-traverser_stake) : ((float(total_pot) - rake) - traverser_stake);
+
+    const device float* r0 = np4_opp_reach(reach, node_id, np, nh, traverser, 0);
+    const device float* r1 = np4_opp_reach(reach, node_id, np, nh, traverser, 1);
+    const device float* r2 = np4_opp_reach(reach, node_id, np, nh, traverser, 2);
+    const device float* t = tables + ti * NP4_STRIDE;
+    float S1  = t[NP4_SCAL + 0];
+    float S2  = t[NP4_SCAL + 1];
+    float TA1 = t[NP4_SCAL + 2];
+    float TB  = t[NP4_SCAL + 3];
+
+    int h1 = hand_cards[h * 2];
+    int h2 = hand_cards[h * 2 + 1];
+
+    float mass = 0.0f;
+    for (int g0 = 0; g0 < nh; g0++) {
+        int a = hand_cards[g0 * 2];
+        int b = hand_cards[g0 * 2 + 1];
+        if (a == h1 || a == h2 || b == h1 || b == h2) continue;
+        float rr0 = r0[g0];
+        if (rr0 == 0.0f) continue;
+
+        int e[4] = { h1, h2, a, b };
+        // the 6 unordered pairs of E, as pair2hand indices (or -1)
+        int ep[6];
+        ep[0] = pair2hand[h1 * 52 + h2];
+        ep[1] = pair2hand[h1 * 52 + a];
+        ep[2] = pair2hand[h1 * 52 + b];
+        ep[3] = pair2hand[h2 * 52 + a];
+        ep[4] = pair2hand[h2 * 52 + b];
+        ep[5] = pair2hand[a  * 52 + b];
+
+        // S1(E), S2(E)
+        float s1e = S1, s2e = S2;
+        for (int k = 0; k < 4; k++) { s1e -= t[NP4_P1 + e[k]]; s2e -= t[NP4_P2 + e[k]]; }
+        for (int k = 0; k < 6; k++) {
+            int i = ep[k];
+            if (i >= 0) { s1e += r1[i]; s2e += r2[i]; }
+        }
+
+        // A1(E) = Σ_{g1⊥E} r1·W    (f(cd) = r1[cd]·W[cd])
+        float a1e = TA1;
+        for (int k = 0; k < 4; k++) a1e -= t[NP4_A1C + e[k]];
+        for (int k = 0; k < 6; k++) {
+            int i = ep[k];
+            if (i >= 0) {
+                float w = t[NP4_P2 + hand_cards[i * 2]] + t[NP4_P2 + hand_cards[i * 2 + 1]];
+                a1e += r1[i] * w;
+            }
+        }
+
+        // A2(E) = Σ_{d∈E} [ V[d] − Σ_{c∈E} Vc[c][d] + Σ_{pairs} r1[cd]·U_d(cd) ]
+        float a2e = 0.0f;
+        for (int kd = 0; kd < 4; kd++) {
+            int d = e[kd];
+            float td = t[NP4_V + d];
+            for (int k = 0; k < 4; k++) td -= t[NP4_VC + e[k] * 52 + d];
+            for (int k = 0; k < 6; k++) {
+                int i = ep[k];
+                if (i >= 0) {
+                    int ca = hand_cards[i * 2];
+                    int cb = hand_cards[i * 2 + 1];
+                    int iad = pair2hand[ca * 52 + d];
+                    int ibd = pair2hand[cb * 52 + d];
+                    float u = ((iad >= 0) ? r2[iad] : 0.0f) + ((ibd >= 0) ? r2[ibd] : 0.0f);
+                    td += r1[i] * u;
+                }
+            }
+            a2e += td;
+        }
+
+        // B(E) = Σ_{g1⊥E} r1·r2
+        float be = TB;
+        for (int k = 0; k < 4; k++) be -= t[NP4_BC + e[k]];
+        for (int k = 0; k < 6; k++) {
+            int i = ep[k];
+            if (i >= 0) be += r1[i] * r2[i];
+        }
+
+        float m2 = s1e * s2e - (a1e - a2e) + be;
+        mass += rr0 * m2;
+    }
+
+    float v = payoff * mass;
+    cfv[node_id * uint(nh) + uint(h)] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
+}

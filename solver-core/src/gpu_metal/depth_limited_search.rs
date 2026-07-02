@@ -113,11 +113,15 @@ pub fn gpu_search_street_strat(
         );
     }
 
-    // Fast lone-survivor terminals: ONLY np==3 (num_opp==2). The kernel reads
-    // exactly two opponents; np>=4 would silently drop opponents 3+ and produce
-    // wrong cfv, so np>=4 uses the base bottom-up (its K>=3 path is already
-    // factored). HU (np==2) folds are already O(nh) inclusion-exclusion.
-    if np == 3 {
+    // Fast lone-survivor terminals. np==3: the 2-opponent brute/factored kernels.
+    // np==4: the K=3 factored-mass pipeline family (exact inclusion-exclusion,
+    // validated vs brute in np4_lone_mass_algebra.rs; factored-only — a brute
+    // K=3 kernel would be O(nh^3)/thread). Without this offload, np=4 terminals
+    // hit the base bottom-up's O(nh^3)-per-node single-thread path — the
+    // seconds-long dispatches behind the WindowServer-starvation panics.
+    // np>=5 stays on the base path (live-5/6 are equity rollouts in production).
+    // HU (np==2) folds are already O(nh) inclusion-exclusion in the base kernel.
+    if np == 3 || (np == 4 && cfg.factored_terminals) {
         let lone: Vec<u32> = (0..tree.num_nodes())
             .filter(|&n| tree.nodes[n].is_terminal())
             .filter(|&n| {

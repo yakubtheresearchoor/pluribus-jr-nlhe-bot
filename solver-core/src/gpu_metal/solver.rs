@@ -73,6 +73,22 @@ struct LoneTerminals {
     d_pair2hand: MetalBuffer<i32>,            // [52*52] card-pair → hand idx (-1)
     n_term: usize,
     factored: bool,
+    // np=4 (K=3 opponents) factored path: 3 table-prep kernels + the main
+    // per-(terminal,hand) mass kernel (see vcfr.metal vcfr_np4_lone_*). Some
+    // only when num_players == 4 at install time.
+    np4: Option<Np4Lone>,
+}
+
+/// Table stride per terminal for the np=4 kernels (must match NP4_STRIDE in
+/// vcfr.metal): P1[52] P2[52] A1c[52] Bc[52] V[52] Vc[52*52] scalars[4].
+const NP4_STRIDE: usize = 2968;
+
+struct Np4Lone {
+    prep_p: ComputePipelineState,
+    prep_q: ComputePipelineState,
+    prep_r: ComputePipelineState,
+    main: ComputePipelineState,
+    d_tables: MetalBuffer<f32>, // [n_term * NP4_STRIDE]
 }
 
 /// Metal-backed vector CFR solver.
@@ -311,6 +327,22 @@ impl MetalVectorCfr {
             pair2hand[a * 52 + b] = h as i32;
             pair2hand[b * 52 + a] = h as i32;
         }
+        // np=4 (K=3): the 2-opponent kernels above can't serve 3 opponents —
+        // install the dedicated factored-mass pipeline family instead (exact,
+        // validated vs brute in np4_lone_mass_algebra.rs). Only the factored
+        // form exists at np=4 (a brute K=3 kernel would be O(nh^3)/thread).
+        let np4 = if self.num_players == 4 {
+            assert!(factored, "np=4 lone terminals only have the factored path");
+            Some(Np4Lone {
+                prep_p: ctx.create_pipeline("vcfr_np4_lone_prep_p").expect("np4 prep_p"),
+                prep_q: ctx.create_pipeline("vcfr_np4_lone_prep_q").expect("np4 prep_q"),
+                prep_r: ctx.create_pipeline("vcfr_np4_lone_prep_r").expect("np4 prep_r"),
+                main: ctx.create_pipeline("vcfr_np4_lone_main").expect("np4 main"),
+                d_tables: ctx.alloc_zeros(term_nodes.len().max(1) * NP4_STRIDE),
+            })
+        } else {
+            None
+        };
         self.lone_terminals = Some(LoneTerminals {
             pipeline,
             factored_pipeline,
@@ -318,6 +350,7 @@ impl MetalVectorCfr {
             d_pair2hand: ctx.upload(&pair2hand),
             n_term: term_nodes.len(),
             factored,
+            np4,
         });
     }
 
@@ -379,6 +412,13 @@ impl MetalVectorCfr {
     fn maybe_wait(&self, buf: &metal::CommandBufferRef) {
         if !self.async_mode.get() {
             buf.wait_until_completed();
+            // Surface GPU faults instead of silently reading zeroed buffers: a
+            // faulted command buffer discards (part of) its work and, without
+            // this check, looks like an all-zero result downstream.
+            let status = buf.status();
+            if status != metal::MTLCommandBufferStatus::Completed {
+                eprintln!("[Metal] COMMAND BUFFER FAULT: status={status:?}");
+            }
         }
     }
 
@@ -776,6 +816,50 @@ impl MetalVectorCfr {
             starting_pot: self.starting_pot, rake_rate: 0.0, rake_cap: 0.0,
             num_combinations: self.num_combinations,
         };
+        // np=4 (K=3 opponents): table-prep P → Q → R, then the main mass kernel.
+        // The four encoders share the tables buffer, so Metal hazard tracking
+        // orders them; reach is read-only. Grid sizes: preps (n_term × 52),
+        // main (n_term × nh).
+        if let Some(np4) = &lt.np4 {
+            let pbytes = std::mem::size_of::<LoneTermParams>() as u64;
+            let pptr = &params as *const _ as *const std::ffi::c_void;
+            for (which, pipe) in [(0, &np4.prep_p), (1, &np4.prep_q), (2, &np4.prep_r)] {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(np4.d_tables.as_ref()), 0);
+                enc.set_buffer(1, Some(lt.d_term_nodes.as_ref()), 0);
+                enc.set_buffer(2, Some(self.d_reach.as_ref()), 0);
+                enc.set_buffer(3, Some(self.d_hand_cards.as_ref()), 0);
+                if which == 2 {
+                    enc.set_buffer(4, Some(lt.d_pair2hand.as_ref()), 0);
+                    enc.set_bytes(5, pbytes, pptr);
+                } else {
+                    enc.set_bytes(4, pbytes, pptr);
+                }
+                let max_tpg = pipe.max_total_threads_per_threadgroup() as usize;
+                let (grid, tg) = ctx.dispatch_2d(lt.n_term, 52, max_tpg);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+            }
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&np4.main);
+            enc.set_buffer(0, Some(self.d_cfv.as_ref()), 0);
+            enc.set_buffer(1, Some(lt.d_term_nodes.as_ref()), 0);
+            enc.set_buffer(2, Some(self.d_nodes.as_ref()), 0);
+            enc.set_buffer(3, Some(self.d_contributions.as_ref()), 0);
+            enc.set_buffer(4, Some(self.d_folded_masks.as_ref()), 0);
+            enc.set_buffer(5, Some(self.d_reach.as_ref()), 0);
+            enc.set_buffer(6, Some(self.d_hand_cards.as_ref()), 0);
+            enc.set_buffer(7, Some(lt.d_pair2hand.as_ref()), 0);
+            enc.set_buffer(8, Some(np4.d_tables.as_ref()), 0);
+            enc.set_bytes(9, pbytes, pptr);
+            let max_tpg = np4.main.max_total_threads_per_threadgroup() as usize;
+            let (grid, tg) = ctx.dispatch_2d(lt.n_term, nh, max_tpg);
+            enc.dispatch_thread_groups(grid, tg);
+            enc.end_encoding();
+            return;
+        }
+
         let pipeline = if lt.factored { &lt.factored_pipeline } else { &lt.pipeline };
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pipeline);
