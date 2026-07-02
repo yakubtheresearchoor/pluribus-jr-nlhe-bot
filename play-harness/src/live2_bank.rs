@@ -173,6 +173,22 @@ pub fn solve_multiway_street_ranged(
     budget_ms: u128,
     ranges_in: Option<Vec<Vec<f32>>>,
 ) -> Option<Live2StreetSolve> {
+    solve_multiway_street_rooted(board, np, commit, pot, iters, budget_ms, ranges_in, &[])
+}
+
+/// + SUBGAME ROOTING: `prefix` = the observed street actions (label, to_total),
+/// frozen to prob 1 in the solve (walk matching mirrors api::walk_to_node).
+#[allow(clippy::too_many_arguments)]
+pub fn solve_multiway_street_rooted(
+    board: &[u8],
+    np: u8,
+    commit: i32,
+    pot: i32,
+    iters: u32,
+    budget_ms: u128,
+    ranges_in: Option<Vec<Vec<f32>>>,
+    prefix: &[(u8, u32)],
+) -> Option<Live2StreetSolve> {
     if np < 3 {
         return None; // HU goes through solve_live2_street (exact)
     }
@@ -211,6 +227,33 @@ pub fn solve_multiway_street_ranged(
         build_tree(&cfg).ok()?
     };
     let mut cfr = VectorCfr::new(&tree, vec![nh; np as usize]);
+    // SUBGAME ROOTING: force the observed prefix (label/class/nearest-amount
+    // matching, same tiers as api::walk_to_node) so the actual line trains.
+    {
+        let class = |l: u8| -> u8 { match l { 0 => 0, 1 | 2 => 1, _ => 2 } };
+        let mut node = 0usize;
+        for &(label, to_total) in prefix {
+            if !tree.nodes[node].is_player() { break; }
+            let children = tree.node_children(node).to_vec();
+            let lbl = |i: usize| tree.nodes[children[i] as usize].action_label;
+            let mut cands: Vec<usize> = (0..children.len()).filter(|&i| lbl(i) == label).collect();
+            if cands.is_empty() {
+                cands = (0..children.len()).filter(|&i| class(lbl(i)) == class(label)).collect();
+            }
+            if cands.is_empty() {
+                cands = (0..children.len()).filter(|&i| label == 0 || lbl(i) != 0).collect();
+            }
+            let pick = match cands.len() {
+                0 => break,
+                1 => cands[0],
+                _ => *cands.iter().min_by_key(|&&i| {
+                    (tree.nodes[children[i] as usize].amount - to_total as i32).abs()
+                }).unwrap(),
+            };
+            cfr.force_action(node, pick, children.len());
+            node = children[pick] as usize;
+        }
+    }
     // Adaptive iters: time one iter, then fit the wall-clock budget (cap `iters`,
     // floor MIN) — identical discipline to the live-2 real-time solve.
     let t = std::time::Instant::now();

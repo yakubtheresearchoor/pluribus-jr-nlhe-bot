@@ -341,7 +341,13 @@ pub fn decide_postflop_with_reach(bp: &Blueprint, req: &DecideRequest, cfg: &Sea
     // 2. Multiway (live ≥ 3) turn/river: FACTORED full-nh re-solve of the actual
     //    board — a real solve where the blueprint has no cell, ahead of the crude
     //    equity rollout.
-    if req.board.len() >= 4 && req.live >= 3 {
+    // RIVERS EXCLUDED from the multiway resolve (P0, 2026-07-02): its weak-hand
+    // valuation is broken — 62o on a DRY river bet 0.80 first-in / jammed 1.0
+    // facing (np=5) and RAISED 0.82 facing at np=3 — this path has been serving
+    // off-grid live-3/4 rivers in production (bluff-raising air). Rivers fall to
+    // the rollout (pot-odds folds trash correctly) until the resolve passes the
+    // dry-board trash gate. Turns keep the resolve (same engine — audit filed).
+    if req.board.len() == 4 && req.live >= 3 {
         if let Some(r) = decide_postflop_resolve(req) {
             return Some(r);
         }
@@ -395,7 +401,8 @@ pub fn decide_postflop_resolve_ranged(req: &DecideRequest, iters: u32, budget_ms
         return None;
     }
     let (commit, pot) = (req.commit_entry as i32, req.pot_entry as i32);
-    let solve = crate::live2_bank::solve_multiway_street_ranged(
+    let prefix: Vec<(u8, u32)> = req.street_actions.iter().map(|a| (a.label, a.to_total)).collect();
+    let solve = crate::live2_bank::solve_multiway_street_rooted(
         &req.board,
         req.live,
         commit,
@@ -403,6 +410,7 @@ pub fn decide_postflop_resolve_ranged(req: &DecideRequest, iters: u32, budget_ms
         iters,
         budget_ms,
         ranges,
+        &prefix,
     )?;
     let node = walk_to_node(&solve.tree, &req.street_actions)?;
     if solve.tree.nodes[node].player_id as usize != req.hero_idx as usize {

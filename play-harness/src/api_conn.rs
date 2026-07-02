@@ -420,53 +420,17 @@ impl ConnDecider {
         // the budget (CONN_RIVER_ITERS_L5/L6). live-6 first-in stays on the
         // instant lookup (range-checks at equilibrium — same policy as the flop).
         // None (walk/hero mismatch) falls through to the lookup as before.
-        // FIRST-IN ONLY (gate results 2026-07-02): the resolve VALUE-BETS
-        // first-in correctly (quads bet — the cell/rollout never did), but
-        // FACING-BET it bluff-jammed trash (0.44 allin w/ 6-high) even range-
-        // conditioned — this path has no subgame rooting, so facing-bet nodes
-        // are off-path (same defect class fixed in the conn search; fix =
-        // thread rooting into solve_multiway_street — follow-up). Facing-bet
-        // rivers keep the lookup/pot-odds path (folds trash correctly).
-        if req.board.len() == 5 && req.live == 5 {
-            if !req.street_actions.is_empty() {
-                return None;
-            }
-            let (it, bd) = if req.live == 5 {
-                (std::env::var("CONN_RIVER_ITERS_L5").ok().and_then(|s| s.parse().ok()).unwrap_or(120u32), 8_000u128)
-            } else {
-                (std::env::var("CONN_RIVER_ITERS_L6").ok().and_then(|s| s.parse().ok()).unwrap_or(40u32), 9_000u128)
-            };
-            // Blueprint reach priors over ALL 1326 combos (class-based; Bayes when
-            // the preflop line is supplied) + the HERO-SEAT FLOOR (same defect
-            // class as the flop: zero-prior hero hands train nothing).
-            let live = req.live as usize;
-            let seat_reach = if !req.preflop_actions.is_empty() && req.seat_positions.len() >= live {
-                let history: Vec<(u8, i32)> = req.preflop_actions.iter().map(|a| (a.label, a.to_total as i32)).collect();
-                Some(self.bp.preflop_seat_reach(&history))
-            } else { None };
-            let mut class_cont: HashMap<usize, f32> = HashMap::new();
-            let mut ranges: Vec<Vec<f32>> = (0..live).map(|seat| {
-                (0..1326usize).map(|hi| {
-                    let (c1, c2) = solver_core::card::index_to_card_pair(hi);
-                    let cls = PreflopClass::from_combo(c1 as Card, c2 as Card).index();
-                    match &seat_reach {
-                        Some(sr) => {
-                            let pos = (req.seat_positions[seat] as usize).min(sr.len() - 1);
-                            sr[pos][cls]
-                        }
-                        None => *class_cont.entry(cls).or_insert_with(|| {
-                            self.bp.preflop_action_dist((c1 as Card, c2 as Card), &[])
-                                .map(|d| d.iter().filter(|(l, _, _)| *l != 0).map(|(_, _, p)| p).sum())
-                                .unwrap_or(1.0)
-                        }),
-                    }
-                }).collect()
-            }).collect();
-            let hero = (req.hero_idx as usize).min(live.saturating_sub(1));
-            let mx = ranges[hero].iter().cloned().fold(0.0f32, f32::max);
-            let floor = (mx * 1e-3).max(f32::MIN_POSITIVE);
-            for r in ranges[hero].iter_mut() { if *r < floor { *r = floor; } }
-            return crate::api::decide_postflop_resolve_ranged(req, it, bd, Some(ranges));
+        // live-5/6 RIVER resolve DISABLED (2026-07-02 late): the multiway
+        // resolve's WEAK-HAND VALUATION is broken at np>=5 — 62o on a DRY
+        // K7249 river bet 0.80 first-in and jammed 1.0 facing a bet (fold
+        // 0.0), rooted AND range-conditioned. Not tie-structure, not rooting:
+        // suspicion = the factored independent-opponent showdown at K=4 and/or
+        // the 1326-range indexing into ChanceTable. P0 debug filed — rivers
+        // stay on lookup/rollout (correct folds) until the resolve passes the
+        // dry-board trash gate. NOTE: live-3/4 off-grid rivers use this same
+        // path in production — exposure checked separately.
+        if req.board.len() == 5 && req.live >= 5 {
+            return None;
         }
         // live-5 searches FLOP + TURN (the adapter now carries the FULL 49-turn
         // grid, so any real turn card resolves exactly). RIVER stays on the

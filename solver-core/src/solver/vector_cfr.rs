@@ -37,6 +37,12 @@ pub struct VectorCfr {
     num_infosets: usize,
     iteration: u32,
     regret_floor: f32,
+    // SUBGAME ROOTING: (strategy offset, action, num_actions) triples forced to
+    // ONE-HOT after every strategy refresh — the observed street-action prefix
+    // plays with probability 1, so every iteration trains the actual line
+    // (mirrors CpuMccfr::freeze_node; without it facing-bet nodes are off-path
+    // and under-trained — measured: trash bluff-jammed rivers).
+    forced: Vec<(usize, usize, usize)>,
 }
 
 impl VectorCfr {
@@ -67,6 +73,7 @@ impl VectorCfr {
             num_infosets,
             iteration: 0,
             regret_floor: -1e30,
+            forced: Vec::new(),
         }
     }
 
@@ -322,6 +329,25 @@ impl VectorCfr {
         }
     }
 
+    /// Force `node` to play `action` with probability 1 (all hands), applied
+    /// after every strategy refresh. No-op if the node has no infoset data.
+    pub fn force_action(&mut self, node: usize, action: usize, num_actions: usize) {
+        let off = self.node_data_offset[node];
+        if off != UNUSED {
+            self.forced.push((off, action, num_actions));
+        }
+    }
+
+    fn apply_forced(&mut self) {
+        let nh = self.nh;
+        for &(off, action, na) in &self.forced {
+            for a in 0..na {
+                let v = if a == action { 1.0 } else { 0.0 };
+                self.strategy[off + a * nh..off + a * nh + nh].fill(v);
+            }
+        }
+    }
+
     pub fn run(
         &mut self,
         tree: &FlatTree,
@@ -339,6 +365,9 @@ impl VectorCfr {
             self.iteration += 1;
 
             self.compute_all_strategies(tree);
+            if !self.forced.is_empty() {
+                self.apply_forced();
+            }
 
             let reach = self.compute_reach(tree, game);
 
@@ -378,6 +407,7 @@ impl VectorCfr {
 
             for traverser in 0..np {
                 self.compute_all_strategies(tree);
+            if !self.forced.is_empty() { self.apply_forced(); }
                 let reach = self.compute_reach(tree, game);
 
                 let cfv = self.bottom_up_recursive(tree, game, traverser, 0, &reach, params.alpha_t, params.beta_t, params.gamma_t);
@@ -480,6 +510,7 @@ impl VectorCfr {
 
         // Step 1: compute strategies (once)
         self.compute_all_strategies(tree);
+            if !self.forced.is_empty() { self.apply_forced(); }
         let strategies = self.strategy.clone();
 
         // Step 2+3: compute reach (once)
