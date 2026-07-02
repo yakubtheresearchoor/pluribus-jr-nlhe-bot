@@ -191,6 +191,11 @@ pub struct MetalVectorCfr {
     np5_mc: i32,
     // np=5: use the cluster-mass kernels (default) vs the exact full-enum family.
     np5_use_cluster: bool,
+    // SUBGAME ROOTING (GPU): forced prefix nodes → one-hot after each strategy
+    // refresh. d_forced = [n_forced*3] (strategy_offset, action, num_actions).
+    force_pipeline: ComputePipelineState,
+    d_forced: Option<MetalBuffer<i32>>,
+    n_forced: usize,
 
     // Scratch buffer for params (legacy sync path; the async path passes
     // params inline via set_bytes so there is no shared-buffer clobber).
@@ -249,6 +254,8 @@ impl MetalVectorCfr {
         // Create pipelines
         let strategies_pipeline = ctx.create_pipeline("vcfr_compute_strategies")
             .expect("Failed to create strategies pipeline");
+        let force_pipeline = ctx.create_pipeline("vcfr_force_strategies")
+            .expect("vcfr_force_strategies pipeline");
         let qre_strategies_pipeline = ctx.create_pipeline("vcfr_compute_strategies_qre")
             .expect("Failed to create qre strategies pipeline");
         let init_reach_pipeline = ctx.create_pipeline("vcfr_init_reach")
@@ -342,6 +349,9 @@ impl MetalVectorCfr {
             rake_cap: tree.rake_cap as f32,
             np5_mc: 128,
             np5_use_cluster: true,
+            force_pipeline,
+            d_forced: None,
+            n_forced: 0,
             d_rake_marker: ctx.alloc_zeros(nn * nh),
             d_params_buf,
             async_mode: std::cell::Cell::new(false),
@@ -359,6 +369,43 @@ impl MetalVectorCfr {
     /// np=5: choose the cluster-mass kernels (default true) vs exact full-enum.
     pub fn set_np5_use_cluster(&mut self, on: bool) {
         self.np5_use_cluster = on;
+    }
+
+
+    /// SUBGAME ROOTING: force `(node, action, num_actions)` triples to one-hot
+    /// after each strategy refresh (GPU mirror of VectorCfr::force_action). Call
+    /// once before run(); overwrites any prior set. Non-player nodes are skipped.
+    pub fn set_forced_actions(&mut self, ctx: &MetalContext, forced: &[(usize, usize, usize)]) {
+        let nh = self.num_hands;
+        let offsets = self.d_infoset_offsets.as_slice();
+        let mut packed: Vec<i32> = Vec::with_capacity(forced.len() * 3);
+        for &(node, action, na) in forced {
+            let info = offsets[node];
+            if info == UNUSED { continue; }
+            let off = info as usize * MAX_NA_POSTFLOP * nh;
+            packed.push(off as i32);
+            packed.push(action as i32);
+            packed.push(na as i32);
+        }
+        self.n_forced = packed.len() / 3;
+        self.d_forced = if self.n_forced > 0 { Some(MetalBuffer::from_slice(ctx.device(), &packed)) } else { None };
+    }
+
+    fn encode_force(&self, ctx: &MetalContext, cmd: &metal::CommandBufferRef, nh: usize) {
+        let (Some(d_forced), true) = (&self.d_forced, self.n_forced > 0) else { return; };
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ForceParams { n_forced: i32, nh: i32 }
+        let p = ForceParams { n_forced: self.n_forced as i32, nh: nh as i32 };
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.force_pipeline);
+        enc.set_buffer(0, Some(self.d_strategy.as_ref()), 0);
+        enc.set_buffer(1, Some(d_forced.as_ref()), 0);
+        enc.set_bytes(2, std::mem::size_of::<ForceParams>() as u64, &p as *const _ as *const std::ffi::c_void);
+        let max = self.force_pipeline.max_total_threads_per_threadgroup() as usize;
+        let (g, t) = ctx.dispatch_2d(self.n_forced, nh, max);
+        enc.dispatch_thread_groups(g, t);
+        enc.end_encoding();
     }
 
     /// Enable QRE (quantal-response) mode at inverse-temperature `lambda` (0 =
@@ -617,6 +664,7 @@ impl MetalVectorCfr {
                     // (the measured `_MTLCommandBuffer init` hot path) into 1.
                     let cmd = self.queue.new_command_buffer();
                     self.encode_compute_strategies(ctx, cmd, ni, nh);
+                    self.encode_force(ctx, cmd, nh);
                     self.encode_init_reach(ctx, cmd, np, nh);
                     self.encode_top_down(ctx, cmd, nh, np as u32);
                     self.encode_bottom_up(
@@ -680,6 +728,7 @@ impl MetalVectorCfr {
     fn launch_compute_strategies(&mut self, ctx: &MetalContext, num_infosets: usize, nh: usize) {
         let cmd = self.queue.new_command_buffer();
         self.encode_compute_strategies(ctx, cmd, num_infosets, nh);
+        self.encode_force(ctx, cmd, nh);
         cmd.commit();
         self.maybe_wait(cmd);
     }

@@ -5813,3 +5813,24 @@ kernel void vcfr_np5cl_main(
     float v = payoff * mass;
     cfv[node*uint(nh)+uint(h)] = (p.num_combinations > 0.0f) ? (v/p.num_combinations) : v;
 }
+
+// ── SUBGAME ROOTING (GPU): overwrite forced prefix nodes' strategy rows to
+// one-hot after each strategy refresh, so every iteration trains the observed
+// line (mirrors CpuMccfr::freeze_node / VectorCfr::force_action). forced[] =
+// packed (strategy_offset, action, num_actions) triples. Grid (n_forced, nh).
+struct ForceParams { int n_forced; int nh; };
+kernel void vcfr_force_strategies(
+    device float* strategy [[buffer(0)]],
+    device const int32_t* forced [[buffer(1)]], // [n_forced*3]: off, action, na
+    constant ForceParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int f = int(gid.x); int h = int(gid.y);
+    if (f >= p.n_forced || h >= p.nh) return;
+    int off = forced[f*3 + 0];
+    int action = forced[f*3 + 1];
+    int na = forced[f*3 + 2];
+    for (int a = 0; a < na; a++) {
+        strategy[off + a * p.nh + h] = (a == action) ? 1.0f : 0.0f;
+    }
+}

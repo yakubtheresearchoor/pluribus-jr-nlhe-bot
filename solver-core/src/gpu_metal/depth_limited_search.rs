@@ -54,7 +54,7 @@ pub fn gpu_search_flop_strat(
     reach: &[Vec<f32>],
     cfg: &GpuSearchCfg,
 ) -> HashMap<usize, Vec<Vec<f32>>> {
-    gpu_search_street_strat(ctx, tree, table, bk, ContStreet::Flop, reach, cfg)
+    gpu_search_street_strat(ctx, tree, table, bk, ContStreet::Flop, reach, cfg, &[])
 }
 
 /// Run the GPU depth-limited search on a `build_tree_depth_limited` tree rooted
@@ -76,6 +76,7 @@ pub fn gpu_search_street_strat(
     cont: ContStreet,
     reach: &[Vec<f32>],
     cfg: &GpuSearchCfg,
+    forced: &[(usize, usize, usize)],
 ) -> HashMap<usize, Vec<Vec<f32>>> {
     let np = tree.num_players as usize;
     let nh = table.num_valid;
@@ -135,6 +136,11 @@ pub fn gpu_search_street_strat(
         }
     }
 
+    if !forced.is_empty() {
+        // SUBGAME ROOTING: the observed street-action prefix plays prob-1 so
+        // every iteration trains the actual line (GPU mirror of freeze_prefix).
+        gpu.set_forced_actions(ctx, forced);
+    }
     let ran = gpu.run_batched_budget(ctx, tree, cfg.iters, cfg.budget_ms);
     if ran < cfg.iters {
         eprintln!("[gpu-search] budget hit: ran {ran}/{} iters in {}ms budget", cfg.iters, cfg.budget_ms);

@@ -693,8 +693,12 @@ pub fn flop_search_k4(
 /// trash hands read UNIFORM facing 6-way pot bets — worse than pot-odds).
 /// Matching mirrors api::walk_to_node (label → class → non-fold; nearest
 /// amount) so the solve trains exactly the node the read will land on.
-fn freeze_prefix(solver: &mut CpuMccfr, tree: &FlatTree, nh: usize, prefix: &[(u8, u32)]) {
+/// Walk the observed street-action prefix through `tree` (label → class →
+/// nearest-amount matching, identical to api::walk_to_node) and return the
+/// (node, action_idx, num_actions) picks — shared by CPU freeze and GPU force.
+pub(crate) fn prefix_picks(tree: &FlatTree, prefix: &[(u8, u32)]) -> Vec<(usize, usize, usize)> {
     let class = |l: u8| -> u8 { match l { 0 => 0, 1 | 2 => 1, _ => 2 } };
+    let mut out = Vec::new();
     let mut node = 0usize;
     for &(label, to_total) in prefix {
         if !tree.nodes[node].is_player() { break; }
@@ -714,11 +718,17 @@ fn freeze_prefix(solver: &mut CpuMccfr, tree: &FlatTree, nh: usize, prefix: &[(u
                 (tree.nodes[children[i] as usize].amount - to_total as i32).abs()
             }).unwrap(),
         };
-        let na = children.len();
+        out.push((node, pick, children.len()));
+        node = children[pick] as usize;
+    }
+    out
+}
+
+fn freeze_prefix(solver: &mut CpuMccfr, tree: &FlatTree, nh: usize, prefix: &[(u8, u32)]) {
+    for (node, pick, na) in prefix_picks(tree, prefix) {
         let mut one_hot = vec![0.0f32; na * nh];
         for h in 0..nh { one_hot[pick * nh + h] = 1.0; }
         solver.freeze_node(node, &one_hot);
-        node = children[pick] as usize;
     }
 }
 
@@ -1122,13 +1132,12 @@ pub fn search_decision(
     // in-solver parity 5.4e-8, 98s watchdog soak clean). Pairs-only cluster
     // mass = 6.5× MORE accurate than the factored mass the CPU search uses for
     // the same fold terminals — GPU live-5 is faster AND more accurate.
-    // FIRST-IN ONLY at live-5: the GPU search has no freeze_prefix rooting, so
-    // facing-bet solves (off-path training needs the observed line forced)
-    // stay on the rooted CPU path.
-    let gpu_ok = (live <= 4 || (live == 5 && prefix.is_empty()))
-        && matches!(cont, ContStreet::Flop | ContStreet::Turn(_));
+    // SUBGAME ROOTING now runs on GPU too (vcfr_force_strategies one-hots the
+    // observed prefix after every strategy refresh), so facing-bet solves are
+    // GPU-eligible at every gated live count.
+    let gpu_ok = live <= 5 && matches!(cont, ContStreet::Flop | ContStreet::Turn(_));
     let strat = if gpu_ok && std::env::var("GPU_SEARCH").is_ok() {
-        try_gpu_search(bp, &tree, cont, live, &overrides, cfg)
+        try_gpu_search(bp, &tree, cont, live, &overrides, cfg, prefix)
             .unwrap_or_else(|| search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides, prefix))
     } else {
         search_street_strat(bp, &tree, &depth, cont, live, street_u8, cfg, seed_salt, &overrides, prefix)
@@ -1147,6 +1156,7 @@ fn try_gpu_search(
     live: usize,
     overrides: &[(usize, Vec<f32>)],
     cfg: &SearchCfg,
+    prefix: &[(u8, u32)],
 ) -> Option<std::collections::HashMap<usize, Vec<Vec<f32>>>> {
     use solver_core::gpu_metal::{gpu_search_street_strat, shared_context, GpuSearchCfg};
     // Shared process-wide context (metallib + queue loaded ONCE) — NOT a per-request
@@ -1164,7 +1174,8 @@ fn try_gpu_search(
     // real-time budget (matches the CPU path's adaptive trim), and an orphaned
     // solve (client disconnect) dies within it instead of pinning the GPU.
     let gcfg = GpuSearchCfg { iters: cfg.iters, sample_m: cfg.sample_m, seed: cfg.seed, factored_terminals: true, lambda: cfg.lambda, budget_ms: 16_000 };
-    Some(gpu_search_street_strat(ctx, tree, bp.game.table(), &bp.bk, cont, &reach, &gcfg))
+    let picks = prefix_picks(tree, prefix);
+    Some(gpu_search_street_strat(ctx, tree, bp.game.table(), &bp.bk, cont, &reach, &gcfg, &picks))
 }
 
 #[cfg(not(feature = "metal"))]

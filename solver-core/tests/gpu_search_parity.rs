@@ -175,7 +175,7 @@ fn gpu_turn_search_matches_cpu() {
 
     let ctx = MetalContext::new().expect("Metal");
     let gcfg = GpuSearchCfg { iters, sample_m: 0, seed: 7, factored_terminals: false, lambda , budget_ms: 120_000 };
-    let gpu = gpu_search_street_strat(&ctx, &tree, fsg.table(), &bk, ContStreet::Turn(0), &reach, &gcfg);
+    let gpu = gpu_search_street_strat(&ctx, &tree, fsg.table(), &bk, ContStreet::Turn(0), &reach, &gcfg, &[]);
 
     let turn = BoardState::Turn as u8;
     let mut total = 0.0f64; let mut count = 0usize; let mut worst = 0.0f32;
