@@ -827,7 +827,13 @@ impl MetalVectorCfr {
             enc.set_buffer(18, Some(self.d_rake_marker.as_ref()), 0);
             enc.set_buffer(19, Some(self.d_last_cfv.as_ref()), 0); // QRE accumulator
 
-            let (grid, tg) = ctx.dispatch_1d(count as usize, 1);
+            // Pack independent node-threads into real threadgroups. tg was 1 —
+            // ~31/32 SIMD lanes idle on every level dispatch. Node threads share
+            // no state (no barriers), so width is pure packing: results identical.
+            // Cap 64: the terminal branch has ~34KB thread-locals; the pipeline
+            // max reflects what the compiler can schedule.
+            let tgw = (self.bottom_up_pipeline.max_total_threads_per_threadgroup() as usize).min(64).max(1);
+            let (grid, tg) = ctx.dispatch_1d(count as usize, tgw);
             enc.dispatch_thread_groups(grid, tg);
             enc.end_encoding();
         }
