@@ -39,6 +39,8 @@
 //! test; nothing else may convert ad hoc.
 
 pub mod blueprint;
+pub mod runtime_spec;
+pub use runtime_spec::{runtime_game_spec, set_runtime_game_spec};
 pub mod eqr;
 pub mod preflop_oracle;
 pub mod live2_bank;

@@ -135,6 +135,65 @@ pub struct GameSpec {
 }
 
 impl GameSpec {
+    /// Serialize to the `game.json` manifest format (one line, stable keys).
+    /// Blueprint dirs carry this so the RUNTIME refines under the SAME game
+    /// economics the blueprint was solved with (stakes vary rake caps/antes/
+    /// depth; a search valuing terminals under the wrong rake or building seam
+    /// trees at the wrong stack refines against inconsistent continuations).
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"num_players\":{},\"sb\":{},\"bb\":{},\"ante\":{},\"stack\":{},\"rake_rate\":{},\"rake_cap\":{},\"no_flop_no_drop\":{}}}",
+            self.num_players, self.sb, self.bb, self.ante, self.stack,
+            self.rake_rate, self.rake_cap, self.no_flop_no_drop
+        )
+    }
+
+    /// Parse the `game.json` manifest. Tolerant of whitespace/field order;
+    /// every field required (a partial manifest is a config error, not a
+    /// default-fill situation — silent defaults are how rake bugs hide).
+    pub fn from_json(s: &str) -> Result<Self, String> {
+        fn num(s: &str, key: &str) -> Result<f64, String> {
+            let pat = format!("\"{key}\"");
+            let i = s.find(&pat).ok_or_else(|| format!("game.json: missing {key}"))?;
+            let rest = &s[i + pat.len()..];
+            let rest = rest.trim_start().strip_prefix(':').ok_or_else(|| format!("game.json: bad {key}"))?;
+            let rest = rest.trim_start();
+            let end = rest
+                .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' || c == 'E' || c == '+'))
+                .unwrap_or(rest.len());
+            rest[..end].parse().map_err(|e| format!("game.json: {key}: {e}"))
+        }
+        fn boolean(s: &str, key: &str) -> Result<bool, String> {
+            let pat = format!("\"{key}\"");
+            let i = s.find(&pat).ok_or_else(|| format!("game.json: missing {key}"))?;
+            Ok(s[i + pat.len()..].trim_start().trim_start_matches(':').trim_start().starts_with("true"))
+        }
+        Ok(GameSpec {
+            num_players: num(s, "num_players")? as u8,
+            sb: num(s, "sb")? as i32,
+            bb: num(s, "bb")? as i32,
+            ante: num(s, "ante")? as i32,
+            stack: num(s, "stack")? as i32,
+            rake_rate: num(s, "rake_rate")?,
+            rake_cap: num(s, "rake_cap")? as i32,
+            no_flop_no_drop: boolean(s, "no_flop_no_drop")?,
+        })
+    }
+
+    /// Load `{dir}/game.json`. `None` when absent (legacy dir — caller decides
+    /// the fallback and should WARN); `Err`-> panic-worthy malformed manifest.
+    pub fn load_from_dir(dir: &str) -> Option<Result<Self, String>> {
+        let path = format!("{dir}/game.json");
+        let s = std::fs::read_to_string(&path).ok()?;
+        Some(Self::from_json(&s))
+    }
+
+    /// Emit `{dir}/game.json` (the blueprint writer calls this so every new
+    /// blueprint carries its economics).
+    pub fn save_to_dir(&self, dir: &str) -> std::io::Result<()> {
+        std::fs::write(format!("{dir}/game.json"), self.to_json())
+    }
+
     /// Derive the PREFLOP-rooted TreeConfig for this game class.
     /// Conventions (all pinned by the tree-correctness + bb-units
     /// gates):

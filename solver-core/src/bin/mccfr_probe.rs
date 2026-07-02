@@ -3806,6 +3806,9 @@ fn gpu_conn_solve() {
         }
         // Phase-A continuation/leaf prior: write the preflop block too (shared by all flops).
         ssbp2_write(&format!("{out_dir}/preflop.ssbp2"), &preA_cum);
+        // Emit the game-economics manifest: the RUNTIME loads this so real-time
+        // refinement uses the SAME rake/ante/stack this blueprint was solved with.
+        let _ = production_game_v1().save_to_dir(&out_dir);
         let ncan = canonical_flops_cached().len();
         let lo: usize = std::env::var("MC_FLOP_LO").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let hi: usize = std::env::var("MC_FLOP_HI").ok().and_then(|s| s.parse().ok()).unwrap_or(ncan).min(ncan);

@@ -97,6 +97,29 @@ impl ConnDecider {
     /// maxna)` = the solve config (6, 5, 200, 7 for blueprint_conn_eqr). `gs14_dir` =
     /// the full 49×48 GS14 bucket cache.
     pub fn load(bp_dir: &str, gs14_dir: &str, np: usize, nraises: usize, nb: usize, maxna: usize) -> std::io::Result<Self> {
+        // Per-blueprint game economics: install this blueprint's `game.json`
+        // (rake rate/cap, ante, stack, blinds) as the PROCESS-WIDE runtime spec —
+        // every decision path (seam trees, GPU/CPU terminal rake, all-in sizing)
+        // must refine under the SAME game class the blueprint was solved with
+        // (stakes vary caps/antes/depth). Legacy dirs without a manifest fall
+        // back to production_game_v1 (the class every pre-manifest blueprint
+        // was solved under) with a WARNING so the gap is visible.
+        match solver_core::tree::action::GameSpec::load_from_dir(bp_dir) {
+            Some(Ok(spec)) => {
+                let installed = crate::runtime_spec::set_runtime_game_spec(spec.clone());
+                eprintln!(
+                    "loaded game spec from {bp_dir}/game.json: stack={}u rake={}%/cap {}u ante={} {}",
+                    spec.stack, spec.rake_rate * 100.0, spec.rake_cap, spec.ante,
+                    if installed { "(installed)" } else { "(runtime spec already set — IGNORED; one process, one game class)" }
+                );
+            }
+            Some(Err(e)) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{bp_dir}/game.json: {e}")));
+            }
+            None => {
+                eprintln!("WARNING: {bp_dir}/game.json missing — assuming production_game_v1 economics (legacy blueprint)");
+            }
+        }
         let bp = ShardedConnBlueprint::load(bp_dir, np, nraises, nb, 16, 16, maxna)?;
         let layout = ConnCellLayout::build(np, nraises, nb);
         let ranges = vec![vec![1.0f32 / NUM_PREFLOP_CLASSES as f32; NUM_PREFLOP_CLASSES]; 6];
@@ -196,7 +219,7 @@ impl ConnDecider {
         if dead < 0 {
             return None;
         }
-        let stack = production_game_v1().stack;
+        let stack = crate::runtime_spec::runtime_game_spec().stack;
         // SPR gate (post-call): the all-in-equity leaf proxy is only valid low.
         let pot_after = (pot + to_call) as f32;
         let rem = (stack - c_opp) as f32;
@@ -439,7 +462,7 @@ impl ConnDecider {
         // SPR-bin the state; if that bin has a cell, pass the state through
         // (postflop_action_dist re-bins it). Else fall back to the nearest same-live
         // rep (which bins to an existing cell).
-        let stack = solver_core::tree::action::production_game_v1().stack;
+        let stack = crate::runtime_spec::runtime_game_spec().stack;
         let bin = solver_core::blueprint::conn_seam_bin_from(live, commit, pot, stack);
         if self.layout.key_idx.contains_key(&bin) {
             return Some((live, commit, pot));

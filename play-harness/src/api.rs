@@ -640,7 +640,7 @@ fn try_gpu_hu_turn_resolve(
     // Shared process-wide context (metallib + queue loaded ONCE) — NOT a per-request
     // MetalContext::new(), which leaked wired GPU memory the driver never reclaimed.
     let ctx = shared_context()?;
-    let cfg = production_game_v1().street_seam_config(
+    let cfg = crate::runtime_spec::runtime_game_spec().street_seam_config(
         BoardState::Turn, 2, commit, pot, crate::live2_bank::live2_bet_menu(),
     );
     let tree = build_tree_depth_limited(&cfg).ok()?;

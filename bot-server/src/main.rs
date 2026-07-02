@@ -205,7 +205,7 @@ async fn decide_handler(
     // (the task is isolated, but the caller gets a dropped connection, not a
     // diagnosable error). Reject with 400 up front so every postflop path is safe.
     if (3..=5).contains(&req.board.len()) {
-        let stack = solver_core::tree::action::production_game_v1().stack;
+        let stack = play_harness::runtime_game_spec().stack;
         let (live, commit, pot) = (req.live as i32, req.commit_entry as i32, req.pot_entry as i32);
         if req.live < 2 || req.live > 6 {
             return Err((StatusCode::BAD_REQUEST, format!("postflop: live must be 2..=6, got {}", req.live)));

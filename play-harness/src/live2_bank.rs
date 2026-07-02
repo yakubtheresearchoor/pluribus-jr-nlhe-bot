@@ -87,7 +87,7 @@ pub struct Live2StreetSolve {
 /// unconstrained subgame re-solve — it does not narrow the opponent's range by the
 /// prior betting. Same simplification the flop bank makes at the flop.
 pub fn solve_live2_street(board: &[u8], commit: i32, pot: i32, iters: u32) -> Option<Live2StreetSolve> {
-    let spec = production_game_v1();
+    let spec = crate::runtime_spec::runtime_game_spec().clone();
     let board_c: Vec<Card> = board.to_vec();
     let ranges = vec![vec![1.0f32; 1326]; 2];
     let (state, table) = match board.len() {
@@ -158,7 +158,7 @@ pub fn solve_multiway_street(
     if np < 3 {
         return None; // HU goes through solve_live2_street (exact)
     }
-    let spec = production_game_v1();
+    let spec = crate::runtime_spec::runtime_game_spec().clone();
     let board_c: Vec<Card> = board.to_vec();
     let ranges = vec![vec![1.0f32; 1326]; np as usize];
     let (state, table) = match board.len() {

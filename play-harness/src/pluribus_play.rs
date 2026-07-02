@@ -1006,7 +1006,9 @@ pub fn search_decision(
     };
     let is_river = street == BoardState::River;
     let street_u8 = street as u8;
-    let spec = production_game_v1();
+    // Per-blueprint economics: the seam tree (rake, stack depth) must match the
+    // game class the blueprint was solved under (game.json manifest).
+    let spec = crate::runtime_spec::runtime_game_spec().clone();
     let mut tcfg = spec.street_seam_config(street, live as u8, commit_entry, pot_entry, rich_bets());
     tcfg.max_bets_per_street = BetCap::all(3);
     let tree = build_tree_depth_limited(&tcfg).ok()?;
