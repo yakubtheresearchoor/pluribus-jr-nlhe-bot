@@ -1351,6 +1351,11 @@ struct LoneTermParams {
     float rake_rate;
     float rake_cap;
     float num_combinations;
+    // np=5 closed-form terminal fields (single Rust owner fills ALL fields —
+    // the BottomUpParams under-fill UB class cannot recur here).
+    int inner_role_base;   // 0: aggregates over opps 0,1,2; 1 (np5): opps 1,2,3
+    int mc_samples;        // 0 = FULL outer enumeration; else M CDF draws
+    uint32_t mc_seed;      // per-iteration seed (Rust XORs iteration in)
 };
 
 kernel void vcfr_lone_terminal_par(
@@ -4913,8 +4918,8 @@ kernel void vcfr_np4cf_prep_a(
     if (ti >= p.n_term || c >= 52) return;
     int nh = p.nh;
     uint node_id = term_nodes[ti];
-    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
-    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 2);
     device float* t = tab + size_t(ti) * NP4CF_STRIDE;
     float pb = 0.0f, pc = 0.0f, bcc = 0.0f, sb = 0.0f, sc = 0.0f, tbc = 0.0f;
     for (int g = 0; g < nh; g++) {
@@ -4939,8 +4944,8 @@ kernel void vcfr_np4cf_prep_b(
     int ti = int(gid.x); int e = int(gid.y);
     if (ti >= p.n_term || e >= 52) return;
     uint node_id = term_nodes[ti];
-    const device float* rb = np4_opp_reach(reach, node_id, p.np, p.nh, p.traverser, 1);
-    const device float* rc = np4_opp_reach(reach, node_id, p.np, p.nh, p.traverser, 2);
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, p.nh, p.traverser, p.inner_role_base + 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, p.nh, p.traverser, p.inner_role_base + 2);
     device float* t = tab + size_t(ti) * NP4CF_STRIDE;
     float g1 = 0.0f, g0 = 0.0f;
     for (int c = 0; c < 52; c++) {
@@ -4990,9 +4995,9 @@ kernel void vcfr_np4cf_prep_sk(
     if (ti >= p.n_term || cell >= 53) return;
     int nh = p.nh;
     uint node_id = term_nodes[ti];
-    const device float* ra = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 0);
-    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
-    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    const device float* ra = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 0);
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 2);
     device float* t = tab + size_t(ti) * NP4CF_STRIDE;
     float acc[13];
     for (int k = 0; k < 13; k++) acc[k] = 0.0f;
@@ -5044,9 +5049,9 @@ kernel void vcfr_np4cf_prep_vk(
     if (ti >= p.n_term || e >= 52) return;
     int nh = p.nh;
     uint node_id = term_nodes[ti];
-    const device float* ra = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 0);
-    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
-    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    const device float* ra = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 0);
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 2);
     device float* t = tab + size_t(ti) * NP4CF_STRIDE;
     float tot[10];
     for (int k = 0; k < 10; k++) tot[k] = 0.0f;
@@ -5085,9 +5090,9 @@ kernel void vcfr_np4cf_prep_mk(
     if (ti >= p.n_term || e >= 52 || ep >= 52) return;
     int nh = p.nh;
     uint node_id = term_nodes[ti];
-    const device float* ra = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 0);
-    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 1);
-    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, 2);
+    const device float* ra = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 0);
+    const device float* rb = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 1);
+    const device float* rc = np4_opp_reach(reach, node_id, p.np, nh, p.traverser, p.inner_role_base + 2);
     device float* t = tab + size_t(ti) * NP4CF_STRIDE;
     float t_tyy = 0.0f, t_zs = 0.0f;
     for (int c = 0; c < 52; c++) {
@@ -5202,9 +5207,9 @@ kernel void vcfr_np4cf_main(
 
     Np4cfCtx x;
     x.t = tab + size_t(ti) * NP4CF_STRIDE;
-    x.ra = np4_opp_reach(reach, node_id, np, nh, traverser, 0);
-    x.rb = np4_opp_reach(reach, node_id, np, nh, traverser, 1);
-    x.rc = np4_opp_reach(reach, node_id, np, nh, traverser, 2);
+    x.ra = np4_opp_reach(reach, node_id, np, nh, traverser, p.inner_role_base + 0);
+    x.rb = np4_opp_reach(reach, node_id, np, nh, traverser, p.inner_role_base + 1);
+    x.rc = np4_opp_reach(reach, node_id, np, nh, traverser, p.inner_role_base + 2);
     x.p2h = p2h;
     x.h1 = hand_cards[h * 2];
     x.h2 = hand_cards[h * 2 + 1];
@@ -5296,6 +5301,311 @@ kernel void vcfr_np4cf_main(
     d_part -= 2.0f * np4cf_rsk(x, SKQBQC, hp_sk);
 
     float mass = s_part + b_part - d_part;
+    float v = payoff * mass;
+    cfv[node_id * uint(nh) + uint(h)] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
+}
+
+// ============================================================================
+// np=5 (K=4 opponents) lone-survivor terminal:
+//   mass4(h) = Σ_{g0⊥h} r0[g0] · mass3_{r1,r2,r3}(h ∪ g0)
+// Inner = the CLOSED-FORM mass3 with a GENERAL 4-card exclusion X (validated
+// 2.1e-14 in Rust `mod cf`; |X|=4 case gated there). Aggregates built by the
+// np4cf prep kernels with inner_role_base=1 (roles = opponents 1,2,3); the
+// outer opponent 0 is enumerated (mc_samples=0) or MC-sampled via a CDF
+// (validated unbiased, CV 7.1% @ M=128). Math gate: k4_mass4_* tests.
+// ============================================================================
+
+// single-k scalar feature of hand g=(a,b) — mirrors cf::sk_of.
+static inline float np5_sk_of(
+    const device float* t, const device float* rb, const device float* rc,
+    const device int32_t* p2h, int g, int a, int b, int k
+) {
+    switch (k) {
+        case SKN: return 1.0f;
+        case SKQB: return rb[g];
+        case SKQC: return rc[g];
+        case SKUB: return t[NP4CF_PB + a] + t[NP4CF_PB + b];
+        case SKUC: return t[NP4CF_PC + a] + t[NP4CF_PC + b];
+        case SKDP: return t[NP4CF_PB + a] * t[NP4CF_PC + a] + t[NP4CF_PB + b] * t[NP4CF_PC + b];
+        case SKG1: return t[NP4CF_G1 + a] + t[NP4CF_G1 + b];
+        case SKG2G: return t[NP4CF_G2 + a * 52 + a] + t[NP4CF_G2 + a * 52 + b]
+                         + t[NP4CF_G2 + b * 52 + a] + t[NP4CF_G2 + b * 52 + b];
+        case SKVBC: return t[NP4CF_BCC + a] + t[NP4CF_BCC + b];
+        case SKQBQC: return rb[g] * rc[g];
+        case SKQBUC: return rb[g] * (t[NP4CF_PC + a] + t[NP4CF_PC + b]);
+        case SKUBQC: return (t[NP4CF_PB + a] + t[NP4CF_PB + b]) * rc[g];
+        default: return (t[NP4CF_PB + a] + t[NP4CF_PB + b]) * (t[NP4CF_PC + a] + t[NP4CF_PC + b]); // SKUBUC
+    }
+    (void)p2h;
+}
+
+// single-k vector feature at e — mirrors cf::vk_of.
+static inline float np5_vk_of(
+    const device float* t, const device float* rb, const device float* rc,
+    const device int32_t* p2h, int g, int a, int b, int k, int e
+) {
+    float pba = np4cf_pr(rb, p2h, a, e), pbb = np4cf_pr(rb, p2h, b, e);
+    float pca = np4cf_pr(rc, p2h, a, e), pcb = np4cf_pr(rc, p2h, b, e);
+    switch (k) {
+        case VKYB: return pba + pbb;
+        case VKYC: return pca + pcb;
+        case VKWBC: return pba * pca + pbb * pcb;
+        case VKKAP: return t[NP4CF_PB + a] * pca + t[NP4CF_PC + a] * pba
+                        + t[NP4CF_PB + b] * pcb + t[NP4CF_PC + b] * pbb;
+        case VKROW: return t[NP4CF_G2 + e * 52 + a] + t[NP4CF_G2 + e * 52 + b];
+        case VKCOL: return t[NP4CF_G2 + a * 52 + e] + t[NP4CF_G2 + b * 52 + e];
+        case VKQBYC: return rb[g] * (pca + pcb);
+        case VKYBQC: return (pba + pbb) * rc[g];
+        case VKUBYC: return (t[NP4CF_PB + a] + t[NP4CF_PB + b]) * (pca + pcb);
+        default: return (pba + pbb) * (t[NP4CF_PC + a] + t[NP4CF_PC + b]); // VKYBUC
+    }
+}
+
+static inline float np5_mk_of(
+    const device float* rb, const device float* rc, const device int32_t* p2h,
+    int a, int b, int k, int e, int ep
+) {
+    float pba = np4cf_pr(rb, p2h, a, e), pbb = np4cf_pr(rb, p2h, b, e);
+    float pca = np4cf_pr(rc, p2h, a, ep), pcb = np4cf_pr(rc, p2h, b, ep);
+    return (k == MKTYY) ? (pba + pbb) * (pca + pcb) : (pba * pca + pbb * pcb);
+}
+
+struct Np5Ctx {
+    const device float* t;
+    const device float* ra;   // inner aggregate weight = opponent 1
+    const device float* rb;   // opponent 2
+    const device float* rc;   // opponent 3
+    const device int32_t* p2h;
+    const device uint8_t* hand_cards;
+    int x[4];
+};
+
+// Σ_{g⊥X} rA·feature — total − 4 rows + 6 pair add-backs. Mirrors cf::rsk/rvk/rmk.
+static inline float np5_rsk(thread const Np5Ctx& c, int k) {
+    float v = c.t[NP4CF_SKT + k];
+    for (int i = 0; i < 4; i++) v -= c.t[NP4CF_SKR + k * 52 + c.x[i]];
+    for (int i = 0; i < 4; i++) for (int j = i + 1; j < 4; j++) {
+        int idx = c.p2h[c.x[i] * 52 + c.x[j]];
+        if (idx >= 0 && c.ra[idx] != 0.0f)
+            v += c.ra[idx] * np5_sk_of(c.t, c.rb, c.rc, c.p2h, idx, c.x[i], c.x[j], k);
+    }
+    return v;
+}
+static inline float np5_rvk(thread const Np5Ctx& c, int k, int e) {
+    float v = c.t[NP4CF_VKT + k * 52 + e];
+    for (int i = 0; i < 4; i++) v -= c.t[NP4CF_VKR + k * 2704 + c.x[i] * 52 + e];
+    for (int i = 0; i < 4; i++) for (int j = i + 1; j < 4; j++) {
+        int idx = c.p2h[c.x[i] * 52 + c.x[j]];
+        if (idx >= 0 && c.ra[idx] != 0.0f)
+            v += c.ra[idx] * np5_vk_of(c.t, c.rb, c.rc, c.p2h, idx, c.x[i], c.x[j], k, e);
+    }
+    return v;
+}
+static inline float np5_rmk(thread const Np5Ctx& c, int k, int e, int ep) {
+    float v = c.t[NP4CF_MKT + k * 2704 + e * 52 + ep];
+    for (int i = 0; i < 4; i++) v -= c.t[NP4CF_MKR + k * 140608 + c.x[i] * 2704 + e * 52 + ep];
+    for (int i = 0; i < 4; i++) for (int j = i + 1; j < 4; j++) {
+        int idx = c.p2h[c.x[i] * 52 + c.x[j]];
+        if (idx >= 0 && c.ra[idx] != 0.0f)
+            v += c.ra[idx] * np5_mk_of(c.rb, c.rc, c.p2h, c.x[i], c.x[j], k, e, ep);
+    }
+    return v;
+}
+
+// mass3 with |X|=4 — literal port of cf::{s_part, b_part, d_part}.
+static inline float np5_mass3_closed(thread const Np5Ctx& c) {
+    const device float* t = c.t;
+    // ── s_part ──
+    float ab = t[NP4CF_GS + 0], ac = t[NP4CF_GS + 1];
+    for (int i = 0; i < 4; i++) { ab -= t[NP4CF_PB + c.x[i]]; ac -= t[NP4CF_PC + c.x[i]]; }
+    for (int i = 0; i < 4; i++) for (int j = i + 1; j < 4; j++) {
+        ab += np4cf_pr(c.rb, c.p2h, c.x[i], c.x[j]);
+        ac += np4cf_pr(c.rc, c.p2h, c.x[i], c.x[j]);
+    }
+    float n = np5_rsk(c, SKN);
+    float sb_sum = np5_rsk(c, SKQB) - np5_rsk(c, SKUB);
+    float sc_sum = np5_rsk(c, SKQC) - np5_rsk(c, SKUC);
+    for (int i = 0; i < 4; i++) {
+        sb_sum += np5_rvk(c, VKYB, c.x[i]);
+        sc_sum += np5_rvk(c, VKYC, c.x[i]);
+    }
+    float cross = np5_rsk(c, SKQBQC) - np5_rsk(c, SKQBUC) - np5_rsk(c, SKUBQC) + np5_rsk(c, SKUBUC);
+    for (int i = 0; i < 4; i++) {
+        cross += np5_rvk(c, VKQBYC, c.x[i]);
+        cross -= np5_rvk(c, VKUBYC, c.x[i]);
+        cross += np5_rvk(c, VKYBQC, c.x[i]);
+        cross -= np5_rvk(c, VKYBUC, c.x[i]);
+    }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++)
+        cross += np5_rmk(c, MKTYY, c.x[i], c.x[j]);
+    float s_part = ab * ac * n + ab * sc_sum + ac * sb_sum + cross;
+
+    // ── b_part ──
+    float tbcx = t[NP4CF_GS + 3];
+    for (int i = 0; i < 4; i++) tbcx -= t[NP4CF_BCC + c.x[i]];
+    for (int i = 0; i < 4; i++) for (int j = i + 1; j < 4; j++) {
+        int idx = c.p2h[c.x[i] * 52 + c.x[j]];
+        if (idx >= 0) tbcx += c.rb[idx] * c.rc[idx];
+    }
+    float b_part = tbcx * n + np5_rsk(c, SKQBQC) - np5_rsk(c, SKVBC);
+    for (int i = 0; i < 4; i++) b_part += np5_rvk(c, VKWBC, c.x[i]);
+
+    // ── d_part ──
+    float phib[4], phic[4];
+    for (int i = 0; i < 4; i++) {
+        float pb = 0.0f, pc = 0.0f;
+        for (int j = 0; j < 4; j++) {
+            pb += np4cf_pr(c.rb, c.p2h, c.x[i], c.x[j]);
+            pc += np4cf_pr(c.rc, c.p2h, c.x[i], c.x[j]);
+        }
+        phib[i] = pb; phic[i] = pc;
+    }
+    float dx = t[NP4CF_GS + 2];
+    for (int i = 0; i < 4; i++) dx -= t[NP4CF_PB + c.x[i]] * t[NP4CF_PC + c.x[i]];
+    for (int i = 0; i < 4; i++) dx -= t[NP4CF_G1 + c.x[i]];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++)
+        dx += t[NP4CF_PB + c.x[j]] * np4cf_pr(c.rc, c.p2h, c.x[j], c.x[i])
+            + t[NP4CF_PC + c.x[j]] * np4cf_pr(c.rb, c.p2h, c.x[j], c.x[i]);
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++)
+        dx += t[NP4CF_G2 + c.x[i] * 52 + c.x[j]];
+    for (int i = 0; i < 4; i++) dx -= phib[i] * phic[i];
+
+    float d_part = dx * n;
+    d_part -= np5_rsk(c, SKDP);
+    d_part -= np5_rsk(c, SKG1);
+    for (int i = 0; i < 4; i++) d_part += np5_rvk(c, VKKAP, c.x[i]);
+    for (int i = 0; i < 4; i++)
+        d_part += t[NP4CF_PB + c.x[i]] * np5_rvk(c, VKYC, c.x[i])
+                + t[NP4CF_PC + c.x[i]] * np5_rvk(c, VKYB, c.x[i]);
+    d_part += np5_rsk(c, SKUBQC) + np5_rsk(c, SKQBUC);
+    for (int i = 0; i < 4; i++) {
+        d_part += np5_rvk(c, VKROW, c.x[i]);
+        d_part += np5_rvk(c, VKCOL, c.x[i]);
+    }
+    d_part += np5_rsk(c, SKG2G);
+    for (int i = 0; i < 4; i++) {
+        d_part -= phib[i] * np5_rvk(c, VKYC, c.x[i]);
+        d_part -= phic[i] * np5_rvk(c, VKYB, c.x[i]);
+        d_part -= np5_rmk(c, MKTYY, c.x[i], c.x[i]);
+    }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++)
+        d_part -= np5_rmk(c, MKZSAME, c.x[i], c.x[j]);
+    for (int i = 0; i < 4; i++) {
+        d_part -= np5_rvk(c, VKYBQC, c.x[i]);
+        d_part -= np5_rvk(c, VKQBYC, c.x[i]);
+    }
+    d_part -= 2.0f * np5_rsk(c, SKQBQC);
+
+    return s_part + b_part - d_part;
+}
+
+// ── CDF prep for the MC outer: thread per terminal, prefix-sum r0. ──
+kernel void vcfr_np5_cdf(
+    device float*          cdf            [[buffer(0)]],  // [n_term * nh]
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const float*    reach          [[buffer(2)]],
+    constant LoneTermParams& p            [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid);
+    if (ti >= p.n_term) return;
+    const device float* r0 = np4_opp_reach(reach, term_nodes[ti], p.np, p.nh, p.traverser, 0);
+    device float* out = cdf + size_t(ti) * p.nh;
+    float s = 0.0f;
+    for (int g = 0; g < p.nh; g++) { s += r0[g]; out[g] = s; }
+}
+
+// splitmix-ish per-(iter, terminal, sample) uniform in [0,1).
+static inline float np5_rand(uint32_t seed, uint ti, uint s) {
+    uint32_t z = seed ^ (ti * 0x9E3779B9u) ^ (s * 0x85EBCA6Bu);
+    z ^= z >> 16; z *= 0x7FEB352Du; z ^= z >> 15; z *= 0x846CA68Bu; z ^= z >> 16;
+    return float(z >> 8) * (1.0f / 16777216.0f);
+}
+
+// ── main: cfv[node][h] = payoff · mass4(h) / nc. Grid (n_term, nh). ──
+kernel void vcfr_np5_lone_main(
+    device float*          cfv            [[buffer(0)]],
+    device const uint32_t* term_nodes     [[buffer(1)]],
+    device const FlatNode* nodes          [[buffer(2)]],
+    device const int32_t*  contributions  [[buffer(3)]],
+    device const uint16_t* folded_masks   [[buffer(4)]],
+    device const float*    reach          [[buffer(5)]],
+    device const uint8_t*  hand_cards     [[buffer(6)]],
+    device const int32_t*  p2h            [[buffer(7)]],
+    device const float*    tab            [[buffer(8)]],
+    device const float*    cdf            [[buffer(9)]],
+    constant LoneTermParams& p            [[buffer(10)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int ti = int(gid.x);
+    int h  = int(gid.y);
+    if (ti >= p.n_term || h >= p.nh) return;
+    int nh = p.nh; int np = p.np; int traverser = p.traverser;
+    uint node_id = term_nodes[ti];
+    uint16_t fold_mask = folded_masks[node_id];
+    FlatNode node = nodes[node_id];
+
+    // payoff — identical conventions to the np3/np4 lone kernels.
+    int c_t = contributions[node_id * uint(np) + uint(traverser)];
+    float traverser_stake = float(p.starting_pot) / float(np) + float(c_t);
+    bool traverser_folded = (fold_mask & (uint16_t)(1u << traverser)) != 0;
+    bool flop_seen = (node.board_state != 3);
+    float eff_rake_rate = flop_seen ? p.rake_rate : 0.0f;
+    float eff_rake_cap  = flop_seen ? p.rake_cap  : 0.0f;
+    int total_pot = p.starting_pot;
+    for (int q = 0; q < np; q++) total_pot += contributions[node_id * uint(np) + uint(q)];
+    int min_contrib = contributions[node_id * uint(np) + 0u];
+    for (int q = 1; q < np; q++) { int cq = contributions[node_id * uint(np) + uint(q)]; if (cq < min_contrib) min_contrib = cq; }
+    int num_main = 0;
+    for (int q = 0; q < np; q++) if (contributions[node_id * uint(np) + uint(q)] >= min_contrib) num_main++;
+    int main_pot_amount = min_contrib * num_main + p.starting_pot;
+    float rake = fmax(0.0f, fmin(float(main_pot_amount) * eff_rake_rate, eff_rake_cap));
+    float payoff = traverser_folded ? (-traverser_stake) : ((float(total_pot) - rake) - traverser_stake);
+
+    Np5Ctx c;
+    c.t = tab + size_t(ti) * NP4CF_STRIDE;
+    // outer opponent 0; inner aggregate roles 1,2,3 (inner_role_base=1).
+    const device float* r0 = np4_opp_reach(reach, node_id, np, nh, traverser, 0);
+    c.ra = np4_opp_reach(reach, node_id, np, nh, traverser, 1);
+    c.rb = np4_opp_reach(reach, node_id, np, nh, traverser, 2);
+    c.rc = np4_opp_reach(reach, node_id, np, nh, traverser, 3);
+    c.p2h = p2h;
+    c.hand_cards = hand_cards;
+    int h1 = hand_cards[h * 2], h2 = hand_cards[h * 2 + 1];
+    c.x[0] = h1; c.x[1] = h2;
+
+    float mass = 0.0f;
+    if (p.mc_samples <= 0) {
+        // FULL outer enumeration (the parity mode).
+        for (int g0 = 0; g0 < nh; g0++) {
+            float w = r0[g0];
+            if (w == 0.0f) continue;
+            int a = hand_cards[g0 * 2], b = hand_cards[g0 * 2 + 1];
+            if (a == h1 || a == h2 || b == h1 || b == h2) continue;
+            c.x[2] = a; c.x[3] = b;
+            mass += w * np5_mass3_closed(c);
+        }
+    } else {
+        // MC outer: M CDF draws ∝ r0, SHARED across h (same seed per terminal).
+        const device float* tcdf = cdf + size_t(ti) * nh;
+        float w_total = tcdf[nh - 1];
+        if (w_total > 0.0f) {
+            float acc = 0.0f;
+            for (int s = 0; s < p.mc_samples; s++) {
+                float u = np5_rand(p.mc_seed, ti, uint(s)) * w_total;
+                // binary search first index with cdf >= u
+                int lo = 0, hi = nh - 1;
+                while (lo < hi) { int mid = (lo + hi) >> 1; if (tcdf[mid] < u) lo = mid + 1; else hi = mid; }
+                int g0 = lo;
+                int a = hand_cards[g0 * 2], b = hand_cards[g0 * 2 + 1];
+                if (a == h1 || a == h2 || b == h1 || b == h2) continue;
+                c.x[2] = a; c.x[3] = b;
+                acc += np5_mass3_closed(c);
+            }
+            mass = acc * w_total / float(p.mc_samples);
+        }
+    }
+
     float v = payoff * mass;
     cfv[node_id * uint(nh) + uint(h)] = (p.num_combinations > 0.0f) ? (v / p.num_combinations) : v;
 }

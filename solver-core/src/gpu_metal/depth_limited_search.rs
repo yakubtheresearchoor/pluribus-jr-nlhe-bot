@@ -121,7 +121,7 @@ pub fn gpu_search_street_strat(
     // seconds-long dispatches behind the WindowServer-starvation panics.
     // np>=5 stays on the base path (live-5/6 are equity rollouts in production).
     // HU (np==2) folds are already O(nh) inclusion-exclusion in the base kernel.
-    if np == 3 || (np == 4 && cfg.factored_terminals) {
+    if np == 3 || ((np == 4 || np == 5) && cfg.factored_terminals) {
         let lone: Vec<u32> = (0..tree.num_nodes())
             .filter(|&n| tree.nodes[n].is_terminal())
             .filter(|&n| {

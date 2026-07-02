@@ -77,6 +77,8 @@ struct LoneTerminals {
     // per-(terminal,hand) mass kernel (see vcfr.metal vcfr_np4_lone_*). Some
     // only when num_players == 4 at install time.
     np4: Option<Np4Lone>,
+    // np=5 (K=4): closed-inner × MC-outer family. Some when num_players == 5.
+    np5: Option<Np5Lone>,
 }
 
 /// Table stride per terminal for the np=4 kernels (must match NP4_STRIDE in
@@ -86,6 +88,23 @@ struct LoneTerminals {
 /// a REGRESSION at live-4 (prep O(nh·52²) > the O(nh²) loop since nh<52²);
 /// they are retained for the live-5 K=4 path where the asymptotics invert.
 const NP4_STRIDE: usize = 2968;
+
+/// np=5 (K=4 opponents) closed-form terminal family: the np4cf aggregate prep
+/// kernels (inner_role_base=1 ⇒ aggregates over opponents 1,2,3) + a CDF prep
+/// for the MC outer + the mass4 main kernel. Math gate: k4_mass4_* tests.
+const NP4CF_STRIDE: usize = 317_792;
+
+struct Np5Lone {
+    prep_a: ComputePipelineState,
+    prep_b: ComputePipelineState,
+    prep_sk: ComputePipelineState,
+    prep_vk: ComputePipelineState,
+    prep_mk: ComputePipelineState,
+    cdf: ComputePipelineState,
+    main: ComputePipelineState,
+    d_tables: MetalBuffer<f32>, // [n_term * NP4CF_STRIDE]
+    d_cdf: MetalBuffer<f32>,    // [n_term * nh]
+}
 
 struct Np4Lone {
     prep_p: ComputePipelineState,
@@ -152,6 +171,8 @@ pub struct MetalVectorCfr {
     // rake_marker instrumentation buffer for vcfr_bottom_up buffer(18) — the
     // kernel writes it unconditionally at terminals; leaving it UNBOUND was UB.
     d_rake_marker: MetalBuffer<u8>,
+    // np=5 MC outer draws per terminal (0 = FULL enumeration — the parity mode).
+    np5_mc: i32,
 
     // Scratch buffer for params (legacy sync path; the async path passes
     // params inline via set_bytes so there is no shared-buffer clobber).
@@ -301,6 +322,7 @@ impl MetalVectorCfr {
             num_combinations: num_combinations as f32,
             rake_rate: tree.rake_rate as f32,
             rake_cap: tree.rake_cap as f32,
+            np5_mc: 128,
             d_rake_marker: ctx.alloc_zeros(nn * nh),
             d_params_buf,
             async_mode: std::cell::Cell::new(false),
@@ -308,6 +330,11 @@ impl MetalVectorCfr {
             lone_terminals: None,
             lambda: 0.0,
         }
+    }
+
+    /// np=5 MC outer sample count (0 = full enumeration; parity/gates use 0).
+    pub fn set_np5_mc_samples(&mut self, m: i32) {
+        self.np5_mc = m;
     }
 
     /// Enable QRE (quantal-response) mode at inverse-temperature `lambda` (0 =
@@ -358,6 +385,22 @@ impl MetalVectorCfr {
         } else {
             None
         };
+        let np5 = if self.num_players == 5 {
+            assert!(factored, "np=5 lone terminals only have the factored path");
+            Some(Np5Lone {
+                prep_a: ctx.create_pipeline("vcfr_np4cf_prep_a").expect("np4cf prep_a"),
+                prep_b: ctx.create_pipeline("vcfr_np4cf_prep_b").expect("np4cf prep_b"),
+                prep_sk: ctx.create_pipeline("vcfr_np4cf_prep_sk").expect("np4cf prep_sk"),
+                prep_vk: ctx.create_pipeline("vcfr_np4cf_prep_vk").expect("np4cf prep_vk"),
+                prep_mk: ctx.create_pipeline("vcfr_np4cf_prep_mk").expect("np4cf prep_mk"),
+                cdf: ctx.create_pipeline("vcfr_np5_cdf").expect("np5 cdf"),
+                main: ctx.create_pipeline("vcfr_np5_lone_main").expect("np5 main"),
+                d_tables: ctx.alloc_zeros(term_nodes.len().max(1) * NP4CF_STRIDE),
+                d_cdf: ctx.alloc_zeros(term_nodes.len().max(1) * nh),
+            })
+        } else {
+            None
+        };
         self.lone_terminals = Some(LoneTerminals {
             pipeline,
             factored_pipeline,
@@ -366,6 +409,7 @@ impl MetalVectorCfr {
             n_term: term_nodes.len(),
             factored,
             np4,
+            np5,
         });
     }
 
@@ -852,6 +896,9 @@ impl MetalVectorCfr {
         struct LoneTermParams {
             nh: i32, np: i32, traverser: i32, n_term: i32,
             starting_pot: i32, rake_rate: f32, rake_cap: f32, num_combinations: f32,
+            // np=5 fields (single owner — ALL fill sites set them; the
+            // BottomUpParams under-fill UB class cannot recur here).
+            inner_role_base: i32, mc_samples: i32, mc_seed: u32,
         }
         let params = LoneTermParams {
             nh: nh as i32, np: np as i32, traverser: traverser as i32, n_term: lt.n_term as i32,
@@ -859,7 +906,84 @@ impl MetalVectorCfr {
             // Real tree rake (was HARDCODED 0.0 — production fold pots un-raked).
             rake_rate: self.rake_rate, rake_cap: self.rake_cap,
             num_combinations: self.num_combinations,
+            inner_role_base: 0, mc_samples: 0, mc_seed: 0,
         };
+        // np=5 (K=4 opponents): np4cf aggregate preps (roles 1,2,3) + CDF + mass4
+        // main (closed-inner × enumerated/MC outer). Encoders share the tables
+        // buffer ⇒ hazard-ordered.
+        if let Some(np5) = &lt.np5 {
+            let mut p5 = params;
+            p5.inner_role_base = 1;
+            p5.mc_samples = self.np5_mc;
+            // per-(iteration, traverser) seed so MC noise decorrelates across
+            // iterations (CFR averaging absorbs it — validated CV 7.1% @ M=128).
+            p5.mc_seed = 0x5EED_2026u32 ^ self.iteration.wrapping_mul(0x9E37_79B9) ^ (traverser << 27);
+            let pbytes = std::mem::size_of::<LoneTermParams>() as u64;
+            let pptr = &p5 as *const _ as *const std::ffi::c_void;
+            let enc2d = |pipe: &ComputePipelineState, cells_y: usize, with_hc: bool, with_p2h: bool| {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(np5.d_tables.as_ref()), 0);
+                enc.set_buffer(1, Some(lt.d_term_nodes.as_ref()), 0);
+                enc.set_buffer(2, Some(self.d_reach.as_ref()), 0);
+                let mut idx = 3;
+                if with_hc { enc.set_buffer(idx, Some(self.d_hand_cards.as_ref()), 0); idx += 1; }
+                if with_p2h { enc.set_buffer(idx, Some(lt.d_pair2hand.as_ref()), 0); idx += 1; }
+                enc.set_bytes(idx as u64, pbytes, pptr);
+                let max_tpg = pipe.max_total_threads_per_threadgroup() as usize;
+                let (grid, tg) = ctx.dispatch_2d(lt.n_term, cells_y, max_tpg);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+            };
+            enc2d(&np5.prep_a, 52, true, false);
+            enc2d(&np5.prep_b, 52, false, true);
+            enc2d(&np5.prep_sk, 53, true, false);
+            enc2d(&np5.prep_vk, 52, true, true);
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&np5.prep_mk);
+                enc.set_buffer(0, Some(np5.d_tables.as_ref()), 0);
+                enc.set_buffer(1, Some(lt.d_term_nodes.as_ref()), 0);
+                enc.set_buffer(2, Some(self.d_reach.as_ref()), 0);
+                enc.set_buffer(3, Some(self.d_hand_cards.as_ref()), 0);
+                enc.set_buffer(4, Some(lt.d_pair2hand.as_ref()), 0);
+                enc.set_bytes(5, pbytes, pptr);
+                let tgy = (np5.prep_mk.max_total_threads_per_threadgroup() as u64).min(52);
+                let groups = MTLSize::new(lt.n_term as u64, 52u64.div_ceil(tgy), 52);
+                let tg = MTLSize::new(1, tgy, 1);
+                enc.dispatch_thread_groups(groups, tg);
+                enc.end_encoding();
+            }
+            if self.np5_mc > 0 {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&np5.cdf);
+                enc.set_buffer(0, Some(np5.d_cdf.as_ref()), 0);
+                enc.set_buffer(1, Some(lt.d_term_nodes.as_ref()), 0);
+                enc.set_buffer(2, Some(self.d_reach.as_ref()), 0);
+                enc.set_bytes(3, pbytes, pptr);
+                let (grid, tg) = ctx.dispatch_1d(lt.n_term, np5.cdf.max_total_threads_per_threadgroup() as usize);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+            }
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&np5.main);
+            enc.set_buffer(0, Some(self.d_cfv.as_ref()), 0);
+            enc.set_buffer(1, Some(lt.d_term_nodes.as_ref()), 0);
+            enc.set_buffer(2, Some(self.d_nodes.as_ref()), 0);
+            enc.set_buffer(3, Some(self.d_contributions.as_ref()), 0);
+            enc.set_buffer(4, Some(self.d_folded_masks.as_ref()), 0);
+            enc.set_buffer(5, Some(self.d_reach.as_ref()), 0);
+            enc.set_buffer(6, Some(self.d_hand_cards.as_ref()), 0);
+            enc.set_buffer(7, Some(lt.d_pair2hand.as_ref()), 0);
+            enc.set_buffer(8, Some(np5.d_tables.as_ref()), 0);
+            enc.set_buffer(9, Some(np5.d_cdf.as_ref()), 0);
+            enc.set_bytes(10, pbytes, pptr);
+            let max_tpg = np5.main.max_total_threads_per_threadgroup() as usize;
+            let (grid, tg) = ctx.dispatch_2d(lt.n_term, nh, max_tpg);
+            enc.dispatch_thread_groups(grid, tg);
+            enc.end_encoding();
+            return;
+        }
         // np=4 (K=3 opponents): table-prep P → Q → R, then the main mass kernel.
         // The four encoders share the tables buffer, so Metal hazard tracking
         // orders them; reach is read-only. Grid sizes: preps (n_term × 52),
