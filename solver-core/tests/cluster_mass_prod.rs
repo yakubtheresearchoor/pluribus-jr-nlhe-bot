@@ -84,3 +84,42 @@ fn cost_at_production_nh() {
     let perf = t1.elapsed().as_secs_f64()/n as f64*1000.0;
     eprintln!("per-terminal (nh={nh}): cluster-pairs={per:.2}ms  factored={perf:.3}ms  ratio={:.0}x  (acc {acc:.0})", per/perf.max(1e-6));
 }
+
+#[test]
+fn fast_matches_base() {
+    use solver_core::solver::cluster_mass::mass_cluster_pairs_fast;
+    let deck=18u8; let hc=hands_deck(deck); let nh=hc.len()/2;
+    let mut rng=Lcg(0xFA57);
+    let mut worst=0.0f64;
+    for kk in [2usize,3,4] {
+        for _ in 0..3 {
+            let rs:Vec<Vec<f32>>=(0..kk).map(|_|(0..nh).map(|_| if rng.f()<0.3{0.0}else{rng.f()}).collect()).collect();
+            let refs:Vec<&[f32]>=rs.iter().map(|r|r.as_slice()).collect();
+            let base=mass_cluster_pairs(&refs,&hc,nh);
+            let fast=mass_cluster_pairs_fast(&refs,&hc,nh);
+            let scale=base.iter().fold(1e-9f32,|a,&b| a.max(b.abs())) as f64;
+            for h in 0..nh { worst=worst.max((fast[h] as f64 - base[h] as f64).abs()/scale); }
+        }
+    }
+    eprintln!("fast vs base (K=2,3,4): worst scale-rel = {worst:.2e}");
+    assert!(worst < 1e-4, "fast must match base: {worst}");
+}
+
+#[test]
+#[ignore = "cost"]
+fn fast_cost() {
+    use solver_core::solver::cluster_mass::mass_cluster_pairs_fast;
+    let mut hc=Vec::new(); let deck:Vec<u8>=(0..47).collect();
+    'o: for i in 0..deck.len(){for j in (i+1)..deck.len(){hc.push(deck[i]);hc.push(deck[j]); if hc.len()/2>=1081{break 'o;}}}
+    let nh=hc.len()/2; let mut rng=Lcg(0xBEE);
+    let rs:Vec<Vec<f32>>=(0..4).map(|_|(0..nh).map(|_| if rng.f()<0.3{0.0}else{rng.f()}).collect()).collect();
+    let refs:Vec<&[f32]>=rs.iter().map(|r|r.as_slice()).collect();
+    let n=200; let mut acc=0.0f32;
+    let t=std::time::Instant::now();
+    for _ in 0..n { acc+=mass_cluster_pairs_fast(&refs,&hc,nh)[0]; }
+    let per=t.elapsed().as_secs_f64()/n as f64*1000.0;
+    let tf=std::time::Instant::now();
+    for _ in 0..n { acc+=factored_total_reach_product(&refs,&hc,nh)[0]; }
+    let perf=tf.elapsed().as_secs_f64()/n as f64*1000.0;
+    eprintln!("fast per-terminal (nh={nh}): {per:.3}ms  vs factored {perf:.3}ms  ratio={:.1}x  (acc {acc:.0})", per/perf.max(1e-6));
+}
