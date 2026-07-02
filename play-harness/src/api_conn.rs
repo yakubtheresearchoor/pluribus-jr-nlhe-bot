@@ -64,7 +64,15 @@ pub struct ConnDecider {
     cfg: SearchCfg,
     /// Per-(flop_id, live) adapter Blueprint cache — built lazily from the GS14
     /// cache (the depth-limited search's bucketing + ranges).
-    bp_cache: Mutex<HashMap<(usize, usize), Arc<SyncBlueprint>>>,
+    // LRU-BOUNDED per-(flop_id, live) adapter cache. Each adapter is ~100-250MB
+    // (per-runout tables + bucketing); an UNBOUNDED map OOM-killed the server in
+    // ~3 min under fleet load touching many distinct flops (RSS 4.8->24GB,
+    // SIGKILL, launchd restart loop). Values are (adapter, lru_stamp); the
+    // second tuple field of the mutex is the stamp counter. Evicted adapters
+    // still in use by in-flight solves stay alive via their Arc.
+    bp_cache: Mutex<(HashMap<(usize, usize), (Arc<SyncBlueprint>, u64)>, u64)>,
+    /// Max cached adapters (CONN_ADAPTER_CACHE, default 24 ~= 3-6GB).
+    adapter_cache_cap: usize,
     /// Preflop jam-subgame (Option A): restore the high-SPR all-in the lean na=8
     /// blueprint omits. Tables built lazily on first low-SPR HU preflop decision.
     jam_cfg: JamCfg,
@@ -164,7 +172,8 @@ impl ConnDecider {
         Ok(ConnDecider {
             bp, layout, gs14_dir: gs14_dir.to_string(), nb, bnt: 49, bnr: 48, canonical_flops,
             cfg,
-            bp_cache: Mutex::new(HashMap::new()),
+            bp_cache: Mutex::new((HashMap::new(), 0)),
+            adapter_cache_cap: std::env::var("CONN_ADAPTER_CACHE").ok().and_then(|s| s.parse().ok()).unwrap_or(24).max(1),
             jam_cfg,
             jam_tables: Mutex::new(None),
             rep_combos,
@@ -298,8 +307,14 @@ impl ConnDecider {
     /// bucketing + initial ranges). Cached per (flop_id, live).
     fn adapter(&self, flop_id: usize, live: usize) -> Option<Arc<SyncBlueprint>> {
         let key = (flop_id, live);
-        if let Some(b) = self.bp_cache.lock().unwrap().get(&key) {
-            return Some(b.clone());
+        {
+            let mut cache = self.bp_cache.lock().unwrap();
+            let (map, stamp) = &mut *cache;
+            if let Some((b, s)) = map.get_mut(&key) {
+                *stamp += 1;
+                *s = *stamp;
+                return Some(b.clone());
+            }
         }
         let canonical = *self.canonical_flops.get(flop_id)?;
         // Adapter runout for the continuation SHOWDOWN tables (MC-sampled by the
@@ -325,7 +340,17 @@ impl ConnDecider {
             cum_flop: vec![], cum_turn: vec![], cum_river: vec![], bk, game,
         };
         let arc = Arc::new(SyncBlueprint(blueprint));
-        self.bp_cache.lock().unwrap().insert(key, arc.clone());
+        {
+            let mut cache = self.bp_cache.lock().unwrap();
+            let (map, stamp) = &mut *cache;
+            while map.len() >= self.adapter_cache_cap {
+                // Evict least-recently-used (O(cap) scan; cap is small).
+                let Some((&old, _)) = map.iter().min_by_key(|(_, (_, s))| *s) else { break };
+                map.remove(&old);
+            }
+            *stamp += 1;
+            map.insert(key, (arc.clone(), *stamp));
+        }
         Some(arc)
     }
 
