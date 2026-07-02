@@ -48,6 +48,7 @@ fn gpu_np5_terminal_matches_rust_reference() {
     for t in 0..np as u32 {
         let mut gpu = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &game.table().hand_cards, nc);
         gpu.set_fast_lone_terminals_ex(&ctx, &lone, true);
+        gpu.set_np5_use_cluster(false); // exact full-enum family for this gate
         gpu.set_np5_mc_samples(0); // FULL outer enumeration = deterministic parity
         let snap = gpu.run_one_iteration_diagnostic(&ctx, &tree, t);
 
@@ -120,10 +121,10 @@ fn gpu_np5_full_scale_bench() {
     let (sos, soi, sps, spi, _) = table.sorted_opp_arrays_base();
     let iw: Vec<Vec<f32>> = (0..np as usize).map(|p| table.initial_weights[p].clone()).collect();
     let nc = table.num_combinations;
-    for (label, m) in [("MC m=128", 128i32), ("MC m=64", 64), ("FULL enum", 0)] {
+    for (label, m) in [("CLUSTER", -1i32), ("MC m=128", 128), ("FULL enum", 0)] {
         let mut gpu = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &table.hand_cards, nc);
         gpu.set_fast_lone_terminals_ex(&ctx, &lone, true);
-        gpu.set_np5_mc_samples(m);
+        if m >= 0 { gpu.set_np5_use_cluster(false); gpu.set_np5_mc_samples(m); }
         let iters = if m == 0 { 3 } else { 20 };
         let t0 = std::time::Instant::now();
         gpu.run_batched(&ctx, &tree, iters);

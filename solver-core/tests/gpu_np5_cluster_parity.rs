@@ -125,3 +125,73 @@ fn gpu_np5_cluster_matches_cpu() {
     eprintln!("np5 cluster GPU vs CPU-fast: worst scale-rel = {worst:.3e} (nh={nh})");
     assert!(worst < 1e-3, "cluster kernel diverges: {worst}");
 }
+
+// ── in-solver gate: the cluster kernels running inside MetalVectorCfr's
+// encode path, vs the CPU reference computed from read-back reaches. ──
+use solver_core::gpu_metal::MetalVectorCfr;
+use solver_core::solver::flop_start_game::FlopChanceTable;
+use solver_core::tree::action::{production_game_v1, BetCap, BetSize, BetSizeOptions, BoardState};
+use solver_core::tree::builder::build_tree_depth_limited;
+
+#[test]
+fn gpu_np5_cluster_in_solver_matches_cpu() {
+    let np = 5u8;
+    let canonical = [3u8, 19, 35];
+    let (turns, river_decks) = solver_core::blueprint::runout_grid(canonical, 12, 12);
+    let turns_u8: Vec<u8> = turns.iter().map(|&c| c as u8).collect();
+    let table = FlopChanceTable::build_full_nh_sampled(canonical, np, &turns_u8, &river_decks);
+    let nh = table.num_valid;
+    let hand_cards = table.hand_cards.clone();
+    let spec = production_game_v1();
+    let mut cfg = spec.street_seam_config(BoardState::Flop, np, 6, 30,
+        BetSizeOptions { bet: vec![BetSize::PotRelative(0.5), BetSize::PotRelative(1.0)], raise: vec![BetSize::PotRelative(1.0)] });
+    cfg.max_bets_per_street = BetCap::all(3);
+    let tree = build_tree_depth_limited(&cfg).expect("tree");
+    let lone: Vec<u32> = (0..tree.num_nodes())
+        .filter(|&n| tree.nodes[n].is_terminal())
+        .filter(|&n| { let fm = tree.get_folded_mask(n);
+            (0..np).filter(|&p| fm & (1 << p) == 0).count() <= 1 })
+        .map(|n| n as u32).collect();
+    let ctx = MetalContext::new().expect("Metal");
+    let (sos, soi, sps, spi, _) = table.sorted_opp_arrays_base();
+    let iw: Vec<Vec<f32>> = (0..np as usize).map(|p| table.initial_weights[p].clone()).collect();
+    let nc = table.num_combinations;
+
+    let mut worst = 0.0f64;
+    for t in 0..np as u32 {
+        let mut gpu = MetalVectorCfr::new(&ctx, &tree, nh, &iw, &sos, &soi, &sps, &spi, &hand_cards, nc);
+        gpu.set_fast_lone_terminals_ex(&ctx, &lone, true); // cluster is DEFAULT
+        let snap = gpu.run_one_iteration_diagnostic(&ctx, &tree, t);
+        for &term in lone.iter().step_by(11) {
+            let node = term as usize;
+            let opps: Vec<usize> = (0..np as usize).filter(|&p| p != t as usize).collect();
+            let rows: Vec<Vec<f32>> = opps.iter().map(|&p| {
+                let base = (node * np as usize + p) * nh;
+                snap.reach_after_topdown[base..base + nh].to_vec()
+            }).collect();
+            let refs: Vec<&[f32]> = rows.iter().map(|r| r.as_slice()).collect();
+            let mass = mass_cluster_pairs_fast(&refs, &hand_cards, nh);
+            // payoff mirror
+            let fm = tree.get_folded_mask(node);
+            let c_t = tree.contributions[node * np as usize + t as usize];
+            let stake = tree.starting_pot as f64 / np as f64 + c_t as f64;
+            let folded = fm & (1 << t) != 0;
+            let flop_seen = tree.nodes[node].board_state != 3;
+            let (rrr, rc2) = if flop_seen { (tree.rake_rate, tree.rake_cap) } else { (0.0, 0.0) };
+            let total_pot: i32 = tree.starting_pot + (0..np as usize).map(|q| tree.contributions[node * np as usize + q]).sum::<i32>();
+            let min_c = (0..np as usize).map(|q| tree.contributions[node * np as usize + q]).min().unwrap();
+            let n_main = (0..np as usize).filter(|&q| tree.contributions[node * np as usize + q] >= min_c).count() as i32;
+            let rake = ((min_c * n_main + tree.starting_pot) as f64 * rrr).min(rc2).max(0.0);
+            let payoff = if folded { -stake } else { total_pot as f64 - rake - stake };
+            let mut scale = 1e-9f64;
+            for h in 0..nh { scale = scale.max((payoff * mass[h] as f64 / nc as f64).abs()); }
+            for h in (0..nh).step_by(53) {
+                let expect = payoff * mass[h] as f64 / nc as f64;
+                let got = snap.cfv[node * nh + h] as f64;
+                worst = worst.max((got - expect).abs() / scale);
+            }
+        }
+    }
+    eprintln!("np5 cluster IN-SOLVER vs CPU reference: worst scale-rel = {worst:.3e}");
+    assert!(worst < 5e-3, "in-solver cluster diverges: {worst}");
+}
