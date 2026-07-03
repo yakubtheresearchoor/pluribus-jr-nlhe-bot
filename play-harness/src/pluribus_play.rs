@@ -1182,6 +1182,7 @@ fn try_gpu_search(
 fn try_gpu_search(
     _bp: &Blueprint, _tree: &FlatTree, _cont: ContStreet, _live: usize,
     _overrides: &[(usize, Vec<f32>)], _cfg: &SearchCfg,
+    _prefix: &[(u8, u32)],
 ) -> Option<std::collections::HashMap<usize, Vec<Vec<f32>>>> {
     None
 }

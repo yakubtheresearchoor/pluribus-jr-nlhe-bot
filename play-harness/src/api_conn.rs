@@ -466,6 +466,19 @@ impl ConnDecider {
         }
         let flop_id = req.flop_id as usize;
         let adapter = self.adapter(flop_id, req.live as usize)?;
+        // OFF-GRID live-3/4 TURNS -> the conn LOOKUP (measured 2026-07-02): the
+        // exact turn resolve behind the street search costs ~4s/ITERATION (the
+        // turn tree recurses all 48 river branches) - 30s np=3 / 171s np=4 in
+        // production, and a budget-starved 6-iter solve is slow AND near-
+        // uniform. live-3/4 cells are RICH converged blueprint strategy; the
+        // instant lookup strictly dominates. (live>=5 adapters carry all 49
+        // turns, so they never off-grid.)
+        if req.board.len() == 4 && req.live <= 4 {
+            let tc = req.board[3];
+            if !adapter.0.turns.contains(&tc) {
+                return None;
+            }
+        }
         let reach_priors = self.reach_priors(req, &adapter.0);
         // Tuned base cfg (par+dcfr+iters); QRE λ from CONN_LAMBDA/CONN_OPP_LAMBDA.
         // live-5 trims iterations to its measured budget (CONN_ITERS_L5 overrides).

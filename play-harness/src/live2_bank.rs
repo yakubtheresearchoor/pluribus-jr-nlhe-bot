@@ -208,7 +208,7 @@ pub fn solve_multiway_street_rooted(
     // (per-node hand vectors) costs 30s/140s REGARDLESS of iters. Lean menu
     // (pot bet + pot raise, cap 2) keeps multiway rivers solvable in budget —
     // the same taper philosophy as the conn cells and the live-6 search menu.
-    let menu = if np >= 5 {
+    let menu = if np >= 5 || (np >= 4 && board.len() == 4) {
         BetSizeOptions {
             bet: vec![solver_core::tree::action::BetSize::PotRelative(1.0)],
             raise: vec![solver_core::tree::action::BetSize::PotRelative(1.0)],
@@ -256,13 +256,23 @@ pub fn solve_multiway_street_rooted(
     }
     // Adaptive iters: time one iter, then fit the wall-clock budget (cap `iters`,
     // floor MIN) — identical discipline to the live-2 real-time solve.
+    // CHUNKED WALL-CLOCK BUDGET (2026-07-02): any fixed-probe estimate lies —
+    // early iterations run on uniform strategies and stay cheap well past a
+    // 1-3 iter probe (measured: 23.5s np=3 / 171s np=4 off-grid turns under a
+    // "9s" budget). Run in chunks and check the clock between them (the same
+    // discipline as the GPU run_batched_budget).
     let t = std::time::Instant::now();
-    cfr.run(&tree, &game, 1);
-    let per_iter = t.elapsed().as_millis().max(1);
-    let fit = (budget_ms / per_iter) as u32;
-    let total = fit.clamp(LIVE2_RT_MIN_ITERS, iters);
-    if total > 1 {
-        cfr.run(&tree, &game, total - 1);
+    let mut done = 0u32;
+    while done < iters {
+        let chunk = 8u32.min(iters - done);
+        cfr.run(&tree, &game, chunk);
+        done += chunk;
+        if std::env::var("DEBUG_RESOLVE").is_ok() {
+            eprintln!("[resolve] iters={done} elapsed={}ms", t.elapsed().as_millis());
+        }
+        if done >= LIVE2_RT_MIN_ITERS && t.elapsed().as_millis() >= budget_ms {
+            break;
+        }
     }
     Some(Live2StreetSolve { tree, cfr, nh, hand_cards })
 }
