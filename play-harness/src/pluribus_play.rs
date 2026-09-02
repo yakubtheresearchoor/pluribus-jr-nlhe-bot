@@ -51,6 +51,11 @@ pub struct SearchCfg {
     /// Run Discounted-CFR (α=1.5,β=0,γ=2 — faster convergence, fewer iters).
     /// `None` ⇒ defer to the `DCFR` env var; `Some(b)` ⇒ explicit.
     pub dcfr: Option<bool>,
+    /// Remaining wall-clock budget for THIS solve (deadline hand-me-down from
+    /// the queue). Clamps every runaway cap (GPU batched budget, CPU per-iter
+    /// cap) so an admitted-late solve finishes shallow instead of late.
+    /// `None` ⇒ the caps' own defaults.
+    pub budget_ms: Option<u64>,
 }
 
 impl Default for SearchCfg {
@@ -63,6 +68,7 @@ impl Default for SearchCfg {
             seed: 0x5EA12C,
             par: None,
             dcfr: None,
+            budget_ms: None,
         }
     }
 }
@@ -483,6 +489,52 @@ pub fn flop_search_exploitability(bp: &Blueprint, commit: i32, pot: i32, cfg: &S
 /// the game it actually solved (not a deeper game it never explored). Uniform
 /// entering ranges (like `flop_search_exploitability`); the magnitude is a solver-
 /// convergence measure, ~independent of the reach prior. Returns (iters, chips).
+/// Sweep with WARM-START seeds: `seed_fn(tree)` returns (node, [a*nh+h])
+/// rows added to cum_strategy at `weight` virtual iterations before solving.
+/// Mirrors flop_search_exploitability_sweep exactly except for the seeding,
+/// so warm-vs-cold curves are apples-to-apples (weight==0.0 == cold).
+pub fn flop_search_exploitability_sweep_seeded(
+    bp: &Blueprint,
+    commit: i32,
+    pot: i32,
+    cfg: &SearchCfg,
+    checkpoints: &[u32],
+    seed_fn: &dyn Fn(&FlatTree) -> Vec<(usize, Vec<f32>)>,
+    weight: f32,
+) -> Vec<(u32, f32)> {
+    let np = bp.np;
+    let nh = bp.nh;
+    let spec = production_game_v1();
+    let mut tcfg = spec.street_seam_config(BoardState::Flop, np as u8, commit, pot, rich_bets());
+    tcfg.max_bets_per_street = BetCap::all(3);
+    let tree = build_tree_depth_limited(&tcfg).expect("flop tree");
+    let depth = depth_leaves(&tree, BoardState::Flop as u8, false, np);
+    let mut depth_bool = vec![false; tree.num_nodes()];
+    for &n in &depth {
+        depth_bool[n] = true;
+    }
+    let seeds = seed_fn(&tree);
+    let mut out = Vec::with_capacity(checkpoints.len());
+    for &iters in checkpoints {
+        let game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        let mut s = CpuMccfr::new(&tree, vec![nh; np]);
+        s.set_depth_limit(&depth);
+        s.set_dcfr(1.5, 0.0, 2.0); // match the deployed search (DCFR on)
+        s.enable_parallel();
+        if weight > 0.0 {
+            for (node, strat) in &seeds {
+                s.seed_cum(*node, strat, weight);
+            }
+        }
+        s.run(&tree, &game, iters);
+        let profile = StrategyProfile::from_usize_offsets(s.cum_strategy_slice(), s.node_offsets(), nh);
+        let mut eval_game = BucketedContinuationGame::new(&bp.game, &bp.bk, cfg.sample_m, cfg.seed);
+        eval_game.set_normalize_reach(true);
+        out.push((iters, exploitability_dl(&tree, &eval_game, &profile, &depth_bool)));
+    }
+    out
+}
+
 pub fn flop_search_exploitability_sweep(
     bp: &Blueprint,
     commit: i32,
@@ -768,7 +820,43 @@ pub fn search_street_strat(
     if !prefix.is_empty() {
         freeze_prefix(&mut s, tree, nh, prefix);
     }
-    s.run(tree, &game, cfg.iters);
+    // HARD runaway guard (CPU twin of GpuSearchCfg::budget_ms): the solve stops
+    // at the wall-clock cap even mid-convergence — an admission permit must
+    // never be held past the decision budget. Chunked per-iteration; safe
+    // because `CpuMccfr::run` resumes (self.iteration persists, so DCFR
+    // discounting and the cumulative average are unchanged vs one call).
+    // MIN_ITERS floors quality: a near-uniform 4-iter answer is worse than a
+    // slightly late one.
+    const CPU_SOLVE_MIN_ITERS: u32 = 8;
+    let cap_ms: u128 = std::env::var("CPU_SOLVE_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16_000)
+        .min(cfg.budget_ms.map_or(u128::MAX, |b| b as u128));
+    let t0 = std::time::Instant::now();
+    let mut done = 0u32;
+    while done < cfg.iters {
+        s.run(tree, &game, 1);
+        done += 1;
+        // Requester gone ⇒ result is discarded upstream; free the core now.
+        if crate::cancel::cancelled() {
+            eprintln!("[cpu-search] cancelled by client disconnect after {done} iters");
+            break;
+        }
+        let over = t0.elapsed().as_millis() >= cap_ms;
+        // 2×cap is ABSOLUTE — even the MIN_ITERS quality floor yields to it
+        // (a pathological cell must not hold a permit forever).
+        if (over && done >= CPU_SOLVE_MIN_ITERS) || t0.elapsed().as_millis() >= 2 * cap_ms {
+            if done < cfg.iters {
+                eprintln!(
+                    "[cpu-search] budget hit: ran {done}/{} iters in {}ms (cap {cap_ms}ms)",
+                    cfg.iters,
+                    t0.elapsed().as_millis()
+                );
+            }
+            break;
+        }
+    }
     let mut m = HashMap::new();
     for n in 0..tree.num_nodes() {
         if tree.nodes[n].is_player() && tree.nodes[n].board_state == street_u8 {
@@ -1173,7 +1261,7 @@ fn try_gpu_search(
     // budget_ms: HARD runaway guard — a deep multiway tree must stop at the
     // real-time budget (matches the CPU path's adaptive trim), and an orphaned
     // solve (client disconnect) dies within it instead of pinning the GPU.
-    let gcfg = GpuSearchCfg { iters: cfg.iters, sample_m: cfg.sample_m, seed: cfg.seed, factored_terminals: true, lambda: cfg.lambda, budget_ms: 16_000 };
+    let gcfg = GpuSearchCfg { iters: cfg.iters, sample_m: cfg.sample_m, seed: cfg.seed, factored_terminals: true, lambda: cfg.lambda, budget_ms: cfg.budget_ms.map_or(16_000, |b| b.min(16_000)) };
     let picks = prefix_picks(tree, prefix);
     Some(gpu_search_street_strat(ctx, tree, bp.game.table(), &bp.bk, cont, &reach, &gcfg, &picks))
 }

@@ -322,7 +322,7 @@ kernel void mccfr_cell(
 // nodes); combined regret/cum (preflop region + per-cell regions). At the seam
 // (c_seam=1 chance node) the live preflop seats are remapped to postflop slots.
 // Preflop nodes (c_pre=1) bucket by preflop CLASS (169); postflop by card bucket.
-struct ConnParams { uint np; uint maxna; float rake_rate; float rake_cap; uint nt; uint nr; uint nh; uint nf; uint post_stride; float prune_c; uint prune_active; uint freeze_pre; };
+struct ConnParams { uint np; uint maxna; float rake_rate; float rake_cap; uint nt; uint nr; uint nh; uint nf; uint post_stride; float prune_c; uint prune_active; uint freeze_pre; uint n_prefix; float target_q; uint prefix_stride; float target_eps; };
 
 kernel void mccfr_conn(
     device const uchar  *c_type    [[buffer(0)]],
@@ -346,8 +346,11 @@ kernel void mccfr_conn(
     device const uchar  *t_alive   [[buffer(18)]],
     device const uchar  *r_alive   [[buffer(19)]],
     device const int    *strength  [[buffer(20)]],  // [run*nh + hand] exact 7-card rank (EXACT showdown)
-    device const float  *f_t       [[buffer(21)]],  // (unused — exact showdown)
-    device const float  *f_l       [[buffer(22)]],  // (unused)
+    // TARGETED EXPLORATION (2026-07-03, repurposed unused slots 21/22):
+    // prefix_act[pi*stride + hop] = forced action INDEX at the hop'th player
+    // node; prefix_meta[pi*2] = len, [pi*2+1] = target player (traverser).
+    device const uchar  *prefix_act [[buffer(21)]],
+    device const uint   *prefix_meta[[buffer(22)]],
     device const float  *f_n       [[buffer(23)]],  // (unused)
     constant uint       &nb_riv    [[buffer(24)]],  // (unused — exact showdown)
     device atomic_float *regret    [[buffer(25)]],
@@ -363,6 +366,25 @@ kernel void mccfr_conn(
     for (uint p = 0; p < np; p++) h[p] = hands_in[tid * np + p];
     uint trav = tid % np;
     ulong s = seeds[tid];
+    // TARGETED EXPLORATION: with prob target_q, force this trajectory down a
+    // rare defense line (folds→open→3-bet, defender to act). The defender
+    // becomes the traverser; every FORCED sampled action multiplies the
+    // importance weight w by the actor's current σ(a) — so the defender trains
+    // against the TRUE weighted 3-bet range, not "any two cards". Unbiased:
+    // targeting reallocates variance, not the fixed point.
+    uint t_hop = 0u; uint t_len = 0u; uint t_pi = 0u; float w = 1.0f;
+    if (P.n_prefix > 0u && P.target_q > 0.0f) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        if ((float)((uint)(s >> 32)) * (1.0f / 4294967296.0f) < P.target_q) {
+            // Simple uniform pick + ε-FLOORED weights at the hops (a rejection
+            // pre-walk was tried and REVERTED: it filters dead-by-σ prefixes
+            // before the floor can rescue them — the two mechanisms cancel).
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            t_pi = (uint)(s % (ulong)P.n_prefix);
+            t_len = prefix_meta[t_pi * 2u];
+            trav = prefix_meta[t_pi * 2u + 1u];
+        }
+    }
     // ALL-FLOPS: this trajectory's flop (host-sampled + host-dealt flop-relative hands).
     // postflop card-map/strength/regret lookups offset by fi. nf=1 ⇒ fi=0 ⇒ all 0.
     uint fi = fi_in[tid];
@@ -383,6 +405,14 @@ kernel void mccfr_conn(
     uint taoff = ti * nh;         // per-ti turn-map / turn-alive offset
     // postflop context (set at the seam): live-slot → hand, traverser slot, #live.
     uint post_hand[6]; uint post_trav = 0; uint nlive = 0;
+    // SEAM MONEY (2026-07-03 pathology fix): the cell trees are SHARED across
+    // preflop lines, so postflop terminals read the CELL's contributions/pot —
+    // the actual line's preflop investment was never charged past the seam
+    // (raising was free ⇒ systematic looseness; HU showed pair inversion).
+    // Carry the line-vs-cell deltas across the seam: set at each crossing,
+    // valid for the whole cell subtree under DFS (same pattern as post_hand).
+    float seam_extra[6]; for (uint p = 0; p < 6; p++) seam_extra[p] = 0.0f;
+    float seam_pot_extra = 0.0f;
 
     struct Frame { uint node; uint ai; uint na; uint base; uint pruned; float cv[CL_MAXNA]; float st[CL_MAXNA]; };
     Frame stack[CL_STACK];
@@ -397,14 +427,29 @@ kernel void mccfr_conn(
                     if (c_seam[cur] == 1) {
                         // SEAM: live preflop seats → postflop slots
                         ushort fm = c_fold[cur];
+                        uint cell_root = children[c_chstart[cur]];
+                        uint bc_pre = cur * np;
+                        uint bc_cell = cell_root * np;
+                        // Real line money: blinds (pre spot) + every seat's
+                        // contribution (folders' dead money included).
+                        float real_pot = (float)c_spot[cur];
+                        for (uint p = 0; p < np; p++) real_pot += (float)c_contrib[bc_pre + p];
                         nlive = 0;
                         for (uint p = 0; p < np; p++) {
                             if (((fm >> p) & 1) == 0) {
                                 if (p == trav) post_trav = nlive;
                                 post_hand[nlive] = h[p];
+                                // my real share (blind split + line contribution)
+                                // minus what the cell root will claim for me.
+                                seam_extra[nlive] = ((float)c_spot[cur] / (float)np + (float)c_contrib[bc_pre + p])
+                                    - ((float)c_spot[cell_root] / max(1.0f, (float)(np - (uint)popcount((uint)fm))) + (float)c_contrib[bc_cell + nlive]);
                                 nlive++;
                             }
                         }
+                        // pot delta: real line pot vs the cell's claimed pot.
+                        float cell_pot = (float)c_spot[cell_root];
+                        for (uint q = 0; q < nlive; q++) cell_pot += (float)c_contrib[bc_cell + q];
+                        seam_pot_extra = real_pot - cell_pot;
                     }
                     cur = children[c_chstart[cur]];
                     continue;
@@ -418,13 +463,16 @@ kernel void mccfr_conn(
                     ushort fm = c_fold[cur];
                     uint bc = cur * np;
                     int c_t = c_contrib[bc + who];
-                    int total = c_spot[cur];
-                    for (uint p = 0; p < useN; p++) total += c_contrib[bc + p];
-                    float half_pot = (float)c_spot[cur] / (float)useN + (float)c_t;
+                    int total_i = c_spot[cur];
+                    for (uint p = 0; p < useN; p++) total_i += c_contrib[bc + p];
+                    // SEAM MONEY: postflop terminals live in a SHARED cell tree —
+                    // re-base pot + my-share to the ACTUAL entry line's money.
+                    float total = (float)total_i + (pre ? 0.0f : seam_pot_extra);
+                    float half_pot = (float)c_spot[cur] / (float)useN + (float)c_t + (pre ? 0.0f : seam_extra[who]);
                     if (((fm >> who) & 1) == 1) { ret = -half_pot; stop = true; returning = true; break; }
                     if (pre) {
                         // preflop fold-win terminal (uncontested) — no showdown, no rake
-                        ret = (float)total - half_pot; stop = true; returning = true; break;
+                        ret = total - half_pot; stop = true; returning = true; break;
                     }
                     // postflop showdown (over live slots)
                     uchar bs = c_bs[cur];
@@ -440,9 +488,9 @@ kernel void mccfr_conn(
                     int minlev = 2147483647;
                     for (uint p = 0; p < useN; p++) { int c = c_contrib[bc + p]; if (c < minlev) minlev = c; }
                     int cnt = 0; for (uint p = 0; p < useN; p++) if (c_contrib[bc + p] >= minlev) cnt++;
-                    int main_pot = minlev * cnt + c_spot[cur];
-                    float rake = min(max((float)main_pot * P.rake_rate, 0.0f), P.rake_cap);
-                    float net_pot = (float)total - rake;
+                    float main_pot = (float)(minlev * cnt + c_spot[cur]) + seam_pot_extra;
+                    float rake = min(max(main_pot * P.rake_rate, 0.0f), P.rake_cap);
+                    float net_pot = total - rake;
                     // EXACT showdown (Pluribus-faithful): score actual sampled hands.
                     int s_t = strength[foff_r + roff + post_hand[who]];
                     uint better = 0, equal = 0; bool anyopp = false;
@@ -471,6 +519,21 @@ kernel void mccfr_conn(
                 for (uint a = 0; a < na; a++) { float r = max(atomic_load_explicit(&regret[base+a], memory_order_relaxed), 0.0f); st[a] = r; sum += r; }
                 if (sum > 0.0f) { for (uint a = 0; a < na; a++) st[a] /= sum; } else { for (uint a = 0; a < na; a++) st[a] = 1.0f/(float)na; }
                 uint who2 = pre ? trav : post_trav;
+                // forced prefix hop (targeted trajectory, preflop, non-traverser
+                // actor by construction): take the prescribed action, accumulate
+                // the importance weight, descend.
+                if (pre && t_hop < t_len) {
+                    uint fa = (uint)prefix_act[t_pi * P.prefix_stride + t_hop];
+                    t_hop++;
+                    // ε-FLOORED importance weight: pure w=σ zeroes out whenever
+                    // the dealt hand never takes the forced action (converged
+                    // pure strategies ⇒ nearly all trajectories wasted). The
+                    // floor trains the defender vs "true range + ε·any-two" —
+                    // a benignly-wider defense, and every trajectory counts.
+                    w *= max(st[fa], P.target_eps);
+                    cur = children[c_chstart[cur] + fa];
+                    continue;
+                }
                 if (actor == who2) {
                     // PRUNING: skip regret≤prune_c subtrees (not river; never all actions).
                     uint pmask = 0;
@@ -516,12 +579,12 @@ kernel void mccfr_conn(
             if (!frozen) {
                 for (uint a = 0; a < stack[sp].na; a++) {
                     if ((stack[sp].pruned >> a) & 1) continue; // pruned: regret/cum unchanged
-                    float delta = stack[sp].cv[a] - v;
+                    float delta = w * (stack[sp].cv[a] - v);
                     float old = atomic_load_explicit(&regret[stack[sp].base + a], memory_order_relaxed);
                     float newv;
                     do { newv = max(old + delta, 0.0f); }
                     while (!atomic_compare_exchange_weak_explicit(&regret[stack[sp].base + a], &old, newv, memory_order_relaxed, memory_order_relaxed));
-                    atomic_fetch_add_explicit(&cum[stack[sp].base + a], stack[sp].st[a], memory_order_relaxed);
+                    atomic_fetch_add_explicit(&cum[stack[sp].base + a], w * stack[sp].st[a], memory_order_relaxed);
                 }
             }
             ret = v; sp--;

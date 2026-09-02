@@ -172,6 +172,7 @@ async fn decide_handler(
     State(st): State<AppState>,
     Json(mut req): Json<DecideRequest>,
 ) -> Result<Json<DecideResponse>, (StatusCode, String)> {
+    let t_start = std::time::Instant::now();
     // PREFLOP (empty board): connected blueprint if loaded, else EQR player.
     if req.board.is_empty() {
         if let Some(conn) = st.conn.as_ref() {
@@ -184,7 +185,16 @@ async fn decide_handler(
             "no preflop strategy loaded (set PF_STRAT)".to_string(),
         ))?;
         return match decide_preflop(&pf.0, &req) {
-            Some(r) => Ok(Json(r)),
+            Some(r) => {
+                // The conn layer could not serve this shape — the EQR PLAYER
+                // (the pre-v5 chart with the measured deep-node leaks) answered.
+                // Loud on purpose: any volume here is a mapping gap to fix.
+                eprintln!(
+                    "[pre-fallback] EQR player served: {} {} (live {}, {} street_actions, to_call {:?})",
+                    r.chosen.action, r.chosen.amount, req.live, req.street_actions.len(), req.to_call
+                );
+                Ok(Json(r))
+            }
             None => Err((StatusCode::BAD_REQUEST, "unmappable preflop node".into())),
         };
     }
@@ -227,23 +237,98 @@ async fn decide_handler(
     // concurrent GPU submission, and waiters await the permit ASYNC (they don't
     // block worker threads, so health/other routes stay responsive). Preflop
     // lookups returned above and never reach here. Saturated ⇒ wait 2s then 503.
-    let _permit = match st.solve_sema.clone().try_acquire_owned() {
+    // Cancel guard first — it also covers the LOOKUP lane below. Dropping this
+    // future (client disconnect) flips the flag and any in-flight work bails.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_guard = play_harness::cancel::CancelOnDrop(cancel.clone());
+
+    // ---------- LOOKUP LANE (no admission permit) ----------
+    // Spots whose PRODUCTION answer is a lookup/rollout (turn/river cell reads,
+    // live-6, off-grid turns) never queue behind heavy solves: they are ms-scale
+    // reads that touch neither the GPU nor a core-bound solve. `search_engages`
+    // mirrors the search gates exactly, so this cannot serve a lookup where the
+    // search is the production path. live-2 stays on the heavy lane (its bank
+    // lookup is cheap but its turn/river paths are exact solves).
+    if (3..=5).contains(&req.board.len()) && req.live >= 3 {
+        if let Some(conn) = st.conn.clone() {
+            if !conn.search_engages(&req) {
+                let flag = cancel.clone();
+                let (served, returned): (Option<DecideResponse>, DecideRequest) =
+                    tokio::task::spawn_blocking(move || {
+                        let r = play_harness::cancel::with_cancel_flag(flag, || {
+                            conn.decide(&req)
+                                .or_else(|| play_harness::api::decide_live6(&req))
+                        });
+                        (r, req)
+                    })
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lookup join: {e}")))?;
+                req = returned;
+                if let Some(r) = served {
+                    return Ok(Json(r));
+                }
+                // Unservable by lookup — fall through to the heavy lane.
+            }
+        }
+    }
+
+    // ---------- HEAVY LANE: deadline-aware queue ----------
+    // The client tells us (or BOTSERVER_DEADLINE_MS defaults) how long it will
+    // wait. We queue for a permit as long as a USEFUL solve can still finish
+    // before that deadline, instead of the old flat 2s-then-503: at game pace a
+    // collision is nearly always depth-1 and a few seconds of patience converts
+    // a lost decision into a served one. The permit wait is fair-FIFO (tokio
+    // semaphore). If the wait outlives the deadline math, fail FAST — the
+    // client's fallback wants the 503 as early as possible.
+    let deadline_total_ms: u64 = req.deadline_ms.unwrap_or_else(|| {
+        std::env::var("BOTSERVER_DEADLINE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000)
+    });
+    // Margin for response serialization + network + client-side slack.
+    const DEADLINE_MARGIN_MS: u64 = 700;
+    // Below this a solve is near-uniform — shed instead of serving noise.
+    const MIN_USEFUL_SOLVE_MS: u64 = 2_500;
+    let deadline = t_start + std::time::Duration::from_millis(deadline_total_ms.saturating_sub(DEADLINE_MARGIN_MS));
+    let wait_cap = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .and_then(|d| d.checked_sub(std::time::Duration::from_millis(MIN_USEFUL_SOLVE_MS)))
+        .unwrap_or_default();
+    #[allow(unused_mut)]
+    let mut permit = match st.solve_sema.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.solve_sema.clone().acquire_owned(),
-        )
-        .await
-        {
+        Err(_) => match tokio::time::timeout(wait_cap, st.solve_sema.clone().acquire_owned()).await {
             Ok(Ok(p)) => p,
             _ => {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "server saturated: too many concurrent solves, retry".into(),
+                    format!(
+                        "queue: cannot finish before the {deadline_total_ms}ms deadline (waited {}ms)",
+                        t_start.elapsed().as_millis()
+                    ),
                 ))
             }
         },
     };
+    // BUDGET HAND-ME-DOWN: whatever deadline remains after queueing is THE
+    // solve budget — every runaway cap downstream (GPU batched budget, CPU
+    // per-iter cap, resolve chunks) clamps to it, so an admitted-late solve
+    // finishes shallow-but-in-time instead of full-depth-but-late.
+    let remaining_ms = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if remaining_ms < MIN_USEFUL_SOLVE_MS {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "queue: deadline exhausted while waiting for a solve slot".into(),
+        ));
+    }
+    req.budget_ms = Some(remaining_ms);
+    // HAMMER FIX (2026-07-02): the permit rides INSIDE each spawn_blocking
+    // closure, NOT this future. When a client disconnects, axum drops this
+    // future — a future-held permit released while its blocking solve kept
+    // running, admitting the next solve on top (measured: 17 concurrent zombie
+    // resolves past max_solves=3). The closures below own the permit for the
+    // true lifetime of the work; the cancel guard reaps abandoned solves.
 
     // POSTFLOP (flop/turn/river) via the connected blueprint (lookup) when loaded.
     // Turn/river need `prior_actions` (the runtime supplies the full postflop path).
@@ -257,14 +342,16 @@ async fn decide_handler(
             // above caps this to one at a time; spawn_blocking keeps it off the
             // async workers. Move `req` in and hand it back so the fallthrough
             // live-2/live-6/legacy paths below can still use it if conn returns None.
-            let (served, returned): (Option<DecideResponse>, DecideRequest) =
+            let flag = cancel.clone();
+            let (served, returned, permit_back) =
                 tokio::task::spawn_blocking(move || {
-                    let r = conn.decide(&req);
-                    (r, req)
+                    let r = play_harness::cancel::with_cancel_flag(flag, || conn.decide(&req));
+                    (r, req, permit)
                 })
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("conn solve join: {e}")))?;
             req = returned;
+            permit = permit_back;
             if let Some(r) = served {
                 return Ok(Json(r));
             }
@@ -281,14 +368,25 @@ async fn decide_handler(
         // 3 bets/street, which makes walk_to_node fall off the tree), fall to the
         // equity rollout (sane check / pot-odds) rather than a 422 the live game
         // can't act on. A proper HU flop facing-bet solve is the follow-up (§11).
+        let flag = cancel.clone();
+        let req2 = Some(req.clone());
         let out = tokio::task::spawn_blocking(move || {
-            play_harness::api::decide_live2(&live2_root, &req)
-                .or_else(|| play_harness::api::decide_live6(&req))
+            let _permit = permit; // held for the work's true lifetime
+            play_harness::cancel::with_cancel_flag(flag, || {
+                play_harness::api::decide_live2(&live2_root, &req)
+                    .or_else(|| play_harness::api::decide_live6(&req))
+            })
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live2 join: {e}")))?;
         return match out {
-            Some(r) => Ok(Json(r)),
+            Some(r) => {
+                let r = match (st.conn.as_ref(), req2.as_ref()) {
+                    (Some(c), Some(rq)) => c.pool_overlay(rq, r),
+                    _ => r,
+                };
+                Ok(Json(r))
+            }
             None => Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "live-2: unresolvable postflop spot (board not 3-5 cards)".into(),
@@ -300,7 +398,11 @@ async fn decide_handler(
     // → check when unbet, pot-odds call/fold when facing a bet. CPU-bound MC →
     // blocking pool.
     if req.live >= 6 {
-        let out = tokio::task::spawn_blocking(move || play_harness::api::decide_live6(&req))
+        let flag = cancel.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            play_harness::cancel::with_cancel_flag(flag, || play_harness::api::decide_live6(&req))
+        })
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live6 join: {e}")))?;
         return match out {
@@ -348,7 +450,11 @@ async fn decide_handler(
     let bp: Arc<SyncBp> = match bp_opt {
         Some(bp) => bp,
         None => {
-            let out = tokio::task::spawn_blocking(move || play_harness::api::decide_live6(&req))
+            let flag = cancel.clone();
+            let out = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                play_harness::cancel::with_cancel_flag(flag, || play_harness::api::decide_live6(&req))
+            })
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live6 join: {e}")))?;
             return match out {
@@ -361,7 +467,11 @@ async fn decide_handler(
     // so each live count fits the ~14s real-time budget without manual env tuning.
     let cfg = play_harness::pluribus_play::SearchCfg::for_live(req.live as usize, &st.cfg);
     // CPU-bound search → blocking pool so the async runtime isn't stalled.
-    let out = tokio::task::spawn_blocking(move || decide_postflop(&bp, &req, &cfg))
+    let flag = cancel.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        play_harness::cancel::with_cancel_flag(flag, || decide_postflop(&bp, &req, &cfg))
+    })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("search join: {e}")))?;
     match out {

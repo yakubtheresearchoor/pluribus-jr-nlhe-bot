@@ -38,6 +38,7 @@ blueprint_conn_v1/
 blueprint_conn_v2/
 blueprint_conn_v3/
 blueprint_conn_v4/
+blueprint_conn_v5/
 blueprint_conn_eqr/
 
 # EQR preflop strategy artifacts (.f32 weights ~3.2GB each, regenerable via eqr_preflop_runner)

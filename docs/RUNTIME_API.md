@@ -66,7 +66,7 @@ on a preflop (empty-board) request.
 | `street_actions` | `[ActionInput]` | postflop | The ordered betting actions **this street**, replayed to find the hero's node. Empty = hero is first to act. |
 | `partner_cards` | `[u8; 2]?` | optional | **Pair mode** (§7): a colluding partner's hole cards, blocked from the pool's range. |
 | `partner_idx` | `u8?` | optional | The partner's index among the live set. |
-| `to_call` | `u32?` | live-6 | Amount (units) the hero must put in to call. Only the live-6 rollout path uses it; falls back to the max `to_total` in `street_actions`. |
+| `to_call` | `u32?` | facing any wager | Amount (units) the hero must ADD to call (delta, not total). Drives the preflop equity guard, the HU jam subgame, and the live-6 rollout — **see docs/CLIENT_TO_CALL.md** (v5, 2026-07-04). Missing ⇒ safe fallbacks (blind fold on untrained facing nodes; jam subgame inert). |
 | `cell_dir` | `string` | live-3/4/5 | Blueprint cell directory (§6.2), e.g. `live3_c6_p20_b15`. Omit when `route` derives it, or rely on the runtime's own cell selection. |
 | `flop_id` | `u32` | live-3/4/5 | Canonical flop id (`0..1754`). Derived by the server when `route = true`. |
 | `route` | `bool` | optional | When `true`, the server canonicalizes the raw `board` (suit isomorphism), derives `flop_id`, and remaps `board`/`hero_cards`/`partner_cards` into the blueprint's canonical suit frame. Lets the runtime send **real cards** and omit `flop_id`. Default `false`. |

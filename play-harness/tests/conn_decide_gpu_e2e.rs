@@ -25,6 +25,13 @@ fn gpu_vs_cpu_flop_decision_e2e() {
     // continuation variance that QRE's exp() amplifies; validated separately at
     // the solver level in gpu_search_parity.)
     let mk = || DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: vec![3, 19, 35], hero_cards: [48, 49], live: 2, hero_idx: 0,
         commit_entry: 6, pot_entry: 12, flop_id: 0, route: false,
         ..Default::default()

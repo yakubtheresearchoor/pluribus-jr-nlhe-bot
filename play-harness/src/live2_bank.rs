@@ -264,13 +264,28 @@ pub fn solve_multiway_street_rooted(
     let t = std::time::Instant::now();
     let mut done = 0u32;
     while done < iters {
-        let chunk = 8u32.min(iters - done);
+        // Chunk of 2 (was 8): under load, per-iteration cost inflates 4-8x and
+        // an 8-iter chunk was measured stretching to minutes — the clock (and
+        // the cancellation flag) must be consulted far more often than that.
+        let chunk = 2u32.min(iters - done);
         cfr.run(&tree, &game, chunk);
         done += chunk;
         if std::env::var("DEBUG_RESOLVE").is_ok() {
             eprintln!("[resolve] iters={done} elapsed={}ms", t.elapsed().as_millis());
         }
-        if done >= LIVE2_RT_MIN_ITERS && t.elapsed().as_millis() >= budget_ms {
+        // Requester gone (client disconnect) ⇒ this result is discarded
+        // upstream; stop burning the core.
+        if crate::cancel::cancelled() {
+            eprintln!("[resolve] cancelled by client disconnect after {done} iters");
+            break;
+        }
+        let el = t.elapsed().as_millis();
+        // 2x budget is ABSOLUTE (the MIN_ITERS quality floor yields to it) —
+        // same discipline as the cpu-search cap: no permit held forever.
+        if (done >= LIVE2_RT_MIN_ITERS && el >= budget_ms) || el >= 2 * budget_ms {
+            if el >= 2 * budget_ms && done < LIVE2_RT_MIN_ITERS {
+                eprintln!("[resolve] budget hit: ran {done}/{iters} iters in {el}ms (budget {budget_ms}ms)");
+            }
             break;
         }
     }

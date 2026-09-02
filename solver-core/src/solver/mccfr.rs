@@ -217,6 +217,20 @@ impl CpuMccfr {
     /// node plays this strategy, is never regret/cum-updated, and its
     /// cum_strategy is set to it so the scored profile reads the
     /// blueprint there. The un-frozen nodes are searched against it.
+    /// WARM-START: add `weight` x `strat` ([a*nh+h], rows normalized) to the
+    /// node's cumulative strategy. The AVERAGE strategy starts biased toward
+    /// `strat` (~`weight` virtual iterations) and decays as real iterations
+    /// accumulate; regrets are untouched (naive regret seeding distorts
+    /// regret-matching — the measured-bad variant). Gate with the
+    /// exploitability sweep before production use.
+    pub fn seed_cum(&mut self, node_idx: usize, strat: &[f32], weight: f32) {
+        let off = self.node_data_offset[node_idx];
+        if off == UNUSED { return; }
+        for (i, &v) in strat.iter().enumerate() {
+            self.cum_strategy[off + i] += weight * v;
+        }
+    }
+
     pub fn freeze_node(&mut self, node_idx: usize, strat: &[f32]) {
         let off = self.node_data_offset[node_idx];
         assert_ne!(off, UNUSED, "freeze_node on a non-player node {node_idx}");

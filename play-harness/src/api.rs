@@ -148,6 +148,42 @@ pub struct ActionInput {
     pub to_total: u32,
 }
 
+/// Per-seat opponent profile (all optional; fractions in 0..1).
+#[derive(Deserialize, Default, Clone)]
+pub struct OpponentStats {
+    pub seat_idx: u8,
+    #[serde(default)]
+    pub user_id: Option<u64>,
+    #[serde(default)]
+    pub vpip: Option<f32>,
+    #[serde(default)]
+    pub pfr: Option<f32>,
+    #[serde(default)]
+    pub three_bet: Option<f32>,
+    #[serde(default)]
+    pub fold_to_three_bet: Option<f32>,
+    #[serde(default)]
+    pub cbet: Option<f32>,
+    #[serde(default)]
+    pub fold_to_cbet: Option<f32>,
+    #[serde(default)]
+    pub wtsd: Option<f32>,
+    #[serde(default)]
+    pub wsd: Option<f32>,
+    #[serde(default)]
+    pub steal: Option<f32>,
+    #[serde(default)]
+    pub check_raise: Option<f32>,
+    #[serde(default)]
+    pub allin: Option<f32>,
+    #[serde(default)]
+    pub af: Option<f32>,
+    #[serde(default)]
+    pub sample_size: Option<u32>,
+    #[serde(default)]
+    pub archetype: Option<String>,
+}
+
 /// A postflop decision request. `board` = 3/4/5 cards (0..51). `hero_cards` =
 /// the hero's 2 hole cards. `partner_cards` (+ `partner_idx`) enable PAIR MODE:
 /// the partner's cards are blocked from the pool's range. `live` = players still
@@ -155,7 +191,7 @@ pub struct ActionInput {
 /// `pot_entry` = the matched commit / total pot ENTERING the current street.
 /// `cell` routes the blueprint (the flop-entry live/commit/pot). `street_actions`
 /// = the ordered actions THIS street.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub struct DecideRequest {
     pub board: Vec<u8>,
     pub hero_cards: [u8; 2],
@@ -217,6 +253,31 @@ pub struct DecideRequest {
     /// is position-specific. Must have ≥ `live` entries to enable the Bayesian prior.
     #[serde(default)]
     pub seat_positions: Vec<u8>,
+    /// Client decision deadline in ms from request arrival (default: server env
+    /// BOTSERVER_DEADLINE_MS, 20000). Drives queue admission ("can we still
+    /// finish in time?") and the solve budget hand-me-down.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    /// PER-SEAT OPPONENT STATS (exploit layer, 2026-07-05): career/tracked
+    /// stats keyed by seam seat. All fields optional — the server blends
+    /// individual stats toward the pool prior by sample size. Unknown seats
+    /// simply get the pool prior.
+    #[serde(default)]
+    pub opponent_stats: Vec<OpponentStats>,
+    /// Population river bluff share for THIS table's stake (overrides the
+    /// POOL_RIVER_BLUFF env when present) — the measured β.
+    #[serde(default)]
+    pub pool_river_bluff: Option<f32>,
+    /// EFFECTIVE STACK in units for THIS hand (min of hero/villain starting
+    /// stacks). The game spec assumes 200u (100bb); short-stack tables break
+    /// every SPR gate and jam solve without this. Omit ⇒ spec stack.
+    #[serde(default)]
+    pub eff_stack: Option<u32>,
+    /// SERVER-SET (any client value is overwritten): wall-clock budget remaining
+    /// for the solve after queueing, handed down so every solver cap clamps to
+    /// it — a solve admitted late runs shallower instead of blowing the deadline.
+    #[serde(default)]
+    pub budget_ms: Option<u64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -399,6 +460,11 @@ pub fn decide_postflop_resolve_with(req: &DecideRequest, iters: u32, budget_ms: 
 
 /// Range-conditioned exact re-solve (the conn live-5/6 river path).
 pub fn decide_postflop_resolve_ranged(req: &DecideRequest, iters: u32, budget_ms: u128, ranges: Option<Vec<Vec<f32>>>) -> Option<DecideResponse> {
+    // Deadline hand-me-down: never budget past what the client can still use.
+    let budget_ms = match req.budget_ms {
+        Some(b) => budget_ms.min(b as u128),
+        None => budget_ms,
+    };
     let t0 = std::time::Instant::now();
     if req.live < 3 || (req.board.len() != 4 && req.board.len() != 5) {
         return None;
@@ -709,9 +775,10 @@ fn try_gpu_hu_turn_resolve(
     let gcfg = GpuSearchCfg {
         iters: 300, sample_m: 0, seed: req.seed.unwrap_or(0x5EED),
         factored_terminals: false, lambda: 0.0,
-        // Hard runaway guard (see GpuSearchCfg::budget_ms) — the HU turn normally
+        // Hard runaway guard (see GpuSearchCfg::budget_ms), clamped to the
+        // client's remaining deadline — the HU turn normally
         // finishes ~5s; this only bites if something degenerates.
-        budget_ms: 16_000,
+        budget_ms: req.budget_ms.map_or(16_000, |b| b.min(16_000)),
     };
     let (hand_cards, strat_map) =
         gpu_hu_turn_strat(ctx, &req.board, &tree, &reach, 200, true, &gcfg);
@@ -813,6 +880,22 @@ const LIVE6_EQUITY_SAMPLES: usize = 20_000;
 /// (no betting strategy exists), so when UNBET it CHECKS; when FACING A BET it
 /// calls or folds by pot-odds vs its Monte-Carlo all-in equity against the field.
 /// Works on flop/turn/river (rolls out the remaining board). No blueprint needed.
+/// MC all-in equity of the hero on the current board vs `live-1` random hands
+/// (the rollout model's equity primitive, exposed for the off-model guard).
+pub fn rollout_equity(req: &DecideRequest) -> Option<f32> {
+    if req.board.len() < 3 || req.board.len() > 5 {
+        return None;
+    }
+    let seed = req.seed.unwrap_or(0xA17C0DE);
+    Some(crate::eqr::allin_equity_on_board(
+        req.hero_cards,
+        &req.board,
+        (req.live as usize).max(2),
+        LIVE6_EQUITY_SAMPLES,
+        seed,
+    ))
+}
+
 pub fn decide_live6(req: &DecideRequest) -> Option<DecideResponse> {
     let t0 = std::time::Instant::now();
     if req.board.len() < 3 || req.board.len() > 5 {

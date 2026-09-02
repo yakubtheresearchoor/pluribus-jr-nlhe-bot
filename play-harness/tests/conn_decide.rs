@@ -35,6 +35,11 @@ fn conn_decider_preflop_jam_hu() {
     let to_call = c_opp - c_hero;
 
     let req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
         board: vec![],
         hero_cards: [48, 49], // AA
         live: 2,
@@ -83,6 +88,11 @@ fn conn_decider_bayesian_reach_prior() {
     let live = live_pos.len();
 
     let mk = |bayes: bool| DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
         board: vec![3, 19, 35], hero_cards: [48, 49], live: live as u8, hero_idx: 0,
         commit_entry: 6, pot_entry: (6 * live) as u32, flop_id: 0, route: false,
         preflop_actions: if bayes { hist.iter().map(|&(l, a)| ActionInput { label: l, to_total: a as u32 }).collect() } else { vec![] },
@@ -112,7 +122,12 @@ fn conn_decider_serves_preflop_and_turn() {
     let Ok(dec) = ConnDecider::load(&std::env::var("CONN_TEST_BP").unwrap_or_else(|_| ws("blueprint_conn_eqr")), &ws("gs14_blueprint_cache"), 6, 5, 200, 7) else { return; };
 
     // PREFLOP: AA should rarely fold.
-    let pre = DecideRequest { board: vec![], hero_cards: [48, 49], live: 6, hero_idx: 3, ..Default::default() };
+    let pre = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None, board: vec![], hero_cards: [48, 49], live: 6, hero_idx: 3, ..Default::default() };
     let r = dec.decide(&pre).expect("preflop");
     assert_eq!(r.street, "preflop");
     let fold = r.actions.iter().find(|a| a.label == 0).map(|a| a.prob).unwrap_or(0.0);
@@ -150,6 +165,11 @@ fn conn_decider_serves_preflop_and_turn() {
     let turn = *deck.iter().find(|&&c| c != h1 && c != h2).unwrap();
 
     let req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
         board: vec![flop[0], flop[1], flop[2], turn],
         hero_cards: [h1, h2],
         live,

@@ -68,6 +68,13 @@ fn live6_river_engagement() {
     use play_harness::api::{decide_postflop_resolve_ranged, route_to_canonical, DecideRequest, ActionInput};
     // the exact e2e request that fell through to the lookup
     let mut req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: vec![51, 50, 20, 9, 30],
         hero_cards: [48, 49],
         live: 6, hero_idx: 1,

@@ -33,7 +33,7 @@ fn live56_search_per_iter() {
         let cfg = SearchCfg { iters, sample_m: 200, par: Some(true), dcfr: Some(true), ..Default::default() };
         let board = bp.flop.to_vec();
         let t0 = std::time::Instant::now();
-        let r = search_decision(&bp, &board, np, 0, None, &[], 4, (np as i32) * 4 + 4, &cfg, &[]);
+        let r = search_decision(&bp, &board, np, 0, None, &[], 4, (np as i32) * 4 + 4, &cfg, &[], &[]);
         let el = t0.elapsed().as_secs_f64();
         let per = el / iters as f64 * 1000.0;
         eprintln!("live-{np}: {iters} iters in {el:.1}s -> {per:.0} ms/iter (solve ok: {})", r.is_some());

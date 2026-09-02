@@ -575,21 +575,42 @@ impl ConnBlueprint {
     /// (shared by ConnBlueprint and ShardedConnBlueprint). Returns the node index,
     /// or None if the history doesn't lead to a player node.
     fn replay_preflop_node(pft: &FlatTree, history: &[(u8, i32)]) -> Option<usize> {
+        // MATCHER FIX (2026-07-03): the conn preflop tree carries raise sizes in
+        // CONTRIBUTIONS, not node `amount` (all raise children read amount=0) —
+        // the old exact `kn.amount == to_total` match therefore NEVER mapped a
+        // history containing a raise: the connected preflop lookup was dead in
+        // production (everything fell to the EQR player) and preflop_seat_reach
+        // silently truncated at the first raise. Match the acting player's
+        // contribution at the child, NEAREST size (same policy as the postflop
+        // walker) — exact when exact, sane when the live size is off-menu.
         let mut node = 0usize; // root
         for &(label, to_total) in history {
             if !pft.nodes[node].is_player() {
                 return None;
             }
+            let acting = pft.nodes[node].player_id;
+            let aggro = matches!(label, 3 | 4 | 5);
             let mut next = None;
+            let mut best = i32::MAX;
             for &k in pft.node_children(node) {
                 let kn = &pft.nodes[k as usize];
-                if kn.action_label != label {
+                // Class-tolerant: any of bet/raise/allin (3|4|5) matches the
+                // aggressive class (clients label preflop opens inconsistently);
+                // passive labels stay exact.
+                let k_aggro = matches!(kn.action_label, 3 | 4 | 5);
+                if (aggro && !k_aggro) || (!aggro && kn.action_label != label) {
                     continue;
                 }
-                if matches!(label, 3 | 4 | 5) {
-                    if kn.amount == to_total { next = Some(k as usize); break; }
+                if aggro {
+                    let sz = pft.get_contribution(k as usize, acting).max(kn.amount);
+                    let d = (sz - to_total).abs();
+                    if d < best {
+                        best = d;
+                        next = Some(k as usize);
+                    }
                 } else {
-                    next = Some(k as usize); break;
+                    next = Some(k as usize);
+                    break;
                 }
             }
             node = next?;
@@ -665,10 +686,85 @@ impl ShardedConnBlueprint {
         Ok(ShardedConnBlueprint { dir: dir.to_string(), np, nraises, nb, nt, nr, maxna, pft, pre_local, pre_ninfo, pre_cum })
     }
 
+    /// True iff `node` (a player node) carries ANY trained average-strategy mass.
+    fn node_trained(&self, node: usize) -> bool {
+        let l = self.pre_local[node];
+        if l < 0 {
+            return false;
+        }
+        let l = l as usize;
+        let nc = NUM_PREFLOP_CLASSES;
+        let row = &self.pre_cum[l * nc * self.maxna..(l + 1) * nc * self.maxna];
+        row.iter().any(|&v| v > 0.0)
+    }
+
+    /// MASS-AWARE replay (2026-07-03): like `replay_preflop_node`, but raise-size
+    /// matching prefers TRAINED branches. MCCFR trains only the played skeleton —
+    /// blind nearest-size matching maps real-world sizes onto zero-mass siblings
+    /// and reads uniform dice. Among aggressive candidates: nearest-by-size among
+    /// trained subtrees first, untrained only when nothing trained matches.
+    fn replay_preflop_node_trained(&self, history: &[(u8, i32)]) -> Option<usize> {
+        let pft = &self.pft;
+        let mut node = 0usize;
+        for &(label, to_total) in history {
+            if !pft.nodes[node].is_player() {
+                return None;
+            }
+            let acting = pft.nodes[node].player_id;
+            let aggro = matches!(label, 3 | 4 | 5);
+            let mut best_trained: Option<(i32, usize)> = None;
+            let mut best_any: Option<(i32, usize)> = None;
+            let mut next = None;
+            for &k in pft.node_children(node) {
+                let kn = &pft.nodes[k as usize];
+                let k_aggro = matches!(kn.action_label, 3 | 4 | 5);
+                if (aggro && !k_aggro) || (!aggro && kn.action_label != label) {
+                    continue;
+                }
+                if !aggro {
+                    next = Some(k as usize);
+                    break;
+                }
+                let sz = pft.get_contribution(k as usize, acting).max(kn.amount);
+                let d = (sz - to_total).abs();
+                // Trained = the CHILD subtree was played: player child with mass,
+                // or a non-player child (terminal/chance — always valid).
+                let trained = !pft.nodes[k as usize].is_player() || self.node_trained(k as usize);
+                if trained && best_trained.map_or(true, |(bd, _)| d < bd) {
+                    best_trained = Some((d, k as usize));
+                }
+                if best_any.map_or(true, |(bd, _)| d < bd) {
+                    best_any = Some((d, k as usize));
+                }
+            }
+            if aggro {
+                next = best_trained.or(best_any).map(|(_, k)| k);
+            }
+            node = next?;
+        }
+        if pft.nodes[node].is_player() { Some(node) } else { None }
+    }
+
+    /// Raw cumulative-strategy mass of the hero-class ROW at the node `history`
+    /// maps to. The per-class training-confidence signal: a node can be trained
+    /// overall while a specific class's row holds only a few noisy visits.
+    pub fn preflop_row_mass(&self, hero: (Card, Card), history: &[(u8, i32)]) -> Option<f32> {
+        let node = self.replay_preflop_node_trained(history)?;
+        let l = self.pre_local[node];
+        if l < 0 {
+            return Some(0.0);
+        }
+        let l = l as usize;
+        let na = self.pft.nodes[node].num_children as usize;
+        let class = PreflopClass::from_combo(hero.0, hero.1).index();
+        let nc = NUM_PREFLOP_CLASSES;
+        Some((0..na).map(|a| self.pre_cum[(l * nc + class) * self.maxna + a].max(0.0)).sum())
+    }
+
     /// Preflop action distribution after replaying `history`, for `hero` cards:
     /// `(action_label, hero-total-contribution, prob)` per child of the acting node.
     pub fn preflop_action_dist(&self, hero: (Card, Card), history: &[(u8, i32)]) -> Option<Vec<(u8, i32, f32)>> {
-        let node = ConnBlueprint::replay_preflop_node(&self.pft, history)?;
+        let node = self.replay_preflop_node_trained(history)?;
         let na = self.pft.nodes[node].num_children as usize;
         let class = PreflopClass::from_combo(hero.0, hero.1).index();
         let dist = normalize_pre_dist(&self.pre_cum, &self.pre_local, self.maxna, node, na, class);
@@ -699,16 +795,25 @@ impl ShardedConnBlueprint {
             let seat = self.pft.nodes[node].player_id as usize;
             let na = self.pft.nodes[node].num_children as usize;
             // Find the action index taken + the next node (mirror replay_preflop_node).
+            // Same contribution-based NEAREST matching as replay_preflop_node
+            // (the exact amount==to_total match never fired: amounts are 0 on
+            // this tree — the Bayesian reach prior was truncating at the first
+            // raise in every raised pot).
             let mut taken: Option<(usize, usize)> = None;
+            let mut best = i32::MAX;
+            let aggro = matches!(label, 3 | 4 | 5);
             for (a, &k) in self.pft.node_children(node).iter().enumerate() {
                 let kn = &self.pft.nodes[k as usize];
-                if kn.action_label != label {
+                let k_aggro = matches!(kn.action_label, 3 | 4 | 5);
+                if (aggro && !k_aggro) || (!aggro && kn.action_label != label) {
                     continue;
                 }
-                if matches!(label, 3 | 4 | 5) {
-                    if kn.amount == to_total {
+                if aggro {
+                    let sz = self.pft.get_contribution(k as usize, seat as u8).max(kn.amount);
+                    let d = (sz - to_total).abs();
+                    if d < best {
+                        best = d;
                         taken = Some((a, k as usize));
-                        break;
                     }
                 } else {
                     taken = Some((a, k as usize));

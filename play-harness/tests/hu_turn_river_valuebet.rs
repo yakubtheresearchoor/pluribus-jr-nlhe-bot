@@ -14,6 +14,13 @@ fn bet_prob(resp: &play_harness::api::DecideResponse) -> f32 {
 fn hu_turn_quads_value_bets_not_check_down() {
     // Quad aces on the turn. board = [As, Ah, 7c, 2d]; hero = [Ac, Ad].
     let mk = |hero_idx: u8| DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: vec![card("As"), card("Ah"), card("7c"), card("2d")],
         hero_cards: [card("Ac"), card("Ad")],
         live: 2, hero_idx,
@@ -40,6 +47,13 @@ fn hu_turn_quads_value_bets_not_check_down() {
 fn hu_river_quads_value_bets_not_check_down() {
     // Quad aces on the river. board = [As, Ah, 7c, 2d, 9s]; hero = [Ac, Ad].
     let mk = |hero_idx: u8| DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: vec![card("As"), card("Ah"), card("7c"), card("2d"), card("9s")],
         hero_cards: [card("Ac"), card("Ad")],
         live: 2, hero_idx,

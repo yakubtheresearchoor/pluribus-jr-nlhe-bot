@@ -3600,14 +3600,66 @@ fn gpu_conn_solve() {
         }
     }
 
-    #[repr(C)] struct ConnParams { np: u32, maxna: u32, rake_rate: f32, rake_cap: f32, nt: u32, nr: u32, nh: u32, nf: u32, post_stride: u32, prune_c: f32, prune_active: u32, freeze_pre: u32 }
+    #[repr(C)] struct ConnParams { np: u32, maxna: u32, rake_rate: f32, rake_cap: f32, nt: u32, nr: u32, nh: u32, nf: u32, post_stride: u32, prune_c: f32, prune_active: u32, freeze_pre: u32, n_prefix: u32, target_q: f32, prefix_stride: u32, target_eps: f32 }
     let post_stride = reg_total - pre_region;       // one flop's postflop regret region
     let reg_buf_len = pre_region + nf_flops * post_stride; // shared preflop + NF×postflop
     let prune_c: f32 = std::env::var("MC_PRUNE_C").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let prune_active: u32 = if std::env::var("MC_PRUNE").is_ok() { 1 } else { 0 };
     // FREEZE-PREFLOP (reach-prior per-flop solve): preflop read, never updated.
     let freeze_pre: u32 = if std::env::var("MC_FREEZE_PRE").is_ok() { 1 } else { 0 };
-    let params = ConnParams { np: np as u32, maxna: maxna as u32, rake_rate: pft.rake_rate as f32, rake_cap: pft.rake_cap as f32, nt: nt_r as u32, nr: nr_r as u32, nh: nh as u32, nf: nf_flops as u32, post_stride: post_stride as u32, prune_c, prune_active, freeze_pre };
+    // TARGETED EXPLORATION (2026-07-03): the natural sampling never reaches
+    // late-position 3-bet defense (compounded line rarity — untrained at 1B
+    // deals). Enumerate every "≥0 passive actions → open → 3-bet, defender to
+    // act" preflop prefix; a MC_TARGET_Q fraction of trajectories is forced
+    // down a random one with the DEFENDER as traverser, importance-weighted by
+    // Πσ(forced action) in-kernel (unbiased: reallocates variance, not the
+    // fixed point). MC_TARGET_Q=0 disables.
+    // DEFAULT 0 (2026-07-03): IS-weighted targeting is mathematically unable to
+    // beat line rarity (the weight IS the rarity, w~1e-4 ⇒ 2500x lighter than
+    // natural updates — measured: depth-5 fill unchanged at q=0.2/0.5). Kept as
+    // an env-gated experiment; the production answer for the untrained tail is
+    // the runtime equity-vs-posterior guard.
+    let target_q: f32 = std::env::var("MC_TARGET_Q").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let mut prefix_paths: Vec<(Vec<u8>, u8)> = Vec::new(); // (action indices, target player)
+    {
+        // DFS over preflop player nodes; path = action indices; stop at 2 raises.
+        let mut stack: Vec<(usize, Vec<u8>, u32, Vec<u8>)> = vec![(0, vec![], 0, vec![])]; // node, path, raises, actors
+        while let Some((n, path, raises, actors)) = stack.pop() {
+            if prefix_paths.len() >= 4096 { break; }
+            if !pft.nodes[n].is_player() || path.len() >= 10 {
+                continue;
+            }
+            let actor = pft.nodes[n].player_id;
+            if raises == 2 {
+                // defender node: target here iff the defender never acted in the prefix
+                if !actors.contains(&actor) {
+                    prefix_paths.push((path.clone(), actor));
+                }
+                continue;
+            }
+            for (a, &k) in pft.node_children(n).iter().enumerate() {
+                let kn = &pft.nodes[k as usize];
+                let is_raise = kn.action_label >= 3;
+                let mut p2 = path.clone();
+                p2.push(a as u8);
+                let mut ac2 = actors.clone();
+                ac2.push(actor);
+                stack.push((k as usize, p2, raises + u32::from(is_raise), ac2));
+            }
+        }
+    }
+    let n_prefix = prefix_paths.len();
+    let prefix_stride = prefix_paths.iter().map(|(p, _)| p.len()).max().unwrap_or(1).max(1);
+    let mut prefix_act = vec![0u8; n_prefix.max(1) * prefix_stride];
+    let mut prefix_meta = vec![0u32; n_prefix.max(1) * 2];
+    for (i, (path, tp)) in prefix_paths.iter().enumerate() {
+        for (h, &a) in path.iter().enumerate() { prefix_act[i * prefix_stride + h] = a; }
+        prefix_meta[i * 2] = path.len() as u32;
+        prefix_meta[i * 2 + 1] = *tp as u32;
+    }
+    eprintln!("[TARGET] {} defense prefixes (stride {prefix_stride}), q={target_q}", n_prefix);
+    let target_eps: f32 = std::env::var("MC_TARGET_EPS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02);
+    let params = ConnParams { np: np as u32, maxna: maxna as u32, rake_rate: pft.rake_rate as f32, rake_cap: pft.rake_cap as f32, nt: nt_r as u32, nr: nr_r as u32, nh: nh as u32, nf: nf_flops as u32, post_stride: post_stride as u32, prune_c, prune_active, freeze_pre, n_prefix: if target_q > 0.0 { n_prefix as u32 } else { 0 }, target_q, prefix_stride: prefix_stride as u32, target_eps };
 
     let ctx = MetalContext::new().expect("metal");
     let dev = ctx.device();
@@ -3622,8 +3674,11 @@ fn gpu_conn_solve() {
         u32b(&children), i32b(&c_local), u16b(&c_fold), i32b(&c_contrib), i32b(&c_spot), u32b(&c_regbase), u32b(&c_nb),
         dev.new_buffer_with_data(&params as *const _ as *const _, std::mem::size_of::<ConnParams>() as u64, so),
         u16b(&flop_b), u16b(&turn_b), u16b(&river_b), u8b(&t_alive), u8b(&r_alive),
-        i32b(&strengths), fb(&ft), fb(&fl), fb(&fn_), u32b(&[tnb as u32]),
+        // slots 21/22 repurposed: targeted-exploration prefix buffers (ft/fl
+        // were unused since the exact-showdown switch)
+        i32b(&strengths), u8b(&prefix_act), u32b(&prefix_meta), fb(&fn_), u32b(&[tnb as u32]),
     ];
+    let _ = (&ft, &fl);
     let b_reg = dev.new_buffer((reg_buf_len*4).max(4) as u64, so);
     let b_cum = dev.new_buffer((reg_buf_len*4).max(4) as u64, so);
     let b_cls = u32b(&hand_cls);
@@ -3717,12 +3772,13 @@ fn gpu_conn_solve() {
             let open = (0..pnn).find(|&i| pre_local[i] >= 0).unwrap_or(0);
             let local = pre_local[open] as usize;
             let na = pft.nodes[open].num_children as usize;
-            let off = local * nc * maxna;
+            // Kernel layout = (local*nc + cl)*maxna + a ([class][action]) — the
+            // pre-2026-07-03 print read [a][c] and misreported trash as loose.
             let labels: Vec<u8> = pft.node_children(open).iter().map(|&c| pft.nodes[c as usize].action_label).collect();
             let rf = |cl: usize, want: u8| -> f32 {
-                let s: f32 = (0..na).map(|a| cum[off + a*nc + cl].max(0.0)).sum();
+                let s: f32 = (0..na).map(|a| cum[(local*nc + cl)*maxna + a].max(0.0)).sum();
                 if s <= 0.0 { return 0.0; }
-                let r: f32 = (0..na).filter(|&a| labels[a]==want).map(|a| cum[off + a*nc + cl].max(0.0)).sum();
+                let r: f32 = (0..na).filter(|&a| labels[a]==want).map(|a| cum[(local*nc + cl)*maxna + a].max(0.0)).sum();
                 r / s
             };
             let ix = |a:&str,b:&str| PreflopClass::from_combo(card_from_str(a).unwrap(), card_from_str(b).unwrap()).index();
@@ -3809,6 +3865,14 @@ fn gpu_conn_solve() {
         // Emit the game-economics manifest: the RUNTIME loads this so real-time
         // refinement uses the SAME rake/ante/stack this blueprint was solved with.
         let _ = production_game_v1().save_to_dir(&out_dir);
+        // MC_PRE_ONLY: preflop-first rebuild — harvest the Phase-A preflop shard
+        // and STOP before the (hours-long) per-flop Phase-B fill. The shard is a
+        // separable artifact (battery-gated offline, deployable alone); Phase B
+        // runs later, once the preflop is verified.
+        if std::env::var("MC_PRE_ONLY").is_ok() {
+            println!("  MC_PRE_ONLY: preflop shard written to {out_dir}/preflop.ssbp2 — skipping Phase B.");
+            return;
+        }
         let ncan = canonical_flops_cached().len();
         let lo: usize = std::env::var("MC_FLOP_LO").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let hi: usize = std::env::var("MC_FLOP_HI").ok().and_then(|s| s.parse().ok()).unwrap_or(ncan).min(ncan);
@@ -3822,7 +3886,7 @@ fn gpu_conn_solve() {
         let bp_check: u64 = std::env::var("MC_BP_CHECK").ok().and_then(|s| s.parse().ok()).unwrap_or(8 * batch as u64);
         let bp_eps: f32 = std::env::var("MC_BP_EPS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.03);
         // nf=1 params with the preflop frozen.
-        let params_b = ConnParams { nf: 1, freeze_pre: 1, post_stride: post_stride as u32, ..params };
+        let params_b = ConnParams { nf: 1, freeze_pre: 1, post_stride: post_stride as u32, n_prefix: 0, target_q: 0.0, ..params };
         let b_params_b = dev.new_buffer_with_data(&params_b as *const _ as *const _, std::mem::size_of::<ConnParams>() as u64, so);
         let reg1_len = pre_region + post_stride;
         let b_reg1 = dev.new_buffer((reg1_len * 4).max(4) as u64, so);

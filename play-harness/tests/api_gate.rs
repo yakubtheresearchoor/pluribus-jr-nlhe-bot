@@ -30,6 +30,13 @@ fn api_multiway_resolve_e2e() {
         let mut served = 0;
         for hero_idx in 0..3u8 {
             let req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
                 board: board.clone(),
                 hero_cards: [deck[0], deck[1]],
                 partner_cards: None,
@@ -94,6 +101,13 @@ fn api_postflop_turn_fallback() {
     let board: Vec<u8> = vec![bp.flop[0], bp.flop[1], bp.flop[2], turn];
     let deck: Vec<u8> = (0..52u8).filter(|&c| board.iter().all(|&b| b != c)).collect();
     let req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board, hero_cards: [deck[0], deck[1]], partner_cards: None, live: bp.np as u8,
         hero_idx: 0, partner_idx: None, commit_entry: commit, pot_entry: pot,
         street_actions: vec![], cell_dir: cell.clone(), flop_id: 0, seed: Some(1),
@@ -116,6 +130,13 @@ fn api_live6_rollout() {
     // AKQ rainbow flop.
     let flop = vec![48u8, 45, 42]; // A♠ K♦ Q♣ (rank*4+suit)
     let base = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: flop.clone(),
         hero_cards: [49, 50], // A♦ A♥ → flopped set of aces
         partner_cards: None,
@@ -139,13 +160,27 @@ fn api_live6_rollout() {
     eprintln!("LIVE6 unbet → {} ({}ms)", r_check.chosen.action, r_check.search_ms);
 
     // Facing a pot-odds-33% bet with a set → call.
-    let strong = DecideRequest { to_call: Some(50), ..clone_req(&base) };
+    let strong = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![], to_call: Some(50), ..clone_req(&base) };
     let r_strong = decide_live6(&strong).expect("live6 set");
     eprintln!("LIVE6 set facing 50 into 100: chose {}", r_strong.chosen.action);
     assert_eq!(r_strong.chosen.action, "call", "a flopped set should call 33% pot odds");
 
     // Same bet with total air (7♠2♦ on AKQ) → fold.
     let weak = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         hero_cards: [28, 9], // 7♠ 2♦
         to_call: Some(50),
         ..clone_req(&base)
@@ -159,6 +194,13 @@ fn api_live6_rollout() {
 /// Shallow-clone a DecideRequest (the struct isn't Clone; rebuild the owned fields).
 fn clone_req(r: &DecideRequest) -> DecideRequest {
     DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: r.preflop_actions.clone(),
+        seat_positions: r.seat_positions.clone(),
         board: r.board.clone(),
         hero_cards: r.hero_cards,
         partner_cards: r.partner_cards,
@@ -192,6 +234,13 @@ fn api_live2_flop() {
     }
     // canonical flop 0 = three rainbow deuces [0,1,2]; hero off-board.
     let canon_req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: vec![0, 1, 2],
         hero_cards: [20, 33],
         partner_cards: None,
@@ -227,6 +276,13 @@ fn api_live2_flop() {
     let perm = [1u8, 0, 3, 2];
     let remap = |c: u8| ((c >> 2) << 2) | perm[(c & 3) as usize];
     let mut routed = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: canon_req.board.iter().map(|&c| remap(c)).collect(),
         hero_cards: [remap(canon_req.hero_cards[0]), remap(canon_req.hero_cards[1])],
         route: true,
@@ -261,6 +317,13 @@ fn api_live2_turn_river() {
         let root_player = probe.tree.nodes[0].player_id as u8;
 
         let req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
             board: board.clone(),
             hero_cards: hero,
             partner_cards: None,
@@ -328,6 +391,13 @@ fn api_route_invariance() {
     let hero = [deck[0], deck[1]];
 
     let base_req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: canon_board.clone(),
         hero_cards: hero,
         partner_cards: None,
@@ -352,6 +422,13 @@ fn api_route_invariance() {
     let raw_board: Vec<u8> = canon_board.iter().map(|&c| remap(c)).collect();
     let raw_hero = [remap(hero[0]), remap(hero[1])];
     let mut routed = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: raw_board,
         hero_cards: raw_hero,
         flop_id: 999, // wrong on purpose — routing must overwrite it
@@ -437,6 +514,13 @@ fn api_route_turn_river() {
         let deck: Vec<u8> = (0..52u8).filter(|&c| used & (1u64 << c) == 0).collect();
         let hero = [deck[0], deck[1]];
         let base_req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
             board: board.clone(),
             hero_cards: hero,
             partner_cards: None,
@@ -462,6 +546,13 @@ fn api_route_turn_river() {
         };
         // permute board + hole, route back.
         let mut routed = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
             board: board.iter().map(|&c| remap(c)).collect(),
             hero_cards: [remap(hero[0]), remap(hero[1])],
             flop_id: 999,
@@ -524,6 +615,13 @@ fn api_decide_smoke() {
 
     // --- SOLO: hero first to act on the flop (no prior street action) ---
     let req = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board: board.clone(),
         hero_cards: hero,
         partner_cards: None,
@@ -552,6 +650,13 @@ fn api_decide_smoke() {
 
     // --- PAIR MODE: hero seat 0, partner seat 1, partner cards blocked from pool ---
     let req_pair = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![],
         board,
         hero_cards: hero,
         partner_cards: Some(partner),
@@ -571,7 +676,14 @@ fn api_decide_smoke() {
     // (with one prior action by seat 1, the node should be hero=seat? — depends on
     // action order; if the mapped node isn't hero's, decide returns None. Use the
     // no-action form to guarantee hero-to-act, but exercise the blocker path.)
-    let req_pair = DecideRequest { street_actions: vec![], ..req_pair };
+    let req_pair = DecideRequest {
+        opponent_stats: vec![],
+        pool_river_bluff: None,
+        eff_stack: None,
+        deadline_ms: None,
+        budget_ms: None,
+        preflop_actions: vec![],
+        seat_positions: vec![], street_actions: vec![], ..req_pair };
     let resp_pair = decide_postflop(&bp, &req_pair, &cfg).expect("pair decision");
     let zp: f32 = resp_pair.actions.iter().map(|a| a.prob).sum();
     eprintln!("PAIR {} live={}: {} actions, Σp={zp:.3}, paired={}, {}ms", resp_pair.street, resp_pair.live, resp_pair.actions.len(), resp_pair.paired, resp_pair.search_ms);
